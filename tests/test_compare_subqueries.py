@@ -195,3 +195,23 @@ def test_error_messages_match_sqlite():
         "SELECT (SELECT nope FROM u)",
     ])
     pair.close()
+
+
+def test_evaluation_timing_matches_sqlite():
+    pair = Pair()
+    pair.script([
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "INSERT INTO t VALUES ((SELECT count(*) FROM t)), ((SELECT count(*) FROM t))",
+        "UPDATE t SET a = (SELECT count(*) FROM t AS s WHERE s.a = t.a)",
+        "UPDATE t SET a = (SELECT max(a) FROM t) + 1",
+        "DELETE FROM t WHERE a > (SELECT min(a) FROM t)",
+        "SELECT * FROM t",
+        "SELECT 1 WHERE 0 AND (SELECT x FROM nosuch)",
+        "SELECT 1 WHERE (SELECT x FROM nosuch) AND 0",
+        "SELECT 1 WHERE 0 AND nosuch_column",
+        "SELECT 1 WHERE 0 AND abs(nosuch_column)",
+        "SELECT 0 AND (SELECT x FROM nosuch), 1 FROM t",
+        "SELECT a FROM t WHERE a > 0 AND (0 AND (SELECT x FROM nosuch))",
+    ])
+    pair.close()

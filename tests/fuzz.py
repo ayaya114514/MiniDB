@@ -244,8 +244,11 @@ class Generator:
         names = [c for c in table.column_names() if c != table.rowid_alias]
         assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in rng.sample(names, rng.randint(1, len(names)))]
         where = self.condition(scope)
-        if any(a.split(" = ")[0] in table.unique_columns for a in assignments):
-            # Which row goes first could decide a UNIQUE conflict: one row only.
+        if any(a.split(" = ")[0] in table.unique_columns for a in assignments) or any(
+            "(SELECT" in a for a in assignments
+        ):
+            # Which row goes first could decide a UNIQUE conflict, or what a
+            # subquery over the table sees: one row only.
             where = f"rowid = {rng.randint(1, 40)}"
         if table.rowid_alias and rng.random() < 0.15:
             # Changing the row id: keep it to one row so the processing order cannot matter.
@@ -368,6 +371,8 @@ class Generator:
             return self.drop_index()
         if roll < 0.08:
             return rng.choice(["BEGIN", "COMMIT", "ROLLBACK"])
+        if roll < 0.085:
+            return "ANALYZE"  # statistics change later plans, never results
         if roll < 0.40:
             return self.insert()
         if roll < 0.50:
