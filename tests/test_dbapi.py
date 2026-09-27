@@ -1,6 +1,7 @@
 """The DB-API 2.0 interface and parameter binding, compared with the sqlite3 module."""
 
 import sqlite3
+import sys
 
 import pytest
 
@@ -29,9 +30,24 @@ def error_message(exc):
     return getattr(exc, "message", str(exc))
 
 
+# The reference is the sqlite3 module of Python 3.12+, whose ``autocommit``
+# parameter MiniDB mirrors.  Python 3.11 lacks it: there, isolation_level=None
+# stands in for autocommit=True in the tests that do not depend on transaction
+# handling, and the transaction tests are skipped.
+HAS_AUTOCOMMIT = sys.version_info >= (3, 12)
+needs_autocommit = pytest.mark.skipif(not HAS_AUTOCOMMIT, reason="sqlite3 autocommit needs Python 3.12+")
+
+
+def connect(module, path, autocommit=True):
+    if module is sqlite3 and not HAS_AUTOCOMMIT:
+        assert autocommit is True
+        return sqlite3.connect(path, isolation_level=None)
+    return module.connect(path, autocommit=autocommit)
+
+
 def outcome(module, script, autocommit=True):
     """Run ``script(connection)`` and describe everything it observed."""
-    conn = module.connect(":memory:", autocommit=autocommit)
+    conn = connect(module, ":memory:", autocommit)
     observed = []
 
     def note(value):
@@ -242,6 +258,7 @@ def test_api_errors_match_sqlite3():
 # ---- transactions ---------------------------------------------------------------
 
 
+@needs_autocommit
 @pytest.mark.parametrize("autocommit", [False, True])
 def test_transaction_behaviour_matches_sqlite3(autocommit, tmp_path):
     def run(module):
@@ -287,6 +304,7 @@ def test_transaction_behaviour_matches_sqlite3(autocommit, tmp_path):
     assert run(minidb) == run(sqlite3)
 
 
+@needs_autocommit
 def test_explicit_transactions_with_autocommit():
     def script(conn, note):
         conn.execute("CREATE TABLE t (a INTEGER)")
