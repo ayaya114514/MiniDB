@@ -3,6 +3,8 @@ name = "minidb"
 version = "0.1.0"
 description = "A small SQLite-like relational database written from scratch in Python"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
