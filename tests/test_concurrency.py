@@ -295,3 +295,12 @@ def test_lock_of_a_dead_process_is_released(path, tmp_path):
     db.execute("INSERT INTO t VALUES (2, 'two')")
     assert db.execute("SELECT id FROM t") == [(1,), (2,)]
     db.close()
+
+
+def test_log_is_checkpointed_automatically(path):
+    db = Database(path)
+    for i in range(2, 1500):
+        db.execute("INSERT INTO t VALUES (?, ?)", (i, "v" * 50))
+        assert db.pager.committed < 1100  # never far beyond the threshold
+    assert db.execute("SELECT count(*) FROM t") == [(1499,)]
+    db.close()
