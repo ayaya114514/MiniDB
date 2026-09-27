@@ -57,6 +57,8 @@ def outcome(module, script, autocommit=True):
         script(conn, note)
     except Exception as exc:  # compare the error, whatever it is
         observed.append(("error", error_class(exc), error_message(exc)))
+    finally:
+        conn.close()
     return observed
 
 
@@ -121,7 +123,16 @@ def test_binding_matches_sqlite3(sql, parameters):
         note(cursor.fetchall())
         note(cursor.description)
 
+    if sql == "SELECT ?, ?3, ?, :x, ?" and len(parameters) == 6 and sys.version_info < (3, 14):
+        # a named placeholder bound from a sequence: sqlite3 before 3.14
+        # only warns; MiniDB already raises like 3.14
+        assert outcome(minidb, script) == [("error", "ProgrammingError", NAMED_FROM_SEQUENCE)]
+        return
     same_behaviour(script)
+
+
+NAMED_FROM_SEQUENCE = ("Binding 5 (':x') is a named parameter, but you supplied a sequence "
+                       "which requires nameless (qmark) placeholders.")
 
 
 def test_parameters_in_every_clause():
