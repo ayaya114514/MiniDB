@@ -207,17 +207,80 @@ def test_persistence(tmp_path):
     pager.close()
 
 
-def test_key_too_large_for_capacity():
-    from minidb.record import encode_record
+class TextKey:
+    """Codec for str keys (UTF-8 with a length prefix), to exercise long keys."""
 
-    class RecordKey:
-        encode = staticmethod(lambda key: encode_record(list(key)))
-        size = staticmethod(lambda key: len(encode_record(list(key))))
+    @staticmethod
+    def encode(key):
+        data = key.encode()
+        return len(data).to_bytes(4, "big") + data
 
-    _, tree = make_tree()
-    tree.codec = RecordKey
-    with pytest.raises(BTreeError):
-        tree.insert(("x" * 1000,), b"")
+    @staticmethod
+    def decode(data, pos):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        return bytes(data[pos + 4:pos + 4 + length]).decode(), pos + 4 + length
+
+    @classmethod
+    def size(cls, key):
+        return 4 + len(key.encode())
+
+
+def random_text(rng, long_share=0.3):
+    length = rng.randint(200, 6000) if rng.random() < long_share else rng.randint(0, 12)
+    return "".join(rng.choice("abcdéxyz") for _ in range(length))
+
+
+@pytest.mark.parametrize("capacity", [160, 512, 4092])
+def test_long_keys_overflow(capacity):
+    rng = random.Random(capacity)
+    pager = Pager()
+    tree = BTree.create(pager, TextKey, capacity)
+    model = {}
+    for step in range(4000):
+        key = random_text(rng)
+        if rng.random() < 0.6 or not model:
+            value = b"v" * rng.randint(0, 30)
+            tree.insert(key, value, replace=True)
+            model[key] = value
+        else:
+            victim = rng.choice(list(model)) if rng.random() < 0.8 else key
+            assert tree.delete(victim) == (victim in model)
+            model.pop(victim, None)
+        if step % 800 == 0:
+            assert tree.check() == len(model)
+    assert tree.check() == len(model)
+    assert list(tree.scan()) == sorted(model.items())
+    long_keys = [k for k in model if TextKey.size(k) > tree.max_key_size]
+    assert long_keys and all(tree.get(k) == model[k] for k in long_keys)
+    for key in list(model):
+        tree.delete(key)
+    assert tree.check() == 0
+    assert pager.page_count - pager.free_page_count() == 2  # every chain was freed
+
+
+def test_long_keys_persist_and_roll_back(tmp_path):
+    rng = random.Random(3)
+    path = str(tmp_path / "keys.db")
+    pager = Pager(path)
+    tree = BTree.create(pager, TextKey, 300)
+    keys = sorted({random_text(rng, 0.5) for _ in range(600)})
+    for key in keys:
+        tree.insert(key, b"")
+    root = tree.root
+    pager.close()
+    pager = Pager(path)
+    tree = BTree(pager, root, TextKey, 300)
+    assert tree.keys() == keys and tree.check() == len(keys)
+    used = pager.page_count - pager.free_page_count()
+    pager.begin_statement()
+    for key in keys[::2]:
+        tree.delete(key)
+    for _ in range(200):
+        tree.insert(random_text(rng, 0.9), b"new", replace=True)
+    pager.rollback_statement()
+    assert tree.keys() == keys and tree.check() == len(keys)
+    assert pager.page_count - pager.free_page_count() == used
+    pager.close()
 
 
 def test_destroy_and_clear_free_pages():

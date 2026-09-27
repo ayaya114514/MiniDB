@@ -131,7 +131,7 @@ def test_old_file_format_is_rejected_clearly(tmp_path):
     path.write_bytes(b"MiniDB format 1\x00" + bytes(PAGE_SIZE - 16))
     with pytest.raises(DatabaseError, match="unsupported MiniDB file format: MiniDB format 1"):
         Database(str(path))
-    assert MAGIC.startswith(b"MiniDB format 2")
+    assert MAGIC.startswith(b"MiniDB format 3")
 
 
 def test_every_page_carries_a_checksum(original):

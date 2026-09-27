@@ -212,15 +212,25 @@ def test_indexes_persist_and_drop_table_removes_them(tmp_path):
         assert pages_in_use > 10
 
 
-def test_long_index_keys_are_rejected_cleanly():
-    db = Database()
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)")
-    db.execute("CREATE INDEX t_s ON t (s)")
-    db.execute("INSERT INTO t VALUES (1, 'short')")
-    with pytest.raises(OperationalError, match="key too large"):
-        db.execute(f"INSERT INTO t VALUES (2, '{'x' * 2000}')")
-    assert db.execute("SELECT count(*) FROM t") == [(1,)]
-    assert db.integrity_check() == []
+def test_long_index_keys_are_supported():
+    pair = Pair()
+    long = lambda i, n: f"'{chr(97 + i % 26) * n}{i}'"  # noqa: E731
+    pair.script([
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT UNIQUE, u TEXT)",
+        "CREATE INDEX t_us ON t (u, s)",
+        "INSERT INTO t VALUES " + ", ".join(
+            f"({i}, {long(i, 3000 + i * 37)}, {long(i % 5, 5000)})" for i in range(60)
+        ),
+        f"INSERT INTO t VALUES (100, {long(7, 3000 + 7 * 37)}, 'dup')",  # UNIQUE violation
+        f"SELECT id FROM t WHERE s = {long(7, 3000 + 7 * 37)}",
+        f"SELECT id FROM t WHERE u = {long(3, 5000)} ORDER BY s",
+        f"SELECT id, length(s) FROM t WHERE s > {long(20, 3000 + 20 * 37)} ORDER BY s LIMIT 5",
+        "UPDATE t SET s = s || 'x' WHERE id % 3 = 0",
+        "DELETE FROM t WHERE id % 4 = 0",
+        "SELECT id, length(s), length(u) FROM t ORDER BY u, s",
+    ])
+    assert pair.mini.integrity_check() == []
+    pair.close()
 
 
 def test_delete_all_clears_indexes(db):
