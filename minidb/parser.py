@@ -26,12 +26,6 @@ class Literal:
 
 
 @dataclass(frozen=True)
-class Bound(Literal):
-    """The value bound to a parameter.  Evaluates like a literal, but SQLite
-    never treats it as an ORDER BY column number or folds it at parse time."""
-
-
-@dataclass(frozen=True)
 class Column:
     name: str
     table: str | None = None
