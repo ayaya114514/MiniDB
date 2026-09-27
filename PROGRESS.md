@@ -139,3 +139,11 @@
 - fuzz（含 ANALYZE 语句）：500 种子 × 500 + 200 种子 × 500（文件模式）两轮。第一轮发现 2 处不一致：一处是计划相关（UPDATE 的 SET 子查询读同一张表、SQLite 按索引顺序处理行），fuzz 改为此类 UPDATE 只作用一行；一处是真实差异（`0 AND (子查询引用不存在的表)` SQLite 不报错），已修复。第二轮 0 不一致。
 - 性能（10 万行，同样取 5 次最好成绩对比阶段 12）：带参数主键点查 0.117 → 0.104 s；拼字面量点查 0.533 → 0.557 s（每条语句都做代价规划，慢约 4%）；自动提交写入 1000 行 0.28 → 0.12 s（每次提交只 fsync 日志，比 sqlite3 默认的回滚日志模式还快）。
 - 已知问题：持续有读者时 checkpoint 一直做不成、日志变长（没有 SQLite 那种基于共享内存读者标记的部分 checkpoint）；目录里会保留大小为 0 的 `-wal` 和 `-lock` 文件。
+
+## 阶段 14：工程化（完成）
+- 类型注解：所有模块级函数和方法（143 个在 executor 里）的参数与返回值都有注解；共享别名 `SQLValue`/`Row`/`RowFunction` 等和 `Page`/`KeyCodec`/`AccessPath` 三个 Protocol。`tests/test_annotations.py` 用 `typing.get_type_hints` 解析全部注解（13 个模块）。
+- 覆盖率（`tools/coverage.py`，标准库 `trace` + `ast`）：98.9% → 99.2%（4524 条语句，未覆盖 36 条）。修正了工具的一个 bug（`trace` 按模块短名缓存忽略判断，导致所有 `__init__.py` 被跳过）。新增进程内的 CLI 入口测试（子进程里执行的代码不计入覆盖率）和缺参数的对照测试。剩余未覆盖：`__main__.py`（只在子进程测试里运行）；`locking.py` 的 Windows 无 `fcntl` 分支和目录 fsync 的 OSError 分支；其余是防御性分支（不可能的内部状态、未知语句类型、页读取不足等）。
+- 多 Python 版本：本地用 mamba 建了 3.11/3.13/3.14 环境逐一跑全部测试。发现并处理：3.11 的 sqlite3 没有 `autocommit` 参数（对照改用 `isolation_level=None`，两组事务对照在 3.11 跳过）；3.14 的 sqlite3 对“命名占位符 + 序列参数”报错（MiniDB 改为同样报错，D68）；3.13+ 的 sqlite3 对未关闭连接发 ResourceWarning。
+- 测试把警告视为错误（`filterwarnings = ["error"]`）：修掉测试里遗留的未关闭文件/连接（崩溃测试释放崩溃连接的文件；`Pair` 由 autouse fixture 统一关闭）。
+- 测试：583 个。Python 3.12/3.13/3.14 全部通过；3.11 上 580 通过、3 跳过。3.11 上额外跑了 200 种子 × 400 的 fuzz，0 不一致。
+- CI：公开仓库 https://github.com/ayaya114514/MiniDB ，GitHub Actions 在 ubuntu-latest 上跑 3.11–3.14 测试矩阵 + fuzz（固定 300 种子、文件模式 100 种子、每次运行换 200 个新种子；每周定时一次）。上线前在本地按 CI 的参数跑过这三段 fuzz（含前两次运行会用到的新种子），0 不一致。
