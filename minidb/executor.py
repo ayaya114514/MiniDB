@@ -73,6 +73,7 @@ class Scope:
         self.parent = parent  # scope of the enclosing query, for correlated subqueries
         self.cell = [None]  # the row of this scope while one of its subqueries runs
         self.uses_outer = False  # some expression here refers to an enclosing query
+        self.used = set()  # (table index, column position) pairs referenced so far
 
     def add(self, table, alias=None):
         name = (alias if alias is not None else table.name).lower()
@@ -111,6 +112,8 @@ class Scope:
             if matches:
                 for inner in passed:
                     inner.uses_outer = True
+                slot, _, index = matches[0]
+                scope.used.add((index, slot - scope.entries[index].offset))
                 return (*matches[0], depth)
             passed.append(scope)
             scope, depth = scope.parent, depth + 1
@@ -715,6 +718,20 @@ class IndexScan:
         self.equal = equal  # key functions for the leading columns
         self.lower = lower  # (key function, inclusive) or None
         self.upper = upper
+        self.covering = False  # rows are built from index keys alone
+
+    @property
+    def yields_rows(self):
+        return self.covering
+
+    def cover_if_possible(self, scope, table_index):
+        """Use the index alone if it holds every column the query uses."""
+        table = self.index.table
+        available = set(self.index.positions) | {len(table.columns)}  # plus the row id
+        if table.rowid_column is not None:
+            available.add(table.rowid_column)
+        used = {position for index, position in scope.used if index == table_index}
+        self.covering = used <= available
 
     def candidates(self, row):
         sort_key = values.sort_key
@@ -745,8 +762,23 @@ class IndexScan:
                 end = prefix + (sort_key(value), HIGH)
             else:
                 end, end_inclusive = prefix + (sort_key(value),), False
+        keys = self.index_tree.scan(start, end, start_inclusive, end_inclusive)
+        if self.covering:
+            table = self.index.table
+            width, positions, alias = len(table.columns), self.index.positions, table.rowid_column
+            for key, _ in keys:
+                rowid = key[-1][1]
+                row = [None] * width
+                for position, (rank, *value) in zip(positions, key):
+                    if rank:
+                        row[position] = value[0]
+                if alias is not None:
+                    row[alias] = rowid
+                row.append(rowid)
+                yield rowid, row
+            return
         get = self.table_tree.get
-        for key, _ in self.index_tree.scan(start, end, start_inclusive, end_inclusive):
+        for key, _ in keys:
             rowid = key[-1][1]
             yield rowid, get(rowid)
 
@@ -756,14 +788,15 @@ class IndexScan:
 
     def describe(self):
         names = self.index.column_names
+        covering = "COVERING " if self.covering else ""
         if not (self.equal or self.lower or self.upper):
-            return f"SCAN USING INDEX {self.index.name}"
+            return f"SCAN USING {covering}INDEX {self.index.name}"
         parts = [f"{name}=?" for name in names[:len(self.equal)]]
         if self.lower:
             parts.append(f"{names[len(self.equal)]}>{'=' if self.lower[1] else ''}?")
         if self.upper:
             parts.append(f"{names[len(self.equal)]}<{'=' if self.upper[1] else ''}?")
-        return f"SEARCH USING INDEX {self.index.name} ({' AND '.join(parts)})"
+        return f"SEARCH USING {covering}INDEX {self.index.name} ({' AND '.join(parts)})"
 
 
 ROWID = -1  # column position standing for the row id in constraints
@@ -1023,7 +1056,7 @@ class Executor:
             right.hidden.add(name.lower())
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
-    def plan_joins(self, scope, joins, where, order_hint=None):
+    def plan_joins(self, scope, joins, where, order_hint=None, covering=False):
         """Plan a nested loop over ``joins``; returns a list of ``JoinLevel``.
 
         WHERE conjuncts and the ON conditions of inner joins form one pool of
@@ -1045,27 +1078,27 @@ class Executor:
                 placed.setdefault(max(tables), []).append(conjunct)
             else:
                 constant.append(conjunct)
-        levels = []
+        # Compile all conditions first: the access paths may then check which
+        # columns the query uses (covering indexes).
+        compiled = []
         for index, join in enumerate(joins):
-            entry = scope.entries[index]
-            if join.kind == "LEFT":
-                usable = split_conjuncts(join.on)
-                match = on_compiler.compile(join.on) if join.on is not None else None
-            else:
-                usable = pool
-                match = None
+            match = None
+            if join.kind == "LEFT" and join.on is not None:
+                match = on_compiler.compile(join.on)
             filters = placed.get(index, [])
             if index == 0:
                 filters = constant + filters
-            levels.append(JoinLevel(
-                entry.table,
-                entry.offset,
-                plan_access(scope, index, self.catalog, usable, compiler,
-                            order_hint if index == 0 else None),
-                join.kind == "LEFT",
-                match,
-                [compiler.compile(f) for f in filters],
-            ))
+            compiled.append((match, [compiler.compile(f) for f in filters]))
+        levels = []
+        for index, (join, (match, filters)) in enumerate(zip(joins, compiled)):
+            entry = scope.entries[index]
+            usable = split_conjuncts(join.on) if join.kind == "LEFT" else pool
+            access = plan_access(scope, index, self.catalog, usable, compiler,
+                                 order_hint if index == 0 else None)
+            if covering and isinstance(access, IndexScan):
+                access.cover_if_possible(scope, index)
+            levels.append(JoinLevel(entry.table, entry.offset, access,
+                                    join.kind == "LEFT", match, filters))
         return levels
 
     @staticmethod
@@ -1382,7 +1415,7 @@ class JoinLevel:
         self.outer = outer  # LEFT JOIN: emit a NULL row when nothing matches
         self.match = match  # LEFT JOIN ON condition
         self.filters = filters  # conditions checked once this table is bound
-        if isinstance(table, DerivedSource):
+        if isinstance(table, DerivedSource) or getattr(access, "yields_rows", False):
             self.load = lambda rowid, row: row  # already a row
         else:
             load_row = Executor.load_row
@@ -1419,7 +1452,7 @@ class CompiledSelect:
         order_columns = self.order_columns(stmt)
         if stmt.source:
             hint = order_columns[0] if order_columns and stmt.limit is not None else None
-            self.levels = executor.plan_joins(scope, joins, stmt.where, hint)
+            self.levels = executor.plan_joins(scope, joins, stmt.where, hint, covering=True)
         elif stmt.where is not None:
             where = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=executor)
             self.condition = where.compile(stmt.where)

@@ -53,7 +53,7 @@ def test_schema_changes_are_visible_to_other_connections(path):
     a.execute("CREATE TABLE u (x INTEGER)")
     a.execute("CREATE INDEX t_v ON t (v)")
     b.execute("INSERT INTO u VALUES (5)")
-    assert b.execute("EXPLAIN SELECT * FROM t WHERE v = 'one'") == [("t", "SEARCH USING INDEX t_v (v=?)")]
+    assert b.execute("EXPLAIN SELECT * FROM t WHERE v = 'one'") == [("t", "SEARCH USING COVERING INDEX t_v (v=?)")]
     assert a.execute("SELECT * FROM u") == [(5,)]
     a.execute("DROP TABLE u")
     with pytest.raises(OperationalError, match="no such table"):
