@@ -1,0 +1,143 @@
+"""SQL lexical analysis: turns a string into a list of tokens."""
+
+from dataclasses import dataclass
+
+KEYWORDS = {
+    "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "COMMIT", "CREATE", "CROSS", "DELETE",
+    "DESC", "DISTINCT", "DROP", "EXISTS", "FROM", "GROUP", "HAVING", "IF", "IN", "INDEX",
+    "INNER", "INSERT", "INTO", "IS", "JOIN", "LEFT", "LIKE", "LIMIT", "NOT", "NULL",
+    "OFFSET", "ON", "OR", "ORDER", "OUTER", "PRIMARY", "ROLLBACK", "SELECT", "SET",
+    "TABLE", "TRANSACTION", "UNIQUE", "UPDATE", "VALUES", "WHERE",
+}
+
+# Longest operators first so that "<=" wins over "<".
+OPERATORS = ["<>", "<=", ">=", "==", "!=", "||", "<", ">", "=", "+", "-", "*", "/", "%",
+             "(", ")", ",", ";", "."]
+
+
+class SQLSyntaxError(Exception):
+    """A lexical or syntax error at a position in the SQL text."""
+
+    def __init__(self, message, text, pos):
+        self.message = message
+        self.text = text
+        self.pos = pos
+        self.line = text.count("\n", 0, pos) + 1
+        self.column = pos - (text.rfind("\n", 0, pos) + 1) + 1
+        super().__init__(f"{message} (line {self.line}, column {self.column})")
+
+    def caret(self):
+        """The offending source line with a ``^`` under the error position."""
+        start = self.text.rfind("\n", 0, self.pos) + 1
+        end = self.text.find("\n", self.pos)
+        line = self.text[start:] if end == -1 else self.text[start:end]
+        return line + "\n" + " " * (self.column - 1) + "^"
+
+
+@dataclass
+class Token:
+    kind: str     # KEYWORD, IDENT, INTEGER, FLOAT, STRING, OP or EOF
+    value: object  # keyword in upper case, identifier name, number, string, operator
+    pos: int
+    text: str     # the exact source text of the token
+
+
+def tokenize(text):
+    tokens = []
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+            continue
+        if text.startswith("--", i):
+            end = text.find("\n", i)
+            i = n if end == -1 else end + 1
+            continue
+        if text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            if end == -1:
+                raise SQLSyntaxError("unterminated comment", text, i)
+            i = end + 2
+            continue
+        start = i
+        if ch.isalpha() or ch == "_":
+            while i < n and (text[i].isalnum() or text[i] in "_$"):
+                i += 1
+            word = text[start:i]
+            if word.upper() in KEYWORDS:
+                tokens.append(Token("KEYWORD", word.upper(), start, word))
+            else:
+                tokens.append(Token("IDENT", word, start, word))
+            continue
+        if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
+            tokens.append(_number(text, i))
+            i += len(tokens[-1].text)
+            continue
+        if ch == "'":
+            value, i = _quoted(text, i, "'")
+            tokens.append(Token("STRING", value, start, text[start:i]))
+            continue
+        if ch in "\"`[":
+            value, i = _quoted(text, i, "]" if ch == "[" else ch)
+            tokens.append(Token("IDENT", value, start, text[start:i]))
+            continue
+        for op in OPERATORS:
+            if text.startswith(op, i):
+                tokens.append(Token("OP", op, start, op))
+                i += len(op)
+                break
+        else:
+            raise SQLSyntaxError(f"unrecognized character {ch!r}", text, i)
+    tokens.append(Token("EOF", None, n, ""))
+    return tokens
+
+
+def _number(text, start):
+    i = start
+    n = len(text)
+    while i < n and text[i].isdigit():
+        i += 1
+    is_float = False
+    if i < n and text[i] == ".":
+        is_float = True
+        i += 1
+        while i < n and text[i].isdigit():
+            i += 1
+    if i < n and text[i] in "eE":
+        j = i + 1
+        if j < n and text[j] in "+-":
+            j += 1
+        if j < n and text[j].isdigit():
+            is_float = True
+            i = j
+            while i < n and text[i].isdigit():
+                i += 1
+    if i < n and (text[i].isalpha() or text[i] == "_"):
+        raise SQLSyntaxError("malformed number", text, start)
+    literal = text[start:i]
+    if is_float:
+        return Token("FLOAT", float(literal), start, literal)
+    value = int(literal)
+    if value >= 2**63:
+        # Like SQLite, integer literals too large for 64 bits become REAL.
+        return Token("FLOAT", float(literal), start, literal)
+    return Token("INTEGER", value, start, literal)
+
+
+def _quoted(text, start, close):
+    """Read a quoted string or identifier; a doubled quote stands for itself."""
+    i = start + 1
+    parts = []
+    while True:
+        end = text.find(close, i)
+        if end == -1:
+            what = "string" if close == "'" else "identifier"
+            raise SQLSyntaxError(f"unterminated {what}", text, start)
+        parts.append(text[i:end])
+        if close != "]" and text.startswith(close * 2, end):
+            parts.append(close)
+            i = end + 2
+            continue
+        return "".join(parts), end + 1
