@@ -215,7 +215,7 @@ fuzzer 与 sqlite 对照时刻意避开“SQLite 的答案取决于它的查询�
 
 ## D42 参数绑定：解析期占位、执行期替换
 占位符 `?`、`?NNN`、`:name`、`@name`、`$name`，编号规则照 SQLite：裸 `?` 取当前最大编号 + 1，
-名字第一次出现时分配编号；编号范围 1..250000。解析结果按 SQL 文本缓存（LRU，256 条），
+名字第一次出现时分配编号；编号范围 1..32766（SQLite 默认的 SQLITE_MAX_VARIABLE_NUMBER；最初照 conda-forge 构建写成 250000，见 D70）。解析结果按 SQL 文本缓存（LRU，256 条），
 执行时把 `Parameter` 节点替换成 `Bound` 值（`Literal` 的子类）得到新的语法树。`Bound` 与字面量
 求值完全相同（没有亲和性），但不参与解析期常量折叠、也不会被当作 ORDER BY 列序号——
 与 SQLite 一致（`ORDER BY ?` 绑定 1 是常量）。绑定值：None/int/float/str，bool 转 int，
@@ -395,3 +395,28 @@ rowid）；ORDER BY 全是第一张表的升序、NULLS FIRST 普通列且与之
 GitHub Actions（`.github/workflows/tests.yml`），ubuntu-latest：3.11–3.14 矩阵跑全部测试并打印
 参考 SQLite 版本；fuzz 作业跑固定种子、文件模式种子，以及按 `GITHUB_RUN_NUMBER` 每次换一批的新种子
 （失败时日志里有种子号，可在本地复现）；每周定时运行一次，没有提交也能继续找新种子。
+
+## D70 标准答案固定为 sqlite.org 发布的 SQLite 3.53.4（不带 ICU）
+第一次在 CI（Ubuntu，系统 SQLite 3.45.1）上运行时对照测试大量失败，查下来本地的“标准答案”本身有问题：
+本地 Python 来自 conda-forge，它的 SQLite 编译时开了 `SQLITE_ENABLE_ICU`（`upper`/`lower`/`LIKE`
+按 Unicode 处理大小写），`SQLITE_MAX_VARIABLE_NUMBER` 也改成了 250000。MiniDB 此前对齐的就是这些
+非默认行为。处理：
+- `tools/reference_sqlite.py` 下载固定版本的 amalgamation（校验 SHA3-256），用默认选项（外加
+  `SQLITE_ENABLE_MATH_FUNCTIONS`，与官方 autoconf 构建一致）编译成动态库，再用
+  `LD_LIBRARY_PATH`/`DYLD_LIBRARY_PATH` 让 Python 的 `sqlite3` 加载它。本地和 CI 用同一个脚本。
+  macOS 的 SIP 让 `/usr/bin` 下的程序（如 perl）启动时丢掉 `DYLD_*` 变量，经由它们启动 Python 时
+  要再用 `env` 设置一次。
+- `tests/sqlcompare.py` 发现链接的 SQLite 带 ICU 就直接报错；pytest 头部显示参考版本，不是
+  3.53.4 时提示（不同版本在常量折叠等边角上确有差异，例如 3.45 不把 `ORDER BY (2 IS NULL)` 当列号）。
+- MiniDB 改为官方默认行为：大小写只认 ASCII 字母——`upper`/`lower`、`LIKE` 的忽略大小写、以及
+  关键字、标识符、类型名的比较（`values.ascii_lower/ascii_upper`）。这也修掉了一个与 ICU 无关的
+  差异：以前表 `É` 和 `é` 被当成同一张表，`ſelect`（长 s）被当成 `SELECT`。
+- 参数编号上限改为默认的 32766。
+
+## D71 常量条件在循环开始前测试一次
+SQLite 把不引用本层 FROM 中任何表、且不含子查询和非确定函数的 WHERE 项（包括内连接的 ON 项）在进入
+循环前求值一次，假或 NULL 就整个跳过循环（也就不会去算 FROM 子查询或行上的表达式）；这样的项出错时，
+即使表是空的也会报错。MiniDB 以前把它们放在第一层逐行求值，并且先物化 FROM 子查询，fuzz 因此发现
+`... WHERE (+(y) IS NULL) AND 0 ...`（整体折叠为 0）时 MiniDB 报了 SQLite 不会报的溢出错误。
+现在 `plan_joins` 把这些项单独返回，SELECT、UPDATE、DELETE 在物化子查询和进入循环之前测试它们。
+（没有被 SQLite 展平的 FROM 子查询，SQLite 可能先物化再测试；这种情况下出错时机仍可能不同。）
