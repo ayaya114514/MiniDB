@@ -52,3 +52,25 @@ key 个数。这样表树（整数 key + 变长行）和以后的二级索引树
 ## D12 阶段 3 临时命令
 在临时语法里加了 `delete <id>`，便于在 SQL 解析器之前测试删除；`.btree` 打印树结构（缩进 +
 每个节点最多显示 8 个 key）。
+
+## D13 运算符优先级与 SQLite 一致
+由低到高：OR、AND、NOT、相等类（`= == != <> IS [NOT] IN LIKE BETWEEN`）、比较（`< <= > >=`）、
+`+ -`、`* / %`、`||`、一元 `- +`。注意 SQLite 把 `=` 和 `<` 放在不同层级（`a < b = c` 解析为
+`(a < b) = c`），这里照搬，保证和 sqlite3 对照时语义一致。`==` 归一为 `=`，`<>` 归一为 `!=`。
+
+## D14 非保留关键字
+`KEY`、`TEXT`、`INTEGER`、`COUNT` 等不作为保留字，词法上是标识符，解析器按上下文识别
+（`PRIMARY KEY`、列类型、函数名），这样它们可以用作列名/表名，和 SQLite 行为接近。
+
+## D15 语法错误格式
+`syntax error near "<token>": expected <what> (line L, column C)`，到达末尾时是
+`syntax error at end of input: ...`。异常对象带 `line`/`column`，`caret()` 返回出错行和 `^` 指示，
+REPL 会打印出来。
+
+## D16 列类型
+只接受 `INTEGER`（`INT` 为别名）和 `TEXT`，其他类型名报语法错误。约束支持 `PRIMARY KEY`、
+`NOT NULL`、`UNIQUE`、`NULL`。
+
+## D17 阶段 4 期间 REPL 仍用临时命令
+阶段 4 只交付词法/语法分析（带完整单测），执行器在阶段 5 重写；在那之前临时命令解析挪到
+`executor.parse_command`，REPL 暂时继续使用它。
