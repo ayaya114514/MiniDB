@@ -17,7 +17,12 @@ exact layout, decoding compiles each distinct header once into a
 row is then a single ``unpack_from`` call.
 """
 
+from __future__ import annotations
+
 import struct
+from collections.abc import Callable
+
+from minidb.values import SQLValue
 
 NULL_CODE, REAL_CODE, ZERO_CODE, ONE_CODE, LONG_TEXT_CODE, SHORT_TEXT_BASE = 0, 5, 6, 7, 8, 16
 MAX_SHORT_TEXT = 255 - SHORT_TEXT_BASE
@@ -32,7 +37,7 @@ class RecordError(Exception):
     pass
 
 
-def encode_record(values):
+def encode_record(values: list[SQLValue]) -> bytes:
     header = bytearray()
     body = bytearray()
     for value in values:
@@ -71,7 +76,7 @@ def encode_record(values):
     return b"\xff" + _u32.pack(len(header)) + bytes(header) + bytes(body)
 
 
-def encoded_size(values):
+def encoded_size(values: list[SQLValue]) -> int:
     """``len(encode_record(values))`` without building the bytes."""
     header = body = 0
     for value in values:
@@ -98,7 +103,7 @@ def encoded_size(values):
 _decoders = {}
 
 
-def _compile(header):
+def _compile(header: bytes) -> tuple[struct.Struct, Callable[[tuple], list[SQLValue]]]:
     """(Struct, assemble function) for records with this header."""
     fmt = [">"]
     parts = []  # Python expressions building the value list from unpacked fields ``f``
@@ -139,7 +144,7 @@ def _compile(header):
     return layout, assemble
 
 
-def decode_record(data, pos=0):
+def decode_record(data: bytes | bytearray | memoryview, pos: int = 0) -> tuple[list[SQLValue], int]:
     """Decode a record starting at ``pos``; returns (values, end position)."""
     size = data[pos]
     pos += 1

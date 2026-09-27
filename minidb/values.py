@@ -6,11 +6,17 @@ three-valued comparison and logic rules, arithmetic with SQLite's overflow
 and division rules, conversions to text, and the scalar functions.
 """
 
+from __future__ import annotations
+
 import math
 import re
+from collections.abc import Callable
 from functools import lru_cache
 
 from minidb.errors import OperationalError
+
+# A SQL value: NULL, INTEGER, REAL or TEXT.
+SQLValue = int | float | str | None
 
 INT_MIN = -(2**63)
 INT_MAX = 2**63 - 1
@@ -26,7 +32,7 @@ _NUMBER_PREFIX = re.compile(rf"[{_SPACE}]*({_NUMBER})")
 _INTEGER_LITERAL = re.compile(r"[+-]?[0-9]+\Z")
 
 
-def _parse_number(literal):
+def _parse_number(literal: str) -> int | float:
     """Convert a numeric literal (already validated) to int or float."""
     if _INTEGER_LITERAL.match(literal):
         value = int(literal)
@@ -35,12 +41,12 @@ def _parse_number(literal):
     return float(literal)
 
 
-def _real(value):
+def _real(value: float) -> float | None:
     """Normalize a float result: NaN becomes NULL, as in SQLite."""
     return None if math.isnan(value) else value
 
 
-def _real_to_int_if_exact(value):
+def _real_to_int_if_exact(value: float) -> int | float:
     if INT_MIN < value < INT_MAX and value == int(value):
         return int(value)
     return value
@@ -49,7 +55,7 @@ def _real_to_int_if_exact(value):
 # ---- affinity ------------------------------------------------------------
 
 
-def numeric_affinity(value):
+def numeric_affinity(value: SQLValue) -> SQLValue:
     """Apply INTEGER (numeric) affinity: well-formed numeric text becomes a number."""
     if isinstance(value, str):
         match = _WHOLE_NUMBER.match(value)
@@ -62,14 +68,14 @@ def numeric_affinity(value):
     return value
 
 
-def text_affinity(value):
+def text_affinity(value: SQLValue) -> SQLValue:
     """Apply TEXT affinity: numbers are converted to their text form."""
     if isinstance(value, (int, float)):
         return to_text(value)
     return value
 
 
-def apply_affinity(value, affinity):
+def apply_affinity(value: SQLValue, affinity: str | None) -> SQLValue:
     if affinity == INTEGER:
         return numeric_affinity(value)
     if affinity == TEXT:
@@ -77,7 +83,7 @@ def apply_affinity(value, affinity):
     return value
 
 
-def comparison_affinities(left, right):
+def comparison_affinities(left: str | None, right: str | None) -> tuple[str | None, str | None]:
     """Which affinity to apply to each operand of a comparison (SQLite rules)."""
     if left == INTEGER and right != INTEGER:
         return None, INTEGER
@@ -93,7 +99,7 @@ def comparison_affinities(left, right):
 # ---- conversions -----------------------------------------------------------
 
 
-def format_real(value):
+def format_real(value: float) -> str:
     """Render a REAL as text like SQLite: 15 significant digits if they
     round-trip, otherwise 17; always with a '.'; exponent form below 1e-4 and
     from 1e17.  (SQLite's own digit generation is approximate, so a few
@@ -118,7 +124,7 @@ def format_real(value):
     return f"{sign}0.{'0' * (-exponent - 1)}{digits}"
 
 
-def to_text(value):
+def to_text(value: SQLValue) -> str | None:
     if value is None or isinstance(value, str):
         return value
     if isinstance(value, float):
@@ -126,7 +132,7 @@ def to_text(value):
     return str(value)
 
 
-def to_number(value):
+def to_number(value: SQLValue) -> int | float | None:
     """Lenient numeric conversion used by arithmetic: text uses its numeric prefix."""
     if not isinstance(value, str):
         return value
@@ -137,7 +143,7 @@ def to_number(value):
 _INTEGER_PREFIX = re.compile(rf"[{_SPACE}]*([+-]?[0-9]+)")
 
 
-def to_int64(value):
+def to_int64(value: SQLValue) -> int:
     """Convert to a 64-bit integer as SQLite does: REALs truncate and saturate,
     TEXT uses its leading integer digits ('1e2' -> 1)."""
     if isinstance(value, str):
@@ -156,14 +162,14 @@ def to_int64(value):
     return value
 
 
-def truth(value):
+def truth(value: SQLValue) -> bool | None:
     """SQL truth value: None for NULL, otherwise whether the number is non-zero."""
     if value is None:
         return None
     return to_number(value) != 0
 
 
-def type_name(value):
+def type_name(value: SQLValue) -> str:
     if value is None:
         return "null"
     if isinstance(value, int):
@@ -176,7 +182,7 @@ def type_name(value):
 # ---- comparison ------------------------------------------------------------
 
 
-def sort_key(value):
+def sort_key(value: SQLValue) -> tuple:
     """Key ordering values like SQLite: NULL < numbers < text."""
     if value is None:
         return (0, 0)
@@ -185,7 +191,7 @@ def sort_key(value):
     return (1, value)
 
 
-def compare(a, b):
+def compare(a: int | float | str, b: int | float | str) -> int:
     """Three-way comparison of two non-NULL values (-1, 0 or 1): numbers < text."""
     a_text, b_text = type(a) is str, type(b) is str
     if a_text == b_text:
@@ -196,13 +202,13 @@ def compare(a, b):
 # ---- operators ---------------------------------------------------------------
 
 
-def _int_result(value, a, b, float_op):
+def _int_result(value: int, a: int, b: int, float_op: Callable[[float, float], float]) -> int | float | None:
     if INT_MIN <= value <= INT_MAX:
         return value
     return _real(float_op(float(a), float(b)))
 
 
-def add(a, b):
+def add(a: SQLValue, b: SQLValue) -> SQLValue:
     a, b = to_number(a), to_number(b)
     if a is None or b is None:
         return None
@@ -211,7 +217,7 @@ def add(a, b):
     return _real(float(a) + float(b))
 
 
-def subtract(a, b):
+def subtract(a: SQLValue, b: SQLValue) -> SQLValue:
     a, b = to_number(a), to_number(b)
     if a is None or b is None:
         return None
@@ -220,7 +226,7 @@ def subtract(a, b):
     return _real(float(a) - float(b))
 
 
-def multiply(a, b):
+def multiply(a: SQLValue, b: SQLValue) -> SQLValue:
     a, b = to_number(a), to_number(b)
     if a is None or b is None:
         return None
@@ -229,7 +235,7 @@ def multiply(a, b):
     return _real(float(a) * float(b))
 
 
-def divide(a, b):
+def divide(a: SQLValue, b: SQLValue) -> SQLValue:
     a, b = to_number(a), to_number(b)
     if a is None or b is None or b == 0:
         return None
@@ -241,7 +247,7 @@ def divide(a, b):
     return _real(float(a) / float(b))
 
 
-def remainder(a, b):
+def remainder(a: SQLValue, b: SQLValue) -> SQLValue:
     na, nb = to_number(a), to_number(b)
     if na is None or nb is None:
         return None
@@ -258,7 +264,7 @@ def remainder(a, b):
     return float(result) if as_real else result
 
 
-def negate(a):
+def negate(a: SQLValue) -> SQLValue:
     a = to_number(a)
     if a is None:
         return None
@@ -267,18 +273,18 @@ def negate(a):
     return -a
 
 
-def concat(a, b):
+def concat(a: SQLValue, b: SQLValue) -> SQLValue:
     if a is None or b is None:
         return None
     return to_text(a) + to_text(b)
 
 
-def logical_not(a):
+def logical_not(a: SQLValue) -> int | None:
     t = truth(a)
     return None if t is None else int(not t)
 
 
-def logical_and(a, b):
+def logical_and(a: SQLValue, b: SQLValue) -> int | None:
     ta, tb = truth(a), truth(b)
     if ta is False or tb is False:
         return 0
@@ -288,7 +294,7 @@ def logical_and(a, b):
 
 
 @lru_cache(maxsize=256)
-def _like_regex(pattern):
+def _like_regex(pattern: str) -> re.Pattern:
     parts = []
     for ch in pattern:
         if ch == "%":
@@ -300,7 +306,7 @@ def _like_regex(pattern):
     return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
 
 
-def like(value, pattern):
+def like(value: SQLValue, pattern: SQLValue) -> int | None:
     """``value LIKE pattern``: case-insensitive, ``%`` and ``_`` wildcards."""
     if value is None or pattern is None:
         return None
@@ -310,7 +316,7 @@ def like(value, pattern):
 # ---- scalar functions ----------------------------------------------------------
 
 
-def _fn_abs(value):
+def _fn_abs(value: SQLValue) -> SQLValue:
     if value is None:
         return None
     if isinstance(value, int):
@@ -320,30 +326,30 @@ def _fn_abs(value):
     return abs(float(to_number(value)))  # TEXT always gives a REAL, as in SQLite
 
 
-def _fn_length(value):
+def _fn_length(value: SQLValue) -> int | None:
     return None if value is None else len(to_text(value))
 
 
-def _fn_lower(value):
+def _fn_lower(value: SQLValue) -> str | None:
     return None if value is None else to_text(value).lower()
 
 
-def _fn_upper(value):
+def _fn_upper(value: SQLValue) -> str | None:
     return None if value is None else to_text(value).upper()
 
 
-def _fn_coalesce(*values):
+def _fn_coalesce(*values: SQLValue) -> SQLValue:
     for value in values:
         if value is not None:
             return value
     return None
 
 
-def _fn_nullif(a, b):
+def _fn_nullif(a: SQLValue, b: SQLValue) -> SQLValue:
     return None if a is not None and b is not None and compare(a, b) == 0 else a
 
 
-def _fn_min(*values):
+def _fn_min(*values: SQLValue) -> SQLValue:
     """Scalar MIN: among equal values (1 and 1.0) SQLite returns the last one."""
     if any(v is None for v in values):
         return None
@@ -354,7 +360,7 @@ def _fn_min(*values):
     return best
 
 
-def _fn_max(*values):
+def _fn_max(*values: SQLValue) -> SQLValue:
     """Scalar MAX: among equal values SQLite returns the first one."""
     if any(v is None for v in values):
         return None
@@ -383,7 +389,7 @@ SCALAR_FUNCTIONS = {
 # ---- aggregate functions -----------------------------------------------------
 
 
-def numeric_type_value(value):
+def numeric_type_value(value: SQLValue) -> SQLValue:
     """SQLite's sqlite3_value_numeric_type() conversion: numeric-looking TEXT
     becomes INTEGER or REAL (without turning '5.0' into 5); other values stay."""
     if isinstance(value, str):
@@ -395,7 +401,7 @@ def numeric_type_value(value):
 _KBN_LIMIT = 4503599627370496  # 2**52
 
 
-def _c_remainder(a, b):
+def _c_remainder(a: int, b: int) -> int:
     result = abs(a) % abs(b)
     return -result if a < 0 else result
 
@@ -404,7 +410,7 @@ class SumAccumulator:
     """SUM/AVG/TOTAL state, ported from SQLite's func.c (Kahan-Babuska-Neumaier
     summation once any value is not an integer, integer overflow detection)."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.count = 0
         self.int_sum = 0
         self.approx = False
@@ -412,14 +418,14 @@ class SumAccumulator:
         self.real_sum = 0.0
         self.error = 0.0
 
-    def _kbn_init(self, value):
+    def _kbn_init(self, value: int) -> None:
         if value <= -_KBN_LIMIT or value >= _KBN_LIMIT:
             small = _c_remainder(value, 16384)
             self.real_sum, self.error = float(value - small), float(small)
         else:
             self.real_sum, self.error = float(value), 0.0
 
-    def _kbn_step(self, r):
+    def _kbn_step(self, r: float) -> None:
         s = self.real_sum
         t = s + r
         if abs(s) > abs(r):
@@ -428,7 +434,7 @@ class SumAccumulator:
             self.error += (r - t) + s
         self.real_sum = t
 
-    def _kbn_step_int(self, value):
+    def _kbn_step_int(self, value: int) -> None:
         if value <= -_KBN_LIMIT or value >= _KBN_LIMIT:
             small = _c_remainder(value, 16384)
             self._kbn_step(float(value - small))
@@ -436,7 +442,7 @@ class SumAccumulator:
         else:
             self._kbn_step(float(value))
 
-    def step(self, value):
+    def step(self, value: SQLValue) -> None:
         value = numeric_type_value(value)
         if value is None:
             return
@@ -460,7 +466,7 @@ class SumAccumulator:
             self.overflow = False
             self._kbn_step(float(to_number(value)))
 
-    def _real_total(self):
+    def _real_total(self) -> float:
         if not self.approx:
             return float(self.int_sum)
         if math.isinf(self.error) or math.isnan(self.error):
@@ -469,7 +475,7 @@ class SumAccumulator:
 
 
 class SumAggregate(SumAccumulator):
-    def result(self):
+    def result(self) -> SQLValue:
         if self.count == 0:
             return None
         if not self.approx:
@@ -480,42 +486,42 @@ class SumAggregate(SumAccumulator):
 
 
 class AvgAggregate(SumAccumulator):
-    def result(self):
+    def result(self) -> SQLValue:
         if self.count == 0:
             return None
         return _real(self._real_total() / self.count)
 
 
 class TotalAggregate(SumAccumulator):
-    def result(self):
+    def result(self) -> SQLValue:
         return _real(self._real_total())
 
 
 class CountAggregate:
-    def __init__(self):
+    def __init__(self) -> None:
         self.count = 0
 
-    def step(self, value):
+    def step(self, value: SQLValue) -> None:
         if value is not None:
             self.count += 1
 
-    def result(self):
+    def result(self) -> SQLValue:
         return self.count
 
 
 class CountStarAggregate(CountAggregate):
-    def step(self):
+    def step(self) -> None:
         self.count += 1
 
 
 class MinMaxAggregate:
     """MIN or MAX; ``step`` reports whether the current extreme changed."""
 
-    def __init__(self, want):
+    def __init__(self, want: int) -> None:
         self.want = want  # -1 for MIN, 1 for MAX
         self.value = None
 
-    def step(self, value):
+    def step(self, value: SQLValue) -> bool:
         if value is None:
             return False
         if self.value is None or compare(value, self.value) == self.want:
@@ -523,15 +529,15 @@ class MinMaxAggregate:
             return True
         return False
 
-    def result(self):
+    def result(self) -> SQLValue:
         return self.value
 
 
 class GroupConcatAggregate:
-    def __init__(self):
+    def __init__(self) -> None:
         self.text = None
 
-    def step(self, value, separator=","):
+    def step(self, value: SQLValue, separator: SQLValue = ",") -> None:
         if value is None:
             return
         value = to_text(value)
@@ -540,7 +546,7 @@ class GroupConcatAggregate:
         else:
             self.text += ("" if separator is None else to_text(separator)) + value
 
-    def result(self):
+    def result(self) -> SQLValue:
         return self.text
 
 
@@ -556,7 +562,7 @@ AGGREGATE_FUNCTIONS = {
 }
 
 
-def is_aggregate_call(name, arg_count):
+def is_aggregate_call(name: str, arg_count: int) -> bool:
     """MIN and MAX are aggregates with one argument and scalar with more."""
     if name in ("MIN", "MAX"):
         return arg_count == 1
@@ -566,7 +572,7 @@ def is_aggregate_call(name, arg_count):
 # ---- CAST ----------------------------------------------------------------------
 
 
-def type_affinity(type_name):
+def type_affinity(type_name: str) -> str:
     """SQLite's rules for the affinity of a declared type name."""
     name = type_name.upper()
     if "INT" in name:
@@ -580,7 +586,7 @@ def type_affinity(type_name):
     return "NUMERIC"
 
 
-def cast(value, target):
+def cast(value: SQLValue, target: str) -> SQLValue:
     """``CAST(value AS <type with affinity target>)`` (not BLOB)."""
     if value is None:
         return None

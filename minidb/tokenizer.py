@@ -1,5 +1,7 @@
 """SQL lexical analysis: turns a string into a list of tokens."""
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 
 from minidb.errors import OperationalError
@@ -21,7 +23,7 @@ OPERATORS = ["<>", "<=", ">=", "==", "!=", "||", "<", ">", "=", "+", "-", "*", "
 class SQLSyntaxError(OperationalError):
     """A lexical or syntax error at a position in the SQL text."""
 
-    def __init__(self, message, text, pos):
+    def __init__(self, message: str, text: str, pos: int) -> None:
         self.message = message
         self.text = text
         self.pos = pos
@@ -29,7 +31,7 @@ class SQLSyntaxError(OperationalError):
         self.column = pos - (text.rfind("\n", 0, pos) + 1) + 1
         super().__init__(f"{message} (line {self.line}, column {self.column})")
 
-    def caret(self):
+    def caret(self) -> str:
         """The offending source line with a ``^`` under the error position."""
         start = self.text.rfind("\n", 0, self.pos) + 1
         end = self.text.find("\n", self.pos)
@@ -46,7 +48,7 @@ class Token:
     text: str     # the exact source text of the token
 
 
-def tokenize(text):
+def tokenize(text: str) -> list[Token]:
     tokens = []
     i = 0
     n = len(text)
@@ -110,7 +112,7 @@ def tokenize(text):
     return tokens
 
 
-def _number(text, start):
+def _number(text: str, start: int) -> Token:
     i = start
     n = len(text)
     while i < n and text[i].isdigit():
@@ -142,7 +144,7 @@ def _number(text, start):
     return Token("INTEGER", value, start, literal)
 
 
-def _quoted(text, start, close):
+def _quoted(text: str, start: int, close: str) -> tuple[str, int]:
     """Read a quoted string or identifier; a doubled quote stands for itself."""
     i = start + 1
     parts = []

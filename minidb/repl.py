@@ -5,13 +5,17 @@ with ``.`` are meta commands (see ``.help``).  Results are printed like the
 ``sqlite3`` shell's default list mode: values separated by ``|``.
 """
 
+from __future__ import annotations
+
 import sys
+from collections.abc import Sequence
+from typing import TextIO
 
 from minidb.btree import BTree
 from minidb.database import Database
 from minidb.errors import Error
 from minidb.tokenizer import SQLSyntaxError, tokenize
-from minidb.values import to_text
+from minidb.values import SQLValue, to_text
 
 PROMPT = "minidb> "
 CONTINUATION_PROMPT = "   ...> "
@@ -24,11 +28,11 @@ HELP = """\
 .tables          List the tables"""
 
 
-def format_row(row):
+def format_row(row: Sequence[SQLValue]) -> str:
     return "|".join("" if value is None else to_text(value) for value in row)
 
 
-def statement_complete(text):
+def statement_complete(text: str) -> bool:
     """Whether ``text`` ends with a ``;`` that is not inside a string or comment."""
     try:
         tokens = tokenize(text)
@@ -38,14 +42,14 @@ def statement_complete(text):
 
 
 class Shell:
-    def __init__(self, db, stdout):
+    def __init__(self, db: Database, stdout: TextIO) -> None:
         self.db = db
         self.out = stdout
 
-    def write(self, text):
+    def write(self, text: str) -> None:
         self.out.write(text + "\n")
 
-    def meta_command(self, line):
+    def meta_command(self, line: str) -> bool:
         """Run a meta command; returns False when the shell should exit."""
         parts = line.split()
         command, args = parts[0], parts[1:]
@@ -78,7 +82,7 @@ class Shell:
             self.write(f'Error: unknown command: {command}. Enter ".help" for help')
         return True
 
-    def run_sql(self, text):
+    def run_sql(self, text: str) -> None:
         try:
             for result in self.db.execute_each(text):
                 for row in result:
@@ -90,7 +94,7 @@ class Shell:
             self.write(f"Error: {exc}")
 
 
-def run(stdin=sys.stdin, stdout=sys.stdout, path=None, interactive=None):
+def run(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout, path: str | None = None, interactive: bool | None = None) -> None:
     """Run the shell on the database file ``path`` (``None`` = in memory)."""
     if interactive is None:
         interactive = stdin.isatty()
@@ -121,7 +125,7 @@ def run(stdin=sys.stdin, stdout=sys.stdout, path=None, interactive=None):
                 buffer = ""
 
 
-def main(argv):
+def main(argv: list[str]) -> int:
     if len(argv) > 1:
         sys.stderr.write("usage: python -m minidb [database-file]\n")
         return 2
