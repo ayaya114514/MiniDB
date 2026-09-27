@@ -3,8 +3,8 @@ import subprocess
 import sys
 
 from minidb.executor import Table
+from minidb.executor import parse_command as parse
 from minidb.pager import PAGE_SIZE, Pager
-from minidb.parser import parse
 from minidb.repl import run
 
 

@@ -14,6 +14,10 @@ class ExecutionError(Exception):
     pass
 
 
+class CommandError(Exception):
+    pass
+
+
 @dataclass
 class InsertStatement:
     id: int
@@ -57,3 +61,36 @@ class Table:
                 raise ExecutionError(f"no row with id {stmt.id}")
             return []
         raise ExecutionError(f"unsupported statement {stmt!r}")
+
+
+def parse_command(text):
+    """Parse the temporary command syntax used until the SQL executor exists:
+
+        insert <id> <name> <age>
+        select
+        delete <id>
+    """
+    words = text.split()
+    if not words:
+        raise CommandError("empty statement")
+    keyword = words[0].lower()
+    if keyword == "insert":
+        if len(words) != 4:
+            raise CommandError("usage: insert <id> <name> <age>")
+        try:
+            row_id = int(words[1])
+            age = int(words[3])
+        except ValueError:
+            raise CommandError("id and age must be integers") from None
+        if row_id < 0:
+            raise CommandError("id must be non-negative")
+        return InsertStatement(row_id, words[2], age)
+    if keyword == "select":
+        if len(words) != 1:
+            raise CommandError("usage: select")
+        return SelectStatement()
+    if keyword == "delete":
+        if len(words) != 2 or not words[1].lstrip("-").isdigit():
+            raise CommandError("usage: delete <id>")
+        return DeleteStatement(int(words[1]))
+    raise CommandError(f"unrecognized statement: {words[0]}")

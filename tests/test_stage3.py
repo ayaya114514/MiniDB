@@ -2,9 +2,9 @@ import io
 import random
 import sqlite3
 
-from minidb.executor import ExecutionError, Table
+from minidb.executor import CommandError, ExecutionError, Table
+from minidb.executor import parse_command as parse
 from minidb.pager import Pager
-from minidb.parser import parse
 from minidb.repl import run
 
 import pytest

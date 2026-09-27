@@ -5,9 +5,9 @@ import sys
 
 import pytest
 
-from minidb.executor import ExecutionError, Table
+from minidb.executor import CommandError, ExecutionError, Table
+from minidb.executor import parse_command as parse
 from minidb.pager import Pager
-from minidb.parser import ParseError, parse
 from minidb.repl import run
 
 
@@ -41,7 +41,7 @@ def test_unknown_meta_command():
     ["", "insert 1 a", "insert x a 1", "insert 1 a y", "insert -1 a 1", "select 1", "update", "delete", "delete x"],
 )
 def test_parse_errors(text):
-    with pytest.raises(ParseError):
+    with pytest.raises(CommandError):
         parse(text)
 
 

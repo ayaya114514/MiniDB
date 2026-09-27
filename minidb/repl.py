@@ -2,9 +2,8 @@
 
 import sys
 
-from minidb.executor import ExecutionError, Table
+from minidb.executor import CommandError, ExecutionError, Table, parse_command
 from minidb.pager import DatabaseError, Pager
-from minidb.parser import ParseError, parse
 
 PROMPT = "minidb> "
 
@@ -45,8 +44,8 @@ def _loop(table, stdin, stdout, interactive):
             stdout.write(f"Error: unknown command: {line}\n")
             continue
         try:
-            rows = table.execute(parse(line))
-        except (ParseError, ExecutionError) as exc:
+            rows = table.execute(parse_command(line))
+        except (CommandError, ExecutionError) as exc:
             stdout.write(f"Error: {exc}\n")
             continue
         for row in rows:
