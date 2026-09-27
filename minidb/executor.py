@@ -1149,27 +1149,50 @@ class JoinLevel:
         self.filters = filters  # conditions checked once this table is bound
 
 
-def constant_integer(expr):
-    """The value of ``expr`` if SQLite would treat it as a column number in
-    ORDER BY / GROUP BY: an integer literal that fits in 32 bits under any
-    number of unary + and -, or ``<non-NULL literal> IS [NOT] NULL``, which
-    SQLite's parser folds to 0 or 1.  Otherwise None."""
+def folded_literal(expr):
+    """The literal SQLite's parser reduces ``expr`` to, or None.
+
+    The parser folds ``X AND 0`` / ``0 AND X`` to 0 unless a side calls a
+    function (LIKE counts), and ``<non-NULL literal> IS [NOT] NULL`` to 0 or 1
+    (looking through unary + and -).  Folded values are only observable
+    through ORDER BY / GROUP BY column numbers.
+    """
     if isinstance(expr, Literal):
-        value = expr.value
-        if isinstance(value, int) and 0 <= value <= 2**31 - 1:
-            return value
+        return expr
+    if isinstance(expr, Binary) and expr.op == "AND":
+        def is_zero(literal):  # an INTEGER 0; Literal(0.0) == Literal(0) in Python
+            return literal is not None and type(literal.value) is int and literal.value == 0
+
+        zero = Literal(0)
+        if (is_zero(folded_literal(expr.left)) or is_zero(folded_literal(expr.right))) and not any(
+            isinstance(e, (Call, Like)) for side in (expr.left, expr.right) for e in walk(side)
+        ):
+            return zero
         return None
+    if isinstance(expr, Binary) and expr.op in ("IS", "IS NOT") and expr.right == Literal(None):
+        operand = expr.left
+        while isinstance(operand, Unary) and operand.op in ("+", "-"):
+            operand = operand.operand
+        literal = folded_literal(operand)
+        if literal is not None and literal.value is not None:
+            return Literal(int(expr.op == "IS NOT"))
+    return None
+
+
+def constant_integer(expr):
+    """The value of ``expr`` if SQLite treats it as a column number in
+    ORDER BY / GROUP BY: an integer (after parser folding) that fits in 32
+    bits, under any number of unary + and -.  Otherwise None."""
     if isinstance(expr, Unary) and expr.op in ("+", "-"):
         value = constant_integer(expr.operand)
         if value is None:
             return None
         return -value if expr.op == "-" else value
-    if isinstance(expr, Binary) and expr.op in ("IS", "IS NOT") and expr.right == Literal(None):
-        operand = expr.left
-        while isinstance(operand, Unary) and operand.op in ("+", "-"):
-            operand = operand.operand
-        if isinstance(operand, Literal) and operand.value is not None:
-            return int(expr.op == "IS NOT")
+    literal = folded_literal(expr)
+    if literal is not None:
+        value = literal.value
+        if isinstance(value, int) and 0 <= value <= 2**31 - 1:
+            return value
     return None
 
 

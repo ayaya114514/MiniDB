@@ -194,6 +194,16 @@ class OverflowPage:
         return OverflowPage(self.pgno, self.next_page, self.data)
 
 
+def _tail_split(sizes, needed, lo, hi):
+    """Largest m in [lo, hi] with sum(sizes[m:]) >= needed, else lo."""
+    total = 0
+    for m in range(len(sizes) - 1, lo - 1, -1):
+        total += sizes[m]
+        if total >= needed and m <= hi:
+            return m
+    return lo
+
+
 def _balanced_split(sizes, lo, hi):
     """Index m in [lo, hi] where sum(sizes[:m]) is closest to half the total."""
     half = sum(sizes) / 2
@@ -357,16 +367,22 @@ class BTree:
         leaf.values.insert(i, stored)
         leaf.size += key_size + value_cell_size(stored)
         if leaf.size > self.capacity:
-            self._split(path, leaf)
+            # A new largest key (e.g. an auto-increment row id) is an append.
+            append = leaf.next_leaf == 0 and i == len(leaf.keys) - 1
+            self._split(path, leaf, append)
 
-    def _split(self, path, node):
-        """Split ``node`` (and then its ancestors) while it is over capacity."""
+    def _split(self, path, node, append=False):
+        """Split ``node`` (and then its ancestors) while it is over capacity.
+
+        For appends every node on the path is the rightmost of its level;
+        those are split unevenly (see ``_split_node``).
+        """
         while node.size > self.capacity:
             if not path:
                 node = self._move_root_down(node)
                 path = [(self.node(self.root), 0)]
             parent, index = path.pop()
-            separator, right = self._split_node(node)
+            separator, right = self._split_node(node, append)
             self.pager.write(parent)
             parent.keys.insert(index, separator)
             parent.children.insert(index + 1, right.pgno)
@@ -382,13 +398,22 @@ class BTree:
         self.pager.write(Internal(self.root, self.codec, [], [child.pgno]))
         return child
 
-    def _split_node(self, node):
-        """Split ``node`` in half by size; returns (separator key, new right node)."""
+    def _split_node(self, node, append=False):
+        """Split ``node`` by size; returns (separator key, new right node).
+
+        Normally both halves get about the same number of bytes.  For an
+        append the new right node gets just enough to reach ``min_fill``, so
+        sequential inserts leave nodes about 75% full instead of 50%.
+        """
         self.pager.write(node)
         key_size = self.codec.size
+        needed = self.min_fill - HEADER_SIZE
         if node.is_leaf:
             sizes = [key_size(k) + value_cell_size(v) for k, v in zip(node.keys, node.values)]
-            m = _balanced_split(sizes, 1, len(sizes) - 1)
+            if append:
+                m = _tail_split(sizes, needed, 1, len(sizes) - 1)
+            else:
+                m = _balanced_split(sizes, 1, len(sizes) - 1)
             right = self.pager.allocate(
                 Leaf, self.codec, node.keys[m:], node.values[m:], node.next_leaf
             )
@@ -397,7 +422,10 @@ class BTree:
             node.recompute_size()
             return right.keys[0], right
         sizes = [4 + key_size(k) for k in node.keys]
-        m = _balanced_split(sizes, 1, len(sizes) - 2)
+        if append:
+            m = _tail_split(sizes, needed, 2, len(sizes) - 1) - 1
+        else:
+            m = _balanced_split(sizes, 1, len(sizes) - 2)
         separator = node.keys[m]
         right = self.pager.allocate(
             Internal, self.codec, node.keys[m + 1:], node.children[m + 1:]
