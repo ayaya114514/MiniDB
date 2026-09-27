@@ -170,6 +170,21 @@ class Select:
 
 
 @dataclass
+class Begin:
+    pass
+
+
+@dataclass
+class Commit:
+    pass
+
+
+@dataclass
+class Rollback:
+    pass
+
+
+@dataclass
 class Explain:
     """``EXPLAIN [QUERY PLAN] stmt``: describe how a statement would read its tables."""
 
@@ -264,6 +279,11 @@ class Parser:
             return self.advance()
         raise self.error(word)
 
+    def _accept_word(self, word):
+        if self.tok.kind == "IDENT" and self.tok.text.upper() == word:
+            return self.advance()
+        return None
+
     def identifier(self, what="identifier"):
         if self.tok.kind != "IDENT":
             raise self.error(what)
@@ -283,6 +303,17 @@ class Parser:
                 raise self.error('";" or end of statement')
 
     def statement(self):
+        if self.accept_keyword("BEGIN"):
+            if self.tok.kind == "IDENT" and self.tok.text.upper() in ("DEFERRED", "IMMEDIATE", "EXCLUSIVE"):
+                self.advance()
+            self.accept_keyword("TRANSACTION")
+            return Begin()
+        if self.accept_keyword("COMMIT") or self._accept_word("END"):
+            self.accept_keyword("TRANSACTION")
+            return Commit()
+        if self.accept_keyword("ROLLBACK"):
+            self.accept_keyword("TRANSACTION")
+            return Rollback()
         if self.accept_keyword("EXPLAIN"):
             if self.tok.kind == "IDENT" and self.tok.text.upper() == "QUERY":
                 self.advance()
