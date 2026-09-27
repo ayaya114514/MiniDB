@@ -116,6 +116,7 @@ class Insert:
 class SelectItem:
     expr: object
     alias: str | None = None
+    text: str = field(default="", compare=False)  # source text, for the column name
 
 
 @dataclass
@@ -147,7 +148,7 @@ class Delete:
 
 # ---- parser ------------------------------------------------------------
 
-TYPE_NAMES = {"INTEGER": "INTEGER", "INT": "INTEGER", "TEXT": "TEXT"}
+TYPE_NAMES = {"INTEGER", "TEXT"}
 
 
 def parse(text):
@@ -275,7 +276,7 @@ class Parser:
         if type_token.kind != "IDENT" or type_token.value.upper() not in TYPE_NAMES:
             raise self.error("column type INTEGER or TEXT")
         self.advance()
-        column = ColumnDef(name, TYPE_NAMES[type_token.value.upper()])
+        column = ColumnDef(name, type_token.value.upper())
         while True:
             if self.accept_keyword("PRIMARY"):
                 self.expect_word("KEY")
@@ -347,13 +348,15 @@ class Parser:
             self.advance()
             self.advance()
             return SelectItem(Star(table))
+        start = self.tok.pos
         expr = self.expr()
+        text = self.text[start:self.tok.pos].strip()
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
         elif self.tok.kind == "IDENT":
             alias = self.advance().value
-        return SelectItem(expr, alias)
+        return SelectItem(expr, alias, text)
 
     def table_ref(self):
         name = self.identifier("table name")
@@ -473,6 +476,10 @@ class Parser:
         return left
 
     def unary(self):
+        if self.accept_keyword("NOT"):
+            # As in SQLite's grammar, NOT may start an operand; it takes
+            # everything that binds tighter than NOT.
+            return Unary("NOT", self.not_expr())
         if self.at_op("-", "+"):
             op = self.advance().value
             token = self.tok

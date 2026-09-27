@@ -94,19 +94,21 @@ def comparison_affinities(left, right):
 
 
 def format_real(value):
-    """Render a REAL as text like SQLite: always with a '.', exponent form
-    below 1e-4 and from 1e17.  Uses the shortest digits that round-trip."""
+    """Render a REAL as text like SQLite: 15 significant digits if they
+    round-trip, otherwise 17; always with a '.'; exponent form below 1e-4 and
+    from 1e17.  (SQLite's own digit generation is approximate, so a few
+    values still differ in the last digits.)"""
     if math.isinf(value):
         return "Inf" if value > 0 else "-Inf"
     if value == 0:
         return "0.0"
-    sign = "-" if value < 0 else ""
-    mantissa, _, exp = repr(abs(value)).partition("e")
-    integer_part, _, fraction = mantissa.partition(".")
-    digits = integer_part + fraction
-    significant = digits.lstrip("0")
-    exponent = len(integer_part) + int(exp or 0) - (len(digits) - len(significant)) - 1
-    digits = significant.rstrip("0")
+    text = f"{value:.14e}"
+    if float(text) != value:
+        text = f"{value:.16e}"
+    mantissa, exponent = text.split("e")
+    exponent = int(exponent)
+    sign = "-" if mantissa.startswith("-") else ""
+    digits = mantissa.lstrip("-").replace(".", "").rstrip("0")
     if exponent < -4 or exponent >= 17:
         sign_char = "+" if exponent >= 0 else "-"
         return f"{sign}{digits[0]}.{digits[1:] or '0'}e{sign_char}{abs(exponent):02d}"
@@ -132,9 +134,17 @@ def to_number(value):
     return _parse_number(match.group(1)) if match else 0
 
 
+_INTEGER_PREFIX = re.compile(rf"[{_SPACE}]*([+-]?[0-9]+)")
+
+
 def to_int64(value):
-    """Convert to a 64-bit integer as SQLite does (truncate, saturate)."""
-    value = to_number(value)
+    """Convert to a 64-bit integer as SQLite does: REALs truncate and saturate,
+    TEXT uses its leading integer digits ('1e2' -> 1)."""
+    if isinstance(value, str):
+        match = _INTEGER_PREFIX.match(value)
+        if not match:
+            return 0
+        return max(INT_MIN, min(INT_MAX, int(match.group(1))))
     if isinstance(value, float):
         if math.isnan(value):
             return 0
@@ -176,9 +186,11 @@ def sort_key(value):
 
 
 def compare(a, b):
-    """Three-way comparison of two non-NULL values (-1, 0 or 1)."""
-    ka, kb = sort_key(a), sort_key(b)
-    return (ka > kb) - (ka < kb)
+    """Three-way comparison of two non-NULL values (-1, 0 or 1): numbers < text."""
+    a_text, b_text = type(a) is str, type(b) is str
+    if a_text == b_text:
+        return (a > b) - (a < b)
+    return 1 if a_text else -1
 
 
 # ---- operators ---------------------------------------------------------------
@@ -230,17 +242,20 @@ def divide(a, b):
 
 
 def remainder(a, b):
-    a, b = to_number(a), to_number(b)
-    if a is None or b is None:
+    na, nb = to_number(a), to_number(b)
+    if na is None or nb is None:
         return None
-    both_int = isinstance(a, int) and isinstance(b, int)
-    a, b = to_int64(a), to_int64(b)
+    if isinstance(na, int) and isinstance(nb, int):
+        a, b, as_real = na, nb, False
+    else:
+        # SQLite converts the original operands (not their numeric values) to integers.
+        a, b, as_real = to_int64(a), to_int64(b), True
     if b == 0:
         return None
     result = abs(a) % abs(b)
     if a < 0:
         result = -result
-    return result if both_int else float(result)
+    return float(result) if as_real else result
 
 
 def negate(a):
@@ -305,12 +320,13 @@ def like(value, pattern):
 
 
 def _fn_abs(value):
-    value = to_number(value)
     if value is None:
         return None
-    if value == INT_MIN and isinstance(value, int):
-        raise OperationalError("integer overflow")
-    return abs(value)
+    if isinstance(value, int):
+        if value == INT_MIN:
+            raise OperationalError("integer overflow")
+        return abs(value)
+    return abs(float(to_number(value)))  # TEXT always gives a REAL, as in SQLite
 
 
 def _fn_length(value):
