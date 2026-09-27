@@ -301,3 +301,56 @@ def test_transaction_statements():
         assert parse(sql) == Rollback()
     with pytest.raises(SQLSyntaxError):
         parse("BEGIN WORK NOW")
+
+
+def test_case_cast_and_subqueries():
+    from minidb.parser import Case, Cast, Compound, DerivedTable, Exists, InSelect, Subquery
+
+    assert where("CASE a WHEN 1 THEN 'x' WHEN 2 THEN 'y' ELSE 'z' END") == Case(
+        a("a"), ((lit(1), lit("x")), (lit(2), lit("y"))), lit("z")
+    )
+    assert where("CASE WHEN a > 1 THEN 1 END") == Case(None, ((Binary(">", a("a"), lit(1)), lit(1)),))
+    assert where("CAST(a AS VARCHAR(10))") == Cast(a("a"), "VARCHAR(10)")
+    assert where("CAST(a AS double precision)") == Cast(a("a"), "double precision")
+    assert where("CAST(a AS DECIMAL(10, -2))").type_name == "DECIMAL(10, -2)"
+    inner = parse("SELECT b FROM u")
+    assert where("a IN (SELECT b FROM u)") == InSelect(a("a"), inner)
+    assert where("a NOT IN (SELECT b FROM u)") == InSelect(a("a"), inner, negated=True)
+    assert where("EXISTS (SELECT b FROM u)") == Exists(inner)
+    assert where("NOT EXISTS (SELECT b FROM u)") == Unary("NOT", Exists(inner))
+    assert where("(SELECT b FROM u) > 1") == Binary(">", Subquery(inner), lit(1))
+    stmt = parse("SELECT * FROM (SELECT b FROM u) x JOIN v USING (b, c) NATURAL LEFT JOIN w")
+    assert stmt.source == [
+        Join(DerivedTable(inner, "x")),
+        Join(TableRef("v"), using=["b", "c"]),
+        Join(TableRef("w"), "LEFT", natural=True),
+    ]
+
+
+def test_compound_select():
+    from minidb.parser import Compound
+
+    stmt = parse("SELECT a FROM t UNION ALL SELECT b FROM u EXCEPT SELECT 1 ORDER BY 1 DESC LIMIT 2")
+    assert isinstance(stmt, Compound)
+    assert stmt.operators == ["UNION ALL", "EXCEPT"]
+    assert len(stmt.selects) == 3 and all(s.order_by == [] for s in stmt.selects)
+    assert stmt.order_by == [OrderItem(lit(1), True)] and stmt.limit == lit(2)
+    assert parse("SELECT ALL a FROM t") == parse("SELECT a FROM t")
+
+
+@pytest.mark.parametrize("sql, message", [
+    ("SELECT CASE END", 'syntax error near "END": expected expression'),
+    ("SELECT CASE 1 ELSE 2 END", 'syntax error near "ELSE": expected WHEN'),
+    ("SELECT CASE WHEN 1 THEN 2", "syntax error at end of input: expected END"),
+    ("SELECT CAST(1 AS)", 'syntax error near ")": expected type name'),
+    ("SELECT CAST(1 AS INT(x))", 'syntax error near "x": expected number'),
+    ("SELECT 1 FROM t UNION", "syntax error at end of input: expected SELECT"),
+    ("SELECT 1 FROM t ORDER BY 1 UNION SELECT 2", 'syntax error near "UNION": expected ";" or end of statement'),
+    ("SELECT * FROM t NATURAL u", 'syntax error near "u": expected JOIN'),
+    ("SELECT * FROM t JOIN u USING ()", 'syntax error near ")": expected column name'),
+    ("SELECT EXISTS 1", 'syntax error near "1": expected "("'),
+])
+def test_new_syntax_errors(sql, message):
+    with pytest.raises(SQLSyntaxError) as info:
+        parse(sql)
+    assert info.value.message == message

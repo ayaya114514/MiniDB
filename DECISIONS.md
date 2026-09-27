@@ -262,3 +262,37 @@ is malformed ...")`；页解码时的任何异常也统一转成这个错误。B
 ## D48 目录 fsync
 创建数据库文件、创建和删除 WAL 后 fsync 所在目录，保证文件的出现/消失本身也持久。
 每次提交多两次 fsync（自动提交写入慢约 50%）。
+
+## D49 SELECT 编译一次、可多次运行
+SELECT 改为先编译成 `CompiledSelect` / `CompiledCompound`（作用域、连接计划、所有闭包），
+`run()` 才读数据。相关子查询在外层每行调用一次 `run()`，不重复编译。作用域有父链：子查询里找
+不到的列去外层找，引用外层列编译成“读外层当前行”的闭包——外层调用子查询前把当前行放进
+自己作用域的 `cell`。聚合查询里传入的是分组行，所以 HAVING/SELECT 里的相关子查询也正确。
+不相关的子查询（整条链上没有外层引用）只算一次并缓存。
+
+## D50 子查询的语义细节（均对照 sqlite 实测）
+- 标量子查询取第一行第一列，无行为 NULL，多列报 "sub-select returns N columns - expected 1"；
+  其亲和性取结果列表达式的亲和性。
+- `x IN (SELECT y ...)` 的亲和性与 `IN (列表)` 不同：两边都是列时有数值亲和性就用数值，否则不转换；
+  只有一边有亲和性就用那一边；得到的亲和性同时作用于左值和子查询的每个值。子查询为空时结果为 0
+  （即使 x 是 NULL）。
+- 含子查询的 WHERE 合取项视为引用了当前查询的所有表：放在最后一层过滤，也不用来选访问路径。
+- FROM 里的子查询（derived table）每次运行时物化，看不到同一 FROM 的其他表（没有 LATERAL），
+  但可以引用更外层的查询；它没有 rowid。
+
+## D51 复合查询
+`UNION [ALL]`、`INTERSECT`、`EXCEPT` 同一优先级、从左到右。去重类运算的结果按行排序，
+同一行出现多次时保留后出现的那个（与 SQLite 的临时索引行为一致）。ORDER BY 只能引用结果列：
+序号、任一分支的结果列名/别名、或与某分支的结果表达式完全相同，否则报
+"ORDER BY term does not match any column in the result set"。
+
+## D52 CAST 与 CASE
+CAST 的类型名按 SQLite 规则取亲和性（含 INT→INTEGER；含 CHAR/CLOB/TEXT→TEXT；含 BLOB 或空→BLOB；
+含 REAL/FLOA/DOUB→REAL；其余 NUMERIC）。转 INTEGER 取文本的整数前缀并在 64 位边界饱和；
+转 NUMERIC 时文本按数值前缀解析、整数值的 REAL（仅来自文本）变 INTEGER。MiniDB 没有 BLOB，
+CAST 到 BLOB 报 `NotSupportedError`。CAST 表达式带目标类型的亲和性（影响比较）。简单 CASE 的
+比较照 `=` 的亲和性规则，NULL 永不匹配。
+
+## D53 JOIN USING / NATURAL
+转成 `左表.c = 右表.c` 的 ON 条件；右表的这些列只能用限定名访问，因此 `c` 与 `*` 都指左表的列
+（LEFT JOIN 时左表的值就是非 NULL 那一侧）。列不在两边时报与 sqlite 相同的错误。

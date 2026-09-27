@@ -5,11 +5,12 @@ from dataclasses import dataclass
 from minidb.errors import OperationalError
 
 KEYWORDS = {
-    "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "COMMIT", "CREATE", "CROSS", "DELETE",
-    "DESC", "DISTINCT", "DROP", "EXISTS", "EXPLAIN", "FROM", "GROUP", "HAVING", "IF", "IN", "INDEX",
-    "INNER", "INSERT", "INTO", "IS", "JOIN", "LEFT", "LIKE", "LIMIT", "NOT", "NULL",
-    "OFFSET", "ON", "OR", "ORDER", "OUTER", "PRIMARY", "ROLLBACK", "SELECT", "SET",
-    "TABLE", "TRANSACTION", "UNIQUE", "UPDATE", "VALUES", "WHERE",
+    "ALL", "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "CASE", "CAST", "COMMIT", "CREATE",
+    "CROSS", "DELETE", "DESC", "DISTINCT", "DROP", "ELSE", "END", "EXCEPT", "EXISTS", "EXPLAIN",
+    "FROM", "GROUP", "HAVING", "IF", "IN", "INDEX", "INNER", "INSERT", "INTERSECT", "INTO", "IS",
+    "JOIN", "LEFT", "LIKE", "LIMIT", "NATURAL", "NOT", "NULL", "OFFSET", "ON", "OR", "ORDER",
+    "OUTER", "PRIMARY", "ROLLBACK", "SELECT", "SET", "TABLE", "THEN", "TRANSACTION", "UNION",
+    "UNIQUE", "UPDATE", "USING", "VALUES", "WHEN", "WHERE",
 }
 
 # Longest operators first so that "<=" wins over "<".
