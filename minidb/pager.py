@@ -7,18 +7,23 @@ they are written back.  Callers must call ``pager.write(page)`` *before*
 modifying a page so the pager can track (and later journal) the change.
 
 Page 0 is the database header.  Freed pages form a singly linked free list.
+
+Statement journal: between ``begin_statement()`` and ``end_statement()`` the
+pager keeps a copy of every page as it was before the statement first touched
+it (every page class implements ``copy()``), so ``rollback_statement()`` can
+undo a statement that failed halfway.  Dirty pages are never written to the
+file before a commit, so a page that was not cached still has its old content
+on disk and needs no copy.
 """
 
 import io
 import os
 import struct
 
+from minidb.errors import DatabaseError
+
 PAGE_SIZE = 4096
 MAGIC = b"MiniDB format 1\x00"
-
-
-class DatabaseError(Exception):
-    pass
 
 
 class RawPage:
@@ -34,6 +39,9 @@ class RawPage:
 
     def to_bytes(self):
         return bytes(self.data)
+
+    def copy(self):
+        return RawPage(self.pgno, self.data)
 
 
 class FreePage:
@@ -51,6 +59,9 @@ class FreePage:
 
     def to_bytes(self):
         return self._format.pack(self.next_free).ljust(PAGE_SIZE, b"\x00")
+
+    def copy(self):
+        return FreePage(self.pgno, self.next_free)
 
 
 class Header:
@@ -74,6 +85,9 @@ class Header:
         data = self._format.pack(MAGIC, self.page_count, self.freelist_head)
         return data.ljust(PAGE_SIZE, b"\x00")
 
+    def copy(self):
+        return Header(self.pgno, self.page_count, self.freelist_head)
+
 
 class Pager:
     def __init__(self, path=None):
@@ -89,6 +103,8 @@ class Pager:
             raise DatabaseError("database file size is not a multiple of the page size")
         self.cache = {}
         self.dirty = set()
+        self.journal = None  # pgno -> page copy (or None) while a statement runs
+        self.journal_dirty = None
         if size == 0:
             self.header = Header()
             self.cache[0] = self.header
@@ -121,9 +137,34 @@ class Pager:
         return page
 
     def write(self, page):
-        """Declare that ``page`` is about to be modified."""
-        self.dirty.add(page.pgno)
-        self.cache[page.pgno] = page
+        """Declare that ``page`` is about to be modified (or replaced by ``page``)."""
+        pgno = page.pgno
+        if self.journal is not None and pgno not in self.journal:
+            old = self.cache.get(pgno)
+            self.journal[pgno] = old.copy() if old is not None else None
+        self.dirty.add(pgno)
+        self.cache[pgno] = page
+
+    # ---- statements ---------------------------------------------------
+
+    def begin_statement(self):
+        self.journal = {}
+        self.journal_dirty = set(self.dirty)
+
+    def end_statement(self):
+        self.journal = None
+        self.journal_dirty = None
+
+    def rollback_statement(self):
+        """Undo every change made since ``begin_statement()``."""
+        for pgno, old in self.journal.items():
+            if old is None:
+                self.cache.pop(pgno, None)
+            else:
+                self.cache[pgno] = old
+        self.dirty = self.journal_dirty
+        self.header = self.cache[0]
+        self.end_statement()
 
     def allocate(self, page_class, *args):
         """Allocate a page (reusing the free list first) as ``page_class(pgno, *args)``."""
@@ -152,6 +193,20 @@ class Pager:
             count += 1
             pgno = self.get(pgno, FreePage).next_free
         return count
+
+    def shrink_cache(self, limit=10_000):
+        """Drop clean pages from the cache once it holds more than ``limit`` pages.
+
+        Only call this between statements: B+ tree code holds page objects
+        while it works.
+        """
+        if len(self.cache) > limit:
+            self.cache = {
+                pgno: page for pgno, page in self.cache.items() if pgno in self.dirty or pgno == 0
+            }
+
+    def commit(self):
+        self.flush()
 
     def flush(self):
         """Write every dirty page back to the file."""

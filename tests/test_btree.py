@@ -240,3 +240,47 @@ def test_dump():
     lines = tree.dump()
     assert lines[0].startswith("- internal (page 1")
     assert any(line.startswith("  - leaf") for line in lines)
+
+
+@pytest.mark.parametrize("seed", range(5))
+def test_statement_rollback_restores_tree(seed, tmp_path):
+    rng = random.Random(seed)
+    path = str(tmp_path / "t.db")
+    pager = Pager(path)
+    tree = BTree.create(pager, capacity=160)
+    model = {}
+    for key in rng.sample(range(5000), 1500):
+        model[key] = value_for(key, rng.randint(0, 40))
+        tree.insert(key, model[key])
+    if seed % 2:
+        pager.commit()  # half of the runs start from clean (flushed) pages
+    snapshot = {pgno: pager.cache[pgno].to_bytes() for pgno in pager.cache}
+    page_count, free_pages = pager.page_count, pager.free_page_count()
+
+    pager.begin_statement()
+    for _ in range(3000):
+        key = rng.randint(0, 6000)
+        if rng.random() < 0.5:
+            tree.insert(key, value_for(key, rng.randint(0, 60)), replace=True)
+        else:
+            tree.delete(key)
+    pager.rollback_statement()
+
+    assert tree.check() == len(model)
+    assert list(tree.scan()) == sorted(model.items())
+    assert (pager.page_count, pager.free_page_count()) == (page_count, free_pages)
+    for pgno, data in snapshot.items():
+        assert pager.cache[pgno].to_bytes() == data
+    pager.close()
+    pager = Pager(path)
+    tree = BTree(pager, tree.root, capacity=160)
+    assert list(tree.scan()) == sorted(model.items())
+    pager.close()
+
+
+def test_statement_commit_keeps_changes():
+    pager, tree = make_tree()
+    pager.begin_statement()
+    tree.insert(1, b"a")
+    pager.end_statement()
+    assert tree.get(1) == b"a"

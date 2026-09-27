@@ -2,6 +2,8 @@
 
 from dataclasses import dataclass
 
+from minidb.errors import Error
+
 KEYWORDS = {
     "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "COMMIT", "CREATE", "CROSS", "DELETE",
     "DESC", "DISTINCT", "DROP", "EXISTS", "FROM", "GROUP", "HAVING", "IF", "IN", "INDEX",
@@ -15,7 +17,7 @@ OPERATORS = ["<>", "<=", ">=", "==", "!=", "||", "<", ">", "=", "+", "-", "*", "
              "(", ")", ",", ";", "."]
 
 
-class SQLSyntaxError(Exception):
+class SQLSyntaxError(Error):
     """A lexical or syntax error at a position in the SQL text."""
 
     def __init__(self, message, text, pos):
