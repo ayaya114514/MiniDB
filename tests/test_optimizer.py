@@ -108,3 +108,59 @@ def test_in_and_or_results_match_sqlite():
         pair.run(f"SELECT * FROM t WHERE {' OR '.join(parts)}")
         pair.run(f"SELECT id FROM t WHERE ({' OR '.join(parts)}) AND id % 2 = 0")
     pair.close()
+
+
+def test_join_order_follows_the_cost():
+    pair = Pair()
+    pair.script([
+        "CREATE TABLE big (id INTEGER PRIMARY KEY, k INTEGER, v TEXT)",
+        "CREATE INDEX big_k ON big (k)",
+        "CREATE TABLE small (k INTEGER, tag TEXT)",
+        "CREATE TABLE mid (id INTEGER PRIMARY KEY, big_id INTEGER)",
+        "INSERT INTO big VALUES " + ", ".join(f"({i}, {i % 500}, 'v{i}')" for i in range(1, 5001)),
+        "INSERT INTO small VALUES (7, 'a'), (8, 'b'), (9, 'c')",
+        "INSERT INTO mid VALUES " + ", ".join(f"({i}, {i * 7})" for i in range(1, 301)),
+    ])
+    db = pair.mini
+    db.execute("ANALYZE")
+    written_badly = "SELECT count(*) FROM big JOIN small ON big.k = small.k"
+    assert [t for t, _ in db.execute("EXPLAIN " + written_badly)] == ["small", "big"]
+    three = ("SELECT count(*) FROM big, mid, small "
+             "WHERE big.id = mid.big_id AND big.k = small.k")
+    plans = db.execute("EXPLAIN " + three)
+    assert plans[0][0] != "big"  # the big table never drives the loop
+    assert all(p != "SCAN" for t, p in plans if t == "big")  # it is only probed
+    pair.run(written_badly)
+    pair.run(three)
+    pair.close()
+
+
+def test_reordered_joins_match_sqlite():
+    pair = Pair()
+    pair.script([
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, y TEXT)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, z INTEGER)",
+        "CREATE TABLE c (k INTEGER, w TEXT)",
+        "CREATE INDEX b_a ON b (a_id)",
+        "CREATE INDEX c_k ON c (k)",
+        "INSERT INTO a VALUES " + ", ".join(f"({i}, {i % 13}, 'y{i % 5}')" for i in range(1, 200)),
+        "INSERT INTO b VALUES " + ", ".join(f"({i}, {i % 250}, {i % 9})" for i in range(1, 600)),
+        "INSERT INTO c VALUES " + ", ".join(f"({i % 20}, 'w{i}')" for i in range(1, 40)),
+    ])
+    rng = random.Random(8)
+    conditions = ["a.id = b.a_id", "b.z = c.k", "a.x = c.k", "a.y = 'y1'", "b.z > 5",
+                  "c.w LIKE 'w1%'", "a.id < 50", "b.id IN (3, 30, 300)", "c.k IN (1, 2, 3)"]
+    for analyzed in (False, True):
+        if analyzed:
+            pair.mini.execute("ANALYZE")
+        for _ in range(60):
+            tables = rng.sample(["a", "b", "c"], rng.randint(2, 3))
+            names = {"a", "b", "c"}
+            usable = [c for c in conditions if {p.split(".")[0] for p in c.split() if "." in p} <= set(tables)]
+            joins = [c for c in usable if c.count(".") == 2]
+            if len(joins) < len(tables) - 1:
+                continue  # skip cross products: they only make the test slow
+            where = " AND ".join(joins[:len(tables) - 1] + rng.sample(usable, min(len(usable), 2)))
+            pair.run(f"SELECT count(*), sum({tables[0]}.id) FROM {', '.join(tables)} WHERE {where}")
+            assert names
+    pair.close()

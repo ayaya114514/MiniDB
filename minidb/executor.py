@@ -1204,6 +1204,7 @@ class Executor:
         filters; each is checked at the first level where all the tables it
         uses are bound.  A LEFT JOIN's ON condition decides which rows match
         at its own level (and is the only thing its access path may use).
+        Without LEFT JOINs the tables are joined in the cheapest order.
         """
         compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
         on_compiler = Compiler(scope, executor=self)
@@ -1211,36 +1212,78 @@ class Executor:
         for join in joins:
             if join.kind != "LEFT":
                 pool += split_conjuncts(join.on)
+        referenced = [(conjunct, tables_referenced(conjunct, scope)) for conjunct in pool]
+        order = list(range(len(joins)))
+        if len(joins) > 1 and all(join.kind != "LEFT" for join in joins):
+            order = self.join_order(scope, referenced, compiler)
+        position = {table: i for i, table in enumerate(order)}
         placed = {}
-        constant = []
-        for conjunct in pool:
-            tables = tables_referenced(conjunct, scope)
-            if tables:
-                placed.setdefault(max(tables), []).append(conjunct)
-            else:
-                constant.append(conjunct)
+        for conjunct, tables in referenced:
+            level = max((position[t] for t in tables), default=0)
+            placed.setdefault(level, []).append(conjunct)
         # Compile all conditions first: the access paths may then check which
         # columns the query uses (covering indexes).
         compiled = []
-        for index, join in enumerate(joins):
+        for level, index in enumerate(order):
+            join = joins[index]
             match = None
             if join.kind == "LEFT" and join.on is not None:
                 match = on_compiler.compile(join.on)
-            filters = placed.get(index, [])
-            if index == 0:
-                filters = constant + filters
-            compiled.append((match, [compiler.compile(f) for f in filters]))
+            compiled.append((match, [compiler.compile(f) for f in placed.get(level, [])]))
         levels = []
-        for index, (join, (match, filters)) in enumerate(zip(joins, compiled)):
+        for level, (index, (match, filters)) in enumerate(zip(order, compiled)):
+            join = joins[index]
             entry = scope.entries[index]
             usable = split_conjuncts(join.on) if join.kind == "LEFT" else pool
-            access = plan_access(scope, index, self.catalog, usable, compiler,
-                                 order_hint if index == 0 else None)
+            hint = order_hint if level == 0 and index == 0 else None
+            access = plan_access(scope, index, self.catalog, usable, compiler, hint,
+                                 bound=set(order[:level]))
             if covering and isinstance(access, IndexScan):
                 access.cover_if_possible(scope, index)
             levels.append(JoinLevel(entry.table, entry.offset, access,
                                     join.kind == "LEFT", match, filters))
         return levels
+
+    def join_order(self, scope, referenced, compiler):
+        """The table order with the lowest estimated nested loop cost: every
+        permutation for up to 6 tables, greedy beyond.  A condition that only
+        filters (no lookup uses it) is guessed to keep a quarter of the rows."""
+        count = len(scope.entries)
+        pool = [conjunct for conjunct, _ in referenced]
+        accesses = {}
+
+        def access(table, bound):
+            key = (table, bound)
+            if key not in accesses:
+                plan = plan_access(scope, table, self.catalog, pool, compiler, bound=set(bound))
+                rows, cost = plan.estimate()
+                if isinstance(plan, (FullScan, DerivedScan)):
+                    newly = sum(1 for _, tables in referenced
+                                if table in tables and tables <= bound | {table})
+                    rows = max(1, rows / RANGE_FACTOR ** newly)
+                accesses[key] = rows, cost
+            return accesses[key]
+
+        def total(order):
+            cost, outer, bound = 0, 1, frozenset()
+            for table in order:
+                rows, probe = access(table, bound)
+                cost += outer * probe
+                outer *= rows
+                bound |= {table}
+            return cost
+
+        if count <= 6:
+            best = min(itertools.permutations(range(count)), key=total)  # first of equals
+            return list(best)
+        order, bound, outer = [], frozenset(), 1
+        while len(order) < count:
+            table = min((t for t in range(count) if t not in bound),
+                        key=lambda t: outer * access(t, bound)[1])
+            outer *= access(table, bound)[0]
+            order.append(table)
+            bound |= {table}
+        return order
 
     @staticmethod
     def join_rows(scope, levels):

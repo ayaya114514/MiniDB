@@ -55,18 +55,29 @@ def test_text_column_compared_with_integer_column_cannot_use_index():
     db.execute("CREATE TABLE s (x TEXT)")
     db.execute("CREATE TABLE n (y INTEGER)")
     db.execute("CREATE INDEX s_x ON s (x)")
+    # x = y converts x to a number, so the index on x (ordered as text) is
+    # unusable in either join order ...
+    for sql in ["SELECT * FROM n JOIN s ON s.x = n.y", "SELECT * FROM s JOIN n ON s.x = n.y"]:
+        assert [p for _, p in db.execute("EXPLAIN " + sql)] == ["SCAN", "SCAN"]
+    # ... but an index on y is fine: the text side is converted instead.
     db.execute("CREATE INDEX n_y ON n (y)")
-    # x = y converts x to a number, so the index on x (ordered as text) is unusable ...
-    assert plan(db, "SELECT * FROM n JOIN s ON s.x = n.y") == ["SCAN", "SCAN"]
-    # ... but the index on y is fine: the text side is converted instead.
-    assert plan(db, "SELECT * FROM s JOIN n ON s.x = n.y") == ["SCAN", "SEARCH USING COVERING INDEX n_y (y=?)"]
+    for sql in ["SELECT * FROM n JOIN s ON s.x = n.y", "SELECT * FROM s JOIN n ON s.x = n.y"]:
+        assert db.execute("EXPLAIN " + sql) == [
+            ("s", "SCAN"), ("n", "SEARCH USING COVERING INDEX n_y (y=?)")
+        ]
 
 
 def test_join_uses_index_and_rowid_on_inner_table(db):
     db.execute("CREATE TABLE u (k INTEGER, name TEXT)")
     db.execute("CREATE INDEX u_k ON u (k)")
-    assert plan(db, "SELECT * FROM u JOIN t ON t.id = u.k") == ["SCAN", "SEARCH USING ROWID (=)"]
-    assert plan(db, "SELECT * FROM t JOIN u ON u.k = t.a") == ["SCAN", "SEARCH USING INDEX u_k (k=?)"]
+    assert db.execute("EXPLAIN SELECT * FROM u JOIN t ON t.id = u.k") == [
+        ("u", "SCAN"), ("t", "SEARCH USING ROWID (=)")
+    ]
+    # u is (nearly) empty and t is large: u goes outside whatever the written order.
+    assert db.execute("EXPLAIN SELECT * FROM t JOIN u ON u.k = t.a") == [
+        ("u", "SCAN"), ("t", "SEARCH USING INDEX t_a (a=?)")
+    ]
+    # LEFT JOIN keeps the written order.
     assert plan(db, "SELECT * FROM t LEFT JOIN u ON u.k = t.a WHERE u.name = 'x'") == [
         "SCAN", "SEARCH USING INDEX u_k (k=?)"
     ]
