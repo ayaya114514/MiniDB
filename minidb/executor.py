@@ -625,6 +625,9 @@ class DerivedScan:
     def candidates(self, row):
         return ((r[-1], r) for r in self.source.rows)
 
+    def order(self):
+        return None
+
     def describe(self):
         return "SCAN SUBQUERY"
 
@@ -635,6 +638,10 @@ class FullScan:
 
     def candidates(self, row):
         return self.tree.scan()
+
+    def order(self):
+        """(columns the rows come ordered by, columns that are constant)."""
+        return [ROWID], set()
 
     def describe(self):
         return "SCAN"
@@ -657,6 +664,9 @@ class RowidLookup:
             value = self.tree.get(key)
             if value is not None:
                 yield key, value
+
+    def order(self):
+        return [ROWID], set()
 
     def describe(self):
         return "SEARCH USING ROWID (=)"
@@ -686,6 +696,9 @@ class RowidRange:
                 end = None  # every number is below any text
             end_inclusive = self.upper[1]
         return self.tree.scan(start, end, start_inclusive, end_inclusive)
+
+    def order(self):
+        return [ROWID], set()
 
     def describe(self):
         return "SEARCH USING ROWID (range)"
@@ -737,8 +750,14 @@ class IndexScan:
             rowid = key[-1][1]
             yield rowid, get(rowid)
 
+    def order(self):
+        positions = self.index.positions
+        return positions[len(self.equal):] + [ROWID], set(positions[:len(self.equal)])
+
     def describe(self):
         names = self.index.column_names
+        if not (self.equal or self.lower or self.upper):
+            return f"SCAN USING INDEX {self.index.name}"
         parts = [f"{name}=?" for name in names[:len(self.equal)]]
         if self.lower:
             parts.append(f"{names[len(self.equal)]}>{'=' if self.lower[1] else ''}?")
@@ -831,7 +850,7 @@ def _bounds(constraints, position):
     return lower, upper
 
 
-def plan_access(scope, index, catalog, conjuncts, compiler):
+def plan_access(scope, index, catalog, conjuncts, compiler, order_hint=None):
     """Choose how to read table ``index`` of ``scope`` given the usable conjuncts.
 
     Preference: row id lookup, then the index matching the most leading
@@ -869,6 +888,12 @@ def plan_access(scope, index, catalog, conjuncts, compiler):
             index_tree = catalog.index_tree(info)
             best = IndexScan(info, index_tree, tree, equal, lower, upper)
             best_score = score
+    if best_score == 0 and order_hint is not None and order_hint != ROWID:
+        # Nothing narrows the scan, but ORDER BY ... LIMIT wants this column
+        # first: walk an index on it in order and stop early.
+        for info in table.indexes:
+            if info.positions[0] == order_hint:
+                return IndexScan(info, catalog.index_tree(info), tree, [], None, None)
     return best
 
 
@@ -998,7 +1023,7 @@ class Executor:
             right.hidden.add(name.lower())
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
-    def plan_joins(self, scope, joins, where):
+    def plan_joins(self, scope, joins, where, order_hint=None):
         """Plan a nested loop over ``joins``; returns a list of ``JoinLevel``.
 
         WHERE conjuncts and the ON conditions of inner joins form one pool of
@@ -1035,7 +1060,8 @@ class Executor:
             levels.append(JoinLevel(
                 entry.table,
                 entry.offset,
-                plan_access(scope, index, self.catalog, usable, compiler),
+                plan_access(scope, index, self.catalog, usable, compiler,
+                            order_hint if index == 0 else None),
                 join.kind == "LEFT",
                 match,
                 [compiler.compile(f) for f in filters],
@@ -1390,14 +1416,43 @@ class CompiledSelect:
         self.group_functions = executor.group_functions(stmt, self.exprs, self.names, scope)
         self.levels = None
         self.condition = None
+        order_columns = self.order_columns(stmt)
         if stmt.source:
-            self.levels = executor.plan_joins(scope, joins, stmt.where)
+            hint = order_columns[0] if order_columns and stmt.limit is not None else None
+            self.levels = executor.plan_joins(scope, joins, stmt.where, hint)
         elif stmt.where is not None:
             where = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=executor)
             self.condition = where.compile(stmt.where)
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
-        self.presorted = False  # set when the access path already yields ORDER BY order
+        # True when the first table's access path already yields ORDER BY order.
+        self.presorted = bool(
+            self.levels and order_columns and not self.is_aggregate
+            and follows_order(order_columns, self.levels[0].access.order())
+        )
+
+    def order_columns(self, stmt):
+        """ORDER BY as positions of the first table's columns (ROWID for the row
+        id), or None unless every term is an ascending, NULLS FIRST plain
+        column of that table."""
+        if not self.order_terms or not self.scope.entries:
+            return None
+        entry = self.scope.entries[0]
+        table = entry.table
+        rowid_slot = self.scope.rowid_slot(0)
+        columns = []
+        for (source, index, descending, nulls_first), item in zip(self.order_terms, stmt.order_by):
+            expr = self.exprs[index] if source == "output" else item.expr
+            if descending or not nulls_first or not isinstance(expr, Column):
+                return None
+            slot, _, table_index, depth = self.scope.resolve(expr)
+            if depth or table_index != 0:
+                return None
+            position = slot - entry.offset
+            if slot == rowid_slot or position == table.rowid_column:
+                position = ROWID
+            columns.append(position)
+        return columns
 
     @property
     def correlated(self):
@@ -1437,6 +1492,25 @@ class CompiledSelect:
         else:
             records = order_records(records, self.order_terms, start, end)
         return [output for output, _ in records]
+
+
+def follows_order(wanted, provided):
+    """Whether rows ordered by ``provided`` = (columns, constant columns) are
+    also ordered by the ``wanted`` columns."""
+    if provided is None:
+        return False
+    order, constant = provided
+    j = 0
+    for position in wanted:
+        if position in constant:
+            continue
+        if j < len(order) and order[j] == position:
+            j += 1
+            if position == ROWID:
+                return True  # the row id is unique: later terms cannot matter
+            continue
+        return False
+    return True
 
 
 class CompiledCompound:
