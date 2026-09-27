@@ -7,3 +7,7 @@ requires-python = ">=3.11"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+filterwarnings = [
+    # sqlite3 (the reference in differential tests) warns about a binding style we test on purpose
+    "ignore:Binding .* is a named parameter:DeprecationWarning",
+]
