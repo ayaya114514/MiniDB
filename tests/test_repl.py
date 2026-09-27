@@ -58,6 +58,18 @@ def test_meta_commands():
     assert output[-1] == "Error: no such table: zz"
 
 
+def test_schema_lists_indexes():
+    output = run_script(
+        "CREATE TABLE t (a INTEGER, b TEXT UNIQUE);\nCREATE INDEX t_a ON t (a);\n"
+        "CREATE UNIQUE INDEX t_ab ON t (a, b);\n.schema t\n"
+    )
+    assert output == [
+        'CREATE TABLE "t" ("a" INTEGER, "b" TEXT UNIQUE);',
+        'CREATE INDEX "t_a" ON "t" ("a");',
+        'CREATE UNIQUE INDEX "t_ab" ON "t" ("a", "b");',
+    ]
+
+
 def test_btree_command_shows_levels():
     inserts = "".join(f"INSERT INTO t VALUES ({i}, '{'x' * 50}');\n" for i in range(300))
     output = run_script("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\n" + inserts + ".btree t\n")
