@@ -126,11 +126,32 @@ class TableRef:
 
 
 @dataclass
+class Join:
+    """One table of a FROM clause and how it joins to the tables before it."""
+
+    table: TableRef
+    kind: str = "INNER"  # INNER (also for "," and CROSS JOIN) or LEFT
+    on: object = None
+
+
+@dataclass
+class OrderItem:
+    expr: object
+    descending: bool = False
+    nulls_first: bool | None = None  # None: NULLs first for ASC, last for DESC
+
+
+@dataclass
 class Select:
     items: list
-    source: TableRef | None = None
+    source: list = field(default_factory=list)  # Join items; empty without FROM
     where: object = None
     distinct: bool = False
+    group_by: list = field(default_factory=list)
+    having: object = None
+    order_by: list = field(default_factory=list)
+    limit: object = None
+    offset: object = None
 
 
 @dataclass
@@ -344,10 +365,41 @@ class Parser:
             items.append(self.select_item())
         stmt = Select(items, distinct=distinct)
         if self.accept_keyword("FROM"):
-            stmt.source = self.table_ref()
+            stmt.source = self.from_clause()
         if self.accept_keyword("WHERE"):
             stmt.where = self.expr()
+        if self.accept_keyword("GROUP"):
+            self.expect_keyword("BY")
+            stmt.group_by = self.expr_list()
+        if self.accept_keyword("HAVING"):
+            stmt.having = self.expr()
+        if self.accept_keyword("ORDER"):
+            self.expect_keyword("BY")
+            stmt.order_by = [self.order_item()]
+            while self.accept_op(","):
+                stmt.order_by.append(self.order_item())
+        if self.accept_keyword("LIMIT"):
+            stmt.limit = self.expr()
+            if self.accept_keyword("OFFSET"):
+                stmt.offset = self.expr()
+            elif self.accept_op(","):
+                # LIMIT <offset>, <count>
+                stmt.offset, stmt.limit = stmt.limit, self.expr()
         return stmt
+
+    def order_item(self):
+        item = OrderItem(self.expr())
+        if self.accept_keyword("DESC"):
+            item.descending = True
+        else:
+            self.accept_keyword("ASC")
+        if self.tok.kind == "IDENT" and self.tok.text.upper() == "NULLS":
+            self.advance()
+            if self.tok.kind == "IDENT" and self.tok.text.upper() in ("FIRST", "LAST"):
+                item.nulls_first = self.advance().text.upper() == "FIRST"
+            else:
+                raise self.error("FIRST or LAST")
+        return item
 
     def select_item(self):
         if self.accept_op("*"):
@@ -371,6 +423,27 @@ class Parser:
         elif self.tok.kind == "IDENT":
             alias = self.advance().value
         return SelectItem(expr, alias, text)
+
+    def from_clause(self):
+        joins = [Join(self.table_ref())]
+        while True:
+            if self.accept_op(","):
+                joins.append(Join(self.table_ref()))
+                continue
+            if self.accept_keyword("LEFT"):
+                self.accept_keyword("OUTER")
+                kind = "LEFT"
+            elif self.accept_keyword("INNER") or self.accept_keyword("CROSS"):
+                kind = "INNER"
+            elif self.at_keyword("JOIN"):
+                kind = "INNER"
+            else:
+                return joins
+            self.expect_keyword("JOIN")
+            join = Join(self.table_ref(), kind)
+            if self.accept_keyword("ON"):
+                join.on = self.expr()
+            joins.append(join)
 
     def table_ref(self):
         name = self.identifier("table name")

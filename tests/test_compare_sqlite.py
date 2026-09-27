@@ -279,7 +279,7 @@ def test_random_crud_against_sqlite():
         choice = rng.random()
         a = rng.choice(["NULL", str(rng.randint(-50, 50)), f"'{rng.randint(0, 9)}'"])
         b = rng.choice(["NULL", f"'s{rng.randint(0, 20)}'", str(rng.randint(0, 5))])
-        c = rng.choice([str(rng.randint(0, 9)), "NULL"])
+        c = "NULL" if rng.random() < 0.1 else str(rng.randint(0, 9))
         key = rng.choice(["NULL", str(rng.randint(1, 300))])
         lo = rng.randint(-60, 60)
         condition = rng.choice([

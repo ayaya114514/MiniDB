@@ -2,7 +2,8 @@ import pytest
 
 from minidb.parser import (
     Between, Binary, Call, Column, ColumnDef, CreateTable, Delete, DropTable, InList, Insert,
-    Like, Literal, Select, SelectItem, Star, TableRef, Unary, Update, parse, parse_script,
+    Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef, Unary, Update, parse,
+    parse_script,
 )
 from minidb.tokenizer import SQLSyntaxError
 
@@ -56,7 +57,7 @@ def test_insert():
 
 
 def test_select():
-    assert parse("SELECT * FROM t") == Select([SelectItem(Star())], TableRef("t"))
+    assert parse("SELECT * FROM t") == Select([SelectItem(Star())], [Join(TableRef("t"))])
     assert parse("SELECT a, b AS x, c y, t.d, t.* FROM t AS u WHERE a = 1") == Select(
         [
             SelectItem(a("a")),
@@ -65,9 +66,42 @@ def test_select():
             SelectItem(Column("d", "t")),
             SelectItem(Star("t")),
         ],
-        TableRef("t", "u"),
+        [Join(TableRef("t", "u"))],
         Binary("=", a("a"), lit(1)),
     )
+
+
+def test_order_by_limit_offset():
+    stmt = parse("SELECT a FROM t ORDER BY a DESC, 2, b ASC NULLS LAST, c nulls first LIMIT 5 OFFSET 2")
+    assert stmt.order_by == [
+        OrderItem(a("a"), True), OrderItem(lit(2)), OrderItem(a("b"), False, False),
+        OrderItem(a("c"), False, True),
+    ]
+    assert (stmt.limit, stmt.offset) == (lit(5), lit(2))
+    stmt = parse("SELECT a FROM t LIMIT 3, 10")
+    assert (stmt.limit, stmt.offset) == (lit(10), lit(3))
+
+
+def test_group_by_having():
+    stmt = parse("SELECT a, count(*) FROM t WHERE b > 0 GROUP BY a, b HAVING count(*) > 1")
+    assert stmt.group_by == [a("a"), a("b")]
+    assert stmt.having == Binary(">", Call("COUNT", (Star(),)), lit(1))
+
+
+def test_joins():
+    stmt = parse(
+        "SELECT * FROM a, b AS x JOIN c ON c.id = x.id INNER JOIN d ON 1 "
+        "LEFT JOIN e ON e.k = a.k LEFT OUTER JOIN f CROSS JOIN g"
+    )
+    assert stmt.source == [
+        Join(TableRef("a")),
+        Join(TableRef("b", "x")),
+        Join(TableRef("c"), "INNER", Binary("=", Column("id", "c"), Column("id", "x"))),
+        Join(TableRef("d"), "INNER", lit(1)),
+        Join(TableRef("e"), "LEFT", Binary("=", Column("k", "e"), Column("k", "a"))),
+        Join(TableRef("f"), "LEFT"),
+        Join(TableRef("g")),
+    ]
 
 
 def test_select_item_text():
@@ -225,6 +259,11 @@ def test_qualified_column():
         ("SELECT a b c FROM t", 'syntax error near "c": expected ";" or end of statement', 12),
         ("SELECT a BETWEEN 1 OR 2", 'syntax error near "OR": expected AND', 20),
         ("SELECT 1 +", "syntax error at end of input: expected expression", 11),
+        ("SELECT a FROM t ORDER a", 'syntax error near "a": expected BY', 23),
+        ("SELECT a FROM t GROUP a", 'syntax error near "a": expected BY', 23),
+        ("SELECT a FROM t LEFT t2", 'syntax error near "t2": expected JOIN', 22),
+        ("SELECT a FROM t ORDER BY a NULLS", "syntax error at end of input: expected FIRST or LAST", 33),
+        ("SELECT a FROM t JOIN", "syntax error at end of input: expected table name", 21),
     ],
 )
 def test_syntax_errors(sql, message, column):

@@ -18,7 +18,7 @@ from minidb.btree import DuplicateKeyError
 from minidb.errors import IntegrityError, OperationalError
 from minidb.parser import (
     Between, Binary, Call, Column, CreateTable, Delete, DropTable, Explain, InList, Insert,
-    Like, Literal, Select, Star, Unary, Update,
+    Join, Like, Literal, Select, Star, TableRef, Unary, Update,
 )
 from minidb.record import decode_record, encode_record
 
@@ -71,7 +71,7 @@ class Scope:
         return matches[0]
 
     def star_columns(self, table_name=None):
-        """(slot, column name) pairs that ``*`` or ``table.*`` expands to."""
+        """(table name, column name) pairs that ``*`` or ``table.*`` expands to."""
         if not self.entries:
             raise OperationalError("no tables specified")
         result = []
@@ -80,7 +80,7 @@ class Scope:
             if table_name is not None and table_name.lower() != name:
                 continue
             found = True
-            result.extend((offset + i, c.name) for i, c in enumerate(table.columns))
+            result.extend((name, c.name) for c in table.columns)
         if not found:
             raise OperationalError(f"no such table: {table_name}")
         return result
@@ -181,10 +181,18 @@ def value_comparator(op, left_affinity, right_affinity):
 
 
 class Compiler:
-    """Compiles expression trees into closures ``fn(row) -> value``."""
+    """Compiles expression trees into closures ``fn(row) -> value``.
 
-    def __init__(self, scope):
+    With an ``AggregateCollector`` the compiler accepts aggregate function
+    calls: each becomes a lookup of the aggregate's result, which the executor
+    appends to the group's representative row.  Without one, an aggregate
+    call is an error reported with ``misuse`` (formatted with the name).
+    """
+
+    def __init__(self, scope, aggregates=None, misuse="misuse of aggregate function {name}()"):
         self.scope = scope
+        self.aggregates = aggregates
+        self.misuse = misuse
 
     def compile(self, expr):
         return self.compile_with_affinity(expr)[0]
@@ -305,6 +313,8 @@ class Compiler:
 
     def call(self, expr):
         name = expr.name
+        if values.is_aggregate_call(name, len(expr.args)):
+            return self._aggregate(expr)
         if name not in values.SCALAR_FUNCTIONS:
             raise OperationalError(f"no such function: {name.lower()}")
         function, min_args, max_args = values.SCALAR_FUNCTIONS[name]
@@ -317,6 +327,74 @@ class Compiler:
             (arg,) = args
             return lambda row: function(arg(row))
         return lambda row: function(*[arg(row) for arg in args])
+
+    def _aggregate(self, expr):
+        name = expr.name
+        if self.aggregates is None:
+            raise OperationalError(self.misuse.format(name=name.lower()))
+        _, min_args, max_args = values.AGGREGATE_FUNCTIONS[name]
+        star = expr.args == (Star(),)
+        if star and name != "COUNT" or not min_args <= len(expr.args) <= max_args:
+            raise OperationalError(f"wrong number of arguments to function {name.lower()}()")
+        if star or not expr.args:
+            args = []  # COUNT(*) and COUNT()
+        else:
+            inner = Compiler(self.scope)  # aggregates may not be nested
+            args = [inner.compile(arg) for arg in expr.args]
+        return itemgetter(self.aggregates.add(name, args, expr.distinct))
+
+
+def contains_aggregate(expr):
+    return any(
+        isinstance(e, Call) and values.is_aggregate_call(e.name, len(e.args)) for e in walk(expr)
+    )
+
+
+class AggregateCollector:
+    """The aggregate calls of a query and their per-group state."""
+
+    def __init__(self, base_width):
+        self.base_width = base_width  # aggregate results follow the row's slots
+        self.calls = []  # (name, argument functions, distinct)
+
+    def add(self, name, args, distinct):
+        self.calls.append((name, args, distinct))
+        return self.base_width + len(self.calls) - 1
+
+    @property
+    def tracks_extreme(self):
+        """A lone MIN()/MAX() makes bare columns come from its row, as in SQLite."""
+        return len(self.calls) == 1 and self.calls[0][0] in ("MIN", "MAX")
+
+    def new_state(self):
+        state = []
+        for name, args, distinct in self.calls:
+            if name == "COUNT" and not args:
+                aggregate = values.CountStarAggregate()
+            else:
+                aggregate = values.AGGREGATE_FUNCTIONS[name][0]()
+            state.append((aggregate, set() if distinct else None))
+        return state
+
+    def step(self, state, row):
+        """Feed one row to every aggregate; True if a lone MIN/MAX changed."""
+        changed = False
+        for (aggregate, seen), (_, args, _) in zip(state, self.calls):
+            if not args:
+                aggregate.step()
+                continue
+            arguments = [arg(row) for arg in args]
+            if seen is not None:
+                key = values.sort_key(arguments[0])
+                if arguments[0] is None or key in seen:
+                    continue
+                seen.add(key)
+            changed = aggregate.step(*arguments) or changed
+        return changed
+
+    @staticmethod
+    def results(state):
+        return [aggregate.result() for aggregate, _ in state]
 
 
 # ---- access paths --------------------------------------------------------------
@@ -466,67 +544,274 @@ class Executor:
         row.append(rowid)
         return row
 
-    def single_table_access(self, table, where):
+    def build_scope(self, joins):
         scope = Scope()
-        scope.add(table)
-        compiler = Compiler(scope)
-        tree = self.catalog.table_tree(table)
-        return scope, compiler, plan_access(scope, 0, tree, split_conjuncts(where), compiler)
+        for join in joins:
+            scope.add(self.catalog.get_table(join.table.name), join.table.alias)
+        return scope
+
+    def plan_joins(self, scope, joins, where):
+        """Plan a nested loop over ``joins``; returns a list of ``JoinLevel``.
+
+        WHERE conjuncts and the ON conditions of inner joins form one pool of
+        filters; each is checked at the first level where all the tables it
+        uses are bound.  A LEFT JOIN's ON condition decides which rows match
+        at its own level (and is the only thing its access path may use).
+        """
+        compiler = Compiler(scope, misuse="misuse of aggregate: {name}()")
+        on_compiler = Compiler(scope)
+        pool = split_conjuncts(where)
+        for join in joins:
+            if join.kind != "LEFT":
+                pool += split_conjuncts(join.on)
+        placed = {}
+        constant = []
+        for conjunct in pool:
+            tables = tables_referenced(conjunct, scope)
+            if tables:
+                placed.setdefault(max(tables), []).append(conjunct)
+            else:
+                constant.append(conjunct)
+        levels = []
+        for index, join in enumerate(joins):
+            table = scope.entries[index][1]
+            tree = self.catalog.table_tree(table)
+            if join.kind == "LEFT":
+                usable = split_conjuncts(join.on)
+                match = on_compiler.compile(join.on) if join.on is not None else None
+            else:
+                usable = pool
+                match = None
+            filters = placed.get(index, [])
+            if index == 0:
+                filters = constant + filters
+            levels.append(JoinLevel(
+                table,
+                scope.entries[index][2],
+                plan_access(scope, index, tree, usable, compiler),
+                join.kind == "LEFT",
+                match,
+                [compiler.compile(f) for f in filters],
+            ))
+        return levels
+
+    @staticmethod
+    def join_rows(scope, levels):
+        """Yield every row of the nested loop join.  The same list object is
+        yielded each time; callers must copy it to keep it."""
+        row = [None] * scope.width
+        truth = values.truth
+        load_row = Executor.load_row
+        depth = len(levels)
+
+        def passes(conditions):
+            for condition in conditions:
+                if not truth(condition(row)):
+                    return False
+            return True
+
+        def visit(i):
+            if i == depth:
+                yield row
+                return
+            level = levels[i]
+            start, stop = level.offset, level.offset + len(level.table.columns) + 1
+            matched = False
+            for rowid, record in level.access.candidates(row):
+                row[start:stop] = load_row(level.table, rowid, record)
+                if level.match is not None and not truth(level.match(row)):
+                    continue
+                matched = True
+                if passes(level.filters):
+                    yield from visit(i + 1)
+            if level.outer and not matched:
+                row[start:stop] = [None] * (stop - start)
+                if passes(level.filters):
+                    yield from visit(i + 1)
+
+        return visit(0)
 
     def matching_rows(self, table, where):
-        """Yield (rowid, row) for rows of a single table satisfying ``where``."""
-        _, compiler, access = self.single_table_access(table, where)
-        condition = compiler.compile(where) if where is not None else None
-        truth = values.truth
-        for rowid, record in access.candidates(None):
-            row = self.load_row(table, rowid, record)
-            if condition is None or truth(condition(row)):
-                yield rowid, row
+        """Yield (rowid, row copy) for rows of a single table satisfying ``where``."""
+        joins = [Join(TableRef(table.name))]
+        scope = self.build_scope(joins)
+        levels = self.plan_joins(scope, joins, where)
+        slot = scope.rowid_slot(0)
+        for row in self.join_rows(scope, levels):
+            yield row[slot], list(row)
 
     def explain(self, stmt):
-        """One row (table, access path) per table the statement reads."""
+        """One row (table, access path) per table the statement reads, in join order."""
         if isinstance(stmt, Select):
-            if stmt.source is None:
-                return Result([], ["table", "plan"])
-            table = self.catalog.get_table(stmt.source.name)
+            joins, where = stmt.source, stmt.where
         else:
-            table = self.catalog.get_table(stmt.table)
-        _, _, access = self.single_table_access(table, stmt.where)
-        return Result([(table.name, access.describe())], ["table", "plan"])
+            joins, where = [Join(TableRef(stmt.table))], stmt.where
+        scope = self.build_scope(joins)
+        levels = self.plan_joins(scope, joins, where)
+        return Result(
+            [(level.table.name, level.access.describe()) for level in levels], ["table", "plan"]
+        )
 
     # ---- SELECT -------------------------------------------------------------
 
     def select(self, stmt):
-        scope = Scope()
-        table = None
-        if stmt.source is not None:
-            table = self.catalog.get_table(stmt.source.name)
-            scope.add(table, stmt.source.alias)
-        compiler = Compiler(scope)
-        functions, names = [], []
+        scope = self.build_scope(stmt.source)
+        exprs, names = self.expand_items(stmt, scope)
+        is_aggregate = bool(stmt.group_by) or any(
+            contains_aggregate(e)
+            for e in exprs + [stmt.having] + [item.expr for item in stmt.order_by]
+            if e is not None
+        )
+        if stmt.having is not None and not is_aggregate:
+            raise OperationalError("HAVING clause on a non-aggregate query")
+        aggregates = AggregateCollector(scope.width) if is_aggregate else None
+        compiler = Compiler(scope, aggregates)
+        outputs = [compiler.compile(e) for e in exprs]
+        order_terms, order_functions = self.order_terms(stmt, exprs, names, compiler)
+        having = compiler.compile(stmt.having) if stmt.having is not None else None
+        group_functions = self.group_functions(stmt, exprs, names, scope)
+        if stmt.source:
+            levels = self.plan_joins(scope, stmt.source, stmt.where)
+            rows = self.join_rows(scope, levels)
+        else:
+            where = Compiler(scope, misuse="misuse of aggregate: {name}()")
+            condition = where.compile(stmt.where) if stmt.where is not None else None
+            rows = [[]] if condition is None or values.truth(condition([])) else []
+
+        def record(row):
+            return (
+                tuple(f(row) for f in outputs),
+                tuple(f(row) for f in order_functions),
+            )
+
+        if not is_aggregate:
+            records = [record(row) for row in rows]
+        else:
+            records = []
+            truth = values.truth
+            for group_row in self.group_rows(rows, scope, group_functions, aggregates):
+                if having is None or truth(having(group_row)):
+                    records.append(record(group_row))
+        if stmt.distinct:
+            records = distinct_records(records)
+        records = sort_records(records, order_terms)
+        records = self.apply_limit(stmt, records)
+        return Result([out for out, _ in records], names)
+
+    def expand_items(self, stmt, scope):
+        """Select-list expressions with ``*`` expanded, and the column names."""
+        exprs, names = [], []
         for item in stmt.items:
             if isinstance(item.expr, Star):
-                for slot, name in scope.star_columns(item.expr.table):
-                    functions.append(itemgetter(slot))
-                    names.append(name)
+                for table_name, column_name in scope.star_columns(item.expr.table):
+                    exprs.append(Column(column_name, table_name))
+                    names.append(column_name)
                 continue
-            functions.append(compiler.compile(item.expr))
+            exprs.append(item.expr)
             if item.alias:
                 names.append(item.alias)
             elif isinstance(item.expr, Column):
                 names.append(item.expr.name)
             else:
                 names.append(item.text)
-        if table is None:
-            rows = [[]]
-            if stmt.where is not None and not values.truth(compiler.compile(stmt.where)([])):
-                rows = []
-        else:
-            rows = (row for _, row in self.matching_rows(table, stmt.where))
-        result = [tuple(f(row) for f in functions) for row in rows]
-        if stmt.distinct:
-            result = distinct_rows(result)
-        return Result(result, names)
+        return exprs, names
+
+    @staticmethod
+    def result_column_reference(expr, names, clause, position, scope):
+        """Resolve ORDER BY / GROUP BY shorthands: a column number or an alias.
+
+        Returns the 0-based result column index, or None for a plain expression.
+        """
+        number = None
+        if isinstance(expr, Literal) and isinstance(expr.value, int):
+            number = expr.value
+        elif (
+            isinstance(expr, Unary) and expr.op == "-"
+            and isinstance(expr.operand, Literal) and isinstance(expr.operand.value, int)
+        ):
+            number = -expr.operand.value
+        if number is not None:
+            if not 1 <= number <= len(names):
+                raise OperationalError(
+                    f"{ordinal(position)} {clause} term out of range - "
+                    f"should be between 1 and {len(names)}"
+                )
+            return number - 1
+        if isinstance(expr, Column) and expr.table is None:
+            lowered = [name.lower() for name in names]
+            if expr.name.lower() in lowered:
+                if clause == "GROUP BY":
+                    try:
+                        scope.resolve(expr)
+                        return None  # an input column wins over an alias in GROUP BY
+                    except OperationalError:
+                        pass
+                return lowered.index(expr.name.lower())
+        return None
+
+    def order_terms(self, stmt, exprs, names, compiler):
+        """Returns ([(source, index, descending, nulls first)], [functions]).
+
+        ``source`` is "output" (index into the result row) or "key" (index into
+        the extra sort values computed by ``functions``)."""
+        terms, functions = [], []
+        for position, item in enumerate(stmt.order_by, 1):
+            nulls_first = item.nulls_first if item.nulls_first is not None else not item.descending
+            index = self.result_column_reference(item.expr, names, "ORDER BY", position, compiler.scope)
+            if index is not None:
+                terms.append(("output", index, item.descending, nulls_first))
+            else:
+                terms.append(("key", len(functions), item.descending, nulls_first))
+                functions.append(compiler.compile(item.expr))
+        return terms, functions
+
+    def group_functions(self, stmt, exprs, names, scope):
+        compiler = Compiler(scope, misuse="aggregate functions are not allowed in the GROUP BY clause")
+        functions = []
+        for position, expr in enumerate(stmt.group_by, 1):
+            index = self.result_column_reference(expr, names, "GROUP BY", position, scope)
+            if index is not None:
+                expr = exprs[index]
+            functions.append(compiler.compile(expr))
+        return functions
+
+    @staticmethod
+    def group_rows(rows, scope, group_functions, aggregates):
+        """Aggregate ``rows`` into groups; yield each group's representative row
+        followed by its aggregate results, ordered by group key."""
+        groups = {}
+        sort_key = values.sort_key
+        tracks_extreme = aggregates.tracks_extreme
+        for row in rows:
+            key = tuple(sort_key(f(row)) for f in group_functions)
+            group = groups.get(key)
+            if group is None:
+                group = groups[key] = [list(row), aggregates.new_state()]
+            if aggregates.step(group[1], row) and tracks_extreme:
+                group[0] = list(row)
+        if not groups and not group_functions:
+            groups[()] = [[None] * scope.width, aggregates.new_state()]
+        for key in sorted(groups):
+            representative, state = groups[key]
+            yield representative + aggregates.results(state)
+
+    @staticmethod
+    def apply_limit(stmt, records):
+        if stmt.limit is None:
+            return records
+        compiler = Compiler(Scope())
+
+        def integer(expr):
+            value = values.numeric_affinity(compiler.compile(expr)([]))
+            if not isinstance(value, int):
+                raise IntegrityError("datatype mismatch")
+            return value
+
+        limit = integer(stmt.limit)
+        offset = max(integer(stmt.offset), 0) if stmt.offset is not None else 0
+        end = None if limit < 0 else offset + limit
+        return records[offset:end]
+
 
     # ---- INSERT --------------------------------------------------------------
 
@@ -671,13 +956,48 @@ class Executor:
         return Result()
 
 
-def distinct_rows(rows):
-    """Remove duplicate rows, keeping the first; 1 and 1.0 count as equal."""
+class JoinLevel:
+    """One table of a nested loop join."""
+
+    def __init__(self, table, offset, access, outer, match, filters):
+        self.table = table
+        self.offset = offset  # position of the table's first slot in a row
+        self.access = access
+        self.outer = outer  # LEFT JOIN: emit a NULL row when nothing matches
+        self.match = match  # LEFT JOIN ON condition
+        self.filters = filters  # conditions checked once this table is bound
+
+
+def ordinal(n):
+    suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def distinct_records(records):
+    """Remove records with duplicate output rows, keeping the first;
+    1 and 1.0 count as equal."""
     seen = set()
     result = []
-    for row in rows:
-        key = tuple(values.sort_key(v) for v in row)
+    for record in records:
+        key = tuple(values.sort_key(v) for v in record[0])
         if key not in seen:
             seen.add(key)
-            result.append(row)
+            result.append(record)
     return result
+
+
+def sort_records(records, terms):
+    """Sort (output, keys) records by ORDER BY terms using stable sorts from the
+    last term to the first."""
+    sort_key = values.sort_key
+    for source, index, descending, nulls_first in reversed(terms):
+        column = 0 if source == "output" else 1
+        # Where NULLs go in the ascending order that is (maybe) reversed afterwards.
+        null_rank = 0 if nulls_first != descending else 2
+
+        def key(record, column=column, index=index, null_rank=null_rank):
+            value = record[column][index]
+            return (null_rank, 0) if value is None else (1, sort_key(value))
+
+        records.sort(key=key, reverse=descending)
+    return records
