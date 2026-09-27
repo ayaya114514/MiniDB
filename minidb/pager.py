@@ -15,7 +15,7 @@ list and a change counter that every commit increments, so other connections
 notice that their cached pages are stale.  Freed pages form a singly linked
 free list.
 
-Transactions and locking: see ``Pager`` and ``minidb.locking``.
+Transactions, the write-ahead log and locking: see ``Pager`` and ``minidb.locking``.
 
 Statement journal: between ``begin_statement()`` and ``end_statement()`` the
 pager keeps a copy of every page as it was before the statement first touched
@@ -28,10 +28,12 @@ on disk and needs no copy.
 import io
 import os
 import struct
-import time
 import zlib
+from bisect import bisect_right
 
 from minidb.errors import DatabaseError
+from minidb.locking import EXCLUSIVE as EXCLUSIVE_LEVEL
+from minidb.locking import UNLOCKED as UNLOCKED_LEVEL
 from minidb.locking import FileLocks, LockTimeout, fsync_directory
 
 PAGE_SIZE = 4096
@@ -40,10 +42,12 @@ USABLE_SIZE = PAGE_SIZE - CHECKSUM_SIZE
 MAGIC = b"MiniDB format 3\x00"
 MAGIC_PREFIX = b"MiniDB format "
 WAL_MAGIC = b"MiniDB WAL 3\x00\x00\x00\x00"
-COMMIT_TAG = b"CMIT"
 
 _u32 = struct.Struct(">I")
-_wal_commit = struct.Struct(">I4sI")  # frame count, COMMIT_TAG, CRC32 of the frames
+_wal_header = struct.Struct(">16sII")  # magic, page size, generation
+_frame_fields = struct.Struct(">III")  # page number, page count if commit frame else 0, generation
+_frame_header = struct.Struct(">IIII")  # the fields above + chained CRC32
+FRAME_SIZE = _frame_header.size + PAGE_SIZE
 
 
 class RawPage:
@@ -125,28 +129,36 @@ def verify_page(pgno, image):
 class Pager:
     """Reads, caches and commits the pages of one database file.
 
-    Transactions (driven by ``Database``):
+    File databases use a write-ahead log in ``<path>-wal`` (SQLite's WAL
+    mode).  The log is a header followed by frames; each frame is a page
+    image with a header holding its page number, the page count if it ends a
+    commit (else 0), the log's generation and a CRC32 chained through all
+    frames of the generation.  A frame counts only if its generation and
+    checksum match; frames after the last commit frame do not count.
 
-    * ``begin_read()`` takes the SHARED lock, recovers a WAL left by a crashed
-      writer, and drops the page cache if another connection has committed
-      since we last looked (the header's change counter moved).
-    * ``begin_write()`` takes the RESERVED lock: at most one writer.
-    * ``commit()`` takes the EXCLUSIVE lock first (a busy timeout here leaves
-      the transaction intact), then:
+    * ``begin_read()`` takes SHARED and fixes a *snapshot*: the frames up to
+      the last commit.  A page is read from its newest frame within the
+      snapshot, otherwise from the database file.  Other connections may
+      commit meanwhile without disturbing the snapshot.
+    * ``begin_write()`` takes RESERVED (one writer at a time).  A transaction
+      whose snapshot is no longer the newest state cannot start writing
+      ("database is locked"), as in SQLite.
+    * ``commit()`` appends the dirty pages as frames, the last one marked as
+      commit frame, and fsyncs the log.  The database file is not touched.
+    * ``spill()`` appends dirty pages early as uncommitted frames, so a large
+      transaction need not keep them in memory; ``rollback()`` truncates the
+      log back to the last commit.
+    * ``checkpoint()`` copies the newest committed version of every logged
+      page into the database file and empties the log.  It needs EXCLUSIVE
+      (no readers), never waits, and simply does nothing when busy.
 
-      1. writes every dirty page to ``<path>-wal`` followed by a commit
-         record holding the frame count and a CRC32 of the frames, fsync;
-      2. writes the pages to the database file, fsync;
-      3. deletes the WAL file (and fsyncs the directory).
-
-    * ``end_transaction()`` releases the locks.
-
-    Dirty pages never reach the database file before step 2, so recovery
-    replays a complete WAL and discards an incomplete one: either the whole
-    transaction is applied or none of it.
+    A crash can only leave frames after the last commit frame, which readers
+    ignore and the next writer truncates; a crash during a checkpoint leaves
+    the log intact.  In-memory databases have no log: commits write pages
+    directly.
 
     ``crash_hook``, if set, is called as ``crash_hook(point, detail)`` at every
-    step of a commit so tests can simulate a crash there.
+    step of a commit or checkpoint so tests can simulate a crash there.
     """
 
     def __init__(self, path=None, timeout=5.0):
@@ -160,6 +172,9 @@ class Pager:
         self.journal = None  # pgno -> page copy (or None) while a statement runs
         self.journal_dirty = None
         self.header = None
+        self.reading = False
+        self.wal = None
+        self._reset_wal_index()
         if path is None:
             self.file = io.BytesIO()
             self.locks = None
@@ -169,6 +184,10 @@ class Pager:
             if created:
                 fsync_directory(path)
             self.locks = FileLocks(self.file, path, timeout)
+            wal_exists = os.path.exists(self.wal_path)
+            self.wal = open(self.wal_path, "r+b" if wal_exists else "w+b", buffering=0)
+            if not wal_exists:
+                fsync_directory(self.wal_path)
         try:
             self.begin_read()
         except BaseException:
@@ -184,11 +203,114 @@ class Pager:
         """True while the file has no committed header yet."""
         return 0 in self.dirty and self.header.change_counter == 0 and self.header.page_count == 1
 
+    # ---- the write-ahead log ------------------------------------------
+
+    def _reset_wal_index(self):
+        self.wal_generation = None
+        self.frames = {}  # pgno -> ascending frame numbers holding it
+        self.committed = 0  # frames in the snapshot (the last commit frame)
+        self.frame_total = 0  # plus our own uncommitted frames
+        self.scan_crc = 0  # checksum chain after the last committed frame
+        self.append_crc = 0
+
+    def _frame_offset(self, number):
+        return _wal_header.size + (number - 1) * FRAME_SIZE
+
+    def _scan_wal(self, apply):
+        """Read the log's committed frames past our snapshot.
+
+        With ``apply`` the index and snapshot are updated; otherwise only
+        returns whether the log holds a newer state than our snapshot."""
+        wal = self.wal
+        wal.seek(0, io.SEEK_END)
+        size = wal.tell()
+        header = None
+        if size >= _wal_header.size:
+            wal.seek(0)
+            magic, page_size, generation = _wal_header.unpack(wal.read(_wal_header.size))
+            if magic == WAL_MAGIC and page_size == PAGE_SIZE:
+                header = generation
+        if header is None or header != self.wal_generation:
+            if not apply:
+                return header is not None or self.committed > 0
+            self._reset_wal_index()
+            if header is None:
+                return False
+            self.wal_generation = header
+            self.scan_crc = header
+        if not apply and header is None:
+            return False
+        start = self._frame_offset(self.committed + 1)
+        wal.seek(start)
+        data = wal.read(size - start) if size > start else b""
+        crc, number, pending, changed = self.scan_crc, self.committed, [], False
+        for pos in range(0, len(data) - FRAME_SIZE + 1, FRAME_SIZE):
+            pgno, commit, generation, checksum = _frame_header.unpack_from(data, pos)
+            image = data[pos + _frame_header.size:pos + FRAME_SIZE]
+            crc = zlib.crc32(data[pos:pos + 12] + image, crc)
+            if generation != self.wal_generation or checksum != crc:
+                break
+            number += 1
+            pending.append((pgno, number))
+            if commit:
+                changed = True
+                if not apply:
+                    return True
+                for page, frame in pending:
+                    self.frames.setdefault(page, []).append(frame)
+                pending = []
+                self.committed = self.frame_total = number
+                self.scan_crc = crc
+        return changed
+
+    def _wal_frame_for(self, pgno):
+        frames = self.frames.get(pgno)
+        if not frames:
+            return None
+        i = bisect_right(frames, self.frame_total)
+        return frames[i - 1] if i else None
+
+    def _append_frames(self, pages, commit):
+        """Append (pgno, image) frames; the last one ends a commit if ``commit``."""
+        wal = self.wal
+        if self.frame_total == self.committed and self.wal_generation is not None:
+            # First frames of this transaction.  Our snapshot is the newest
+            # state (we hold RESERVED), so anything after its last commit
+            # frame was left by a crashed writer: drop it.
+            wal.truncate(self._frame_offset(self.committed + 1))
+            self.append_crc = self.scan_crc
+        if self.wal_generation is None:
+            # Start a new generation of the log.
+            self.wal_generation = int.from_bytes(os.urandom(4), "big")
+            wal.seek(0)
+            wal.truncate()
+            wal.write(_wal_header.pack(WAL_MAGIC, PAGE_SIZE, self.wal_generation))
+            self.scan_crc = self.append_crc = self.wal_generation
+        wal.seek(self._frame_offset(self.frame_total + 1))
+        crc = self.append_crc
+        last = len(pages) - 1
+        for i, (pgno, image) in enumerate(pages):
+            if commit and i == last:
+                self._crash_point("wal_commit")
+            self._crash_point("wal_frame", i)
+            commit_size = self.header.page_count if commit and i == last else 0
+            fields = _frame_fields.pack(pgno, commit_size, self.wal_generation)
+            crc = zlib.crc32(fields + image, crc)
+            wal.write(fields + _u32.pack(crc) + image)
+            self.frame_total += 1
+            self.frames.setdefault(pgno, []).append(self.frame_total)
+        self.append_crc = crc
+
     # ---- reading ------------------------------------------------------
 
     def _read_image(self, pgno):
-        self.file.seek(pgno * PAGE_SIZE)
-        image = self.file.read(PAGE_SIZE)
+        frame = self._wal_frame_for(pgno) if self.wal is not None else None
+        if frame is not None:
+            self.wal.seek(self._frame_offset(frame) + _frame_header.size)
+            image = self.wal.read(PAGE_SIZE)
+        else:
+            self.file.seek(pgno * PAGE_SIZE)
+            image = self.file.read(PAGE_SIZE)
         if len(image) != PAGE_SIZE:
             raise DatabaseError(f"database disk image is malformed (short read of page {pgno})")
         return image
@@ -197,20 +319,21 @@ class Pager:
         return verify_page(pgno, self._read_image(pgno))
 
     def _read_header(self):
-        """Read and validate page 0 from the file; None if the file is empty."""
+        """Read and validate page 0 (from the log or the file); None if the
+        database has never been committed."""
         self.file.seek(0, io.SEEK_END)
         size = self.file.tell()
-        if size == 0:
-            return None
         if size % PAGE_SIZE:
             raise DatabaseError("database file size is not a multiple of the page size")
+        if size == 0 and self._wal_frame_for(0) is None:
+            return None
         image = self._read_image(0)
         if not image.startswith(MAGIC_PREFIX):
             raise DatabaseError("file is not a MiniDB database")
         if not image.startswith(MAGIC):
             raise DatabaseError(f"unsupported MiniDB file format: {image[:15].decode(errors='replace')}")
         header = Header.from_bytes(0, verify_page(0, image))
-        if header.page_count > size // PAGE_SIZE:
+        if not self.frames and header.page_count > size // PAGE_SIZE:
             raise DatabaseError("database disk image is malformed (file is truncated)")
         return header
 
@@ -293,17 +416,22 @@ class Pager:
         return count
 
     def check_checksums(self):
-        """Read every committed page of the file and verify its checksum;
-        returns the damaged page numbers.  (Pages allocated by the current
-        transaction are not in the file yet.)"""
-        damaged = []
-        committed = self._read_header()
-        for pgno in range(committed.page_count if committed else 0):
-            try:
-                self._read(pgno)
-            except DatabaseError:
-                damaged.append(pgno)
-        return damaged
+        """Read every committed page and verify its checksum; returns the
+        damaged page numbers.  (Pages allocated by the current transaction
+        are not stored yet.)"""
+        saved = self.frame_total
+        self.frame_total = self.committed  # look at the committed state only
+        try:
+            damaged = []
+            committed = self._read_header()
+            for pgno in range(committed.page_count if committed else 0):
+                try:
+                    self._read(pgno)
+                except DatabaseError:
+                    damaged.append(pgno)
+            return damaged
+        finally:
+            self.frame_total = saved
 
     def shrink_cache(self, limit=10_000):
         """Drop clean pages from the cache once it holds more than ``limit`` pages.
@@ -319,13 +447,16 @@ class Pager:
     # ---- transactions -------------------------------------------------
 
     def begin_read(self):
-        """Start reading: SHARED lock, crash recovery, cache validation.
+        """Start reading: SHARED lock, snapshot of the log, cache validation.
 
-        Returns True if the cache was dropped because the file changed."""
+        Returns True if the cache was dropped because the database changed."""
         if self.dirty - {0}:
             raise AssertionError("begin_read() inside a transaction with changes")
         if self.locks is not None:
-            self._shared_without_hot_wal()
+            self.locks.shared()
+        if self.wal is not None:
+            self._scan_wal(apply=True)
+        self.reading = True
         header = self._read_header()
         if header is None:
             self.cache = {}
@@ -345,35 +476,18 @@ class Pager:
         self.dirty = set()
         return True
 
-    def _shared_without_hot_wal(self):
-        """Take SHARED; if a crashed writer left a WAL, recover it first."""
-        locks = self.locks
-        deadline = time.monotonic() + locks.timeout
-        while True:
-            locks.shared()
-            if not os.path.exists(self.wal_path):
-                return
-            # We hold SHARED, so no commit is running: the WAL is left over
-            # from a crash.  Whoever gets RESERVED recovers it.
-            if locks.try_reserve():
-                try:
-                    locks.exclusive()
-                    self._recover()
-                    locks.downgrade()
-                finally:
-                    locks.release_reserved()
-                return
-            locks.release_db()  # someone else is recovering; retry
-            if time.monotonic() >= deadline:
-                raise LockTimeout("database is locked")
-            time.sleep(0.001)
-
     def begin_write(self, wait=True):
-        """Become the (only) writer: take RESERVED."""
-        if self.locks is not None:
-            self.locks.reserve(wait)
+        """Become the (only) writer: take RESERVED.  Fails like a busy lock if
+        another connection committed after our snapshot was taken."""
+        if self.locks is None or self.locks.reserved:
+            return
+        self.locks.reserve(wait)
+        if self.reading and self._scan_wal(apply=False):
+            self.locks.release_reserved()
+            raise LockTimeout("database is locked")
 
     def end_transaction(self):
+        self.reading = False
         if self.locks is not None:
             self.locks.release_all()
 
@@ -382,40 +496,54 @@ class Pager:
             self.crash_hook(point, detail)
 
     def commit(self):
-        """Make every dirty page durable (see the class docstring).
+        """Make every change durable (see the class docstring).
 
         May raise ``OperationalError("database is locked")`` before anything
         is written; the transaction is then still intact."""
-        if not self.dirty:
+        if not self.dirty and self.frame_total == self.committed:
             return
         if self.locks is not None:
-            self.locks.reserve()
-            self.locks.exclusive()
+            self.begin_write()
         self.write(self.header)
         self.header.change_counter = (self.header.change_counter + 1) & 0xFFFFFFFF
         pages = [(pgno, with_checksum(self.cache[pgno].to_bytes())) for pgno in sorted(self.dirty)]
-        if self.wal_path is not None:
-            self._write_wal(pages)
-        for i, (pgno, image) in enumerate(pages):
-            self._crash_point("db_page", i)
-            self.file.seek(pgno * PAGE_SIZE)
-            self.file.write(image)
-        if self.wal_path is not None:
-            self._crash_point("db_sync")
-            os.fsync(self.file.fileno())
-            self._crash_point("wal_delete")
-            os.remove(self.wal_path)
-            fsync_directory(self.wal_path)
+        if self.wal is None:
+            for pgno, image in pages:
+                self.file.seek(pgno * PAGE_SIZE)
+                self.file.write(image)
+        else:
+            self._append_frames(pages, commit=True)
+            self._crash_point("wal_sync")
+            os.fsync(self.wal.fileno())
+            self.committed = self.frame_total
+            self.scan_crc = self.append_crc
         self.dirty.clear()
-        if self.locks is not None:
-            self.locks.downgrade()
+
+    def spill(self):
+        """Write the dirty pages to the log as uncommitted frames, so they no
+        longer need to stay in memory.  Call between statements."""
+        if self.wal is None or not self.dirty:
+            return
+        self.begin_write()
+        pages = [(pgno, with_checksum(self.cache[pgno].to_bytes())) for pgno in sorted(self.dirty)]
+        self._append_frames(pages, commit=False)
+        self.dirty.clear()
 
     def rollback(self):
-        """Discard every uncommitted change."""
+        """Discard every uncommitted change, including spilled frames."""
         for pgno in self.dirty:
             self.cache.pop(pgno, None)
         self.dirty.clear()
         self.end_statement()
+        if self.wal is not None and self.frame_total > self.committed:
+            for pgno, frames in list(self.frames.items()):
+                while frames and frames[-1] > self.committed:
+                    frames.pop()
+                    self.cache.pop(pgno, None)
+                if not frames:
+                    del self.frames[pgno]
+            self.frame_total = self.committed
+            self.wal.truncate(self._frame_offset(self.committed + 1))
         header = self._read_header()
         if header is None:  # a new file that was never committed
             header = Header()
@@ -423,66 +551,57 @@ class Pager:
         self.header = header
         self.cache[0] = header
 
-    def _write_wal(self, pages):
-        with open(self.wal_path, "wb", buffering=0) as wal:
-            wal.write(WAL_MAGIC + _u32.pack(PAGE_SIZE))
-            checksum = 0
-            for i, (pgno, image) in enumerate(pages):
-                self._crash_point("wal_frame", i)
-                frame = _u32.pack(pgno) + image
-                wal.write(frame)
-                checksum = zlib.crc32(frame, checksum)
-            self._crash_point("wal_commit")
-            wal.write(_wal_commit.pack(len(pages), COMMIT_TAG, checksum))
-            self._crash_point("wal_sync")
-            os.fsync(wal.fileno())
-        fsync_directory(self.wal_path)
-
-    def _recover(self):
-        """Replay a complete WAL into the database file; discard an incomplete one."""
-        frames = read_wal(self.wal_path)
-        for pgno, image in frames:
-            self.file.seek(pgno * PAGE_SIZE)
-            self.file.write(image)
-        if frames:
+    def checkpoint(self):
+        """Copy the log into the database file and empty it, if no other
+        connection is reading or writing; returns whether it happened."""
+        if self.wal is None or self.dirty or self.frame_total != self.committed:
+            return False
+        if self.committed == 0:
+            return False
+        locks = self.locks
+        had_reserved, level = locks.reserved, locks.db_level
+        if not had_reserved and not locks.try_reserve():
+            return False
+        try:
+            if not locks.try_exclusive():
+                return False
+            self._scan_wal(apply=True)  # we might have been behind
+            images = {pgno: self._read_image(pgno) for pgno in self.frames}
+            for i, (pgno, image) in enumerate(sorted(images.items())):
+                self._crash_point("checkpoint_page", i)
+                self.file.seek(pgno * PAGE_SIZE)
+                self.file.write(image)
+            self._crash_point("checkpoint_sync")
             os.fsync(self.file.fileno())
-        os.remove(self.wal_path)
-        fsync_directory(self.wal_path)
+            self._crash_point("wal_reset")
+            self.wal.truncate(0)
+            os.fsync(self.wal.fileno())
+            self._reset_wal_index()
+            return True
+        finally:
+            if locks.db_level == EXCLUSIVE_LEVEL:
+                if level == UNLOCKED_LEVEL:
+                    locks.release_db()
+                else:
+                    locks.downgrade()
+            if not had_reserved:
+                locks.release_reserved()
 
     def close_files(self):
         """Close without committing (also used after a crash)."""
         if self.locks is not None:
             self.locks.close()
+        if self.wal is not None:
+            self.wal.close()
         self.file.close()
 
     def close(self):
-        """Commit any dirty pages and close the file."""
+        """Commit any dirty pages, checkpoint if possible and close the file."""
         if self.file.closed:
             return
         try:
             self.commit()
+            self.end_transaction()
+            self.checkpoint()
         finally:
             self.close_files()
-
-
-def read_wal(path):
-    """Return the committed frames [(pgno, page image)] of a WAL file, or []
-    if the file is incomplete or corrupt."""
-    with open(path, "rb") as wal:
-        data = wal.read()
-    header_size = len(WAL_MAGIC) + 4
-    frame_size = 4 + PAGE_SIZE
-    body = len(data) - header_size - _wal_commit.size
-    if body < 0 or body % frame_size or not data.startswith(WAL_MAGIC):
-        return []
-    if _u32.unpack_from(data, len(WAL_MAGIC))[0] != PAGE_SIZE:
-        return []
-    count, tag, checksum = _wal_commit.unpack_from(data, len(data) - _wal_commit.size)
-    frames_bytes = data[header_size:header_size + body]
-    if tag != COMMIT_TAG or count != body // frame_size or zlib.crc32(frames_bytes) != checksum:
-        return []
-    frames = []
-    for i in range(count):
-        frame = frames_bytes[i * frame_size:(i + 1) * frame_size]
-        frames.append((_u32.unpack_from(frame)[0], frame[4:]))
-    return frames

@@ -15,6 +15,8 @@ from minidb.parser import (
 from minidb.values import INT_MAX, INT_MIN
 
 STATEMENT_CACHE_SIZE = 256
+SPILL_PAGES = 1000  # dirty pages a transaction may hold before they go to the log
+CACHE_PAGES_AFTER_SPILL = 2000
 WRITE_STATEMENTS = (Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex)
 
 
@@ -146,6 +148,10 @@ class Database:
                 pager.end_transaction()
             raise
         pager.end_statement()
+        if self.in_transaction and len(pager.dirty) > SPILL_PAGES:
+            # Keep big transactions out of memory: move their pages to the log.
+            pager.spill()
+            pager.shrink_cache(CACHE_PAGES_AFTER_SPILL)
         if not self.in_transaction:
             try:
                 self._commit()
@@ -228,7 +234,11 @@ class Database:
         if self.in_transaction:
             self.in_transaction = False
             self.rollback()
-        self.pager.close_files()
+            self.pager.end_transaction()
+        try:
+            self.pager.checkpoint()  # only if nobody else is using the database
+        finally:
+            self.pager.close_files()
 
     def __enter__(self):
         return self

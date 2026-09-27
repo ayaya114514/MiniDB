@@ -152,38 +152,44 @@ def test_close_rolls_back_open_transaction(tmp_path):
     db.close()
 
 
-def test_uncommitted_changes_never_reach_the_file(tmp_path):
+def test_uncommitted_changes_never_reach_the_database_file(tmp_path):
     path = str(tmp_path / "db")
     db = Database(path)
     db.execute("CREATE TABLE t (a TEXT)")
-    size = os.path.getsize(path)
+    db.close()  # checkpointed: everything is in the database file
     with open(path, "rb") as f:
         content = f.read()
+    db = Database(path)
     db.execute("BEGIN")
     db.execute("INSERT INTO t VALUES " + ", ".join(f"('{i}')" for i in range(3000)))
-    with open(path, "rb") as f:
-        assert f.read() == content
-    assert os.path.getsize(path) == size
-    assert not os.path.exists(path + "-wal")
+    db.pager.spill()  # uncommitted pages may reach the log, never the database file
+    assert os.path.getsize(path + "-wal") > 0
     db.execute("COMMIT")
-    assert os.path.getsize(path) > size
-    assert not os.path.exists(path + "-wal")
+    with open(path, "rb") as f:
+        assert f.read() == content  # commits only append to the log
+    db.close()  # the last connection checkpoints
+    assert os.path.getsize(path) > len(content)
+    assert os.path.getsize(path + "-wal") == 0
+    db = Database(path)
+    assert db.execute("SELECT count(*) FROM t") == [(3000,)]
     db.close()
 
 
 # ---- crash recovery -----------------------------------------------------------------
 
-CRASH_POINTS = [
+COMMIT_CRASH_POINTS = [
     # (point, detail, transaction survives?)
     ("wal_frame", 0, False),
     ("wal_frame", 5, False),
-    ("wal_commit", None, False),
-    ("wal_sync", None, True),  # the commit record was written (a process crash keeps it)
-    ("db_page", 0, True),
-    ("db_page", 3, True),
-    ("db_page", 20, True),
-    ("db_sync", None, True),
-    ("wal_delete", None, True),
+    ("wal_commit", None, False),  # all frames but the commit frame were written
+    ("wal_sync", None, True),  # the commit frame was written (a process crash keeps it)
+]
+CHECKPOINT_CRASH_POINTS = [
+    ("checkpoint_page", 0),
+    ("checkpoint_page", 3),
+    ("checkpoint_page", 20),
+    ("checkpoint_sync", None),
+    ("wal_reset", None),
 ]
 
 
@@ -205,114 +211,160 @@ def big_transaction(db):
     db.execute("INSERT INTO side VALUES (42)")
 
 
-@pytest.mark.parametrize("point, detail, survives", CRASH_POINTS)
+def reopen_and_check(path, expected):
+    db = Database(path)
+    assert snapshot(db) == expected
+    assert db.integrity_check() == []
+    db.execute("INSERT INTO t (a, b) VALUES (1, 'after recovery')")
+    db.close()
+    db = Database(path)
+    assert db.execute("SELECT count(*) FROM t WHERE b = 'after recovery'") == [(1,)]
+    db.close()
+
+
+@pytest.mark.parametrize("point, detail, survives", COMMIT_CRASH_POINTS)
 def test_crash_during_commit(tmp_path, point, detail, survives):
     path = str(tmp_path / "db")
     db = build_database(path)
     before = snapshot(db)
     big_transaction(db)
     after = snapshot(db)
-    assert len(db.pager.dirty) > 21  # enough pages for every crash point above
+    assert len(db.pager.dirty) > 6  # enough frames for every crash point above
     db.pager.crash_hook = crash_at(point, detail)
     with pytest.raises(SimulatedCrash):
         db.execute("COMMIT")
     with pytest.raises(DatabaseError):
         db.execute("SELECT 1")  # the crashed connection cannot be used any more
-
-    db = Database(path)
-    assert snapshot(db) == (after if survives else before)
-    assert db.integrity_check() == []
-    assert not os.path.exists(path + "-wal")
-    db.execute("INSERT INTO t (a, b) VALUES (1, 'after recovery')")
-    db.close()
+    reopen_and_check(path, after if survives else before)
 
 
-@pytest.mark.parametrize("point, detail, survives", CRASH_POINTS)
+@pytest.mark.parametrize("point, detail", CHECKPOINT_CRASH_POINTS)
+def test_crash_during_checkpoint(tmp_path, point, detail):
+    path = str(tmp_path / "db")
+    db = build_database(path)
+    big_transaction(db)
+    db.execute("COMMIT")
+    after = snapshot(db)
+    db.pager.crash_hook = crash_at(point, detail)
+    with pytest.raises(SimulatedCrash):
+        db.pager.checkpoint()
+    db.pager.close_files()  # the process dies
+    reopen_and_check(path, after)  # committed data is never lost
+
+
+@pytest.mark.parametrize("point, detail, survives", COMMIT_CRASH_POINTS)
 def test_crash_during_autocommit_statement(tmp_path, point, detail, survives):
     path = str(tmp_path / "db")
     db = build_database(path)
     before = snapshot(db)
     db.pager.crash_hook = crash_at(point, detail)
-    statement = "UPDATE t SET b = b || '-changed' WHERE id < 1200"
     with pytest.raises(SimulatedCrash):
-        db.execute(statement)
-    db = Database(path)
+        db.execute("UPDATE t SET b = b || '-changed' WHERE id < 1200")
     expected = before
     if survives:
         expected = {"t": [
             (r[0], r[1], r[2], r[3] + "-changed" if r[0] < 1200 else r[3]) for r in before["t"]
         ]}
-    assert snapshot(db) == expected
-    assert db.integrity_check() == []
-    db.close()
+    reopen_and_check(path, expected)
 
 
-def test_torn_wal_is_discarded(tmp_path):
-    """Power loss before the WAL was synced may cut it anywhere: recovery must
-    then ignore it and keep the old state."""
+def committed_states(tmp_path):
+    """A database file plus a log holding six commits; returns the path,
+    the database file and log bytes, and the state after each commit."""
     path = str(tmp_path / "db")
     db = build_database(path)
-    before = snapshot(db)
-    big_transaction(db)
-    db.pager.crash_hook = crash_at("db_page", 0)  # WAL written in full, database untouched
-    with pytest.raises(SimulatedCrash):
-        db.execute("COMMIT")
-    wal = path + "-wal"
-    with open(wal, "rb") as f:
-        complete = f.read()
-    for cut in [0, 10, 25, PAGE_SIZE, len(complete) // 2, len(complete) - 1]:
-        with open(wal, "wb") as f:
-            f.write(complete[:cut])
-        db = Database(path)
-        assert snapshot(db) == before
-        db.close()
-        assert not os.path.exists(wal)
-    corrupted = bytearray(complete)
-    corrupted[len(complete) // 3] ^= 0xFF
-    with open(wal, "wb") as f:
-        f.write(corrupted)
+    db.close()  # checkpoint: state 0 is in the database file, the log is empty
     db = Database(path)
-    assert snapshot(db) == before
-    db.close()
-    # The intact WAL, on the other hand, is replayed.
-    with open(wal, "wb") as f:
-        f.write(complete)
-    db = Database(path)
-    assert snapshot(db) != before
-    assert db.integrity_check() == []
-    db.close()
-
-
-def test_recovery_is_idempotent(tmp_path):
-    """A crash during recovery leaves the WAL in place, so replaying again works."""
-    path = str(tmp_path / "db")
-    db = build_database(path)
-    big_transaction(db)
-    after = snapshot(db)
-    db.pager.crash_hook = crash_at("db_page", 10)
-    with pytest.raises(SimulatedCrash):
-        db.execute("COMMIT")
+    states = [snapshot(db)]
+    for step in range(3):  # every statement is a commit
+        db.execute(f"UPDATE t SET a = a + 1 WHERE id % 3 = {step}")
+        states.append(snapshot(db))
+        db.execute(f"INSERT INTO t (a, b) VALUES ({step}, 'step{step}')")
+        states.append(snapshot(db))
+    with open(path, "rb") as f:
+        database = f.read()
     with open(path + "-wal", "rb") as f:
-        wal = f.read()
+        log = f.read()
+    db.pager.close_files()  # leave the log as it is (no checkpoint)
+    return path, database, log, states
+
+
+def test_torn_or_damaged_log_keeps_a_committed_state(tmp_path):
+    """Power loss may cut the log anywhere and damage its tail: recovery must
+    then show exactly the state after some earlier commit."""
+    path, database, log, states = committed_states(tmp_path)
+    rng = random.Random(4)
+    cuts = [0, 10, 40, len(log) // 3, len(log) // 2, len(log) - 1, len(log)]
+    cuts += [rng.randrange(len(log)) for _ in range(15)]
+    seen = set()
+    for cut in cuts:
+        for damage in (False, True):
+            data = bytearray(log[:cut])
+            if damage and cut > 100:
+                data[rng.randrange(40, cut)] ^= 0xFF
+            with open(path, "wb") as f:
+                f.write(database)
+            with open(path + "-wal", "wb") as f:
+                f.write(data)
+            db = Database(path)
+            state = snapshot(db)
+            assert state in states
+            seen.add(states.index(state))
+            assert db.integrity_check() == []
+            db.close()
+    assert len(seen) >= 4 and 0 in seen and len(states) - 1 in seen
+
+
+def test_checkpoint_is_idempotent(tmp_path):
+    """A crash during a checkpoint leaves the log in place, so doing it again works."""
+    path, database, log, states = committed_states(tmp_path)
     for _ in range(3):
-        db = Database(path)  # replays and deletes the WAL
-        assert snapshot(db) == after
-        db.close()
         with open(path + "-wal", "wb") as f:
-            f.write(wal)  # as if the previous recovery had crashed before deleting it
-    os.remove(path + "-wal")
+            f.write(log)  # as if the previous checkpoint had crashed before emptying it
+        db = Database(path)
+        assert snapshot(db) == states[-1]
+        db.close()  # checkpoints into the (already partly updated) database file
+        assert os.path.getsize(path + "-wal") == 0
+    db = Database(path)
+    assert snapshot(db) == states[-1]
+    db.close()
 
 
 def test_crash_on_first_commit_of_new_database(tmp_path):
+    for point, survives in [("wal_frame", False), ("wal_sync", True)]:
+        path = str(tmp_path / f"{point}.db")
+        pager = Pager(path)
+        pager.crash_hook = crash_at(point, 0 if point == "wal_frame" else None)
+        with pytest.raises(SimulatedCrash):
+            pager.commit()
+        pager.close_files()
+        assert os.path.getsize(path) == 0
+        db = Database(path)  # an empty new database, or the logged header
+        db.execute("CREATE TABLE t (a INTEGER)")
+        db.close()
+        assert Database(path).execute("SELECT * FROM t") == []
+
+
+def test_uncommitted_frames_of_a_crashed_writer_are_ignored_and_dropped(tmp_path):
     path = str(tmp_path / "db")
-    pager = Pager(path)
-    pager.crash_hook = crash_at("db_page", 0)
-    with pytest.raises(SimulatedCrash):
-        pager.commit()
-    pager.close_files()  # a dead process releases its files and locks
-    assert os.path.getsize(path) == 0
-    db = Database(path)  # recovery writes the header page from the WAL
-    db.execute("CREATE TABLE t (a INTEGER)")
+    db = build_database(path)
+    before = snapshot(db)
+    committed_size = os.path.getsize(path + "-wal")
+    reader = Database(path)
+    assert snapshot(reader) == before
+    big_transaction(db)
+    db.pager.spill()  # uncommitted frames in the log
+    db.pager.close_files()  # the writer dies
+    assert snapshot(reader) == before  # frames without a commit frame do not count
+    assert os.path.getsize(path + "-wal") > committed_size + 100 * 4096
+    reader.execute("INSERT INTO t (a, b) VALUES (1, 'x')")  # truncates them first
+    # (Correctness would not need it - chained checksums make the leftovers
+    # invalid - but the dead frames must not stay in the file.)
+    assert os.path.getsize(path + "-wal") <= committed_size + 10 * (4096 + 16)
+    assert reader.integrity_check() == []
+    reader.close()
+    db = Database(path)
+    assert len(snapshot(db)["t"]) == len(before["t"]) + 1
     db.close()
 
 
@@ -334,6 +386,7 @@ CHILD = textwrap.dedent("""
 
     db.pager.crash_hook = hook
     db.execute("COMMIT")
+    db.pager.checkpoint()
     os._exit(0)
 """)
 
@@ -341,9 +394,10 @@ CHILD = textwrap.dedent("""
 @pytest.mark.parametrize("point, detail, survives", [
     ("wal_frame", 2, False),
     ("wal_commit", None, False),
-    ("db_page", 0, True),
-    ("db_page", 7, True),
-    ("wal_delete", None, True),
+    ("wal_sync", None, True),
+    ("checkpoint_page", 0, True),
+    ("checkpoint_page", 7, True),
+    ("wal_reset", None, True),
     ("never", None, True),
 ])
 def test_real_process_crash(tmp_path, point, detail, survives):
@@ -372,14 +426,12 @@ def test_real_process_crash(tmp_path, point, detail, survives):
     db.close()
 
 
-def test_wal_creation_and_deletion_are_made_durable(tmp_path, monkeypatch):
+def test_new_files_are_made_durable(tmp_path, monkeypatch):
     import minidb.pager as pager_module
 
     synced = []
     monkeypatch.setattr(pager_module, "fsync_directory", lambda path: synced.append(path))
     path = str(tmp_path / "db")
     db = Database(path)
-    synced.clear()
-    db.execute("CREATE TABLE t (a INTEGER)")
-    assert synced == [path + "-wal", path + "-wal"]  # after creating and after deleting it
+    assert synced == [path, path + "-wal"]  # the database file and the log were created
     db.close()

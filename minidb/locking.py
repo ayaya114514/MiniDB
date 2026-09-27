@@ -1,14 +1,16 @@
 """Cross-process locks for one database file.
 
-Three locks, modelled on SQLite's rollback-journal locking:
+Three locks, modelled on SQLite's locking (see ``minidb.pager`` for how the
+WAL uses them):
 
 * SHARED    - held while a transaction reads.  ``flock(LOCK_SH)`` on the
               database file.
 * RESERVED  - held by the (single) connection that has started writing.
               ``flock(LOCK_EX)`` on ``<db>-lock``.
-* EXCLUSIVE - held while a commit writes the WAL and the database file; no
-              reader may hold SHARED meanwhile.  ``flock(LOCK_EX)`` on the
-              database file.
+* EXCLUSIVE - held while a checkpoint copies pages from the WAL into the
+              database file; no reader may hold SHARED meanwhile.
+              ``flock(LOCK_EX)`` on the database file, only ever tried
+              without waiting.
 
 ``flock`` locks belong to an open file, so two connections in the same
 process exclude each other too (POSIX ``fcntl`` locks would not).  Every
@@ -78,6 +80,16 @@ class FileLocks:
         assert self.reserved
         _flock(self.db_fd, fcntl.LOCK_EX, self.timeout)
         self.db_level = EXCLUSIVE
+
+    def try_exclusive(self):
+        """Take EXCLUSIVE only if no other connection reads right now (used by
+        checkpoints, which never wait).  Returns whether it worked."""
+        if fcntl is None or self.db_level == EXCLUSIVE:
+            return True
+        if _try_flock(self.db_fd, fcntl.LOCK_EX):
+            self.db_level = EXCLUSIVE
+            return True
+        return False
 
     def downgrade(self):
         """EXCLUSIVE -> SHARED (after a commit, keeping the reader's lock)."""
