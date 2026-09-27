@@ -13,9 +13,12 @@ Operator precedence, lowest first (as in SQLite):
     unary -  +
 """
 
-from dataclasses import dataclass, field
+from __future__ import annotations
 
-from minidb.tokenizer import SQLSyntaxError, tokenize
+from dataclasses import dataclass, field
+from typing import Union
+
+from minidb.tokenizer import SQLSyntaxError, Token, tokenize
 
 # ---- expressions -------------------------------------------------------
 
@@ -279,13 +282,24 @@ class Delete:
     where: object = None
 
 
+# Any expression node, and any statement.
+Expr = Union[
+    Literal, Parameter, Column, Star, Unary, Binary, Between, InList, Like, Case, Cast,
+    Subquery, InSelect, Exists, Call,
+]
+Statement = Union[
+    CreateTable, CreateIndex, DropTable, DropIndex, Insert, Select, Compound, Update, Delete,
+    Begin, Commit, Rollback, Analyze, Explain,
+]
+
+
 # ---- parser ------------------------------------------------------------
 
 TYPE_NAMES = {"INTEGER", "TEXT"}
 MAX_PARAMETER_INDEX = 250_000
 
 
-def parse(text):
+def parse(text: str) -> Statement:
     """Parse a single SQL statement (a trailing ``;`` is optional)."""
     statements = parse_script(text)
     if len(statements) != 1:
@@ -295,13 +309,13 @@ def parse(text):
     return statements[0]
 
 
-def parse_script(text):
+def parse_script(text: str) -> list[Statement]:
     """Parse zero or more statements separated by ``;``."""
     return Parser(text).parse_script()
 
 
 class Parser:
-    def __init__(self, text):
+    def __init__(self, text: str) -> None:
         self.text = text
         self.tokens = tokenize(text)
         self.i = 0
@@ -309,60 +323,60 @@ class Parser:
     # ---- token helpers ------------------------------------------------
 
     @property
-    def tok(self):
+    def tok(self) -> Token:
         return self.tokens[self.i]
 
-    def advance(self):
+    def advance(self) -> Token:
         token = self.tokens[self.i]
         if token.kind != "EOF":
             self.i += 1
         return token
 
-    def error(self, expected, token=None):
+    def error(self, expected: str, token: Token | None = None) -> SQLSyntaxError:
         token = token or self.tok
         where = "at end of input" if token.kind == "EOF" else f'near "{token.text}"'
         return SQLSyntaxError(f"syntax error {where}: expected {expected}", self.text, token.pos)
 
-    def at_keyword(self, *words):
+    def at_keyword(self, *words: str) -> bool:
         return self.tok.kind == "KEYWORD" and self.tok.value in words
 
-    def at_op(self, *ops):
+    def at_op(self, *ops: str) -> bool:
         return self.tok.kind == "OP" and self.tok.value in ops
 
-    def accept_keyword(self, word):
+    def accept_keyword(self, word: str) -> Token | None:
         if self.at_keyword(word):
             return self.advance()
         return None
 
-    def accept_op(self, op):
+    def accept_op(self, op: str) -> Token | None:
         if self.at_op(op):
             return self.advance()
         return None
 
-    def expect_keyword(self, word):
+    def expect_keyword(self, word: str) -> Token:
         if not self.at_keyword(word):
             raise self.error(word)
         return self.advance()
 
-    def expect_op(self, op):
+    def expect_op(self, op: str) -> Token:
         if not self.at_op(op):
             raise self.error(f'"{op}"')
         return self.advance()
 
-    def expect_word(self, word):
+    def expect_word(self, word: str) -> Token:
         """Expect a non-reserved word such as KEY (tokenized as an identifier)."""
         if self.tok.kind == "IDENT" and self.tok.text.upper() == word:
             return self.advance()
         raise self.error(word)
 
-    def identifier(self, what="identifier"):
+    def identifier(self, what: str = "identifier") -> str:
         if self.tok.kind != "IDENT":
             raise self.error(what)
         return self.advance().value
 
     # ---- statements ---------------------------------------------------
 
-    def parse_script(self):
+    def parse_script(self) -> list[Statement]:
         """Parse all statements.  Each gets ``param_count`` (the largest
         parameter index it uses) and ``param_names`` ({index: name})."""
         statements = []
@@ -380,7 +394,7 @@ class Parser:
             if self.tok.kind != "EOF" and not self.at_op(";"):
                 raise self.error('";" or end of statement')
 
-    def statement(self):
+    def statement(self) -> Statement:
         if self.accept_keyword("BEGIN"):
             mode = "DEFERRED"
             if self.tok.kind == "IDENT" and self.tok.text.upper() in ("DEFERRED", "IMMEDIATE", "EXCLUSIVE"):
@@ -416,7 +430,7 @@ class Parser:
             return self.drop()
         raise self.error("a statement")
 
-    def create(self):
+    def create(self) -> CreateTable | CreateIndex:
         self.expect_keyword("CREATE")
         if self.at_keyword("UNIQUE", "INDEX"):
             return self.create_index()
@@ -430,14 +444,14 @@ class Parser:
         self.expect_op(")")
         return CreateTable(name, columns, if_not_exists)
 
-    def if_not_exists(self):
+    def if_not_exists(self) -> bool:
         if self.accept_keyword("IF"):
             self.expect_keyword("NOT")
             self.expect_keyword("EXISTS")
             return True
         return False
 
-    def create_index(self):
+    def create_index(self) -> CreateIndex:
         unique = bool(self.accept_keyword("UNIQUE"))
         self.expect_keyword("INDEX")
         if_not_exists = self.if_not_exists()
@@ -451,13 +465,13 @@ class Parser:
         self.expect_op(")")
         return CreateIndex(name, table, columns, unique, if_not_exists)
 
-    def indexed_column(self):
+    def indexed_column(self) -> str:
         name = self.identifier("column name")
         if not self.accept_keyword("ASC"):
             self.accept_keyword("DESC")  # accepted; the index order is always ascending
         return name
 
-    def column_def(self):
+    def column_def(self) -> ColumnDef:
         name = self.identifier("column name")
         type_token = self.tok
         if type_token.kind != "IDENT" or type_token.value.upper() not in TYPE_NAMES:
@@ -478,7 +492,7 @@ class Parser:
             else:
                 return column
 
-    def drop(self):
+    def drop(self) -> DropTable | DropIndex:
         self.expect_keyword("DROP")
         if self.accept_keyword("INDEX"):
             kind = DropIndex
@@ -492,7 +506,7 @@ class Parser:
         name = self.identifier("index name" if kind is DropIndex else "table name")
         return kind(name, if_exists)
 
-    def insert(self):
+    def insert(self) -> Insert:
         self.expect_keyword("INSERT")
         self.expect_keyword("INTO")
         table = self.identifier("table name")
@@ -508,13 +522,13 @@ class Parser:
             rows.append(self.value_row())
         return Insert(table, columns, rows)
 
-    def value_row(self):
+    def value_row(self) -> list[Expr]:
         self.expect_op("(")
         values = self.expr_list()
         self.expect_op(")")
         return values
 
-    def query(self):
+    def query(self) -> Select | Compound:
         """A SELECT or a compound SELECT, with ORDER BY and LIMIT."""
         selects = [self.select_core()]
         operators = []
@@ -539,7 +553,7 @@ class Parser:
                 stmt.offset, stmt.limit = stmt.limit, self.expr()
         return stmt
 
-    def select_core(self):
+    def select_core(self) -> Select:
         self.expect_keyword("SELECT")
         distinct = bool(self.accept_keyword("DISTINCT"))
         if not distinct:
@@ -559,7 +573,7 @@ class Parser:
             stmt.having = self.expr()
         return stmt
 
-    def order_item(self):
+    def order_item(self) -> OrderItem:
         item = OrderItem(self.expr())
         if self.accept_keyword("DESC"):
             item.descending = True
@@ -573,7 +587,7 @@ class Parser:
                 raise self.error("FIRST or LAST")
         return item
 
-    def select_item(self):
+    def select_item(self) -> SelectItem:
         if self.accept_op("*"):
             return SelectItem(Star())
         if (
@@ -596,7 +610,7 @@ class Parser:
             alias = self.advance().value
         return SelectItem(expr, alias, text)
 
-    def from_clause(self):
+    def from_clause(self) -> list[Join]:
         joins = [Join(self.table_ref())]
         while True:
             if self.accept_op(","):
@@ -629,7 +643,7 @@ class Parser:
                 self.expect_op(")")
             joins.append(join)
 
-    def table_ref(self):
+    def table_ref(self) -> TableRef | DerivedTable:
         if self.at_op("(") and self.tokens[self.i + 1].kind == "KEYWORD" and self.tokens[self.i + 1].value == "SELECT":
             self.advance()
             query = self.query()
@@ -648,7 +662,7 @@ class Parser:
             alias = self.advance().value
         return TableRef(name, alias)
 
-    def update(self):
+    def update(self) -> Update:
         self.expect_keyword("UPDATE")
         table = self.identifier("table name")
         self.expect_keyword("SET")
@@ -658,12 +672,12 @@ class Parser:
         where = self.expr() if self.accept_keyword("WHERE") else None
         return Update(table, assignments, where)
 
-    def assignment(self):
+    def assignment(self) -> tuple[str, Expr]:
         name = self.identifier("column name")
         self.expect_op("=")
         return name, self.expr()
 
-    def delete(self):
+    def delete(self) -> Delete:
         self.expect_keyword("DELETE")
         self.expect_keyword("FROM")
         table = self.identifier("table name")
@@ -672,33 +686,33 @@ class Parser:
 
     # ---- expressions --------------------------------------------------
 
-    def expr_list(self):
+    def expr_list(self) -> list[Expr]:
         exprs = [self.expr()]
         while self.accept_op(","):
             exprs.append(self.expr())
         return exprs
 
-    def expr(self):
+    def expr(self) -> Expr:
         return self.or_expr()
 
-    def or_expr(self):
+    def or_expr(self) -> Expr:
         left = self.and_expr()
         while self.accept_keyword("OR"):
             left = Binary("OR", left, self.and_expr())
         return left
 
-    def and_expr(self):
+    def and_expr(self) -> Expr:
         left = self.not_expr()
         while self.accept_keyword("AND"):
             left = Binary("AND", left, self.not_expr())
         return left
 
-    def not_expr(self):
+    def not_expr(self) -> Expr:
         if self.accept_keyword("NOT"):
             return Unary("NOT", self.not_expr())
         return self.equality()
 
-    def equality(self):
+    def equality(self) -> Expr:
         left = self.comparison()
         while True:
             if self.at_op("=", "==", "!=", "<>"):
@@ -731,34 +745,34 @@ class Parser:
             else:
                 return left
 
-    def comparison(self):
+    def comparison(self) -> Expr:
         left = self.additive()
         while self.at_op("<", "<=", ">", ">="):
             op = self.advance().value
             left = Binary(op, left, self.additive())
         return left
 
-    def additive(self):
+    def additive(self) -> Expr:
         left = self.multiplicative()
         while self.at_op("+", "-"):
             op = self.advance().value
             left = Binary(op, left, self.multiplicative())
         return left
 
-    def multiplicative(self):
+    def multiplicative(self) -> Expr:
         left = self.concat()
         while self.at_op("*", "/", "%"):
             op = self.advance().value
             left = Binary(op, left, self.concat())
         return left
 
-    def concat(self):
+    def concat(self) -> Expr:
         left = self.unary()
         while self.accept_op("||"):
             left = Binary("||", left, self.unary())
         return left
 
-    def unary(self):
+    def unary(self) -> Expr:
         if self.accept_keyword("NOT"):
             # As in SQLite's grammar, NOT may start an operand; it takes
             # everything that binds tighter than NOT.
@@ -772,7 +786,7 @@ class Parser:
             return Unary(op, self.unary())
         return self.primary()
 
-    def primary(self):
+    def primary(self) -> Expr:
         token = self.tok
         if token.kind in ("INTEGER", "FLOAT", "STRING"):
             self.advance()
@@ -811,7 +825,7 @@ class Parser:
             return Column(token.value)
         raise self.error("expression")
 
-    def case(self):
+    def case(self) -> Case:
         base = None if self.at_keyword("WHEN") else self.expr()
         whens = []
         while self.accept_keyword("WHEN"):
@@ -824,7 +838,7 @@ class Parser:
         self.expect_keyword("END")
         return Case(base, tuple(whens), else_)
 
-    def type_name(self):
+    def type_name(self) -> str:
         """A type name as SQLite accepts it: words, then an optional (n) or (n, m)."""
         start = self.tok.pos
         if self.tok.kind != "IDENT":
@@ -842,7 +856,7 @@ class Parser:
             self.expect_op(")")
         return " ".join(self.text[start:self.tok.pos].split())
 
-    def parameter(self):
+    def parameter(self) -> Parameter:
         token = self.advance()
         text = token.value
         if text.startswith("?"):
@@ -865,7 +879,7 @@ class Parser:
         self.param_count = max(self.param_count, index)
         return Parameter(index, name)
 
-    def call(self, name):
+    def call(self, name: str) -> Call:
         if self.accept_op("*"):
             self.expect_op(")")
             return Call(name, (Star(),))

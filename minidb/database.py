@@ -1,7 +1,10 @@
 """The public entry point: a connection to one database file."""
 
+from __future__ import annotations
+
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping, Sequence
+from typing import Any
 
 from minidb.catalog import Catalog
 from minidb.errors import DatabaseError, OperationalError, ProgrammingError
@@ -12,7 +15,10 @@ from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Insert, Rollback,
     Update, parse_script,
 )
-from minidb.values import INT_MAX, INT_MIN
+from minidb.values import INT_MAX, INT_MIN, SQLValue
+
+# Values for ?-parameters: by position, or by name.
+Parameters = Sequence[object] | Mapping[str, object]
 
 STATEMENT_CACHE_SIZE = 256
 SPILL_PAGES = 1000  # dirty pages a transaction may hold before they go to the log
@@ -37,7 +43,7 @@ class Database:
     text, so executing the same SQL again skips tokenizing and parsing.
     """
 
-    def __init__(self, path=None, timeout=5.0):
+    def __init__(self, path: str | None = None, timeout: float = 5.0) -> None:
         """``timeout``: seconds to wait for a lock held by another connection."""
         self.pager = Pager(path, timeout)  # starts inside a read transaction
         try:
@@ -59,10 +65,10 @@ class Database:
         self._statements = OrderedDict()  # SQL text -> parsed statements
 
     @property
-    def last_insert_rowid(self):
+    def last_insert_rowid(self) -> int:
         return self.executor.last_insert_rowid
 
-    def parse(self, sql):
+    def parse(self, sql: str) -> list[Any]:
         """Parse ``sql`` into statements, using the statement cache."""
         statements = self._statements.get(sql)
         if statements is None:
@@ -74,13 +80,13 @@ class Database:
             self._statements.move_to_end(sql)
         return statements
 
-    def execute(self, sql, parameters=None):
+    def execute(self, sql: str, parameters: Parameters | None = None) -> Result:
         result = Result()
         for result in self.execute_each(sql, parameters):
             pass
         return result
 
-    def execute_each(self, sql, parameters=None):
+    def execute_each(self, sql: str, parameters: Parameters | None = None) -> Iterator[Result]:
         """Run the statements in ``sql`` one by one, yielding each result."""
         statements = self.parse(sql)
         if parameters is not None and len(statements) > 1:
@@ -91,7 +97,7 @@ class Database:
                 values = resolve_parameters(stmt, parameters)
             yield self.execute_statement(stmt, values)
 
-    def execute_statement(self, stmt, parameters=()):
+    def execute_statement(self, stmt: Any, parameters: Sequence[SQLValue] = ()) -> Result:
         """Run one parsed statement.
 
         Locking: a statement or explicit transaction reads under SHARED.  A
@@ -168,11 +174,11 @@ class Database:
             self.total_changes += result.rowcount
         return result
 
-    def _begin_read(self):
+    def _begin_read(self) -> None:
         if self.pager.begin_read():
             self.catalog.load()  # another connection committed: the schema may differ
 
-    def _commit(self):
+    def _commit(self) -> None:
         try:
             self.pager.commit()
             if self.pager.committed >= CHECKPOINT_FRAMES:
@@ -188,12 +194,12 @@ class Database:
             raise
         self.pager.shrink_cache()
 
-    def rollback(self):
+    def rollback(self) -> None:
         """Discard all uncommitted changes."""
         self.pager.rollback()
         self.catalog.load()
 
-    def integrity_check(self):
+    def integrity_check(self) -> list[str]:
         """Check page checksums, every B+ tree and every index; returns a list
         of problems (empty if all is well)."""
         if self.in_transaction:
@@ -204,7 +210,7 @@ class Database:
         finally:
             self.pager.end_transaction()
 
-    def _integrity_check(self):
+    def _integrity_check(self) -> list[str]:
         problems = [f"page {pgno}: bad checksum" for pgno in self.pager.check_checksums()]
         if problems:
             return problems
@@ -232,7 +238,7 @@ class Database:
                     problems.append(f"index {index.name} does not match table {table.name}")
         return problems
 
-    def close(self):
+    def close(self) -> None:
         """Close the database; an open transaction is rolled back."""
         if self.broken or self.pager.file.closed:
             return
@@ -245,10 +251,10 @@ class Database:
         finally:
             self.pager.close_files()
 
-    def __enter__(self):
+    def __enter__(self) -> Database:
         return self
 
-    def __exit__(self, *exc_info):
+    def __exit__(self, *exc_info: object) -> None:
         self.close()
 
 
@@ -256,7 +262,7 @@ class Database:
 # ---- parameters ----------------------------------------------------------------
 
 
-def adapt(value, position):
+def adapt(value: object, position: int) -> SQLValue:
     """Check a bound Python value and convert it to a SQL value."""
     if value is None or isinstance(value, (float, str)):
         return value
@@ -271,7 +277,7 @@ def adapt(value, position):
     )
 
 
-def resolve_parameters(stmt, parameters):
+def resolve_parameters(stmt: Any, parameters: Parameters | None) -> list[SQLValue]:
     """The statement's parameter values as a list indexed by parameter number
     - 1 (sqlite3's rules and messages)."""
     count = stmt.param_count

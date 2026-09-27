@@ -25,11 +25,15 @@ file before a commit, so a page that was not cached still has its old content
 on disk and needs no copy.
 """
 
+from __future__ import annotations
+
 import io
 import os
 import struct
 import zlib
 from bisect import bisect_right
+from collections.abc import Callable
+from typing import Any, Protocol, Self
 
 from minidb.errors import DatabaseError
 from minidb.locking import EXCLUSIVE as EXCLUSIVE_LEVEL
@@ -50,21 +54,37 @@ _frame_header = struct.Struct(">IIII")  # the fields above + chained CRC32
 FRAME_SIZE = _frame_header.size + PAGE_SIZE
 
 
+class Page(Protocol):
+    """What the pager needs from a page object."""
+
+    pgno: int
+
+    def to_bytes(self) -> bytes: ...
+
+    def copy(self) -> Page: ...
+
+
+class PageDecoder(Protocol):
+    """A page class, or anything else that decodes page images."""
+
+    def from_bytes(self, pgno: int, data: bytes) -> Page: ...
+
+
 class RawPage:
     """A page whose content is an uninterpreted byte array."""
 
-    def __init__(self, pgno, data=None):
+    def __init__(self, pgno: int, data: bytes | bytearray | None = None) -> None:
         self.pgno = pgno
         self.data = bytearray(data) if data is not None else bytearray(USABLE_SIZE)
 
     @classmethod
-    def from_bytes(cls, pgno, data):
+    def from_bytes(cls, pgno: int, data: bytes) -> Self:
         return cls(pgno, data)
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         return bytes(self.data)
 
-    def copy(self):
+    def copy(self) -> Self:
         return RawPage(self.pgno, self.data)
 
 
@@ -73,18 +93,18 @@ class FreePage:
 
     _format = struct.Struct(">I")
 
-    def __init__(self, pgno, next_free=0):
+    def __init__(self, pgno: int, next_free: int = 0) -> None:
         self.pgno = pgno
         self.next_free = next_free
 
     @classmethod
-    def from_bytes(cls, pgno, data):
+    def from_bytes(cls, pgno: int, data: bytes) -> Self:
         return cls(pgno, cls._format.unpack_from(data)[0])
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         return self._format.pack(self.next_free).ljust(USABLE_SIZE, b"\x00")
 
-    def copy(self):
+    def copy(self) -> Self:
         return FreePage(self.pgno, self.next_free)
 
 
@@ -93,32 +113,32 @@ class Header:
 
     _format = struct.Struct(">16sIII")
 
-    def __init__(self, pgno=0, page_count=1, freelist_head=0, change_counter=0):
+    def __init__(self, pgno: int = 0, page_count: int = 1, freelist_head: int = 0, change_counter: int = 0) -> None:
         self.pgno = pgno
         self.page_count = page_count
         self.freelist_head = freelist_head
         self.change_counter = change_counter
 
     @classmethod
-    def from_bytes(cls, pgno, data):
+    def from_bytes(cls, pgno: int, data: bytes) -> Self:
         _magic, page_count, freelist_head, counter = cls._format.unpack_from(data)
         return cls(pgno, page_count, freelist_head, counter)
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         data = self._format.pack(MAGIC, self.page_count, self.freelist_head, self.change_counter)
         return data.ljust(USABLE_SIZE, b"\x00")
 
-    def copy(self):
+    def copy(self) -> Self:
         return Header(self.pgno, self.page_count, self.freelist_head, self.change_counter)
 
 
-def with_checksum(data):
+def with_checksum(data: bytes) -> bytes:
     """A page image as stored on disk: ``data`` followed by its CRC32."""
     assert len(data) == USABLE_SIZE, len(data)
     return data + _u32.pack(zlib.crc32(data))
 
 
-def verify_page(pgno, image):
+def verify_page(pgno: int, image: bytes) -> bytes:
     """Return the usable part of a page image, or raise if it is damaged."""
     data = image[:USABLE_SIZE]
     if _u32.unpack_from(image, USABLE_SIZE)[0] != zlib.crc32(data):
@@ -161,7 +181,7 @@ class Pager:
     step of a commit or checkpoint so tests can simulate a crash there.
     """
 
-    def __init__(self, path=None, timeout=5.0):
+    def __init__(self, path: str | None = None, timeout: float = 5.0) -> None:
         """Open (or create) the database file at ``path``; ``None`` means in
         memory.  The new pager is inside a read transaction."""
         self.path = path
@@ -195,17 +215,17 @@ class Pager:
             raise
 
     @property
-    def page_count(self):
+    def page_count(self) -> int:
         return self.header.page_count
 
     @property
-    def is_new(self):
+    def is_new(self) -> bool:
         """True while the file has no committed header yet."""
         return 0 in self.dirty and self.header.change_counter == 0 and self.header.page_count == 1
 
     # ---- the write-ahead log ------------------------------------------
 
-    def _reset_wal_index(self):
+    def _reset_wal_index(self) -> None:
         self.wal_generation = None
         self.frames = {}  # pgno -> ascending frame numbers holding it
         self.committed = 0  # frames in the snapshot (the last commit frame)
@@ -213,10 +233,10 @@ class Pager:
         self.scan_crc = 0  # checksum chain after the last committed frame
         self.append_crc = 0
 
-    def _frame_offset(self, number):
+    def _frame_offset(self, number: int) -> int:
         return _wal_header.size + (number - 1) * FRAME_SIZE
 
-    def _scan_wal(self, apply):
+    def _scan_wal(self, apply: bool) -> bool:
         """Read the log's committed frames past our snapshot.
 
         With ``apply`` the index and snapshot are updated; otherwise only
@@ -263,14 +283,14 @@ class Pager:
                 self.scan_crc = crc
         return changed
 
-    def _wal_frame_for(self, pgno):
+    def _wal_frame_for(self, pgno: int) -> int | None:
         frames = self.frames.get(pgno)
         if not frames:
             return None
         i = bisect_right(frames, self.frame_total)
         return frames[i - 1] if i else None
 
-    def _append_frames(self, pages, commit):
+    def _append_frames(self, pages: list[tuple[int, bytes]], commit: bool) -> None:
         """Append (pgno, image) frames; the last one ends a commit if ``commit``."""
         wal = self.wal
         if self.frame_total == self.committed and self.wal_generation is not None:
@@ -303,7 +323,7 @@ class Pager:
 
     # ---- reading ------------------------------------------------------
 
-    def _read_image(self, pgno):
+    def _read_image(self, pgno: int) -> bytes:
         frame = self._wal_frame_for(pgno) if self.wal is not None else None
         if frame is not None:
             self.wal.seek(self._frame_offset(frame) + _frame_header.size)
@@ -315,10 +335,10 @@ class Pager:
             raise DatabaseError(f"database disk image is malformed (short read of page {pgno})")
         return image
 
-    def _read(self, pgno):
+    def _read(self, pgno: int) -> bytes:
         return verify_page(pgno, self._read_image(pgno))
 
-    def _read_header(self):
+    def _read_header(self) -> Header | None:
         """Read and validate page 0 (from the log or the file); None if the
         database has never been committed."""
         self.file.seek(0, io.SEEK_END)
@@ -337,7 +357,7 @@ class Pager:
             raise DatabaseError("database disk image is malformed (file is truncated)")
         return header
 
-    def get(self, pgno, page_class):
+    def get(self, pgno: int, page_class: PageDecoder) -> Page:
         """Return page ``pgno`` decoded as ``page_class`` (cached)."""
         page = self.cache.get(pgno)
         if page is None:
@@ -355,7 +375,7 @@ class Pager:
             self.cache[pgno] = page
         return page
 
-    def write(self, page):
+    def write(self, page: Page) -> None:
         """Declare that ``page`` is about to be modified (or replaced by ``page``)."""
         pgno = page.pgno
         if self.journal is not None and pgno not in self.journal:
@@ -366,15 +386,15 @@ class Pager:
 
     # ---- statements ---------------------------------------------------
 
-    def begin_statement(self):
+    def begin_statement(self) -> None:
         self.journal = {}
         self.journal_dirty = set(self.dirty)
 
-    def end_statement(self):
+    def end_statement(self) -> None:
         self.journal = None
         self.journal_dirty = None
 
-    def rollback_statement(self):
+    def rollback_statement(self) -> None:
         """Undo every change made since ``begin_statement()``."""
         for pgno, old in self.journal.items():
             if old is None:
@@ -387,7 +407,7 @@ class Pager:
 
     # ---- allocation ---------------------------------------------------
 
-    def allocate(self, page_class, *args):
+    def allocate(self, page_class: Callable[..., Page], *args: Any) -> Any:
         """Allocate a page (reusing the free list first) as ``page_class(pgno, *args)``."""
         header = self.header
         self.write(header)
@@ -401,13 +421,13 @@ class Pager:
         self.write(page)
         return page
 
-    def free(self, pgno):
+    def free(self, pgno: int) -> None:
         header = self.header
         self.write(header)
         self.write(FreePage(pgno, header.freelist_head))
         header.freelist_head = pgno
 
-    def free_page_count(self):
+    def free_page_count(self) -> int:
         count = 0
         pgno = self.header.freelist_head
         while pgno:
@@ -415,7 +435,7 @@ class Pager:
             pgno = self.get(pgno, FreePage).next_free
         return count
 
-    def check_checksums(self):
+    def check_checksums(self) -> list[int]:
         """Read every committed page and verify its checksum; returns the
         damaged page numbers.  (Pages allocated by the current transaction
         are not stored yet.)"""
@@ -433,7 +453,7 @@ class Pager:
         finally:
             self.frame_total = saved
 
-    def shrink_cache(self, limit=10_000):
+    def shrink_cache(self, limit: int = 10_000) -> None:
         """Drop clean pages from the cache once it holds more than ``limit`` pages.
 
         Only call this between statements: B+ tree code holds page objects
@@ -446,7 +466,7 @@ class Pager:
 
     # ---- transactions -------------------------------------------------
 
-    def begin_read(self):
+    def begin_read(self) -> bool:
         """Start reading: SHARED lock, snapshot of the log, cache validation.
 
         Returns True if the cache was dropped because the database changed."""
@@ -476,7 +496,7 @@ class Pager:
         self.dirty = set()
         return True
 
-    def begin_write(self, wait=True):
+    def begin_write(self, wait: bool = True) -> None:
         """Become the (only) writer: take RESERVED.  Fails like a busy lock if
         another connection committed after our snapshot was taken."""
         if self.locks is None or self.locks.reserved:
@@ -486,16 +506,16 @@ class Pager:
             self.locks.release_reserved()
             raise LockTimeout("database is locked")
 
-    def end_transaction(self):
+    def end_transaction(self) -> None:
         self.reading = False
         if self.locks is not None:
             self.locks.release_all()
 
-    def _crash_point(self, point, detail=None):
+    def _crash_point(self, point: str, detail: int | None = None) -> None:
         if self.crash_hook is not None:
             self.crash_hook(point, detail)
 
-    def commit(self):
+    def commit(self) -> None:
         """Make every change durable (see the class docstring).
 
         May raise ``OperationalError("database is locked")`` before anything
@@ -519,7 +539,7 @@ class Pager:
             self.scan_crc = self.append_crc
         self.dirty.clear()
 
-    def spill(self):
+    def spill(self) -> None:
         """Write the dirty pages to the log as uncommitted frames, so they no
         longer need to stay in memory.  Call between statements."""
         if self.wal is None or not self.dirty:
@@ -529,7 +549,7 @@ class Pager:
         self._append_frames(pages, commit=False)
         self.dirty.clear()
 
-    def rollback(self):
+    def rollback(self) -> None:
         """Discard every uncommitted change, including spilled frames."""
         for pgno in self.dirty:
             self.cache.pop(pgno, None)
@@ -551,7 +571,7 @@ class Pager:
         self.header = header
         self.cache[0] = header
 
-    def checkpoint(self):
+    def checkpoint(self) -> bool:
         """Copy the log into the database file and empty it, if no other
         connection is reading or writing; returns whether it happened."""
         if self.wal is None or self.dirty or self.frame_total != self.committed:
@@ -587,7 +607,7 @@ class Pager:
             if not had_reserved:
                 locks.release_reserved()
 
-    def close_files(self):
+    def close_files(self) -> None:
         """Close without committing (also used after a crash)."""
         if self.locks is not None:
             self.locks.close()
@@ -595,7 +615,7 @@ class Pager:
             self.wal.close()
         self.file.close()
 
-    def close(self):
+    def close(self) -> None:
         """Commit any dirty pages, checkpoint if possible and close the file."""
         if self.file.closed:
             return

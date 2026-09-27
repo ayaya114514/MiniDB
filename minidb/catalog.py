@@ -18,29 +18,38 @@ an index the average number of rows per distinct value of each prefix of its
 columns (like SQLite's sqlite_stat1).
 """
 
+from __future__ import annotations
+
+from collections.abc import Sequence
+
 from minidb import values
 from minidb.btree import BTree
 from minidb.errors import DatabaseError, OperationalError
-from minidb.parser import CreateIndex, CreateTable, parse
+from minidb.pager import Pager
+from minidb.parser import ColumnDef, CreateIndex, CreateTable, parse
 from minidb.record import decode_record, encode_record, encoded_size
+from minidb.values import SQLValue
 
 SCHEMA_ROOT = 1
 RESERVED_PREFIX = "minidb_"
 AUTO_INDEX_PREFIX = "minidb_autoindex_"
 
 
-def quote(name):
+def quote(name: str) -> str:
     return '"' + name.replace('"', '""') + '"'
 
 
 # ---- index keys ------------------------------------------------------------------
+
+# An index key: the sort keys of the indexed values, then (1, rowid).
+IndexKey = tuple
 
 # Sentinels that sort below / above every (rank, value) pair of an index key.
 LOW = (-1,)
 HIGH = (3,)
 
 
-def index_key(key_values, rowid):
+def index_key(key_values: Sequence[SQLValue], rowid: int) -> IndexKey:
     """The B+ tree key for an index entry: the sort keys of the indexed values
     followed by the row id, so that every key is unique."""
     return tuple(values.sort_key(v) for v in key_values) + ((1, rowid),)
@@ -50,20 +59,20 @@ class IndexKeyCodec:
     """Serializes index keys (tuples of sort-key pairs) as records."""
 
     @staticmethod
-    def _plain(pair):
+    def _plain(pair: tuple) -> SQLValue:
         return None if pair[0] == 0 else pair[1]
 
     @classmethod
-    def encode(cls, key):
+    def encode(cls, key: IndexKey) -> bytes:
         return encode_record([cls._plain(pair) for pair in key])
 
     @staticmethod
-    def decode(data, pos):
+    def decode(data: bytes, pos: int) -> tuple[IndexKey, int]:
         row, end = decode_record(data, pos)
         return tuple(values.sort_key(v) for v in row), end
 
     @classmethod
-    def size(cls, key):
+    def size(cls, key: IndexKey) -> int:
         return encoded_size([cls._plain(pair) for pair in key])
 
 
@@ -73,7 +82,7 @@ class IndexKeyCodec:
 class TableInfo:
     has_rowid = True
 
-    def __init__(self, name, columns, root, schema_key=None):
+    def __init__(self, name: str, columns: list[ColumnDef], root: int, schema_key: int | None = None) -> None:
         self.name = name
         self.columns = columns
         self.root = root
@@ -88,17 +97,17 @@ class TableInfo:
         )
         self.affinities = [values.INTEGER if c.type == "INTEGER" else values.TEXT for c in columns]
 
-    def column_index(self, name):
+    def column_index(self, name: str) -> int | None:
         return self.positions.get(name.lower())
 
-    def auto_index_columns(self):
+    def auto_index_columns(self) -> list[str]:
         """Columns that need an automatic unique index, in column order."""
         return [
             c.name for i, c in enumerate(self.columns)
             if (c.unique or c.primary_key) and i != self.rowid_column
         ]
 
-    def sql(self):
+    def sql(self) -> str:
         parts = []
         for column in self.columns:
             text = f"{quote(column.name)} {column.type}"
@@ -113,7 +122,7 @@ class TableInfo:
 
 
 class IndexInfo:
-    def __init__(self, name, table, column_names, unique, root, schema_key=None):
+    def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int, schema_key: int | None = None) -> None:
         self.name = name
         self.table = table
         self.column_names = [table.columns[table.column_index(c)].name for c in column_names]
@@ -125,20 +134,20 @@ class IndexInfo:
         self.stat_key = None
 
     @property
-    def is_auto(self):
+    def is_auto(self) -> bool:
         return self.name.lower().startswith(AUTO_INDEX_PREFIX)
 
-    def key(self, row, rowid):
+    def key(self, row: Sequence[SQLValue], rowid: int) -> IndexKey:
         return index_key([row[p] for p in self.positions], rowid)
 
-    def sql(self):
+    def sql(self) -> str:
         columns = ", ".join(quote(c) for c in self.column_names)
         unique = "UNIQUE " if self.unique else ""
         return f"CREATE {unique}INDEX {quote(self.name)} ON {quote(self.table.name)} ({columns})"
 
 
 class Catalog:
-    def __init__(self, pager):
+    def __init__(self, pager: Pager) -> None:
         self.pager = pager
         self.version = 0  # bumped by every schema change; prepared plans check it
         if pager.page_count == 1:
@@ -148,7 +157,7 @@ class Catalog:
         self.schema = BTree(pager, SCHEMA_ROOT)
         self.load()
 
-    def load(self):
+    def load(self) -> None:
         """(Re)build the in-memory schema from the schema table."""
         self.version += 1
         self.tables = {}
@@ -177,36 +186,36 @@ class Catalog:
 
     # ---- lookups ----------------------------------------------------------
 
-    def get_table(self, name):
+    def get_table(self, name: str) -> TableInfo:
         table = self.tables.get(name.lower())
         if table is None:
             raise OperationalError(f"no such table: {name}")
         return table
 
-    def has_table(self, name):
+    def has_table(self, name: str) -> bool:
         return name.lower() in self.tables
 
-    def table_tree(self, table):
+    def table_tree(self, table: TableInfo) -> BTree:
         return BTree(self.pager, table.root)
 
-    def index_tree(self, index):
+    def index_tree(self, index: IndexInfo) -> BTree:
         return BTree(self.pager, index.root, IndexKeyCodec)
 
     # ---- changes ------------------------------------------------------------
 
-    def _add_entry(self, kind, name, table_name, root, sql):
+    def _add_entry(self, kind: str, name: str, table_name: str, root: int, sql: str) -> int:
         key = (self.schema.last_key() or 0) + 1
         self.schema.insert(key, encode_record([kind, name, table_name, root, sql]))
         return key
 
-    def _check_new_name(self, name):
+    def _check_new_name(self, name: str) -> None:
         lowered = name.lower()
         if lowered.startswith(RESERVED_PREFIX):
             raise OperationalError(f"object name reserved for internal use: {name}")
         if lowered in self.indexes:
             raise OperationalError(f"there is already an index named {name}")
 
-    def create_table(self, stmt: CreateTable):
+    def create_table(self, stmt: CreateTable) -> TableInfo | None:
         if self.has_table(stmt.name):
             if stmt.if_not_exists:
                 return None
@@ -229,7 +238,7 @@ class Catalog:
             self._create_index(name, table, [column], unique=True)
         return table
 
-    def drop_table(self, name, if_exists=False):
+    def drop_table(self, name: str, if_exists: bool = False) -> None:
         if not self.has_table(name):
             if if_exists:
                 return
@@ -244,7 +253,7 @@ class Catalog:
         self.table_tree(table).destroy()
         self.schema.delete(table.schema_key)
 
-    def create_index(self, stmt: CreateIndex):
+    def create_index(self, stmt: CreateIndex) -> IndexInfo | None:
         """Create an index; returns it (still empty) or None if it already exists."""
         lowered = stmt.name.lower()
         if lowered in self.indexes:
@@ -263,7 +272,7 @@ class Catalog:
                 raise OperationalError(f"no such column: {column}")
         return self._create_index(stmt.name, table, stmt.columns, stmt.unique)
 
-    def _create_index(self, name, table, columns, unique):
+    def _create_index(self, name: str, table: TableInfo, columns: list[str], unique: bool) -> IndexInfo:
         self.version += 1
         root = BTree.create(self.pager, IndexKeyCodec).root
         index = IndexInfo(name, table, columns, unique, root)
@@ -272,7 +281,7 @@ class Catalog:
         table.indexes.insert(0, index)
         return index
 
-    def drop_index(self, name, if_exists=False):
+    def drop_index(self, name: str, if_exists: bool = False) -> None:
         index = self.indexes.get(name.lower())
         if index is None:
             if if_exists:
@@ -284,7 +293,7 @@ class Catalog:
             )
         self._drop_index(index)
 
-    def _drop_index(self, index):
+    def _drop_index(self, index: IndexInfo) -> None:
         self.version += 1
         self.index_tree(index).destroy()
         self.schema.delete(index.schema_key)
@@ -295,7 +304,7 @@ class Catalog:
 
     # ---- statistics ---------------------------------------------------------
 
-    def analyze(self, name=None):
+    def analyze(self, name: str | None = None) -> None:
         """Gather statistics for one table (or the table of an index) or all."""
         if name is None:
             tables = list(self.tables.values())
@@ -323,7 +332,7 @@ class Catalog:
                 self._set_stat(index, index.name, [rows] + average)
                 index.stat_average = average
 
-    def _set_stat(self, owner, name, numbers):
+    def _set_stat(self, owner: TableInfo | IndexInfo, name: str, numbers: list[int | float]) -> None:
         if owner.stat_key is not None:
             self.schema.delete(owner.stat_key)
         text = " ".join(f"{n:g}" if isinstance(n, float) else str(n) for n in numbers)

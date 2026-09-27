@@ -32,11 +32,15 @@ Page layouts (all integers big-endian):
     overflow page u32 next overflow page | data
 """
 
+from __future__ import annotations
+
 import struct
 from bisect import bisect_left, bisect_right
+from collections.abc import Callable, Iterator
+from typing import Any, Protocol, Self
 
 from minidb.errors import Error
-from minidb.pager import USABLE_SIZE
+from minidb.pager import USABLE_SIZE, Pager
 
 LEAF, INTERNAL = 1, 2
 HEADER_SIZE = 7
@@ -58,19 +62,29 @@ class DuplicateKeyError(BTreeError):
     pass
 
 
+class KeyCodec(Protocol):
+    """How a tree serializes its keys."""
+
+    def encode(self, key: Any) -> bytes: ...
+
+    def decode(self, data: bytes, pos: int) -> tuple[Any, int]: ...
+
+    def size(self, key: Any) -> int: ...
+
+
 class IntKey:
     """Codec for 64-bit signed integer keys (table row ids)."""
 
     @staticmethod
-    def encode(key):
+    def encode(key: int) -> bytes:
         return _i64.pack(key)
 
     @staticmethod
-    def decode(data, pos):
+    def decode(data: bytes, pos: int) -> tuple[int, int]:
         return _i64.unpack_from(data, pos)[0], pos + 8
 
     @staticmethod
-    def size(key):
+    def size(key: int) -> int:
         return 8
 
 
@@ -79,20 +93,20 @@ class OverflowRef:
 
     __slots__ = ("length", "pgno")
 
-    def __init__(self, length, pgno):
+    def __init__(self, length: int, pgno: int) -> None:
         self.length = length
         self.pgno = pgno
 
 
-def value_cell_size(value):
+def value_cell_size(value: bytes | OverflowRef) -> int:
     return 10 if isinstance(value, OverflowRef) else 2 + len(value)
 
 
-def key_cell_size(codec, key, ref):
+def key_cell_size(codec: KeyCodec, key: Any, ref: OverflowRef | None) -> int:
     return 10 if ref is not None else 2 + codec.size(key)
 
 
-def _write_key(out, encode, key, ref):
+def _write_key(out: bytearray, encode: Callable[[Any], bytes], key: Any, ref: OverflowRef | None) -> None:
     if ref is not None:
         out += _u16.pack(OVERFLOW_MARK)
         out += _overflow_ref.pack(ref.length, ref.pgno)
@@ -105,7 +119,7 @@ def _write_key(out, encode, key, ref):
 class Leaf:
     is_leaf = True
 
-    def __init__(self, pgno, codec, keys=None, values=None, next_leaf=0, key_refs=None, size=None):
+    def __init__(self, pgno: int, codec: KeyCodec, keys: list | None = None, values: list | None = None, next_leaf: int = 0, key_refs: list | None = None, size: int | None = None) -> None:
         self.pgno = pgno
         self.codec = codec
         self.keys = keys if keys is not None else []
@@ -117,21 +131,21 @@ class Leaf:
         else:
             self.size = size
 
-    def cell_sizes(self):
+    def cell_sizes(self) -> list[int]:
         codec = self.codec
         return [
             key_cell_size(codec, k, r) + value_cell_size(v)
             for k, r, v in zip(self.keys, self.key_refs, self.values)
         ]
 
-    def recompute_size(self):
+    def recompute_size(self) -> None:
         self.size = HEADER_SIZE + sum(self.cell_sizes())
 
-    def copy(self):
+    def copy(self) -> Self:
         return Leaf(self.pgno, self.codec, list(self.keys), list(self.values), self.next_leaf,
                     list(self.key_refs), self.size)
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         out = bytearray(_header.pack(LEAF, len(self.keys), self.next_leaf))
         encode = self.codec.encode
         for key, ref, value in zip(self.keys, self.key_refs, self.values):
@@ -148,7 +162,7 @@ class Leaf:
 class Internal:
     is_leaf = False
 
-    def __init__(self, pgno, codec, keys=None, children=None, key_refs=None, size=None):
+    def __init__(self, pgno: int, codec: KeyCodec, keys: list | None = None, children: list[int] | None = None, key_refs: list | None = None, size: int | None = None) -> None:
         self.pgno = pgno
         self.codec = codec
         self.keys = keys if keys is not None else []
@@ -159,18 +173,18 @@ class Internal:
         else:
             self.size = size
 
-    def cell_sizes(self):
+    def cell_sizes(self) -> list[int]:
         codec = self.codec
         return [4 + key_cell_size(codec, k, r) for k, r in zip(self.keys, self.key_refs)]
 
-    def recompute_size(self):
+    def recompute_size(self) -> None:
         self.size = HEADER_SIZE + sum(self.cell_sizes())
 
-    def copy(self):
+    def copy(self) -> Self:
         return Internal(self.pgno, self.codec, list(self.keys), list(self.children),
                         list(self.key_refs), self.size)
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         out = bytearray(_header.pack(INTERNAL, len(self.keys), self.children[-1]))
         encode = self.codec.encode
         for child, key, ref in zip(self.children, self.keys, self.key_refs):
@@ -183,11 +197,11 @@ class NodeReader:
     """Decodes pages of one tree (whose keys use ``codec``) into node objects;
     keys stored in overflow pages are read through ``pager``."""
 
-    def __init__(self, codec, pager):
+    def __init__(self, codec: KeyCodec, pager: Pager) -> None:
         self.codec = codec
         self.pager = pager
 
-    def _read_key(self, data, pos):
+    def _read_key(self, data: bytes, pos: int) -> tuple[Any, OverflowRef | None, int]:
         (length,) = _u16.unpack_from(data, pos)
         pos += 2
         if length != OVERFLOW_MARK:
@@ -197,7 +211,7 @@ class NodeReader:
         key, _ = self.codec.decode(read_chain(self.pager, ref), 0)
         return key, ref, pos + 8
 
-    def from_bytes(self, pgno, data):
+    def from_bytes(self, pgno: int, data: bytes) -> Leaf | Internal:
         node_type, count, link = _header.unpack_from(data)
         pos = HEADER_SIZE
         keys, refs = [], []
@@ -228,7 +242,7 @@ class NodeReader:
         raise BTreeError(f"page {pgno} is not a B+ tree node")
 
 
-def read_chain(pager, ref):
+def read_chain(pager: Pager, ref: OverflowRef) -> bytes:
     """The bytes stored in the overflow chain ``ref``."""
     parts = []
     pgno = ref.pgno
@@ -240,23 +254,23 @@ def read_chain(pager, ref):
 
 
 class OverflowPage:
-    def __init__(self, pgno, next_page=0, data=b""):
+    def __init__(self, pgno: int, next_page: int = 0, data: bytes = b"") -> None:
         self.pgno = pgno
         self.next_page = next_page
         self.data = data
 
     @classmethod
-    def from_bytes(cls, pgno, data):
+    def from_bytes(cls, pgno: int, data: bytes) -> OverflowPage:
         return cls(pgno, _u32.unpack_from(data)[0], bytes(data[4:]))
 
-    def to_bytes(self):
+    def to_bytes(self) -> bytes:
         return (_u32.pack(self.next_page) + self.data).ljust(USABLE_SIZE, b"\x00")
 
-    def copy(self):
+    def copy(self) -> Self:
         return OverflowPage(self.pgno, self.next_page, self.data)
 
 
-def _tail_split(sizes, needed, lo, hi):
+def _tail_split(sizes: list[int], needed: int, lo: int, hi: int) -> int:
     """Largest m in [lo, hi] with sum(sizes[m:]) >= needed, else lo."""
     total = 0
     for m in range(len(sizes) - 1, lo - 1, -1):
@@ -266,7 +280,7 @@ def _tail_split(sizes, needed, lo, hi):
     return lo
 
 
-def _balanced_split(sizes, lo, hi):
+def _balanced_split(sizes: list[int], lo: int, hi: int) -> int:
     """Index m in [lo, hi] where sum(sizes[:m]) is closest to half the total."""
     half = sum(sizes) / 2
     best, best_diff, prefix = lo, None, sum(sizes[:lo])
@@ -280,7 +294,7 @@ def _balanced_split(sizes, lo, hi):
 
 
 class BTree:
-    def __init__(self, pager, root, codec=IntKey, capacity=USABLE_SIZE):
+    def __init__(self, pager: Pager, root: int, codec: KeyCodec = IntKey, capacity: int = USABLE_SIZE) -> None:
         self.pager = pager
         self.root = root
         self.codec = codec
@@ -291,17 +305,17 @@ class BTree:
         self.max_leaf_cell = capacity // 5
 
     @classmethod
-    def create(cls, pager, codec=IntKey, capacity=USABLE_SIZE):
+    def create(cls, pager: Pager, codec: KeyCodec = IntKey, capacity: int = USABLE_SIZE) -> BTree:
         """Allocate an empty tree and return it."""
         root = pager.allocate(Leaf, codec)
         return cls(pager, root.pgno, codec, capacity)
 
-    def node(self, pgno):
+    def node(self, pgno: int) -> Leaf | Internal:
         return self.pager.get(pgno, self.reader)
 
     # ---- lookups -------------------------------------------------------
 
-    def _find_leaf(self, key):
+    def _find_leaf(self, key: Any) -> tuple[list[tuple[Internal, int]], Leaf]:
         """Descend to the leaf that may hold ``key``; returns (path, leaf).
 
         ``path`` lists (internal node, child index) pairs from the root down.
@@ -314,25 +328,25 @@ class BTree:
             node = self.node(node.children[i])
         return path, node
 
-    def _leftmost_leaf(self):
+    def _leftmost_leaf(self) -> Leaf:
         node = self.node(self.root)
         while not node.is_leaf:
             node = self.node(node.children[0])
         return node
 
-    def get(self, key, default=None):
+    def get(self, key: Any, default: bytes | None = None) -> bytes | None:
         _, leaf = self._find_leaf(key)
         i = bisect_left(leaf.keys, key)
         if i < len(leaf.keys) and leaf.keys[i] == key:
             return self._load_value(leaf.values[i])
         return default
 
-    def __contains__(self, key):
+    def __contains__(self, key: Any) -> bool:
         _, leaf = self._find_leaf(key)
         i = bisect_left(leaf.keys, key)
         return i < len(leaf.keys) and leaf.keys[i] == key
 
-    def scan(self, start=None, end=None, start_inclusive=True, end_inclusive=True):
+    def scan(self, start: Any = None, end: Any = None, start_inclusive: bool = True, end_inclusive: bool = True) -> Iterator[tuple[Any, bytes]]:
         """Yield (key, value) pairs in key order within the given bounds.
 
         The tree must not be modified while the generator is in use.
@@ -355,10 +369,10 @@ class BTree:
                 return
             leaf, i = self.node(leaf.next_leaf), 0
 
-    def keys(self):
+    def keys(self) -> list:
         return [key for key, _ in self.scan()]
 
-    def __len__(self):
+    def __len__(self) -> int:
         count = 0
         leaf = self._leftmost_leaf()
         while True:
@@ -367,7 +381,7 @@ class BTree:
                 return count
             leaf = self.node(leaf.next_leaf)
 
-    def last_key(self):
+    def last_key(self) -> Any:
         """The largest key in the tree, or None when it is empty."""
         node = self.node(self.root)
         while not node.is_leaf:
@@ -376,7 +390,7 @@ class BTree:
 
     # ---- values and overflow pages ------------------------------------
 
-    def _store_chain(self, data):
+    def _store_chain(self, data: bytes) -> OverflowRef:
         chunks = [data[i:i + OVERFLOW_DATA_SIZE] for i in range(0, len(data), OVERFLOW_DATA_SIZE)]
         pages = [self.pager.allocate(OverflowPage) for _ in chunks]
         for page, next_page, chunk in zip(pages, pages[1:] + [None], chunks):
@@ -384,27 +398,27 @@ class BTree:
             page.data = bytes(chunk)
         return OverflowRef(len(data), pages[0].pgno)
 
-    def _store_value(self, value, key_cell):
+    def _store_value(self, value: bytes, key_cell: int) -> bytes | OverflowRef:
         if key_cell + 2 + len(value) <= self.max_leaf_cell:
             return bytes(value)
         return self._store_chain(value)
 
-    def _store_key(self, key):
+    def _store_key(self, key: Any) -> OverflowRef | None:
         """None if ``key`` fits in a cell, else the OverflowRef of a new chain."""
         if self.codec.size(key) <= self.max_key_size:
             return None
         return self._store_chain(self.codec.encode(key))
 
-    def _copy_key(self, key, ref):
+    def _copy_key(self, key: Any, ref: OverflowRef | None) -> OverflowRef | None:
         """The ref for a second cell holding ``key`` (a separator copy)."""
         return None if ref is None else self._store_chain(self.codec.encode(key))
 
-    def _load_value(self, value):
+    def _load_value(self, value: bytes | OverflowRef) -> bytes:
         if not isinstance(value, OverflowRef):
             return value
         return read_chain(self.pager, value)
 
-    def _free_value(self, value):
+    def _free_value(self, value: bytes | OverflowRef | None) -> None:
         """Free the overflow chain of a value or key ref (no-op for inline data)."""
         if isinstance(value, OverflowRef):
             pgno = value.pgno
@@ -413,12 +427,12 @@ class BTree:
                 self.pager.free(pgno)
                 pgno = next_page
 
-    def _key_cell(self, key, ref):
+    def _key_cell(self, key: Any, ref: OverflowRef | None) -> int:
         return key_cell_size(self.codec, key, ref)
 
     # ---- insertion -----------------------------------------------------
 
-    def insert(self, key, value, replace=False):
+    def insert(self, key: Any, value: bytes, replace: bool = False) -> None:
         """Insert ``key`` -> ``value`` (bytes).
 
         Raises DuplicateKeyError if the key exists, unless ``replace`` is true.
@@ -444,7 +458,7 @@ class BTree:
             append = leaf.next_leaf == 0 and i == len(leaf.keys) - 1
             self._split(path, leaf, append)
 
-    def _split(self, path, node, append=False):
+    def _split(self, path: list[tuple[Internal, int]], node: Leaf | Internal, append: bool = False) -> None:
         """Split ``node`` (and then its ancestors) while it is over capacity.
 
         For appends every node on the path is the rightmost of its level;
@@ -463,7 +477,7 @@ class BTree:
             parent.size += 4 + self._key_cell(separator, separator_ref)
             node = parent
 
-    def _move_root_down(self, root):
+    def _move_root_down(self, root: Leaf | Internal) -> Leaf | Internal:
         """Move the root's contents to a new page below a fresh one-child root."""
         if root.is_leaf:
             child = self.pager.allocate(
@@ -476,7 +490,7 @@ class BTree:
         self.pager.write(Internal(self.root, self.codec, [], [child.pgno]))
         return child
 
-    def _split_node(self, node, append=False):
+    def _split_node(self, node: Leaf | Internal, append: bool = False) -> tuple[Any, OverflowRef | None, Leaf | Internal]:
         """Split ``node`` by size; returns (separator key, its ref, new right node).
 
         Normally both halves get about the same number of bytes.  For an
@@ -513,7 +527,7 @@ class BTree:
 
     # ---- deletion ------------------------------------------------------
 
-    def delete(self, key):
+    def delete(self, key: Any) -> bool:
         """Remove ``key``; returns False if it was not present."""
         path, leaf = self._find_leaf(key)
         i = bisect_left(leaf.keys, key)
@@ -528,7 +542,7 @@ class BTree:
         self._rebalance(path, leaf)
         return True
 
-    def _rebalance(self, path, node):
+    def _rebalance(self, path: list[tuple[Internal, int]], node: Leaf | Internal) -> None:
         """Fix underflow of ``node`` by merging with or borrowing from a sibling."""
         while path and node.size < self.min_fill:
             parent, index = path[-1]
@@ -551,7 +565,7 @@ class BTree:
         if not path and not node.is_leaf and not node.keys:
             self._collapse_root(node)
 
-    def _try_merge(self, parent, left_index, left, right):
+    def _try_merge(self, parent: Internal, left_index: int, left: Leaf | Internal, right: Leaf | Internal) -> bool:
         separator, separator_ref = parent.keys[left_index], parent.key_refs[left_index]
         separator_size = 4 + self._key_cell(separator, separator_ref)
         if left.is_leaf:
@@ -575,7 +589,7 @@ class BTree:
         parent.size -= separator_size
         return True
 
-    def _redistribute(self, parent, left_index, left, right):
+    def _redistribute(self, parent: Internal, left_index: int, left: Leaf | Internal, right: Leaf | Internal) -> None:
         old = (parent.keys[left_index], parent.key_refs[left_index])
         if left.is_leaf:
             keys = left.keys + right.keys
@@ -604,7 +618,7 @@ class BTree:
         parent.key_refs[left_index] = separator_ref
         parent.size += self._key_cell(separator, separator_ref) - self._key_cell(*old)
 
-    def _collapse_root(self, root):
+    def _collapse_root(self, root: Internal) -> None:
         """The root has a single child: copy that child into the root page."""
         child = self.node(root.children[0])
         if child.is_leaf:
@@ -617,7 +631,7 @@ class BTree:
 
     # ---- whole-tree operations ------------------------------------------
 
-    def destroy(self):
+    def destroy(self) -> None:
         """Free every page of the tree, including the root."""
         stack = [self.root]
         while stack:
@@ -631,7 +645,7 @@ class BTree:
                 self._free_value(ref)
             self.pager.free(node.pgno)
 
-    def clear(self):
+    def clear(self) -> None:
         """Remove every key, leaving an empty root leaf."""
         root = self.node(self.root)
         if root.is_leaf:
@@ -644,7 +658,7 @@ class BTree:
             self._free_value(ref)
         self.pager.write(Leaf(self.root, self.codec))
 
-    def estimated_count(self):
+    def estimated_count(self) -> int:
         """A cheap estimate of the number of keys: the fan-out along the
         leftmost path multiplied together (reads one page per level)."""
         estimate, node = 1, self.node(self.root)
@@ -653,14 +667,14 @@ class BTree:
             node = self.node(node.children[0])
         return max(1, estimate * len(node.keys))
 
-    def depth(self):
+    def depth(self) -> int:
         depth, node = 1, self.node(self.root)
         while not node.is_leaf:
             depth += 1
             node = self.node(node.children[0])
         return depth
 
-    def dump(self, max_keys=8):
+    def dump(self, max_keys: int = 8) -> list[str]:
         """Return the tree structure as indented text lines (the ``.btree`` command)."""
         lines = []
 
@@ -681,7 +695,7 @@ class BTree:
         visit(self.root, 0)
         return lines
 
-    def check(self):
+    def check(self) -> int:
         """Verify the structural invariants; returns the number of keys.
 
         Checks key order and separator bounds, equal leaf depth, node sizes

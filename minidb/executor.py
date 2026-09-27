@@ -17,23 +17,51 @@ whose ``run()`` can be called many times: a correlated subquery runs once per
 row of its outer query.
 """
 
+from __future__ import annotations
+
 import dataclasses
 import heapq
 import itertools
 import random
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
+from typing import Any, Protocol, Union
 
 from minidb import values
-from minidb.catalog import HIGH
+from minidb.btree import BTree
+from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo
 from minidb.errors import IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
     Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable, Delete,
     DerivedTable, DropIndex, DropTable, Exists, Explain, InList, InSelect, Insert, Join, Like,
     Literal, Parameter, Select, Star, Subquery, TableRef, Unary, Update,
 )
+from minidb.parser import Expr, Statement
+from minidb.values import SQLValue
 from minidb.record import decode_record, encode_record
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")
+
+Row = list  # the values of every table of a query, each followed by its row id
+RowFunction = Callable[[Row], Any]  # a compiled expression
+Record = tuple[tuple, tuple]  # (result row, extra ORDER BY values)
+OrderTerm = tuple[str, int, bool, bool]  # (source, index, descending, NULLs first)
+Bound = Union[tuple[RowFunction, bool], None]  # (key function, inclusive)
+Source = Union[TableInfo, "DerivedSource"]  # a table or a subquery in FROM
+CompiledQuery = Union["CompiledSelect", "CompiledCompound"]
+PreparedStatement = Union["PreparedSelect", "PreparedInsert", "PreparedUpdate", "PreparedDelete"]
+
+
+class AccessPath(Protocol):
+    """How one table of a query is read (see the access path classes)."""
+
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]: ...
+
+    def order(self) -> tuple[list[int], set[int]] | None: ...
+
+    def estimate(self) -> tuple[float, float]: ...
+
+    def describe(self) -> str: ...
 
 
 class Result(list):
@@ -42,7 +70,7 @@ class Result(list):
     ``rowcount`` is the number of rows an INSERT, UPDATE or DELETE changed
     (-1 for other statements), as in sqlite3."""
 
-    def __init__(self, rows=(), columns=(), rowcount=-1):
+    def __init__(self, rows: Iterable[tuple] = (), columns: Iterable[str] = (), rowcount: int = -1) -> None:
         super().__init__(rows)
         self.columns = list(columns)
         self.rowcount = rowcount
@@ -56,7 +84,7 @@ class ScopeEntry:
 
     __slots__ = ("name", "table", "offset", "hidden")
 
-    def __init__(self, name, table, offset):
+    def __init__(self, name: str, table: Source, offset: int) -> None:
         self.name = name  # alias or table name, lower case
         self.table = table
         self.offset = offset  # position of its first column in a row
@@ -66,7 +94,7 @@ class ScopeEntry:
 class Scope:
     """The tables visible to expressions and where their values sit in a row."""
 
-    def __init__(self, parent=None):
+    def __init__(self, parent: Scope | None = None) -> None:
         self.entries = []
         self.width = 0
         self.parent = parent  # scope of the enclosing query, for correlated subqueries
@@ -74,16 +102,16 @@ class Scope:
         self.uses_outer = False  # some expression here refers to an enclosing query
         self.used = set()  # (table index, column position) pairs referenced so far
 
-    def add(self, table, alias=None):
+    def add(self, table: Source, alias: str | None = None) -> None:
         name = (alias if alias is not None else table.name).lower()
         self.entries.append(ScopeEntry(name, table, self.width))
         self.width += len(table.columns) + 1
 
-    def rowid_slot(self, index):
+    def rowid_slot(self, index: int) -> int:
         entry = self.entries[index]
         return entry.offset + len(entry.table.columns)
 
-    def _matches(self, column):
+    def _matches(self, column: Column) -> list[tuple[int, str | None, int]]:
         matches = []
         lowered = column.name.lower()
         for index, entry in enumerate(self.entries):
@@ -100,7 +128,7 @@ class Scope:
                 matches.append((entry.offset + len(table.columns), values.INTEGER, index))
         return matches
 
-    def resolve(self, column):
+    def resolve(self, column: Column) -> tuple[int, str | None, int, int]:
         """Return (slot, affinity, table index, depth) for a column reference;
         ``depth`` counts how many enclosing queries up the column was found."""
         scope, depth, passed = self, 0, []
@@ -119,13 +147,13 @@ class Scope:
         full_name = f"{column.table}.{column.name}" if column.table else column.name
         raise OperationalError(f"no such column: {full_name}")
 
-    def ancestor(self, depth):
+    def ancestor(self, depth: int) -> Scope:
         scope = self
         for _ in range(depth):
             scope = scope.parent
         return scope
 
-    def star_columns(self, table_name=None):
+    def star_columns(self, table_name: str | None = None) -> list[tuple[str, str]]:
         """(table name, column name) pairs that ``*`` or ``table.*`` expands to."""
         if not self.entries:
             raise OperationalError("no tables specified")
@@ -144,7 +172,7 @@ class Scope:
         return result
 
 
-def walk(expr):
+def walk(expr: Expr) -> Iterator[Expr]:
     """Yield ``expr`` and all of its sub-expressions (not entering subqueries)."""
     yield expr
     if isinstance(expr, Unary):
@@ -179,7 +207,7 @@ def walk(expr):
             yield from walk(expr.else_)
 
 
-def tables_referenced(expr, scope):
+def tables_referenced(expr: Expr, scope: Scope) -> set[int]:
     """Indexes of the tables of ``scope`` that ``expr`` uses.  An expression
     with a subquery counts as using all of them (it may be correlated)."""
     tables = set()
@@ -193,7 +221,7 @@ def tables_referenced(expr, scope):
     return tables
 
 
-def split_conjuncts(expr):
+def split_conjuncts(expr: Expr | None) -> list[Expr]:
     if expr is None:
         return []
     if isinstance(expr, Binary) and expr.op == "AND":
@@ -226,7 +254,7 @@ _AFFINITY_FUNCTIONS = {values.INTEGER: values.numeric_affinity, values.TEXT: val
 _FLIPPED = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
 
-def value_comparator(op, left_affinity, right_affinity):
+def value_comparator(op: str, left_affinity: str | None, right_affinity: str | None) -> Callable[[SQLValue, SQLValue], int | None]:
     """A function (a, b) -> 1, 0 or None comparing two values with SQLite's rules."""
     convert_left, convert_right = (
         _AFFINITY_FUNCTIONS.get(a)
@@ -269,17 +297,16 @@ class Compiler:
     call is an error reported with ``misuse`` (formatted with the name).
     """
 
-    def __init__(self, scope, aggregates=None, misuse="misuse of aggregate function {name}()",
-                 executor=None):
+    def __init__(self, scope: Scope, aggregates: AggregateCollector | None = None, misuse: str = "misuse of aggregate function {name}()", executor: Executor | None = None) -> None:
         self.scope = scope
         self.aggregates = aggregates
         self.misuse = misuse
         self.executor = executor  # needed to compile subqueries
 
-    def compile(self, expr):
+    def compile(self, expr: Expr) -> RowFunction:
         return self.compile_with_affinity(expr)[0]
 
-    def compile_with_affinity(self, expr):
+    def compile_with_affinity(self, expr: Expr) -> tuple[RowFunction, str | None]:
         """Return (function, affinity); only column references have an affinity."""
         if isinstance(expr, Literal):
             value = expr.value
@@ -320,7 +347,7 @@ class Compiler:
             raise OperationalError("* is only allowed in a select list or COUNT(*)")
         raise OperationalError(f"cannot evaluate {expr!r}")
 
-    def _unary(self, expr):
+    def _unary(self, expr: Unary) -> RowFunction:
         operand = self.compile(expr.operand)
         if expr.op == "-":
             negate = values.negate
@@ -330,7 +357,7 @@ class Compiler:
         logical_not = values.logical_not
         return lambda row: logical_not(operand(row))
 
-    def _binary(self, expr):
+    def _binary(self, expr: Binary) -> RowFunction:
         op = expr.op
         if op == "AND" and folded_literal(expr) == Literal(0):
             # SQLite's parser replaces this by 0: the operands are never
@@ -365,7 +392,7 @@ class Compiler:
         comparator = value_comparator(op, left_affinity, right_affinity)
         return lambda row: comparator(left(row), right(row))
 
-    def _between(self, expr):
+    def _between(self, expr: Between) -> RowFunction:
         value, affinity = self.compile_with_affinity(expr.expr)
         low, low_affinity = self.compile_with_affinity(expr.low)
         high, high_affinity = self.compile_with_affinity(expr.high)
@@ -381,7 +408,7 @@ class Compiler:
 
         return between
 
-    def _in_list(self, expr):
+    def _in_list(self, expr: InList) -> RowFunction:
         value, affinity = self.compile_with_affinity(expr.expr)
         items = [self.compile(item) for item in expr.items]
         convert = _AFFINITY_FUNCTIONS.get(affinity)
@@ -406,7 +433,7 @@ class Compiler:
 
         return in_list
 
-    def _like(self, expr):
+    def _like(self, expr: Like) -> RowFunction:
         value = self.compile(expr.expr)
         pattern = self.compile(expr.pattern)
         like, logical_not = values.like, values.logical_not
@@ -414,7 +441,7 @@ class Compiler:
             return lambda row: logical_not(like(value(row), pattern(row)))
         return lambda row: like(value(row), pattern(row))
 
-    def _cast(self, expr):
+    def _cast(self, expr: Cast) -> tuple[RowFunction, str | None]:
         target = values.type_affinity(expr.type_name)
         if target == "BLOB":
             raise NotSupportedError("MiniDB has no BLOB values: cannot CAST to BLOB")
@@ -423,7 +450,7 @@ class Compiler:
         affinity = values.TEXT if target == "TEXT" else values.INTEGER
         return (lambda row: cast(operand(row), target)), affinity
 
-    def _case(self, expr):
+    def _case(self, expr: Case) -> RowFunction:
         whens = []
         truth = values.truth
         if expr.base is None:
@@ -454,7 +481,7 @@ class Compiler:
 
     # ---- subqueries -------------------------------------------------------
 
-    def _subquery(self, query, columns=None):
+    def _subquery(self, query: Select | Compound, columns: int | None = None) -> CompiledQuery:
         """Compile ``query`` as a subquery of this scope; returns a function
         ``rows(outer_row)`` and the compiled query.  Uncorrelated subqueries
         run once; correlated ones run for every outer row."""
@@ -467,7 +494,7 @@ class Compiler:
             )
         return compiled
 
-    def _runner(self, compiled, transform, max_rows=None):
+    def _runner(self, compiled: CompiledQuery, transform: Callable[[list[tuple]], Any], max_rows: int | None = None) -> Callable[[Row], Any]:
         """A function outer_row -> transform(rows of the subquery)."""
         cell = self.scope.cell
         if compiled.correlated:
@@ -484,16 +511,16 @@ class Compiler:
             return cache[0]
         return run_once
 
-    def _scalar_subquery(self, expr):
+    def _scalar_subquery(self, expr: Subquery) -> tuple[RowFunction, str | None]:
         compiled = self._subquery(expr.query, columns=1)
         run = self._runner(compiled, lambda rows: rows[0][0] if rows else None, max_rows=1)
         return run, compiled.affinities[0]
 
-    def _exists(self, expr):
+    def _exists(self, expr: Exists) -> RowFunction:
         compiled = self._subquery(expr.query)
         return self._runner(compiled, lambda rows: int(bool(rows)), max_rows=1)
 
-    def _in_select(self, expr):
+    def _in_select(self, expr: InSelect) -> RowFunction:
         compiled = self._subquery(expr.query, columns=1)
         value, value_affinity = self.compile_with_affinity(expr.expr)
         affinity = in_select_affinity(value_affinity, compiled.affinities[-1])
@@ -524,7 +551,7 @@ class Compiler:
             return None if has_null else missing
         return in_select
 
-    def call(self, expr):
+    def call(self, expr: Call) -> RowFunction:
         name = expr.name
         if values.is_aggregate_call(name, len(expr.args)):
             return self._aggregate(expr)
@@ -541,7 +568,7 @@ class Compiler:
             return lambda row: function(arg(row))
         return lambda row: function(*[arg(row) for arg in args])
 
-    def _aggregate(self, expr):
+    def _aggregate(self, expr: Call) -> RowFunction:
         name = expr.name
         if self.aggregates is None:
             raise OperationalError(self.misuse.format(name=name.lower()))
@@ -557,7 +584,7 @@ class Compiler:
         return itemgetter(self.aggregates.add(name, args, expr.distinct))
 
 
-def in_select_affinity(left, right):
+def in_select_affinity(left: str | None, right: str | None) -> str | None:
     """Affinity for ``x IN (SELECT y ...)`` (SQLite's sqlite3CompareAffinity):
     both columns: numeric if either is, else none; otherwise whichever exists.
     It is applied to both sides."""
@@ -566,7 +593,7 @@ def in_select_affinity(left, right):
     return left if left is not None else right
 
 
-def contains_aggregate(expr):
+def contains_aggregate(expr: Expr) -> bool:
     return any(
         isinstance(e, Call) and values.is_aggregate_call(e.name, len(e.args)) for e in walk(expr)
     )
@@ -575,20 +602,20 @@ def contains_aggregate(expr):
 class AggregateCollector:
     """The aggregate calls of a query and their per-group state."""
 
-    def __init__(self, base_width):
+    def __init__(self, base_width: int) -> None:
         self.base_width = base_width  # aggregate results follow the row's slots
         self.calls = []  # (name, argument functions, distinct)
 
-    def add(self, name, args, distinct):
+    def add(self, name: str, args: list[RowFunction], distinct: bool) -> int:
         self.calls.append((name, args, distinct))
         return self.base_width + len(self.calls) - 1
 
     @property
-    def tracks_extreme(self):
+    def tracks_extreme(self) -> bool:
         """A lone MIN()/MAX() makes bare columns come from its row, as in SQLite."""
         return len(self.calls) == 1 and self.calls[0][0] in ("MIN", "MAX")
 
-    def new_state(self):
+    def new_state(self) -> list[tuple[Any, set | None]]:
         state = []
         for name, args, distinct in self.calls:
             if name == "COUNT" and not args:
@@ -598,7 +625,7 @@ class AggregateCollector:
             state.append((aggregate, set() if distinct else None))
         return state
 
-    def step(self, state, row):
+    def step(self, state: list[tuple[Any, set | None]], row: Row) -> bool:
         """Feed one row to every aggregate; True if a lone MIN/MAX changed."""
         changed = False
         for (aggregate, seen), (_, args, _) in zip(state, self.calls):
@@ -615,7 +642,7 @@ class AggregateCollector:
         return changed
 
     @staticmethod
-    def results(state):
+    def results(state: list[tuple[Any, set | None]]) -> list[SQLValue]:
         return [aggregate.result() for aggregate, _ in state]
 
 
@@ -639,49 +666,49 @@ DEFAULT_EQUAL_ROWS = 10
 class DerivedScan:
     """All rows of a derived table (a subquery in FROM), materialized per run."""
 
-    def __init__(self, source):
+    def __init__(self, source: DerivedSource) -> None:
         self.source = source
 
-    def candidates(self, row):
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         return ((r[-1], r) for r in self.source.rows)
 
-    def order(self):
+    def order(self) -> tuple[list[int], set[int]] | None:
         return None
 
-    def estimate(self):
+    def estimate(self) -> tuple[float, float]:
         return 100, 100  # unknown until the subquery runs
 
-    def describe(self):
+    def describe(self) -> str:
         return "SCAN SUBQUERY"
 
 
 class FullScan:
-    def __init__(self, tree, rows):
+    def __init__(self, tree: BTree, rows: int) -> None:
         self.tree = tree
         self.rows = rows
 
-    def candidates(self, row):
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         return self.tree.scan()
 
-    def order(self):
+    def order(self) -> tuple[list[int], set[int]] | None:
         """(columns the rows come ordered by, columns that are constant)."""
         return [ROWID], set()
 
-    def estimate(self):
+    def estimate(self) -> tuple[float, float]:
         return self.rows, self.rows
 
-    def describe(self):
+    def describe(self) -> str:
         return "SCAN"
 
 
 class RowidLookup:
     """Rows whose row id equals one of the given expressions (``=`` or ``IN``)."""
 
-    def __init__(self, tree, key_functions):
+    def __init__(self, tree: BTree, key_functions: list[RowFunction]) -> None:
         self.tree = tree
         self.key_functions = key_functions
 
-    def rowids(self, row):
+    def rowids(self, row: Row) -> list[int]:
         keys = set()
         for key_function in self.key_functions:
             key = values.numeric_affinity(key_function(row))
@@ -689,33 +716,33 @@ class RowidLookup:
                 keys.add(key)
         return sorted(keys)
 
-    def candidates(self, row):
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         for key in self.rowids(row):
             value = self.tree.get(key)
             if value is not None:
                 yield key, value
 
-    def order(self):
+    def order(self) -> tuple[list[int], set[int]] | None:
         return [ROWID], set()
 
-    def estimate(self):
+    def estimate(self) -> tuple[float, float]:
         count = len(self.key_functions)
         return count, count * SEEK_COST
 
-    def describe(self):
+    def describe(self) -> str:
         return "SEARCH USING ROWID (=)"
 
 
 class RowidRange:
     """Rows whose row id lies between optional lower and upper bounds."""
 
-    def __init__(self, tree, lower, upper, rows):
+    def __init__(self, tree: BTree, lower: Bound, upper: Bound, rows: int) -> None:
         self.tree = tree
         self.lower = lower  # (key function, inclusive) or None
         self.upper = upper
         self.rows = rows
 
-    def candidates(self, row):
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         start = end = None
         start_inclusive = end_inclusive = True
         if self.lower:
@@ -732,17 +759,17 @@ class RowidRange:
             end_inclusive = self.upper[1]
         return self.tree.scan(start, end, start_inclusive, end_inclusive)
 
-    def rowids(self, row):
+    def rowids(self, row: Row) -> list[int]:
         return [key for key, _ in self.candidates(row)]
 
-    def order(self):
+    def order(self) -> tuple[list[int], set[int]] | None:
         return [ROWID], set()
 
-    def estimate(self):
+    def estimate(self) -> tuple[float, float]:
         rows = max(1, self.rows // (RANGE_FACTOR ** (bool(self.lower) + bool(self.upper))))
         return rows, rows + SEEK_COST
 
-    def describe(self):
+    def describe(self) -> str:
         return "SEARCH USING ROWID (range)"
 
 
@@ -750,7 +777,7 @@ class IndexScan:
     """Rows found through a secondary index: equality on a prefix of its
     columns, optionally followed by a range on the next column."""
 
-    def __init__(self, index, index_tree, table_tree, equal, lower, upper, table_rows):
+    def __init__(self, index: IndexInfo, index_tree: BTree, table_tree: BTree, equal: list[RowFunction], lower: Bound, upper: Bound, table_rows: int) -> None:
         self.index = index
         self.index_tree = index_tree
         self.table_tree = table_tree
@@ -761,10 +788,10 @@ class IndexScan:
         self.covering = False  # rows are built from index keys alone
 
     @property
-    def yields_rows(self):
+    def yields_rows(self) -> bool:
         return self.covering
 
-    def cover_if_possible(self, scope, table_index):
+    def cover_if_possible(self, scope: Scope, table_index: int) -> None:
         """Use the index alone if it holds every column the query uses."""
         table = self.index.table
         available = set(self.index.positions) | {len(table.columns)}  # plus the row id
@@ -773,7 +800,7 @@ class IndexScan:
         used = {position for index, position in scope.used if index == table_index}
         self.covering = used <= available
 
-    def keys(self, row):
+    def keys(self, row: Row) -> Iterator[tuple]:
         """The index keys in range, in order."""
         sort_key = values.sort_key
         prefix = []
@@ -805,10 +832,10 @@ class IndexScan:
                 end, end_inclusive = prefix + (sort_key(value),), False
         return (key for key, _ in self.index_tree.scan(start, end, start_inclusive, end_inclusive))
 
-    def rowids(self, row):
+    def rowids(self, row: Row) -> list[int]:
         return [key[-1][1] for key in self.keys(row)]
 
-    def candidates(self, row):
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         keys = self.keys(row)
         if self.covering:
             table = self.index.table
@@ -829,11 +856,11 @@ class IndexScan:
             rowid = key[-1][1]
             yield rowid, get(rowid)
 
-    def order(self):
+    def order(self) -> tuple[list[int], set[int]] | None:
         positions = self.index.positions
         return positions[len(self.equal):] + [ROWID], set(positions[:len(self.equal)])
 
-    def estimate(self):
+    def estimate(self) -> tuple[float, float]:
         rows = self.table_rows
         matched = len(self.equal)
         if matched:
@@ -847,7 +874,7 @@ class IndexScan:
         per_row = 1 if self.covering else 1 + FETCH_COST
         return rows, SEEK_COST + rows * per_row
 
-    def describe(self):
+    def describe(self) -> str:
         names = self.index.column_names
         covering = "COVERING " if self.covering else ""
         if not (self.equal or self.lower or self.upper):
@@ -864,28 +891,28 @@ class MultiScan:
     """The union of several row id / index lookups: ``col IN (...)`` on an
     index, or the terms of an OR.  Rows come in row id order."""
 
-    def __init__(self, parts, table_tree, label):
+    def __init__(self, parts: list[AccessPath], table_tree: BTree, label: str) -> None:
         self.parts = parts
         self.table_tree = table_tree
         self.label = label
 
-    def rowids(self, row):
+    def rowids(self, row: Row) -> list[int]:
         rowids = set()
         for part in self.parts:
             rowids.update(part.rowids(row))
         return sorted(rowids)
 
-    def candidates(self, row):
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         get = self.table_tree.get
         for rowid in self.rowids(row):
             record = get(rowid)
             if record is not None:
                 yield rowid, record
 
-    def order(self):
+    def order(self) -> tuple[list[int], set[int]] | None:
         return [ROWID], set()
 
-    def estimate(self):
+    def estimate(self) -> tuple[float, float]:
         rows = cost = 0
         for part in self.parts:
             part_rows, part_cost = part.estimate()
@@ -893,7 +920,7 @@ class MultiScan:
             cost += part_cost
         return rows, cost + rows * FETCH_COST
 
-    def describe(self):
+    def describe(self) -> str:
         return f"MULTI-INDEX {self.label} (" + "; ".join(p.describe() for p in self.parts) + ")"
 
 
@@ -903,13 +930,13 @@ ROWID = -1  # column position standing for the row id in constraints
 class Constraint:
     """A WHERE/ON conjunct of the form ``column op key`` usable by an access path."""
 
-    def __init__(self, position, op, key):
+    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction]) -> None:
         self.position = position  # column position in the table, or ROWID
         self.op = op  # "=", "<", "<=", ">", ">=" or "IN"
         self.key = key  # key function(s) evaluated on the outer row
 
 
-def find_constraints(scope, index, conjuncts, compiler, bound):
+def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int]) -> list[Constraint]:
     """Constraints on table ``index`` whose other side only uses the tables in
     ``bound`` (already joined) or constants.
 
@@ -972,7 +999,7 @@ def find_constraints(scope, index, conjuncts, compiler, bound):
     return constraints
 
 
-def _bounds(constraints, position):
+def _bounds(constraints: list[Constraint], position: int) -> tuple[Bound, Bound]:
     """The first lower and upper bound constraints on ``position``."""
     lower = upper = None
     for c in constraints:
@@ -985,20 +1012,20 @@ def _bounds(constraints, position):
     return lower, upper
 
 
-def split_disjuncts(expr):
+def split_disjuncts(expr: Expr) -> list[Expr]:
     if isinstance(expr, Binary) and expr.op == "OR":
         return split_disjuncts(expr.left) + split_disjuncts(expr.right)
     return [expr]
 
 
-def table_rows(catalog, table):
+def table_rows(catalog: Catalog, table: TableInfo) -> int:
     """Rows in ``table``: from ANALYZE if available, else a cheap estimate."""
     if table.stat_rows is not None:
         return max(1, table.stat_rows)
     return max(DEFAULT_MIN_ROWS, catalog.table_tree(table).estimated_count())
 
 
-def access_candidates(scope, index, catalog, conjuncts, compiler, bound, rows):
+def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int], rows: int) -> list[AccessPath]:
     """Every access path the conjuncts allow for table ``index``, full scan first."""
     table = scope.entries[index].table
     tree = catalog.table_tree(table)
@@ -1032,7 +1059,7 @@ def access_candidates(scope, index, catalog, conjuncts, compiler, bound, rows):
     return candidates
 
 
-def plan_access(scope, index, catalog, conjuncts, compiler, order_hint=None, bound=None):
+def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, order_hint: int | None = None, bound: set[int] | frozenset[int] | None = None) -> AccessPath:
     """Choose the cheapest way to read table ``index`` of ``scope``.
 
     ``bound`` is the set of tables joined before it (default: those before it
@@ -1075,13 +1102,13 @@ def plan_access(scope, index, catalog, conjuncts, compiler, order_hint=None, bou
 
 
 class Executor:
-    def __init__(self, catalog):
+    def __init__(self, catalog: Catalog) -> None:
         self.catalog = catalog
         self.last_insert_rowid = 0
         self.parameters = []  # values of ?-parameters; compiled plans read this list
         self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
 
-    def execute(self, stmt, parameters=()):
+    def execute(self, stmt: Statement, parameters: Sequence[SQLValue] = ()) -> Result:
         """Execute a parsed statement with the given parameter values (a list
         indexed by parameter number - 1)."""
         self.parameters[:] = parameters
@@ -1108,7 +1135,7 @@ class Executor:
             return Result()
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
 
-    def prepare(self, stmt):
+    def prepare(self, stmt: Select | Compound | Insert | Update | Delete) -> PreparedStatement:
         """The compiled plan of a SELECT/INSERT/UPDATE/DELETE.  Plans are kept
         on the (cached) syntax tree and reused until the schema changes."""
         cached = getattr(stmt, "_plan", None)
@@ -1130,21 +1157,21 @@ class Executor:
     # ---- reading rows ------------------------------------------------------
 
     @staticmethod
-    def load_row(table, rowid, record):
+    def load_row(table: TableInfo, rowid: int, record: bytes) -> Row:
         row = decode_record(record)[0]
         if table.rowid_column is not None:
             row[table.rowid_column] = rowid
         row.append(rowid)
         return row
 
-    def compile_query(self, stmt, parent=None):
+    def compile_query(self, stmt: Select | Compound, parent: Scope | None = None) -> CompiledQuery:
         """Compile a SELECT or compound SELECT (``parent``: the enclosing
         query's scope when this is a subquery)."""
         if isinstance(stmt, Compound):
             return CompiledCompound(self, stmt, parent)
         return CompiledSelect(self, stmt, parent)
 
-    def build_from(self, joins, scope):
+    def build_from(self, joins: list[Join], scope: Scope) -> tuple[list[Join], list[DerivedSource]]:
         """Add the FROM clause's tables to ``scope``.
 
         Returns the joins with USING / NATURAL turned into ON conditions, and
@@ -1170,7 +1197,7 @@ class Executor:
         return normalized, derived
 
     @staticmethod
-    def using_condition(scope, index, join):
+    def using_condition(scope: Scope, index: int, join: Join) -> Join:
         """``JOIN t USING (c, ...)`` / ``NATURAL JOIN t`` as an ON condition.
         The right table's copies of the columns become reachable only by
         qualified name, so ``c`` and ``*`` mean the left table's column."""
@@ -1200,7 +1227,7 @@ class Executor:
             right.hidden.add(name.lower())
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
-    def plan_joins(self, scope, joins, where, order_hint=None, covering=False):
+    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False) -> list[JoinLevel]:
         """Plan a nested loop over ``joins``; returns a list of ``JoinLevel``.
 
         WHERE conjuncts and the ON conditions of inner joins form one pool of
@@ -1247,7 +1274,7 @@ class Executor:
                                     join.kind == "LEFT", match, filters))
         return levels
 
-    def join_order(self, scope, referenced, compiler):
+    def join_order(self, scope: Scope, referenced: list[tuple[Expr, set[int]]], compiler: Compiler) -> list[int]:
         """The table order with the lowest estimated nested loop cost: every
         permutation for up to 6 tables, greedy beyond.  A condition that only
         filters (no lookup uses it) is guessed to keep a quarter of the rows."""
@@ -1289,7 +1316,7 @@ class Executor:
         return order
 
     @staticmethod
-    def join_rows(scope, levels):
+    def join_rows(scope: Scope, levels: list[JoinLevel]) -> Iterator[Row]:
         """Yield every row of the nested loop join.  The same list object is
         yielded each time; callers must copy it to keep it."""
         row = [None] * scope.width
@@ -1324,7 +1351,7 @@ class Executor:
 
         return visit(0)
 
-    def explain(self, stmt):
+    def explain(self, stmt: Select | Compound | Update | Delete) -> Result:
         """One row (table, access path) per table the statement reads, in join order."""
         if isinstance(stmt, (Select, Compound)):
             compiled = self.compile_query(stmt)
@@ -1340,7 +1367,7 @@ class Executor:
 
     # ---- SELECT -------------------------------------------------------------
 
-    def expand_items(self, stmt, scope):
+    def expand_items(self, stmt: Select, scope: Scope) -> tuple[list[Expr], list[str]]:
         """Select-list expressions with ``*`` expanded, and the column names."""
         exprs, names = [], []
         for item in stmt.items:
@@ -1359,7 +1386,7 @@ class Executor:
         return exprs, names
 
     @staticmethod
-    def result_column_reference(expr, names, clause, position, scope):
+    def result_column_reference(expr: Expr, names: list[str], clause: str, position: int, scope: Scope) -> int | None:
         """Resolve ORDER BY / GROUP BY shorthands: a column number or an alias.
 
         Returns the 0-based result column index, or None for a plain expression.
@@ -1384,7 +1411,7 @@ class Executor:
                 return lowered.index(expr.name.lower())
         return None
 
-    def order_terms(self, stmt, exprs, names, compiler):
+    def order_terms(self, stmt: Select, exprs: list[Expr], names: list[str], compiler: Compiler) -> tuple[list[OrderTerm], list[RowFunction]]:
         """Returns ([(source, index, descending, nulls first)], [functions]).
 
         ``source`` is "output" (index into the result row) or "key" (index into
@@ -1401,7 +1428,7 @@ class Executor:
         return terms, functions
 
     @staticmethod
-    def compound_order_terms(stmt, parts):
+    def compound_order_terms(stmt: Compound, parts: list[CompiledSelect]) -> list[OrderTerm]:
         """ORDER BY of a compound SELECT: every term must name a result column
         (by number, by name or alias, or as the same expression)."""
         terms = []
@@ -1433,7 +1460,7 @@ class Executor:
             terms.append(("output", index, item.descending, nulls_first))
         return terms
 
-    def group_functions(self, stmt, exprs, names, scope):
+    def group_functions(self, stmt: Select, exprs: list[Expr], names: list[str], scope: Scope) -> list[RowFunction]:
         compiler = Compiler(
             scope, misuse="aggregate functions are not allowed in the GROUP BY clause", executor=self
         )
@@ -1446,7 +1473,7 @@ class Executor:
         return functions
 
     @staticmethod
-    def group_rows(rows, scope, group_functions, aggregates):
+    def group_rows(rows: Iterable[Row], scope: Scope, group_functions: list[RowFunction], aggregates: AggregateCollector) -> Iterator[Row]:
         """Aggregate ``rows`` into groups; yield each group's representative row
         followed by its aggregate results, ordered by group key."""
         groups = {}
@@ -1465,7 +1492,7 @@ class Executor:
             representative, state = groups[key]
             yield representative + aggregates.results(state)
 
-    def compile_limit(self, stmt):
+    def compile_limit(self, stmt: Select | Compound) -> Callable[[], tuple[int, int | None]] | None:
         """Functions () -> (offset, end) for LIMIT/OFFSET, or None."""
         if stmt.limit is None:
             return None
@@ -1488,7 +1515,7 @@ class Executor:
 
     # ---- INSERT --------------------------------------------------------------
 
-    def prepare_row(self, table, row):
+    def prepare_row(self, table: TableInfo, row: Row) -> int | None:
         """Apply column affinities and NOT NULL checks; returns the requested row id."""
         for i, affinity in enumerate(table.affinities):
             row[i] = values.apply_affinity(row[i], affinity)
@@ -1502,7 +1529,7 @@ class Executor:
             raise IntegrityError("datatype mismatch")
         return rowid
 
-    def check_unique(self, table, row, rowid):
+    def check_unique(self, table: TableInfo, row: Row, rowid: int) -> None:
         """Raise if another row has the same values in a UNIQUE index.
 
         NULLs never conflict.  Indexes are checked newest first, like SQLite.
@@ -1520,22 +1547,22 @@ class Executor:
                     columns = ", ".join(f"{table.name}.{c}" for c in index.column_names)
                     raise IntegrityError(f"UNIQUE constraint failed: {columns}")
 
-    def add_index_entries(self, table, row, rowid):
+    def add_index_entries(self, table: TableInfo, row: Row, rowid: int) -> None:
         for index in table.indexes:
             self.catalog.index_tree(index).insert(index.key(row, rowid), b"")
 
-    def remove_index_entries(self, table, row, rowid):
+    def remove_index_entries(self, table: TableInfo, row: Row, rowid: int) -> None:
         for index in table.indexes:
             self.catalog.index_tree(index).delete(index.key(row, rowid))
 
     @staticmethod
-    def encode(table, row):
+    def encode(table: TableInfo, row: Row) -> bytes:
         stored = list(row)
         if table.rowid_column is not None:
             stored[table.rowid_column] = None  # kept in the key, not the record
         return encode_record(stored)
 
-    def insert_row(self, table, tree, row):
+    def insert_row(self, table: TableInfo, tree: BTree, row: Row) -> int:
         rowid = self.prepare_row(table, row)
         if rowid is None:
             rowid = self.new_rowid(tree)
@@ -1549,7 +1576,7 @@ class Executor:
         return rowid
 
     @staticmethod
-    def new_rowid(tree):
+    def new_rowid(tree: BTree) -> int:
         """One more than the largest row id; if that is taken by the maximum
         integer, try random ones like SQLite does."""
         last = tree.last_key()
@@ -1564,7 +1591,7 @@ class Executor:
         raise OperationalError("database or disk is full")
 
     @staticmethod
-    def rowid_conflict(table):
+    def rowid_conflict(table: TableInfo) -> IntegrityError:
         if table.rowid_column is None:
             return IntegrityError(f"UNIQUE constraint failed: {table.name}.rowid")
         name = table.columns[table.rowid_column].name
@@ -1572,7 +1599,7 @@ class Executor:
 
     # ---- indexes -------------------------------------------------------------
 
-    def create_index(self, stmt):
+    def create_index(self, stmt: CreateIndex) -> Result:
         index = self.catalog.create_index(stmt)
         if index is None:
             return Result()
@@ -1589,7 +1616,7 @@ class Executor:
 class JoinLevel:
     """One table of a nested loop join."""
 
-    def __init__(self, table, offset, access, outer, match, filters):
+    def __init__(self, table: Source, offset: int, access: AccessPath, outer: bool, match: RowFunction | None, filters: list[RowFunction]) -> None:
         self.table = table
         self.offset = offset  # position of the table's first slot in a row
         self.access = access
@@ -1606,7 +1633,7 @@ class JoinLevel:
 class CompiledSelect:
     """A SELECT compiled once; ``run()`` evaluates it (again) and returns its rows."""
 
-    def __init__(self, executor, stmt, parent=None):
+    def __init__(self, executor: Executor, stmt: Select, parent: Scope | None = None) -> None:
         self.executor = executor
         self.scope = scope = Scope(parent)
         joins, self.derived = executor.build_from(stmt.source, scope)
@@ -1645,7 +1672,7 @@ class CompiledSelect:
             and follows_order(order_columns, self.levels[0].access.order())
         )
 
-    def order_columns(self, stmt):
+    def order_columns(self, stmt: Select) -> list[int] | None:
         """ORDER BY as positions of the first table's columns (ROWID for the row
         id), or None unless every term is an ascending, NULLS FIRST plain
         column of that table."""
@@ -1669,10 +1696,10 @@ class CompiledSelect:
         return columns
 
     @property
-    def correlated(self):
+    def correlated(self) -> bool:
         return self.scope.uses_outer
 
-    def run(self, max_rows=None):
+    def run(self, max_rows: int | None = None) -> list[tuple]:
         """The result rows (tuples).  ``max_rows`` lets a caller that needs
         only the first rows (EXISTS, scalar subqueries) stop early."""
         for source in self.derived:
@@ -1708,7 +1735,7 @@ class CompiledSelect:
         return [output for output, _ in records]
 
 
-def follows_order(wanted, provided):
+def follows_order(wanted: list[int], provided: tuple[list[int], set[int]] | None) -> bool:
     """Whether rows ordered by ``provided`` = (columns, constant columns) are
     also ordered by the ``wanted`` columns."""
     if provided is None:
@@ -1730,7 +1757,7 @@ def follows_order(wanted, provided):
 class CompiledCompound:
     """``SELECT ... UNION [ALL] | INTERSECT | EXCEPT SELECT ...`` compiled once."""
 
-    def __init__(self, executor, stmt, parent=None):
+    def __init__(self, executor: Executor, stmt: Compound, parent: Scope | None = None) -> None:
         self.parts = [CompiledSelect(executor, select, parent) for select in stmt.selects]
         count = len(self.parts[0].names)
         for operator, part in zip(stmt.operators, self.parts[1:]):
@@ -1747,10 +1774,10 @@ class CompiledCompound:
         self.limit = executor.compile_limit(stmt)
 
     @property
-    def correlated(self):
+    def correlated(self) -> bool:
         return any(part.correlated for part in self.parts)
 
-    def run(self, max_rows=None):
+    def run(self, max_rows: int | None = None) -> list[tuple]:
         rows = self.parts[0].run()
         for operator, part in zip(self.operators, self.parts[1:]):
             rows = combine(operator, rows, part.run())
@@ -1760,15 +1787,15 @@ class CompiledCompound:
 
 
 class PreparedSelect:
-    def __init__(self, compiled):
+    def __init__(self, compiled: CompiledQuery) -> None:
         self.compiled = compiled
 
-    def run(self):
+    def run(self) -> Result:
         return Result(self.compiled.run(), self.compiled.names)
 
 
 class PreparedInsert:
-    def __init__(self, executor, stmt):
+    def __init__(self, executor: Executor, stmt: Insert) -> None:
         self.executor = executor
         table = self.table = executor.catalog.get_table(stmt.table)
         width = len(table.columns)
@@ -1794,7 +1821,7 @@ class PreparedInsert:
             self.rows.append([compiler.compile(e) for e in exprs])
         self.tree = executor.catalog.table_tree(table)
 
-    def run(self):
+    def run(self) -> Result:
         executor, table, width = self.executor, self.table, len(self.table.columns)
         # All VALUES are computed first: SQLite evaluates their (constant)
         # subqueries once, before any row is inserted.
@@ -1812,7 +1839,7 @@ class PreparedInsert:
 class PreparedSingleTable:
     """The part of UPDATE / DELETE that finds the rows matching WHERE."""
 
-    def __init__(self, executor, table_name, where):
+    def __init__(self, executor: Executor, table_name: str, where: Expr | None) -> None:
         self.executor = executor
         self.table = executor.catalog.get_table(table_name)
         self.tree = executor.catalog.table_tree(self.table)
@@ -1821,14 +1848,14 @@ class PreparedSingleTable:
         self.levels = executor.plan_joins(self.scope, joins, where)
         self.rowid_slot = self.scope.rowid_slot(0)
 
-    def matching_rows(self):
+    def matching_rows(self) -> list[tuple[int, Row]]:
         """(rowid, row copy) of every matching row, all found before any change."""
         slot = self.rowid_slot
         return [(row[slot], list(row)) for row in self.executor.join_rows(self.scope, self.levels)]
 
 
 class PreparedUpdate(PreparedSingleTable):
-    def __init__(self, executor, stmt):
+    def __init__(self, executor: Executor, stmt: Update) -> None:
         super().__init__(executor, stmt.table, stmt.where)
         table, width = self.table, len(self.table.columns)
         compiler = Compiler(self.scope, executor=executor)
@@ -1841,7 +1868,7 @@ class PreparedUpdate(PreparedSingleTable):
                 position = width if table.rowid_column is None else table.rowid_column
             self.assignments.append((position, compiler.compile(expr)))
 
-    def run(self):
+    def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
         width = len(table.columns)
         matches = self.matching_rows()
@@ -1871,11 +1898,11 @@ class PreparedUpdate(PreparedSingleTable):
 
 
 class PreparedDelete(PreparedSingleTable):
-    def __init__(self, executor, stmt):
+    def __init__(self, executor: Executor, stmt: Delete) -> None:
         super().__init__(executor, stmt.table, stmt.where)
         self.delete_all = stmt.where is None
 
-    def run(self):
+    def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
         if self.delete_all:
             count = len(tree)
@@ -1890,7 +1917,7 @@ class PreparedDelete(PreparedSingleTable):
         return Result(rowcount=len(matches))
 
 
-def combine(operator, left, right):
+def combine(operator: str, left: list[tuple], right: list[tuple]) -> list[tuple]:
     """Apply a compound operator.  Like SQLite, the distinct forms return rows
     in sorted order, and a later duplicate replaces an earlier one."""
     if operator == "UNION ALL":
@@ -1917,7 +1944,7 @@ def combine(operator, left, right):
 class ColumnName:
     __slots__ = ("name",)
 
-    def __init__(self, name):
+    def __init__(self, name: str) -> None:
         self.name = name
 
 
@@ -1928,7 +1955,7 @@ class DerivedSource:
     rowid_column = None
     indexes = ()
 
-    def __init__(self, name, compiled):
+    def __init__(self, name: str, compiled: CompiledQuery) -> None:
         self.name = name or "subquery"
         self.compiled = compiled
         self.columns = [ColumnName(name) for name in compiled.names]
@@ -1938,14 +1965,14 @@ class DerivedSource:
             self.positions.setdefault(name.lower(), i)
         self.rows = []
 
-    def column_index(self, name):
+    def column_index(self, name: str) -> int | None:
         return self.positions.get(name.lower())
 
-    def materialize(self):
+    def materialize(self) -> None:
         self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
 
 
-def folded_literal(expr):
+def folded_literal(expr: Expr) -> Literal | None:
     """The literal SQLite's parser reduces ``expr`` to, or None.
 
     The parser folds ``X AND 0`` / ``0 AND X`` to 0 unless a side calls a
@@ -1975,7 +2002,7 @@ def folded_literal(expr):
     return None
 
 
-def fold_and(expr):
+def fold_and(expr: Expr | None) -> Expr | None:
     """``expr`` with every AND that SQLite's parser folds to 0 replaced by 0."""
     if isinstance(expr, Binary) and expr.op == "AND":
         folded = Binary("AND", fold_and(expr.left), fold_and(expr.right))
@@ -1983,7 +2010,7 @@ def fold_and(expr):
     return expr
 
 
-def constant_integer(expr):
+def constant_integer(expr: Expr) -> int | None:
     """The value of ``expr`` if SQLite treats it as a column number in
     ORDER BY / GROUP BY: an integer (after parser folding) that fits in 32
     bits, under any number of unary + and -.  Otherwise None."""
@@ -2000,12 +2027,12 @@ def constant_integer(expr):
     return None
 
 
-def ordinal(n):
+def ordinal(n: int) -> str:
     suffix = "th" if 10 <= n % 100 <= 20 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"
 
 
-def distinct_records(records):
+def distinct_records(records: Iterable[Record]) -> Iterator[Record]:
     """Drop records with duplicate output rows, keeping the first;
     1 and 1.0 count as equal."""
     seen = set()
@@ -2022,17 +2049,17 @@ class Descending:
 
     __slots__ = ("key",)
 
-    def __init__(self, key):
+    def __init__(self, key: tuple) -> None:
         self.key = key
 
-    def __lt__(self, other):
+    def __lt__(self, other: Descending) -> bool:
         return other.key < self.key
 
-    def __eq__(self, other):
+    def __eq__(self, other: object) -> bool:
         return self.key == other.key
 
 
-def order_key(terms):
+def order_key(terms: list[OrderTerm]) -> Callable[[Record], list]:
     """A key function for (output, keys) records ordering by ``terms``."""
     sort_key = values.sort_key
     parts = []
@@ -2055,7 +2082,7 @@ def order_key(terms):
     return key
 
 
-def order_records(records, terms, start=0, end=None):
+def order_records(records: Iterable[Record], terms: list[OrderTerm], start: int = 0, end: int | None = None) -> list[Record]:
     """Sort records by ORDER BY ``terms`` (stably) and keep [start:end].
     With a LIMIT only the first ``end`` records are kept while sorting."""
     key = order_key(terms)

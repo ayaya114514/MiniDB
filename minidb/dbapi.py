@@ -17,9 +17,13 @@ Transactions follow Python 3.12's sqlite3 ``autocommit`` attribute:
   BEGIN ... COMMIT; ``commit()`` and ``rollback()`` do nothing.
 """
 
-import os
+from __future__ import annotations
 
-from minidb.database import Database
+import os
+from collections.abc import Iterable
+from typing import Any
+
+from minidb.database import Database, Parameters
 from minidb.errors import (  # noqa: F401 - re-exported as PEP 249 requires
     DatabaseError, DataError, Error, IntegrityError, InterfaceError, InternalError,
     NotSupportedError, OperationalError, ProgrammingError, Warning,
@@ -31,7 +35,7 @@ threadsafety = 1  # threads may share the module but not connections
 paramstyle = "qmark"  # "?"; ":name", "@name", "$name" and "?NNN" work too
 
 
-def connect(database=":memory:", autocommit=False):
+def connect(database: str | os.PathLike = ":memory:", autocommit: bool = False) -> Connection:
     """Open a connection; ``database`` is a file path or ":memory:"."""
     return Connection(database, autocommit)
 
@@ -48,7 +52,7 @@ class Connection:
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
 
-    def __init__(self, database=":memory:", autocommit=False):
+    def __init__(self, database: str | os.PathLike = ":memory:", autocommit: bool = False) -> None:
         path = None if database == ":memory:" else os.fspath(database)
         self._db = Database(path)
         self.autocommit = autocommit
@@ -56,40 +60,40 @@ class Connection:
             self._db.execute("BEGIN")
 
     @property
-    def database(self):
+    def database(self) -> Database:
         """The underlying ``minidb.database.Database``."""
         if self._db is None:
             raise ProgrammingError("Cannot operate on a closed database.")
         return self._db
 
     @property
-    def in_transaction(self):
+    def in_transaction(self) -> bool:
         return self.database.in_transaction
 
     @property
-    def total_changes(self):
+    def total_changes(self) -> int:
         return self.database.total_changes
 
-    def cursor(self):
+    def cursor(self) -> Cursor:
         self.database  # raises if closed
         return Cursor(self)
 
-    def execute(self, sql, parameters=()):
+    def execute(self, sql: str, parameters: Parameters = ()) -> Cursor:
         return self.cursor().execute(sql, parameters)
 
-    def executemany(self, sql, seq_of_parameters):
+    def executemany(self, sql: str, seq_of_parameters: Iterable[Parameters]) -> Cursor:
         return self.cursor().executemany(sql, seq_of_parameters)
 
-    def executescript(self, sql):
+    def executescript(self, sql: str) -> Cursor:
         return self.cursor().executescript(sql)
 
-    def commit(self):
+    def commit(self) -> None:
         self._end_transaction("COMMIT")
 
-    def rollback(self):
+    def rollback(self) -> None:
         self._end_transaction("ROLLBACK")
 
-    def _end_transaction(self, sql):
+    def _end_transaction(self, sql: str) -> None:
         db = self.database
         if self.autocommit:
             return
@@ -97,16 +101,16 @@ class Connection:
             db.execute(sql)
         db.execute("BEGIN")
 
-    def close(self):
+    def close(self) -> None:
         """Close the connection; an uncommitted transaction is rolled back."""
         if self._db is not None:
             self._db.close()
             self._db = None
 
-    def __enter__(self):
+    def __enter__(self) -> Connection:
         return self
 
-    def __exit__(self, exc_type, exc, traceback):
+    def __exit__(self, exc_type: type | None, exc: BaseException | None, traceback: object) -> bool:
         """Commit if the block succeeded, roll back if it raised (like sqlite3)."""
         if exc_type is None:
             self.commit()
@@ -116,7 +120,7 @@ class Connection:
 
 
 class Cursor:
-    def __init__(self, connection):
+    def __init__(self, connection: Connection) -> None:
         self.connection = connection
         self.arraysize = 1
         self.description = None
@@ -126,24 +130,24 @@ class Cursor:
         self._position = 0
         self._closed = False
 
-    def _database(self):
+    def _database(self) -> Database:
         if self._closed:
             raise ProgrammingError("Cannot operate on a closed cursor.")
         return self.connection.database
 
-    def _single_statement(self, sql):
+    def _single_statement(self, sql: str) -> Any:
         statements = self._database().parse(sql)
         if len(statements) > 1:
             raise ProgrammingError("You can only execute one statement at a time.")
         return statements[0] if statements else None
 
-    def _reset(self):
+    def _reset(self) -> None:
         self.description = None
         self.rowcount = -1
         self._rows = []
         self._position = 0
 
-    def execute(self, sql, parameters=()):
+    def execute(self, sql: str, parameters: Parameters = ()) -> Cursor:
         statement = self._single_statement(sql)
         self._reset()
         if statement is None:
@@ -157,7 +161,7 @@ class Cursor:
         self.lastrowid = db.last_insert_rowid
         return self
 
-    def executemany(self, sql, seq_of_parameters):
+    def executemany(self, sql: str, seq_of_parameters: Iterable[Parameters]) -> Cursor:
         statement = self._single_statement(sql)
         self._reset()
         if statement is None:
@@ -171,7 +175,7 @@ class Cursor:
         self.rowcount = total  # lastrowid is left alone, as in sqlite3
         return self
 
-    def executescript(self, sql):
+    def executescript(self, sql: str) -> Cursor:
         """Run several statements (no implicit transaction handling)."""
         self._reset()
         self._database().execute(sql)
@@ -179,7 +183,7 @@ class Cursor:
 
     # ---- fetching -------------------------------------------------------
 
-    def fetchone(self):
+    def fetchone(self) -> tuple | None:
         self._database()
         if self._position >= len(self._rows):
             return None
@@ -187,34 +191,34 @@ class Cursor:
         self._position += 1
         return row
 
-    def fetchmany(self, size=None):
+    def fetchmany(self, size: int | None = None) -> list[tuple]:
         self._database()
         size = self.arraysize if size is None else size
         rows = self._rows[self._position:self._position + size]
         self._position += len(rows)
         return rows
 
-    def fetchall(self):
+    def fetchall(self) -> list[tuple]:
         self._database()
         rows = self._rows[self._position:]
         self._position = len(self._rows)
         return rows
 
-    def __iter__(self):
+    def __iter__(self) -> Cursor:
         return self
 
-    def __next__(self):
+    def __next__(self) -> tuple:
         row = self.fetchone()
         if row is None:
             raise StopIteration
         return row
 
-    def close(self):
+    def close(self) -> None:
         self._closed = True
         self._rows = []
 
-    def setinputsizes(self, sizes):
+    def setinputsizes(self, sizes: object) -> None:
         pass
 
-    def setoutputsize(self, size, column=None):
+    def setoutputsize(self, size: object, column: object = None) -> None:
         pass
