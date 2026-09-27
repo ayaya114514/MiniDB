@@ -18,6 +18,8 @@ row of its outer query.
 """
 
 import dataclasses
+import heapq
+import itertools
 import random
 from operator import itemgetter
 
@@ -1395,6 +1397,7 @@ class CompiledSelect:
             self.condition = where.compile(stmt.where)
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
+        self.presorted = False  # set when the access path already yields ORDER BY order
 
     @property
     def correlated(self):
@@ -1412,30 +1415,27 @@ class CompiledSelect:
         else:
             rows = []
         outputs, order_functions = self.outputs, self.order_functions
-        records = []
-        if not self.is_aggregate:
-            stop = max_rows
-            if self.distinct or self.order_terms or self.limit is not None:
-                stop = None
-            for row in rows:
-                records.append((tuple(f(row) for f in outputs), tuple(f(row) for f in order_functions)))
-                if stop is not None and len(records) >= stop:
-                    break
-        else:
+        start, end = self.limit() if self.limit is not None else (0, None)
+        if max_rows is not None and not self.order_terms and not self.distinct:
+            end = max_rows if end is None else min(end, start + max_rows)
+        if self.is_aggregate:
             truth, having = values.truth, self.having
-            groups = self.executor.group_rows(rows, self.scope, self.group_functions, self.aggregates)
-            for group_row in groups:
-                if having is None or truth(having(group_row)):
-                    records.append((
-                        tuple(f(group_row) for f in outputs),
-                        tuple(f(group_row) for f in order_functions),
-                    ))
+            rows = (
+                group_row
+                for group_row in self.executor.group_rows(
+                    rows, self.scope, self.group_functions, self.aggregates
+                )
+                if having is None or truth(having(group_row))
+            )
+        records = ((tuple(f(row) for f in outputs), tuple(f(row) for f in order_functions))
+                   for row in rows)
         if self.distinct:
             records = distinct_records(records)
-        records = sort_records(records, self.order_terms)
-        if self.limit is not None:
-            start, end = self.limit()
-            records = records[start:end]
+        if self.presorted or not self.order_terms:
+            # Rows already come in ORDER BY order: stop as soon as LIMIT is met.
+            records = itertools.islice(records, start, end)
+        else:
+            records = order_records(records, self.order_terms, start, end)
         return [output for output, _ in records]
 
 
@@ -1466,10 +1466,8 @@ class CompiledCompound:
         rows = self.parts[0].run()
         for operator, part in zip(self.operators, self.parts[1:]):
             rows = combine(operator, rows, part.run())
-        records = sort_records([(row, ()) for row in rows], self.order_terms)
-        if self.limit is not None:
-            start, end = self.limit()
-            records = records[start:end]
+        start, end = self.limit() if self.limit is not None else (0, None)
+        records = order_records([(row, ()) for row in rows], self.order_terms, start, end)
         return [row for row, _ in records]
 
 
@@ -1707,30 +1705,59 @@ def ordinal(n):
 
 
 def distinct_records(records):
-    """Remove records with duplicate output rows, keeping the first;
+    """Drop records with duplicate output rows, keeping the first;
     1 and 1.0 count as equal."""
     seen = set()
-    result = []
+    sort_key = values.sort_key
     for record in records:
-        key = tuple(values.sort_key(v) for v in record[0])
+        key = tuple(sort_key(v) for v in record[0])
         if key not in seen:
             seen.add(key)
-            result.append(record)
-    return result
+            yield record
 
 
-def sort_records(records, terms):
-    """Sort (output, keys) records by ORDER BY terms using stable sorts from the
-    last term to the first."""
+class Descending:
+    """Wraps a sort key so that it orders in reverse (for DESC terms)."""
+
+    __slots__ = ("key",)
+
+    def __init__(self, key):
+        self.key = key
+
+    def __lt__(self, other):
+        return other.key < self.key
+
+    def __eq__(self, other):
+        return self.key == other.key
+
+
+def order_key(terms):
+    """A key function for (output, keys) records ordering by ``terms``."""
     sort_key = values.sort_key
-    for source, index, descending, nulls_first in reversed(terms):
-        column = 0 if source == "output" else 1
-        # Where NULLs go in the ascending order that is (maybe) reversed afterwards.
-        null_rank = 0 if nulls_first != descending else 2
+    parts = []
+    for source, index, descending, nulls_first in terms:
+        parts.append((0 if source == "output" else 1, index, descending,
+                      (0,) if nulls_first else (2,)))
 
-        def key(record, column=column, index=index, null_rank=null_rank):
+    def key(record):
+        result = []
+        for column, index, descending, null_key in parts:
             value = record[column][index]
-            return (null_rank, 0) if value is None else (1, sort_key(value))
+            if value is None:
+                result.append(null_key)
+            elif descending:
+                result.append((1, Descending(sort_key(value))))
+            else:
+                result.append((1, sort_key(value)))
+        return result
 
-        records.sort(key=key, reverse=descending)
-    return records
+    return key
+
+
+def order_records(records, terms, start=0, end=None):
+    """Sort records by ORDER BY ``terms`` (stably) and keep [start:end].
+    With a LIMIT only the first ``end`` records are kept while sorting."""
+    key = order_key(terms)
+    if end is not None:
+        return heapq.nsmallest(end, records, key=key)[start:]
+    return sorted(records, key=key)[start:end]
