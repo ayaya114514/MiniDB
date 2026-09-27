@@ -303,5 +303,11 @@ def resolve_parameters(stmt: Any, parameters: Parameters | None) -> list[SQLValu
             f"{count}, and there are {len(parameters)} supplied."
         )
     for index, value in enumerate(parameters, 1):
+        name = stmt.param_names.get(index)
+        if name is not None:  # Python 3.14's rule (3.12 and 3.13 only warn)
+            raise ProgrammingError(
+                f"Binding {index} ('{name}') is a named parameter, but you supplied a "
+                "sequence which requires nameless (qmark) placeholders."
+            )
         values[index - 1] = adapt(value, index)
     return values
