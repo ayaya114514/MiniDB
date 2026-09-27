@@ -1,5 +1,6 @@
 """Differential testing helper: run the same SQL on MiniDB and sqlite3."""
 
+import re
 import sqlite3
 
 from minidb.database import Database
@@ -12,9 +13,24 @@ def typed(row):
     return tuple((type_name(v), v) for v in row)
 
 
+_FULL_PRECISION_REAL = re.compile(r"-?\d+\.\d{12,}(e[+-]\d+)?\Z|-?\d\.\d{12,}e[+-]\d+\Z")
+
+
+def _loose_value(v):
+    if isinstance(v, (int, float)):
+        return ("number", v)
+    if isinstance(v, str) and _FULL_PRECISION_REAL.match(v):
+        # A REAL rendered as text with 16-17 digits: SQLite's approximate
+        # digit generation may differ in the last digits and need not even
+        # round-trip (DECISIONS.md D20), so compare 13 significant digits.
+        return ("real text", format(float(v), ".13g"))
+    return (type_name(v), v)
+
+
 def loose(row):
-    """Compare numbers by value only (1 == 1.0 == 1.0, 0 == -0.0)."""
-    return tuple(("number", v) if isinstance(v, (int, float)) else (type_name(v), v) for v in row)
+    """Compare numbers by value only (1 == 1.0 == 1.0, 0 == -0.0), and
+    full-precision REALs rendered as text by the double they denote."""
+    return tuple(_loose_value(v) for v in row)
 
 
 def row_order_key(normalized_row):
