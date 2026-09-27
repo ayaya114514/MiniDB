@@ -26,9 +26,9 @@ from minidb.btree import BTreeError, DuplicateKeyError
 from minidb.catalog import HIGH
 from minidb.errors import IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
-    Between, Binary, Bound, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
-    Delete, DerivedTable, DropIndex, DropTable, Exists, Explain, InList, InSelect, Insert, Join,
-    Like, Literal, Select, Star, Subquery, TableRef, Unary, Update,
+    Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable, Delete,
+    DerivedTable, DropIndex, DropTable, Exists, Explain, InList, InSelect, Insert, Join, Like,
+    Literal, Parameter, Select, Star, Subquery, TableRef, Unary, Update,
 )
 from minidb.record import decode_record, encode_record
 
@@ -280,6 +280,10 @@ class Compiler:
         if isinstance(expr, Literal):
             value = expr.value
             return (lambda row: value), None
+        if isinstance(expr, Parameter):
+            # Read at run time, so a prepared plan works for any bound values.
+            parameters, i = self.executor.parameters, expr.index - 1
+            return (lambda row: parameters[i]), None
         if isinstance(expr, Column):
             slot, affinity, _, depth = self.scope.resolve(expr)
             if depth == 0:
@@ -464,6 +468,7 @@ class Compiler:
                 return transform(compiled.run(max_rows))
             return run_correlated
         cache = []
+        self.executor.once_caches.append(cache)  # emptied before every execution
 
         def run_once(row):
             if not cache:
@@ -872,16 +877,18 @@ class Executor:
     def __init__(self, catalog):
         self.catalog = catalog
         self.last_insert_rowid = 0
+        self.parameters = []  # values of ?-parameters; compiled plans read this list
+        self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
 
-    def execute(self, stmt):
-        if isinstance(stmt, (Select, Compound)):
-            return self.select(stmt)
-        if isinstance(stmt, Insert):
-            return self.insert(stmt)
-        if isinstance(stmt, Update):
-            return self.update(stmt)
-        if isinstance(stmt, Delete):
-            return self.delete(stmt)
+    def execute(self, stmt, parameters=()):
+        """Execute a parsed statement with the given parameter values (a list
+        indexed by parameter number - 1)."""
+        self.parameters[:] = parameters
+        if isinstance(stmt, (Select, Compound, Insert, Update, Delete)):
+            plan = self.prepare(stmt)
+            for cache in plan.once_caches:
+                cache.clear()
+            return plan.run()
         if isinstance(stmt, CreateTable):
             self.catalog.create_table(stmt)
             return Result()
@@ -896,6 +903,25 @@ class Executor:
         if isinstance(stmt, Explain):
             return self.explain(stmt.statement)
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
+
+    def prepare(self, stmt):
+        """The compiled plan of a SELECT/INSERT/UPDATE/DELETE.  Plans are kept
+        on the (cached) syntax tree and reused until the schema changes."""
+        cached = getattr(stmt, "_plan", None)
+        if cached is not None and cached[0] == self.catalog.version:
+            return cached[1]
+        self.once_caches = []
+        if isinstance(stmt, (Select, Compound)):
+            plan = PreparedSelect(self.compile_query(stmt))
+        elif isinstance(stmt, Insert):
+            plan = PreparedInsert(self, stmt)
+        elif isinstance(stmt, Update):
+            plan = PreparedUpdate(self, stmt)
+        else:
+            plan = PreparedDelete(self, stmt)
+        plan.once_caches = self.once_caches
+        stmt._plan = (self.catalog.version, plan)
+        return plan
 
     # ---- reading rows ------------------------------------------------------
 
@@ -1050,15 +1076,6 @@ class Executor:
 
         return visit(0)
 
-    def matching_rows(self, table, where):
-        """Yield (rowid, row copy) for rows of a single table satisfying ``where``."""
-        scope = Scope()
-        joins, _ = self.build_from([Join(TableRef(table.name))], scope)
-        levels = self.plan_joins(scope, joins, where)
-        slot = scope.rowid_slot(0)
-        for row in self.join_rows(scope, levels):
-            yield row[slot], list(row)
-
     def explain(self, stmt):
         """One row (table, access path) per table the statement reads, in join order."""
         if isinstance(stmt, (Select, Compound)):
@@ -1074,10 +1091,6 @@ class Executor:
         )
 
     # ---- SELECT -------------------------------------------------------------
-
-    def select(self, stmt):
-        compiled = self.compile_query(stmt)
-        return Result(compiled.run(), compiled.names)
 
     def expand_items(self, stmt, scope):
         """Select-list expressions with ``*`` expanded, and the column names."""
@@ -1227,37 +1240,6 @@ class Executor:
 
     # ---- INSERT --------------------------------------------------------------
 
-    def insert(self, stmt):
-        table = self.catalog.get_table(stmt.table)
-        width = len(table.columns)
-        if stmt.columns is None:
-            positions = list(range(width))
-        else:
-            positions = []
-            for name in stmt.columns:
-                position = table.column_index(name)
-                if position is None:
-                    raise OperationalError(f"table {table.name} has no column named {name}")
-                positions.append(position)
-        compiler = Compiler(Scope(), executor=self)
-        rows = []
-        for exprs in stmt.rows:
-            if len(exprs) != len(positions):
-                if stmt.columns is None:
-                    raise OperationalError(
-                        f"table {table.name} has {width} columns "
-                        f"but {len(exprs)} values were supplied"
-                    )
-                raise OperationalError(f"{len(exprs)} values for {len(positions)} columns")
-            rows.append([compiler.compile(e) for e in exprs])
-        tree = self.catalog.table_tree(table)
-        for functions in rows:
-            row = [None] * width
-            for position, function in zip(positions, functions):
-                row[position] = function([])
-            self.last_insert_rowid = self.insert_row(table, tree, row)
-        return Result(rowcount=len(rows))
-
     def prepare_row(self, table, row):
         """Apply column affinities and NOT NULL checks; returns the requested row id."""
         for i, affinity in enumerate(table.affinities):
@@ -1342,65 +1324,6 @@ class Executor:
             return IntegrityError(f"UNIQUE constraint failed: {table.name}.rowid")
         name = table.columns[table.rowid_column].name
         return IntegrityError(f"UNIQUE constraint failed: {table.name}.{name}")
-
-    # ---- UPDATE --------------------------------------------------------------
-
-    def update(self, stmt):
-        table = self.catalog.get_table(stmt.table)
-        width = len(table.columns)
-        scope = Scope()
-        scope.add(table)
-        compiler = Compiler(scope, executor=self)
-        assignments = []
-        for name, expr in stmt.assignments:
-            position = table.column_index(name)
-            if position is None:
-                if name.lower() not in ROWID_NAMES:
-                    raise OperationalError(f"no such column: {name}")
-                position = width if table.rowid_column is None else table.rowid_column
-            assignments.append((position, compiler.compile(expr)))
-        tree = self.catalog.table_tree(table)
-        matches = list(self.matching_rows(table, stmt.where))
-        for rowid, old in matches:
-            new = list(old)
-            for position, function in assignments:
-                new[position] = function(old)
-            row = new[:width]
-            if table.rowid_column is None:
-                new_rowid = values.numeric_affinity(new[width])
-                if not isinstance(new_rowid, int):
-                    raise IntegrityError("datatype mismatch")
-                self.prepare_row(table, row)
-            else:
-                new_rowid = self.prepare_row(table, row)
-                if new_rowid is None:
-                    raise IntegrityError("datatype mismatch")
-            if new_rowid != rowid and new_rowid in tree:
-                raise self.rowid_conflict(table)
-            self.check_unique(table, row, rowid)
-            self.remove_index_entries(table, old, rowid)
-            if new_rowid != rowid:
-                tree.delete(rowid)
-            tree.insert(new_rowid, self.encode(table, row), replace=True)
-            self.add_index_entries(table, row, new_rowid)
-        return Result(rowcount=len(matches))
-
-    # ---- DELETE --------------------------------------------------------------
-
-    def delete(self, stmt):
-        table = self.catalog.get_table(stmt.table)
-        tree = self.catalog.table_tree(table)
-        if stmt.where is None:
-            count = len(tree)
-            tree.clear()
-            for index in table.indexes:
-                self.catalog.index_tree(index).clear()
-            return Result(rowcount=count)
-        matches = list(self.matching_rows(table, stmt.where))
-        for rowid, row in matches:
-            self.remove_index_entries(table, row, rowid)
-            tree.delete(rowid)
-        return Result(rowcount=len(matches))
 
     # ---- indexes -------------------------------------------------------------
 
@@ -1550,6 +1473,132 @@ class CompiledCompound:
         return [row for row, _ in records]
 
 
+class PreparedSelect:
+    def __init__(self, compiled):
+        self.compiled = compiled
+
+    def run(self):
+        return Result(self.compiled.run(), self.compiled.names)
+
+
+class PreparedInsert:
+    def __init__(self, executor, stmt):
+        self.executor = executor
+        table = self.table = executor.catalog.get_table(stmt.table)
+        width = len(table.columns)
+        if stmt.columns is None:
+            self.positions = list(range(width))
+        else:
+            self.positions = []
+            for name in stmt.columns:
+                position = table.column_index(name)
+                if position is None:
+                    raise OperationalError(f"table {table.name} has no column named {name}")
+                self.positions.append(position)
+        compiler = Compiler(Scope(), executor=executor)
+        self.rows = []
+        for exprs in stmt.rows:
+            if len(exprs) != len(self.positions):
+                if stmt.columns is None:
+                    raise OperationalError(
+                        f"table {table.name} has {width} columns "
+                        f"but {len(exprs)} values were supplied"
+                    )
+                raise OperationalError(f"{len(exprs)} values for {len(self.positions)} columns")
+            self.rows.append([compiler.compile(e) for e in exprs])
+        self.tree = executor.catalog.table_tree(table)
+
+    def run(self):
+        executor, table, width = self.executor, self.table, len(self.table.columns)
+        for functions in self.rows:
+            row = [None] * width
+            for position, function in zip(self.positions, functions):
+                row[position] = function([])
+            executor.last_insert_rowid = executor.insert_row(table, self.tree, row)
+        return Result(rowcount=len(self.rows))
+
+
+class PreparedSingleTable:
+    """The part of UPDATE / DELETE that finds the rows matching WHERE."""
+
+    def __init__(self, executor, table_name, where):
+        self.executor = executor
+        self.table = executor.catalog.get_table(table_name)
+        self.tree = executor.catalog.table_tree(self.table)
+        self.scope = Scope()
+        joins, _ = executor.build_from([Join(TableRef(self.table.name))], self.scope)
+        self.levels = executor.plan_joins(self.scope, joins, where)
+        self.rowid_slot = self.scope.rowid_slot(0)
+
+    def matching_rows(self):
+        """(rowid, row copy) of every matching row, all found before any change."""
+        slot = self.rowid_slot
+        return [(row[slot], list(row)) for row in self.executor.join_rows(self.scope, self.levels)]
+
+
+class PreparedUpdate(PreparedSingleTable):
+    def __init__(self, executor, stmt):
+        super().__init__(executor, stmt.table, stmt.where)
+        table, width = self.table, len(self.table.columns)
+        compiler = Compiler(self.scope, executor=executor)
+        self.assignments = []
+        for name, expr in stmt.assignments:
+            position = table.column_index(name)
+            if position is None:
+                if name.lower() not in ROWID_NAMES:
+                    raise OperationalError(f"no such column: {name}")
+                position = width if table.rowid_column is None else table.rowid_column
+            self.assignments.append((position, compiler.compile(expr)))
+
+    def run(self):
+        executor, table, tree = self.executor, self.table, self.tree
+        width = len(table.columns)
+        matches = self.matching_rows()
+        for rowid, old in matches:
+            new = list(old)
+            for position, function in self.assignments:
+                new[position] = function(old)
+            row = new[:width]
+            if table.rowid_column is None:
+                new_rowid = values.numeric_affinity(new[width])
+                if not isinstance(new_rowid, int):
+                    raise IntegrityError("datatype mismatch")
+                executor.prepare_row(table, row)
+            else:
+                new_rowid = executor.prepare_row(table, row)
+                if new_rowid is None:
+                    raise IntegrityError("datatype mismatch")
+            if new_rowid != rowid and new_rowid in tree:
+                raise executor.rowid_conflict(table)
+            executor.check_unique(table, row, rowid)
+            executor.remove_index_entries(table, old, rowid)
+            if new_rowid != rowid:
+                tree.delete(rowid)
+            tree.insert(new_rowid, executor.encode(table, row), replace=True)
+            executor.add_index_entries(table, row, new_rowid)
+        return Result(rowcount=len(matches))
+
+
+class PreparedDelete(PreparedSingleTable):
+    def __init__(self, executor, stmt):
+        super().__init__(executor, stmt.table, stmt.where)
+        self.delete_all = stmt.where is None
+
+    def run(self):
+        executor, table, tree = self.executor, self.table, self.tree
+        if self.delete_all:
+            count = len(tree)
+            tree.clear()
+            for index in table.indexes:
+                executor.catalog.index_tree(index).clear()
+            return Result(rowcount=count)
+        matches = self.matching_rows()
+        for rowid, row in matches:
+            executor.remove_index_entries(table, row, rowid)
+            tree.delete(rowid)
+        return Result(rowcount=len(matches))
+
+
 def combine(operator, left, right):
     """Apply a compound operator.  Like SQLite, the distinct forms return rows
     in sorted order, and a later duplicate replaces an earlier one."""
@@ -1613,8 +1662,6 @@ def folded_literal(expr):
     (looking through unary + and -).  Folded values are only observable
     through ORDER BY / GROUP BY column numbers.
     """
-    if isinstance(expr, Bound):
-        return None  # bound parameters are values, never folded or column numbers
     if isinstance(expr, Literal):
         return expr
     if isinstance(expr, Binary) and expr.op == "AND":

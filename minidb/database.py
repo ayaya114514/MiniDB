@@ -1,6 +1,5 @@
 """The public entry point: a connection to one database file."""
 
-import dataclasses
 from collections import OrderedDict
 from collections.abc import Mapping
 
@@ -10,8 +9,8 @@ from minidb.executor import Executor, Result
 from minidb.locking import LockTimeout
 from minidb.pager import Pager
 from minidb.parser import (
-    Begin, Bound, Commit, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Insert,
-    Parameter, Rollback, Update, parse_script,
+    Begin, Commit, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Insert, Rollback,
+    Update, parse_script,
 )
 from minidb.values import INT_MAX, INT_MIN
 
@@ -82,11 +81,12 @@ class Database:
         if parameters is not None and len(statements) > 1:
             raise ProgrammingError("You can only execute one statement at a time.")
         for stmt in statements:
+            values = ()
             if stmt.param_count or parameters is not None:
-                stmt = bind(stmt, resolve_parameters(stmt, parameters))
-            yield self.execute_statement(stmt)
+                values = resolve_parameters(stmt, parameters)
+            yield self.execute_statement(stmt, values)
 
-    def execute_statement(self, stmt):
+    def execute_statement(self, stmt, parameters=()):
         """Run one parsed statement.
 
         Locking: a statement or explicit transaction reads under SHARED.  A
@@ -138,7 +138,7 @@ class Database:
             pager.begin_write(wait=False)
         pager.begin_statement()
         try:
-            result = self.executor.execute(stmt)
+            result = self.executor.execute(stmt, parameters)
         except BaseException:
             pager.rollback_statement()
             self.catalog.load()
@@ -257,11 +257,12 @@ def adapt(value, position):
 
 
 def resolve_parameters(stmt, parameters):
-    """Map the statement's parameter indexes to values (sqlite3's rules and messages)."""
+    """The statement's parameter values as a list indexed by parameter number
+    - 1 (sqlite3's rules and messages)."""
     count = stmt.param_count
     if parameters is None:
         parameters = ()
-    values = {}
+    values = [None] * count
     if isinstance(parameters, Mapping):
         for index in range(1, count + 1):
             name = stmt.param_names.get(index)
@@ -272,7 +273,7 @@ def resolve_parameters(stmt, parameters):
                 )
             if name[1:] not in parameters:
                 raise ProgrammingError(f"You did not supply a value for binding parameter {name}.")
-            values[index] = adapt(parameters[name[1:]], index)
+            values[index - 1] = adapt(parameters[name[1:]], index)
         return values
     parameters = list(parameters)
     if len(parameters) != count:
@@ -281,25 +282,5 @@ def resolve_parameters(stmt, parameters):
             f"{count}, and there are {len(parameters)} supplied."
         )
     for index, value in enumerate(parameters, 1):
-        values[index] = adapt(value, index)
+        values[index - 1] = adapt(value, index)
     return values
-
-
-def bind(node, values):
-    """A copy of the syntax tree ``node`` with every Parameter replaced by its value."""
-    if isinstance(node, Parameter):
-        return Bound(values[node.index])
-    if isinstance(node, (list, tuple)):
-        items = [bind(item, values) for item in node]
-        if all(new is old for new, old in zip(items, node)):
-            return node
-        return type(node)(items)
-    if dataclasses.is_dataclass(node) and not isinstance(node, type):
-        changes = {}
-        for field in dataclasses.fields(node):
-            old = getattr(node, field.name)
-            new = bind(old, values)
-            if new is not old:
-                changes[field.name] = new
-        return dataclasses.replace(node, **changes) if changes else node
-    return node

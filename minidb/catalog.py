@@ -131,6 +131,7 @@ class IndexInfo:
 class Catalog:
     def __init__(self, pager):
         self.pager = pager
+        self.version = 0  # bumped by every schema change; prepared plans check it
         if pager.page_count == 1:
             tree = BTree.create(pager)
             if tree.root != SCHEMA_ROOT:
@@ -140,6 +141,7 @@ class Catalog:
 
     def load(self):
         """(Re)build the in-memory schema from the schema table."""
+        self.version += 1
         self.tables = {}
         self.indexes = {}
         entries = [decode_record(value)[0] + [key] for key, value in self.schema.scan()]
@@ -199,6 +201,7 @@ class Catalog:
             seen.add(column.name.lower())
         if sum(column.primary_key for column in stmt.columns) > 1:
             raise OperationalError(f'table "{stmt.name}" has more than one primary key')
+        self.version += 1
         root = BTree.create(self.pager).root
         table = TableInfo(stmt.name, stmt.columns, root)
         table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql())
@@ -213,6 +216,7 @@ class Catalog:
             if if_exists:
                 return
             raise OperationalError(f"no such table: {name}")
+        self.version += 1
         table = self.tables[name.lower()]
         for index in list(table.indexes):
             self._drop_index(index)
@@ -240,6 +244,7 @@ class Catalog:
         return self._create_index(stmt.name, table, stmt.columns, stmt.unique)
 
     def _create_index(self, name, table, columns, unique):
+        self.version += 1
         root = BTree.create(self.pager, IndexKeyCodec).root
         index = IndexInfo(name, table, columns, unique, root)
         index.schema_key = self._add_entry("index", name, table.name, root, index.sql())
@@ -260,6 +265,7 @@ class Catalog:
         self._drop_index(index)
 
     def _drop_index(self, index):
+        self.version += 1
         self.index_tree(index).destroy()
         self.schema.delete(index.schema_key)
         del self.indexes[index.name.lower()]
