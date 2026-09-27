@@ -59,7 +59,7 @@ def test_text_column_compared_with_integer_column_cannot_use_index():
     # x = y converts x to a number, so the index on x (ordered as text) is unusable ...
     assert plan(db, "SELECT * FROM n JOIN s ON s.x = n.y") == ["SCAN", "SCAN"]
     # ... but the index on y is fine: the text side is converted instead.
-    assert plan(db, "SELECT * FROM s JOIN n ON s.x = n.y") == ["SCAN", "SEARCH USING INDEX n_y (y=?)"]
+    assert plan(db, "SELECT * FROM s JOIN n ON s.x = n.y") == ["SCAN", "SEARCH USING COVERING INDEX n_y (y=?)"]
 
 
 def test_join_uses_index_and_rowid_on_inner_table(db):
