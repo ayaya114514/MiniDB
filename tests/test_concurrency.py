@@ -202,8 +202,10 @@ READER = textwrap.dedent("""
         n = db.execute("SELECT n FROM counter")[0][0]
         logged = db.execute("SELECT count(*) FROM log")[0][0]
         db.execute("COMMIT")
-        assert total == 5000, total
-        assert n == logged, (n, logged)
+        assert total == 5000, total  # transfers happen only inside transactions
+        # Autocommit rounds bump the counter and insert the log row as two
+        # separate commits, so each worker may be one step ahead in between.
+        assert 0 <= n - logged <= int(sys.argv[3]), (n, logged)
         checks += 1
     print(checks)
 """)
@@ -229,7 +231,8 @@ def test_many_processes_lose_no_updates_and_see_only_whole_commits(tmp_path):
         for w in range(workers)
     ]
     reader = subprocess.Popen(
-        [sys.executable, str(reader_script), path, "3"], stdout=subprocess.PIPE, text=True
+        [sys.executable, str(reader_script), path, "3", str(workers)],
+        stdout=subprocess.PIPE, text=True,
     )
     assert [p.wait(timeout=120) for p in procs] == [0] * workers
     out, _ = reader.communicate(timeout=120)
