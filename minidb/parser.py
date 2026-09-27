@@ -226,6 +226,13 @@ class Select:
 
 
 @dataclass
+class Analyze:
+    """``ANALYZE [table or index]``: gather statistics for the planner."""
+
+    name: str | None = None
+
+
+@dataclass
 class Begin:
     mode: str = "DEFERRED"  # DEFERRED, IMMEDIATE or EXCLUSIVE
 
@@ -391,6 +398,8 @@ class Parser:
         if self.accept_keyword("ROLLBACK"):
             self.accept_keyword("TRANSACTION")
             return Rollback()
+        if self.accept_keyword("ANALYZE"):
+            return Analyze(self.identifier("table name") if self.tok.kind == "IDENT" else None)
         if self.accept_keyword("EXPLAIN"):
             if self.tok.kind == "IDENT" and self.tok.text.upper() == "QUERY":
                 self.advance()

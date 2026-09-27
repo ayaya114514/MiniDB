@@ -28,7 +28,7 @@ from minidb.btree import BTreeError, DuplicateKeyError
 from minidb.catalog import HIGH
 from minidb.errors import IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
-    Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable, Delete,
+    Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable, Delete,
     DerivedTable, DropIndex, DropTable, Exists, Explain, InList, InSelect, Insert, Join, Like,
     Literal, Parameter, Select, Star, Subquery, TableRef, Unary, Update,
 )
@@ -617,6 +617,20 @@ class AggregateCollector:
 
 
 # ---- access paths --------------------------------------------------------------
+#
+# Every access path yields (rowid, record or row) candidates for one table,
+# reports the order it yields rows in, and estimates (rows, cost) so the
+# planner can compare them.  Costs are in "row visits": reading a row from a
+# table scan costs 1, finding one through an index costs a seek plus a table
+# lookup.
+
+SEEK_COST = 4  # descending a B+ tree
+FETCH_COST = 2  # looking a row up in the table after finding it in an index
+RANGE_FACTOR = 4  # a range condition keeps a quarter of the rows (one bound)
+# Without ANALYZE statistics, like SQLite: a table has at least this many rows
+# and an equality on an index column matches about this many.
+DEFAULT_MIN_ROWS = 100
+DEFAULT_EQUAL_ROWS = 10
 
 
 class DerivedScan:
@@ -631,13 +645,17 @@ class DerivedScan:
     def order(self):
         return None
 
+    def estimate(self):
+        return 100, 100  # unknown until the subquery runs
+
     def describe(self):
         return "SCAN SUBQUERY"
 
 
 class FullScan:
-    def __init__(self, tree):
+    def __init__(self, tree, rows):
         self.tree = tree
+        self.rows = rows
 
     def candidates(self, row):
         return self.tree.scan()
@@ -645,6 +663,9 @@ class FullScan:
     def order(self):
         """(columns the rows come ordered by, columns that are constant)."""
         return [ROWID], set()
+
+    def estimate(self):
+        return self.rows, self.rows
 
     def describe(self):
         return "SCAN"
@@ -657,19 +678,26 @@ class RowidLookup:
         self.tree = tree
         self.key_functions = key_functions
 
-    def candidates(self, row):
+    def rowids(self, row):
         keys = set()
         for key_function in self.key_functions:
             key = values.numeric_affinity(key_function(row))
             if isinstance(key, int):
                 keys.add(key)
-        for key in sorted(keys):
+        return sorted(keys)
+
+    def candidates(self, row):
+        for key in self.rowids(row):
             value = self.tree.get(key)
             if value is not None:
                 yield key, value
 
     def order(self):
         return [ROWID], set()
+
+    def estimate(self):
+        count = len(self.key_functions)
+        return count, count * SEEK_COST
 
     def describe(self):
         return "SEARCH USING ROWID (=)"
@@ -678,10 +706,11 @@ class RowidLookup:
 class RowidRange:
     """Rows whose row id lies between optional lower and upper bounds."""
 
-    def __init__(self, tree, lower, upper):
+    def __init__(self, tree, lower, upper, rows):
         self.tree = tree
         self.lower = lower  # (key function, inclusive) or None
         self.upper = upper
+        self.rows = rows
 
     def candidates(self, row):
         start = end = None
@@ -700,8 +729,15 @@ class RowidRange:
             end_inclusive = self.upper[1]
         return self.tree.scan(start, end, start_inclusive, end_inclusive)
 
+    def rowids(self, row):
+        return [key for key, _ in self.candidates(row)]
+
     def order(self):
         return [ROWID], set()
+
+    def estimate(self):
+        rows = max(1, self.rows // (RANGE_FACTOR ** (bool(self.lower) + bool(self.upper))))
+        return rows, rows + SEEK_COST
 
     def describe(self):
         return "SEARCH USING ROWID (range)"
@@ -711,13 +747,14 @@ class IndexScan:
     """Rows found through a secondary index: equality on a prefix of its
     columns, optionally followed by a range on the next column."""
 
-    def __init__(self, index, index_tree, table_tree, equal, lower, upper):
+    def __init__(self, index, index_tree, table_tree, equal, lower, upper, table_rows):
         self.index = index
         self.index_tree = index_tree
         self.table_tree = table_tree
         self.equal = equal  # key functions for the leading columns
         self.lower = lower  # (key function, inclusive) or None
         self.upper = upper
+        self.table_rows = table_rows
         self.covering = False  # rows are built from index keys alone
 
     @property
@@ -733,13 +770,14 @@ class IndexScan:
         used = {position for index, position in scope.used if index == table_index}
         self.covering = used <= available
 
-    def candidates(self, row):
+    def keys(self, row):
+        """The index keys in range, in order."""
         sort_key = values.sort_key
         prefix = []
         for key_function in self.equal:
             value = key_function(row)
             if value is None:
-                return  # col = NULL is never true
+                return iter(())  # col = NULL is never true
             prefix.append(sort_key(value))
         prefix = tuple(prefix)
         start, start_inclusive = prefix, True
@@ -749,7 +787,7 @@ class IndexScan:
         if self.lower:
             value = self.lower[0](row)
             if value is None:
-                return
+                return iter(())
             if self.lower[1]:
                 start, start_inclusive = prefix + (sort_key(value),), True
             else:
@@ -757,34 +795,54 @@ class IndexScan:
         if self.upper:
             value = self.upper[0](row)
             if value is None:
-                return
+                return iter(())
             if self.upper[1]:
                 end = prefix + (sort_key(value), HIGH)
             else:
                 end, end_inclusive = prefix + (sort_key(value),), False
-        keys = self.index_tree.scan(start, end, start_inclusive, end_inclusive)
+        return (key for key, _ in self.index_tree.scan(start, end, start_inclusive, end_inclusive))
+
+    def rowids(self, row):
+        return [key[-1][1] for key in self.keys(row)]
+
+    def candidates(self, row):
+        keys = self.keys(row)
         if self.covering:
             table = self.index.table
             width, positions, alias = len(table.columns), self.index.positions, table.rowid_column
-            for key, _ in keys:
+            for key in keys:
                 rowid = key[-1][1]
-                row = [None] * width
+                built = [None] * width
                 for position, (rank, *value) in zip(positions, key):
                     if rank:
-                        row[position] = value[0]
+                        built[position] = value[0]
                 if alias is not None:
-                    row[alias] = rowid
-                row.append(rowid)
-                yield rowid, row
+                    built[alias] = rowid
+                built.append(rowid)
+                yield rowid, built
             return
         get = self.table_tree.get
-        for key, _ in keys:
+        for key in keys:
             rowid = key[-1][1]
             yield rowid, get(rowid)
 
     def order(self):
         positions = self.index.positions
         return positions[len(self.equal):] + [ROWID], set(positions[:len(self.equal)])
+
+    def estimate(self):
+        rows = self.table_rows
+        matched = len(self.equal)
+        if matched:
+            if self.index.unique and matched == len(self.index.positions):
+                rows = 1
+            elif self.index.stat_average:
+                rows = self.index.stat_average[matched - 1]
+            else:
+                rows = min(rows, DEFAULT_EQUAL_ROWS / 2 ** (matched - 1))
+        rows = max(1, rows / RANGE_FACTOR ** (bool(self.lower) + bool(self.upper)))
+        per_row = 1 if self.covering else 1 + FETCH_COST
+        return rows, SEEK_COST + rows * per_row
 
     def describe(self):
         names = self.index.column_names
@@ -799,6 +857,43 @@ class IndexScan:
         return f"SEARCH USING {covering}INDEX {self.index.name} ({' AND '.join(parts)})"
 
 
+class MultiScan:
+    """The union of several row id / index lookups: ``col IN (...)`` on an
+    index, or the terms of an OR.  Rows come in row id order."""
+
+    def __init__(self, parts, table_tree, label):
+        self.parts = parts
+        self.table_tree = table_tree
+        self.label = label
+
+    def rowids(self, row):
+        rowids = set()
+        for part in self.parts:
+            rowids.update(part.rowids(row))
+        return sorted(rowids)
+
+    def candidates(self, row):
+        get = self.table_tree.get
+        for rowid in self.rowids(row):
+            record = get(rowid)
+            if record is not None:
+                yield rowid, record
+
+    def order(self):
+        return [ROWID], set()
+
+    def estimate(self):
+        rows = cost = 0
+        for part in self.parts:
+            part_rows, part_cost = part.estimate()
+            rows += part_rows
+            cost += part_cost
+        return rows, cost + rows * FETCH_COST
+
+    def describe(self):
+        return f"MULTI-INDEX {self.label} (" + "; ".join(p.describe() for p in self.parts) + ")"
+
+
 ROWID = -1  # column position standing for the row id in constraints
 
 
@@ -811,8 +906,9 @@ class Constraint:
         self.key = key  # key function(s) evaluated on the outer row
 
 
-def find_constraints(scope, index, conjuncts, compiler):
-    """Constraints on table ``index`` whose other side only uses earlier tables.
+def find_constraints(scope, index, conjuncts, compiler, bound):
+    """Constraints on table ``index`` whose other side only uses the tables in
+    ``bound`` (already joined) or constants.
 
     Keys are converted with the comparison affinity SQLite would apply to
     them; comparisons that would convert the *column* side are unusable.
@@ -820,7 +916,6 @@ def find_constraints(scope, index, conjuncts, compiler):
     entry = scope.entries[index]
     table, offset = entry.table, entry.offset
     rowid_slot = scope.rowid_slot(index)
-    earlier = set(range(index))
     constraints = []
 
     def column_position(expr):
@@ -833,28 +928,32 @@ def find_constraints(scope, index, conjuncts, compiler):
             return ROWID
         return slot - offset
 
-    def key_function(position, expr):
-        if tables_referenced(expr, scope) - earlier:
+    def key_function(position, expr, key_affinity=None):
+        if tables_referenced(expr, scope) - bound:
             return None
         function, affinity = compiler.compile_with_affinity(expr)
         if position == ROWID:
             return function  # row id lookups apply numeric affinity themselves
-        column_conversion, key_conversion = values.comparison_affinities(
-            table.affinities[position], affinity
-        )
-        if column_conversion is not None:
-            return None
-        convert = _AFFINITY_FUNCTIONS.get(key_conversion)
+        if key_affinity is not None:  # IN: the column's affinity applies to the items
+            convert = _AFFINITY_FUNCTIONS.get(table.affinities[position])
+        else:
+            column_conversion, key_conversion = values.comparison_affinities(
+                table.affinities[position], affinity
+            )
+            if column_conversion is not None:
+                return None
+            convert = _AFFINITY_FUNCTIONS.get(key_conversion)
         if convert is None:
             return function
         return lambda row: convert(function(row))
 
     for conjunct in conjuncts:
         if isinstance(conjunct, InList) and not conjunct.negated:
-            if column_position(conjunct.expr) == ROWID:
-                keys = [key_function(ROWID, item) for item in conjunct.items]
+            position = column_position(conjunct.expr)
+            if position is not None:
+                keys = [key_function(position, item, "IN") for item in conjunct.items]
                 if all(keys):
-                    constraints.append(Constraint(ROWID, "IN", keys))
+                    constraints.append(Constraint(position, "IN", keys))
             continue
         if not isinstance(conjunct, Binary) or conjunct.op not in _FLIPPED or conjunct.op == "!=":
             continue
@@ -883,27 +982,31 @@ def _bounds(constraints, position):
     return lower, upper
 
 
-def plan_access(scope, index, catalog, conjuncts, compiler, order_hint=None):
-    """Choose how to read table ``index`` of ``scope`` given the usable conjuncts.
+def split_disjuncts(expr):
+    if isinstance(expr, Binary) and expr.op == "OR":
+        return split_disjuncts(expr.left) + split_disjuncts(expr.right)
+    return [expr]
 
-    Preference: row id lookup, then the index matching the most leading
-    columns by equality (a fully matched UNIQUE index first), then a row id
-    range, then an index range, then a full scan.
-    """
+
+def table_rows(catalog, table):
+    """Rows in ``table``: from ANALYZE if available, else a cheap estimate."""
+    if table.stat_rows is not None:
+        return max(1, table.stat_rows)
+    return max(DEFAULT_MIN_ROWS, catalog.table_tree(table).estimated_count())
+
+
+def access_candidates(scope, index, catalog, conjuncts, compiler, bound, rows):
+    """Every access path the conjuncts allow for table ``index``, full scan first."""
     table = scope.entries[index].table
-    if isinstance(table, DerivedSource):
-        return DerivedScan(table)
     tree = catalog.table_tree(table)
-    constraints = find_constraints(scope, index, conjuncts, compiler)
+    constraints = find_constraints(scope, index, conjuncts, compiler, bound)
+    candidates = [FullScan(tree, rows)]
     for c in constraints:
-        if c.position == ROWID and c.op == "=":
-            return RowidLookup(tree, [c.key])
-        if c.position == ROWID and c.op == "IN":
-            return RowidLookup(tree, c.key)
-    best, best_score = FullScan(tree), 0
+        if c.position == ROWID and c.op in ("=", "IN"):
+            candidates.append(RowidLookup(tree, [c.key] if c.op == "=" else c.key))
     lower, upper = _bounds(constraints, ROWID)
     if lower or upper:
-        best, best_score = RowidRange(tree, lower, upper), 3 + bool(lower and upper)
+        candidates.append(RowidRange(tree, lower, upper, rows))
     for info in table.indexes:
         equal = []
         for position in info.positions:
@@ -914,19 +1017,54 @@ def plan_access(scope, index, catalog, conjuncts, compiler, order_hint=None):
         lower = upper = None
         if len(equal) < len(info.positions):
             lower, upper = _bounds(constraints, info.positions[len(equal)])
-        score = 10 * len(equal) + 2 * bool(lower) + 2 * bool(upper)
-        if info.unique and len(equal) == len(info.positions):
-            score += 500
-        if score > best_score:
-            index_tree = catalog.index_tree(info)
-            best = IndexScan(info, index_tree, tree, equal, lower, upper)
-            best_score = score
-    if best_score == 0 and order_hint is not None and order_hint != ROWID:
+        if equal or lower or upper:
+            candidates.append(IndexScan(info, catalog.index_tree(info), tree, equal, lower, upper, rows))
+        first = info.positions[0]
+        for c in constraints:
+            if c.position == first and c.op == "IN":
+                index_tree = catalog.index_tree(info)
+                parts = [IndexScan(info, index_tree, tree, [key], None, None, rows) for key in c.key]
+                candidates.append(MultiScan(parts, tree, "IN"))
+                break
+    return candidates
+
+
+def plan_access(scope, index, catalog, conjuncts, compiler, order_hint=None, bound=None):
+    """Choose the cheapest way to read table ``index`` of ``scope``.
+
+    ``bound`` is the set of tables joined before it (default: those before it
+    in ``scope``); conditions may use their columns as lookup keys.  An OR
+    whose every term can use a row id or index lookup becomes a union of
+    those lookups."""
+    table = scope.entries[index].table
+    if isinstance(table, DerivedSource):
+        return DerivedScan(table)
+    if bound is None:
+        bound = set(range(index))
+    rows = table_rows(catalog, table)
+    candidates = access_candidates(scope, index, catalog, conjuncts, compiler, bound, rows)
+    for conjunct in conjuncts:
+        terms = split_disjuncts(conjunct)
+        if len(terms) < 2:
+            continue
+        parts = []
+        for term in terms:
+            options = access_candidates(
+                scope, index, catalog, split_conjuncts(term), compiler, bound, rows
+            )[1:]  # without the full scan
+            if not options:
+                break
+            parts.append(min(options, key=lambda a: a.estimate()[1]))
+        else:
+            candidates.append(MultiScan(parts, catalog.table_tree(table), "OR"))
+    best = min(candidates, key=lambda a: a.estimate()[1])  # the first of equals wins
+    if isinstance(best, FullScan) and order_hint is not None and order_hint != ROWID:
         # Nothing narrows the scan, but ORDER BY ... LIMIT wants this column
         # first: walk an index on it in order and stop early.
         for info in table.indexes:
             if info.positions[0] == order_hint:
-                return IndexScan(info, catalog.index_tree(info), tree, [], None, None)
+                tree = catalog.table_tree(table)
+                return IndexScan(info, catalog.index_tree(info), tree, [], None, None, rows)
     return best
 
 
@@ -962,6 +1100,9 @@ class Executor:
             return Result()
         if isinstance(stmt, Explain):
             return self.explain(stmt.statement)
+        if isinstance(stmt, Analyze):
+            self.catalog.analyze(stmt.name)
+            return Result()
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
 
     def prepare(self, stmt):
