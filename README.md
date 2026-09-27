@@ -1,0 +1,149 @@
+# MiniDB
+
+用 Python 从零实现的小型关系数据库，行为以 SQLite 为标准答案：解析并执行 SQL，数据按 4 KB
+页存在单个文件里，表和索引都是 B+ 树，提交通过预写日志（WAL）保证原子性和崩溃恢复。
+
+只依赖 Python 标准库（3.11+），测试用 pytest。约 4,200 行实现代码。
+
+## 功能
+
+**SQL**
+
+- `CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`；列类型 `INTEGER`、`TEXT`；
+  约束 `PRIMARY KEY`、`NOT NULL`、`UNIQUE`。`INTEGER PRIMARY KEY` 是 rowid 的别名；
+  其他表有隐藏的 `rowid`（也可写 `oid`、`_rowid_`）。
+- `INSERT`（多行 `VALUES`、指定列）、`UPDATE`（可改主键）、`DELETE`。
+- `SELECT`：`*` / `t.*`、别名、`DISTINCT`、`WHERE`、`GROUP BY`、`HAVING`、
+  `ORDER BY`（多列、`ASC`/`DESC`、`NULLS FIRST/LAST`、列序号、别名）、`LIMIT`/`OFFSET`、
+  不带 `FROM` 的 `SELECT`。
+- 连接：`,`、`[INNER] JOIN`、`CROSS JOIN`、`LEFT [OUTER] JOIN ... ON`，任意多张表。
+- 表达式：比较、`AND`/`OR`/`NOT`（三值逻辑）、`+ - * / %`、`||`、`IS [NOT]`、
+  `[NOT] IN (...)`、`[NOT] BETWEEN`、`[NOT] LIKE`。
+- 函数：`abs`、`length`、`lower`、`upper`、`coalesce`、`ifnull`、`nullif`、`typeof`、多参数
+  `min`/`max`；聚合 `count`、`sum`、`avg`、`min`、`max`、`total`、`group_concat`（均支持 `DISTINCT`）。
+- 索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`，UNIQUE 列自动建索引；
+  执行器对“索引列前缀等值 + 下一列范围”使用索引，也用于连接的内层表。
+  `EXPLAIN [QUERY PLAN]` 显示每张表的访问路径。
+- 事务：`BEGIN`、`COMMIT`/`END`、`ROLLBACK`；不在事务中时每条语句自动提交；每条语句都是原子的
+  （多行 `INSERT` 中途违反约束，整条语句不生效）。
+
+**与 SQLite 一致的语义**（都有对照测试）：类型亲和性（`INTEGER` 列把 `'12'` 存成 12）、
+比较时的亲和性转换、NULL 三值逻辑、64 位整数溢出转 REAL、整数除法、`SUM`/`AVG` 的补偿求和
+（浮点结果逐位一致）、约束报错的文字、`ORDER BY 2` 这类列序号规则等。
+
+## 使用
+
+```sh
+python -m minidb app.db          # 打开（或创建）数据库文件；不带参数则是内存数据库
+```
+
+```text
+minidb> CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age INTEGER);
+minidb> INSERT INTO users (name, age) VALUES ('alice', 30), ('bob', 25);
+minidb> SELECT name, age + 1 FROM users WHERE age > 26;
+alice|31
+minidb> .btree users
+- leaf (page 2, 2 keys): 1, 2
+minidb> .exit
+```
+
+语句以 `;` 结束，可以跨多行。元命令：`.tables`、`.schema [TABLE]`、`.btree TABLE`（打印 B+ 树
+结构）、`.help`、`.exit`。语法错误会给出行号、列号和 `^` 标记。
+
+Python API：
+
+```python
+from minidb.database import Database
+
+with Database("app.db") as db:          # Database() 为内存数据库
+    db.execute("CREATE TABLE t (a INTEGER, b TEXT)")
+    db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
+    result = db.execute("SELECT b, a * 10 FROM t ORDER BY a DESC")
+    print(result, result.columns)       # [('y', 20), ('x', 10)] ['b', 'a * 10']
+    print(db.integrity_check())         # [] 表示所有 B+ 树和索引都一致
+```
+
+异常都继承自 `minidb.errors.Error`：`SQLSyntaxError`、`OperationalError`（找不到表/列等）、
+`IntegrityError`（约束违反）、`DatabaseError`（文件损坏）。
+
+## 架构
+
+```text
+SQL 文本
+  │  tokenizer.py   词法分析：关键字、标识符、数字、字符串、运算符，错误带位置
+  ▼
+  │  parser.py      递归下降语法分析 → 语法树（dataclass），运算符优先级与 SQLite 相同
+  ▼
+  │  executor.py    名字解析、表达式编译成闭包、访问路径规划、嵌套循环连接、
+  │                 聚合/排序/限制、INSERT/UPDATE/DELETE 与约束检查
+  │  values.py      SQL 值语义：亲和性、比较、算术、文本转换、标量和聚合函数
+  │  catalog.py     schema（表、索引）存在第 1 页的 B+ 树里，打开时重建
+  ▼
+  │  btree.py       B+ 树：按字节大小分裂/合并/借位，叶子兄弟链，范围扫描，overflow 页
+  ▼
+  │  pager.py       4 KB 页的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
+  ▼
+数据库文件 app.db（+ 提交过程中短暂存在的 app.db-wal）
+```
+
+- **database.py** 是入口：`Database.execute()` 负责语句原子性、自动提交和事务状态。
+- **record.py** 负责行的序列化（类型标签 + 负载）。
+- **repl.py** 是命令行界面。
+
+几个关键设计（完整理由见 [DECISIONS.md](DECISIONS.md)）：
+
+- **页对象缓存**：pager 缓存解码后的页对象，B+ 树直接在 Python 列表上 `bisect`，写回时才序列化。
+- **B+ 树**：节点满/欠满按字节数判断，同一套代码服务整数 key 的表树和变长 key 的索引树；
+  根页号终生不变；顺序追加时不均匀分裂，页填充率约 75%。
+- **索引 key**：索引列值的 SQLite 排序键元组 + rowid，保证唯一且顺序与 SQL 比较一致。
+- **提交协议（WAL 重做日志）**：脏页先整页写入 `-wal` 文件并附 CRC32 提交记录、fsync，然后写回
+  数据文件、fsync，最后删掉 WAL。打开时完整的 WAL 被重放，不完整的被丢弃。未提交的页绝不写入
+  数据文件（no-steal），所以 `ROLLBACK` 只需丢弃内存中的脏页。
+
+## 测试
+
+```sh
+.venv/bin/python -m pytest                                        # 全部测试（约 300 个）
+.venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
+.venv/bin/python tests/benchmark.py --rows 100000                 # 性能测试
+```
+
+- **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
+  且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
+- **模糊测试**（`tests/fuzz.py`）：随机 schema（约束、单列/多列/唯一索引）+ 随机增删改查、
+  嵌套表达式、聚合、连接、事务、建删索引，每个种子结束时做 `integrity_check`。
+- **B+ 树**：上万次随机插入删除后校验不变量（有序、分隔键边界、同深度、填充率、兄弟链）。
+- **崩溃恢复**：在提交的每一步（写 WAL 帧、写提交记录、写数据页、fsync、删 WAL）模拟崩溃，
+  包括子进程里真实的 `os._exit`，以及截断/损坏的 WAL，重开后数据必须是事务前或事务后的完整状态。
+
+## 性能
+
+100,000 行（`id, name, age, city`），数据库文件，Apple Silicon，Python 3.12，与 sqlite3 同样的 SQL：
+
+| 操作 | MiniDB | sqlite3 |
+|---|---:|---:|
+| 插入 10 万行，每行一条 INSERT，一个事务 | 3.5 s | 0.25 s |
+| 插入 10 万行，每条 INSERT 1000 行，一个事务 | 2.2 s | 0.08 s |
+| 自动提交插入 1000 行（每行一次 commit + fsync） | 0.18 s | 0.21 s |
+| 1 万次主键点查 | 0.33 s | 0.07 s |
+| 全表扫描 `count(*) WHERE age > 50` | 0.15 s | 0.003 s |
+| `GROUP BY city` 三个聚合 | 0.20 s | 0.03 s |
+| `CREATE INDEX` on age | 0.74 s | 0.02 s |
+| 10 万行与小表连接（每行一次索引查找） | 0.36 s | 0.007 s |
+| 数据库文件大小 | 17.1 MB | 6.6 MB |
+
+纯 Python 实现比 C 写的 SQLite 慢 5–150 倍，主要开销在逐行解码和表达式求值；点查和提交开销接近。
+完整结果见 [PROGRESS.md](PROGRESS.md)。
+
+## 已知限制
+
+- 类型只有 `INTEGER`、`TEXT`（以及运算产生的 REAL）；没有 BLOB、`CAST`、`CASE`、子查询、
+  `UNION`、视图、触发器、`ALTER TABLE`、`JOIN ... USING`、`NATURAL JOIN`、`RIGHT/FULL JOIN`。
+- REAL 转文本时，少数没有短十进制表示的值与 SQLite 在最后几位数字上不同（SQLite 用自己的近似
+  转换算法），见 DECISIONS.md D20。
+- 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
+  多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、常量表达式出错的求值时机），MiniDB 不保证选择相同。
+- 索引 key 不支持 overflow，单个索引项约 512 字节以内；超长时报错。
+- 单连接、无并发控制；大事务的脏页全部驻留内存；数据库文件不会收缩（空闲页只复用）。
+- 查询规划简单：不做连接重排，不用索引避免排序，没有覆盖索引。
+- WAL 删除后没有 fsync 目录项；删除的持久性依赖文件系统。
