@@ -1,0 +1,107 @@
+import pytest
+
+from minidb.pager import PAGE_SIZE, DatabaseError, Pager, RawPage
+from minidb.record import RecordError, decode_record, encode_record
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        [],
+        [None],
+        [0, 1, -1, 2**63 - 1, -(2**63)],
+        [1.5, -0.0, 1e300],
+        ["", "hello", "日本語", "a|b'c"],
+        [1, "x", None, 2.5],
+    ],
+)
+def test_record_round_trip(values):
+    data = encode_record(values)
+    decoded, end = decode_record(data)
+    assert decoded == values
+    assert end == len(data)
+
+
+def test_record_rejects_unsupported_values():
+    with pytest.raises(RecordError):
+        encode_record([2**63])
+    with pytest.raises(RecordError):
+        encode_record([b"bytes"])
+    with pytest.raises(RecordError):
+        encode_record([True])
+
+
+def test_new_file_has_header_page(tmp_path):
+    path = tmp_path / "t.db"
+    pager = Pager(str(path))
+    assert pager.page_count == 1
+    pager.close()
+    assert path.stat().st_size == PAGE_SIZE
+
+
+def test_pages_survive_close_and_reopen(tmp_path):
+    path = str(tmp_path / "t.db")
+    pager = Pager(path)
+    pages = [pager.allocate(RawPage) for _ in range(5)]
+    for i, page in enumerate(pages):
+        page.data[:5] = b"page%d" % i
+    pager.close()
+
+    pager = Pager(path)
+    assert pager.page_count == 6
+    for i, page in enumerate(pages):
+        assert pager.get(page.pgno, RawPage).data[:5] == b"page%d" % i
+    pager.close()
+
+
+def test_page_cache_returns_same_object(tmp_path):
+    pager = Pager(str(tmp_path / "t.db"))
+    page = pager.allocate(RawPage)
+    pager.close()
+    pager = Pager(str(tmp_path / "t.db"))
+    assert pager.get(page.pgno, RawPage) is pager.get(page.pgno, RawPage)
+
+
+def test_free_list_reuses_pages():
+    pager = Pager()
+    a = pager.allocate(RawPage)
+    b = pager.allocate(RawPage)
+    pager.free(a.pgno)
+    pager.free(b.pgno)
+    assert pager.free_page_count() == 2
+    assert pager.allocate(RawPage).pgno == b.pgno
+    assert pager.allocate(RawPage).pgno == a.pgno
+    assert pager.allocate(RawPage).pgno == 3
+    assert pager.free_page_count() == 0
+
+
+def test_free_list_persists(tmp_path):
+    path = str(tmp_path / "t.db")
+    pager = Pager(path)
+    pages = [pager.allocate(RawPage) for _ in range(3)]
+    pager.free(pages[1].pgno)
+    pager.close()
+    pager = Pager(path)
+    assert pager.free_page_count() == 1
+    assert pager.allocate(RawPage).pgno == pages[1].pgno
+    pager.close()
+
+
+def test_out_of_range_page(tmp_path):
+    pager = Pager()
+    with pytest.raises(DatabaseError):
+        pager.get(1, RawPage)
+
+
+def test_rejects_non_database_file(tmp_path):
+    path = tmp_path / "junk.db"
+    path.write_bytes(b"x" * PAGE_SIZE)
+    with pytest.raises(DatabaseError):
+        Pager(str(path))
+
+
+def test_rejects_partial_page_file(tmp_path):
+    path = tmp_path / "junk.db"
+    path.write_bytes(b"x" * 100)
+    with pytest.raises(DatabaseError):
+        Pager(str(path))
