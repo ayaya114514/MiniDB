@@ -287,15 +287,6 @@ def logical_and(a, b):
     return 1
 
 
-def logical_or(a, b):
-    ta, tb = truth(a), truth(b)
-    if ta or tb:
-        return 1
-    if ta is None or tb is None:
-        return None
-    return 0
-
-
 @lru_cache(maxsize=256)
 def _like_regex(pattern):
     parts = []

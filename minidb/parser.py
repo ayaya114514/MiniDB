@@ -355,11 +355,6 @@ class Parser:
             return self.advance()
         raise self.error(word)
 
-    def _accept_word(self, word):
-        if self.tok.kind == "IDENT" and self.tok.text.upper() == word:
-            return self.advance()
-        return None
-
     def identifier(self, what="identifier"):
         if self.tok.kind != "IDENT":
             raise self.error(what)

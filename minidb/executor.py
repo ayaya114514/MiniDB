@@ -24,7 +24,6 @@ import random
 from operator import itemgetter
 
 from minidb import values
-from minidb.btree import BTreeError, DuplicateKeyError
 from minidb.catalog import HIGH
 from minidb.errors import IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
@@ -1523,10 +1522,7 @@ class Executor:
 
     def add_index_entries(self, table, row, rowid):
         for index in table.indexes:
-            try:
-                self.catalog.index_tree(index).insert(index.key(row, rowid), b"")
-            except BTreeError as exc:
-                raise OperationalError(f"index {index.name}: {exc}") from None
+            self.catalog.index_tree(index).insert(index.key(row, rowid), b"")
 
     def remove_index_entries(self, table, row, rowid):
         for index in table.indexes:
@@ -1586,10 +1582,7 @@ class Executor:
             row = self.load_row(table, rowid, record)
             if index.unique:
                 self.check_unique(table, row, rowid)
-            try:
-                index_tree.insert(index.key(row, rowid), b"")
-            except BTreeError as exc:
-                raise OperationalError(f"index {index.name}: {exc}") from None
+            index_tree.insert(index.key(row, rowid), b"")
         return Result()
 
 

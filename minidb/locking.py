@@ -71,16 +71,6 @@ class FileLocks:
         _flock(self.db_fd, fcntl.LOCK_SH, self.timeout)
         self.db_level = SHARED
 
-    def exclusive(self):
-        """Wait until no other connection reads, then lock out all readers.
-
-        Must hold RESERVED, so no other connection can be upgrading too."""
-        if fcntl is None or self.db_level == EXCLUSIVE:
-            return
-        assert self.reserved
-        _flock(self.db_fd, fcntl.LOCK_EX, self.timeout)
-        self.db_level = EXCLUSIVE
-
     def try_exclusive(self):
         """Take EXCLUSIVE only if no other connection reads right now (used by
         checkpoints, which never wait).  Returns whether it worked."""
