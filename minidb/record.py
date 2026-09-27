@@ -1,78 +1,137 @@
 """Serialization of rows (lists of SQL values) to bytes and back.
 
-Layout: a u16 value count, then for every value a one-byte type tag and payload:
+A record is ``header size | header | body``.  The header size is one byte,
+or 0xFF followed by a u32 for very wide rows.  The header holds one type
+code per value:
 
-    0  NULL     no payload
-    1  INTEGER  8-byte signed big-endian
-    2  REAL     8-byte IEEE double
-    3  TEXT     u32 byte length + UTF-8 bytes
+    0          NULL
+    1, 2, 3, 4 INTEGER stored in 1, 2, 4 or 8 bytes (signed, big-endian)
+    5          REAL, 8-byte IEEE double
+    6, 7       the INTEGERs 0 and 1 (no body bytes)
+    8          TEXT whose UTF-8 length follows in the header as a u32
+    16..255    TEXT of (code - 16) UTF-8 bytes
+
+The body holds the payloads in order.  Because the header determines the
+exact layout, decoding compiles each distinct header once into a
+``struct.Struct`` plus a small assembly function and caches it: decoding a
+row is then a single ``unpack_from`` call.
 """
 
 import struct
 
-NULL, INTEGER, REAL, TEXT = 0, 1, 2, 3
-
-_count = struct.Struct(">H")
-_int = struct.Struct(">q")
+NULL_CODE, REAL_CODE, ZERO_CODE, ONE_CODE, LONG_TEXT_CODE, SHORT_TEXT_BASE = 0, 5, 6, 7, 8, 16
+MAX_SHORT_TEXT = 255 - SHORT_TEXT_BASE
+_INT_FORMATS = {1: "b", 2: "h", 3: "i", 4: "q"}
+_INT_LIMITS = [(1, 2**7), (2, 2**15), (3, 2**31), (4, 2**63)]
+_u32 = struct.Struct(">I")
 _real = struct.Struct(">d")
-_len = struct.Struct(">I")
+_CACHE_LIMIT = 20_000
 
 
 class RecordError(Exception):
     pass
 
 
-def encode_value(value, out):
-    if value is None:
-        out.append(NULL)
-    elif isinstance(value, bool):
-        raise RecordError("booleans are not SQL values")
-    elif isinstance(value, int):
-        if not -(2**63) <= value < 2**63:
-            raise RecordError("integer overflow")
-        out.append(INTEGER)
-        out += _int.pack(value)
-    elif isinstance(value, float):
-        out.append(REAL)
-        out += _real.pack(value)
-    elif isinstance(value, str):
-        data = value.encode("utf-8")
-        out.append(TEXT)
-        out += _len.pack(len(data))
-        out += data
-    else:
-        raise RecordError(f"cannot store value of type {type(value).__name__}")
-
-
-def decode_value(data, pos):
-    tag = data[pos]
-    pos += 1
-    if tag == NULL:
-        return None, pos
-    if tag == INTEGER:
-        return _int.unpack_from(data, pos)[0], pos + 8
-    if tag == REAL:
-        return _real.unpack_from(data, pos)[0], pos + 8
-    if tag == TEXT:
-        (length,) = _len.unpack_from(data, pos)
-        pos += 4
-        return bytes(data[pos:pos + length]).decode("utf-8"), pos + length
-    raise RecordError(f"bad type tag {tag}")
-
-
 def encode_record(values):
-    out = bytearray(_count.pack(len(values)))
+    header = bytearray()
+    body = bytearray()
     for value in values:
-        encode_value(value, out)
-    return bytes(out)
+        if value is None:
+            header.append(NULL_CODE)
+        elif isinstance(value, bool):
+            raise RecordError("booleans are not SQL values")
+        elif isinstance(value, int):
+            if value == 0:
+                header.append(ZERO_CODE)
+            elif value == 1:
+                header.append(ONE_CODE)
+            else:
+                for code, limit in _INT_LIMITS:
+                    if -limit <= value < limit:
+                        header.append(code)
+                        body += value.to_bytes(1 << (code - 1), "big", signed=True)
+                        break
+                else:
+                    raise RecordError("integer overflow")
+        elif isinstance(value, float):
+            header.append(REAL_CODE)
+            body += _real.pack(value)
+        elif isinstance(value, str):
+            data = value.encode("utf-8")
+            if len(data) <= MAX_SHORT_TEXT:
+                header.append(SHORT_TEXT_BASE + len(data))
+            else:
+                header.append(LONG_TEXT_CODE)
+                header += _u32.pack(len(data))
+            body += data
+        else:
+            raise RecordError(f"cannot store value of type {type(value).__name__}")
+    if len(header) < 0xFF:
+        return bytes([len(header)]) + bytes(header) + bytes(body)
+    return b"\xff" + _u32.pack(len(header)) + bytes(header) + bytes(body)
+
+
+_decoders = {}
+
+
+def _compile(header):
+    """(Struct, assemble function) for records with this header."""
+    fmt = [">"]
+    parts = []  # Python expressions building the value list from unpacked fields ``f``
+    field = 0
+    i = 0
+    while i < len(header):
+        code = header[i]
+        i += 1
+        if code == NULL_CODE:
+            parts.append("None")
+        elif code == ZERO_CODE:
+            parts.append("0")
+        elif code == ONE_CODE:
+            parts.append("1")
+        elif code in _INT_FORMATS:
+            fmt.append(_INT_FORMATS[code])
+            parts.append(f"f[{field}]")
+            field += 1
+        elif code == REAL_CODE:
+            fmt.append("d")
+            parts.append(f"f[{field}]")
+            field += 1
+        elif code == LONG_TEXT_CODE or code >= SHORT_TEXT_BASE:
+            if code == LONG_TEXT_CODE:
+                if i + 4 > len(header):
+                    raise RecordError("truncated record header")
+                length = _u32.unpack_from(header, i)[0]
+                i += 4
+            else:
+                length = code - SHORT_TEXT_BASE
+            fmt.append(f"{length}s")
+            parts.append(f"f[{field}].decode()")
+            field += 1
+        else:
+            raise RecordError(f"bad type code {code}")
+    layout = struct.Struct("".join(fmt))
+    assemble = eval(f"lambda f: [{', '.join(parts)}]")  # noqa: S307 - built from type codes only
+    return layout, assemble
 
 
 def decode_record(data, pos=0):
     """Decode a record starting at ``pos``; returns (values, end position)."""
-    (count,) = _count.unpack_from(data, pos)
-    pos += 2
-    values = []
-    for _ in range(count):
-        value, pos = decode_value(data, pos)
-        values.append(value)
-    return values, pos
+    size = data[pos]
+    pos += 1
+    if size == 0xFF:
+        size = _u32.unpack_from(data, pos)[0]
+        pos += 4
+    header = bytes(data[pos:pos + size])
+    decoder = _decoders.get(header)
+    if decoder is None:
+        decoder = _compile(header)
+        if len(_decoders) < _CACHE_LIMIT:
+            _decoders[header] = decoder
+    layout, assemble = decoder
+    pos += size
+    try:
+        fields = layout.unpack_from(data, pos)
+    except struct.error as exc:
+        raise RecordError(f"truncated record: {exc}") from None
+    return assemble(fields), pos + layout.size

@@ -37,9 +37,9 @@ from minidb.locking import FileLocks, LockTimeout, fsync_directory
 PAGE_SIZE = 4096
 CHECKSUM_SIZE = 4
 USABLE_SIZE = PAGE_SIZE - CHECKSUM_SIZE
-MAGIC = b"MiniDB format 2\x00"
+MAGIC = b"MiniDB format 3\x00"
 MAGIC_PREFIX = b"MiniDB format "
-WAL_MAGIC = b"MiniDB WAL 2\x00\x00\x00\x00"
+WAL_MAGIC = b"MiniDB WAL 3\x00\x00\x00\x00"
 COMMIT_TAG = b"CMIT"
 
 _u32 = struct.Struct(">I")
