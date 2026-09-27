@@ -215,3 +215,36 @@ def test_evaluation_timing_matches_sqlite():
         "SELECT a FROM t WHERE a > 0 AND (0 AND (SELECT x FROM nosuch))",
     ])
     pair.close()
+
+
+def test_constant_conditions_are_tested_before_the_loop():
+    """SQLite tests WHERE terms that use none of the query's tables (and no
+    subquery) once, before its loop: a false one skips the loop and so the
+    errors that the rows would have raised; a failing one fails even when
+    the table is empty."""
+    pair = Pair(check_messages=True)
+    pair.script([
+        "CREATE TABLE big (x INTEGER)",
+        "INSERT INTO big VALUES (9223372036854775807), (1)",
+        "CREATE TABLE t (a INTEGER)",
+        "INSERT INTO t VALUES (1), (2), (3)",
+        "CREATE TABLE empty (a INTEGER)",
+        "SELECT y FROM (SELECT (SELECT sum(x) FROM big) AS y FROM t) AS d WHERE 0",
+        "SELECT y FROM (SELECT (SELECT sum(x) FROM big) AS y FROM t) AS d WHERE y IS NULL AND 0",
+        "SELECT y FROM (SELECT (SELECT sum(x) FROM big) AS y FROM t) AS d WHERE 1",
+        "SELECT count(*), sum(a) FROM t WHERE 0",
+        "SELECT count(*) FROM t WHERE NULL",
+        "SELECT a FROM t WHERE 1 AND a > 1",
+        "SELECT * FROM empty WHERE abs(-9223372036854775808)",
+        "SELECT * FROM empty WHERE a > 0 AND abs(-9223372036854775808)",
+        "SELECT t.a, e.a FROM t LEFT JOIN empty AS e ON e.a = t.a WHERE 0",
+        "SELECT t.a, e.a FROM t LEFT JOIN empty AS e ON 0",
+        "SELECT a, (SELECT count(*) FROM t AS s WHERE o.a > 1) FROM t AS o",
+        "DELETE FROM empty WHERE abs(-9223372036854775808)",
+        "UPDATE t SET a = a + 1 WHERE 0 AND a",
+        "DELETE FROM t WHERE 1 AND a = 3",
+        "SELECT * FROM t",
+    ])
+    pair.run("SELECT a FROM t WHERE ?", parameters=[0])
+    pair.run("SELECT a FROM t WHERE ? AND a < 3", parameters=[1])
+    pair.close()
