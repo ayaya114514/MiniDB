@@ -37,7 +37,7 @@ from minidb.parser import (
     Literal, Parameter, Select, Star, Subquery, TableRef, Unary, Update,
 )
 from minidb.parser import Expr, Statement
-from minidb.values import SQLValue
+from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, encode_record
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")
@@ -103,7 +103,7 @@ class Scope:
         self.used = set()  # (table index, column position) pairs referenced so far
 
     def add(self, table: Source, alias: str | None = None) -> None:
-        name = (alias if alias is not None else table.name).lower()
+        name = ascii_lower(alias if alias is not None else table.name)
         self.entries.append(ScopeEntry(name, table, self.width))
         self.width += len(table.columns) + 1
 
@@ -113,10 +113,10 @@ class Scope:
 
     def _matches(self, column: Column) -> list[tuple[int, str | None, int]]:
         matches = []
-        lowered = column.name.lower()
+        lowered = ascii_lower(column.name)
         for index, entry in enumerate(self.entries):
             if column.table is not None:
-                if column.table.lower() != entry.name:
+                if ascii_lower(column.table) != entry.name:
                     continue
             elif lowered in entry.hidden:
                 continue
@@ -160,11 +160,11 @@ class Scope:
         result = []
         found = False
         for entry in self.entries:
-            if table_name is not None and table_name.lower() != entry.name:
+            if table_name is not None and ascii_lower(table_name) != entry.name:
                 continue
             found = True
             for column in entry.table.columns:
-                if table_name is None and column.name.lower() in entry.hidden:
+                if table_name is None and ascii_lower(column.name) in entry.hidden:
                     continue
                 result.append((entry.name, column.name))
         if not found:
@@ -556,12 +556,12 @@ class Compiler:
         if values.is_aggregate_call(name, len(expr.args)):
             return self._aggregate(expr)
         if name not in values.SCALAR_FUNCTIONS:
-            raise OperationalError(f"no such function: {name.lower()}")
+            raise OperationalError(f"no such function: {ascii_lower(name)}")
         function, min_args, max_args = values.SCALAR_FUNCTIONS[name]
         if expr.distinct or len(expr.args) < min_args or (
             max_args is not None and len(expr.args) > max_args
         ):
-            raise OperationalError(f"wrong number of arguments to function {name.lower()}()")
+            raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
         args = [self.compile(arg) for arg in expr.args]
         if len(args) == 1:
             (arg,) = args
@@ -571,11 +571,11 @@ class Compiler:
     def _aggregate(self, expr: Call) -> RowFunction:
         name = expr.name
         if self.aggregates is None:
-            raise OperationalError(self.misuse.format(name=name.lower()))
+            raise OperationalError(self.misuse.format(name=ascii_lower(name)))
         _, min_args, max_args = values.AGGREGATE_FUNCTIONS[name]
         star = expr.args == (Star(),)
         if star and name != "COUNT" or not min_args <= len(expr.args) <= max_args:
-            raise OperationalError(f"wrong number of arguments to function {name.lower()}()")
+            raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
         if star or not expr.args:
             args = []  # COUNT(*) and COUNT()
         else:
@@ -1207,7 +1207,7 @@ class Executor:
         def left_with(name):
             return next(
                 (e for e in left_entries
-                 if e.table.column_index(name) is not None and name.lower() not in e.hidden),
+                 if e.table.column_index(name) is not None and ascii_lower(name) not in e.hidden),
                 None,
             )
 
@@ -1224,7 +1224,7 @@ class Executor:
                 )
             equal = Binary("=", Column(name, left.name), Column(name, right.name))
             condition = equal if condition is None else Binary("AND", condition, equal)
-            right.hidden.add(name.lower())
+            right.hidden.add(ascii_lower(name))
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
     def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False) -> list[JoinLevel]:
@@ -1400,15 +1400,15 @@ class Executor:
                 )
             return number - 1
         if isinstance(expr, Column) and expr.table is None:
-            lowered = [name.lower() for name in names]
-            if expr.name.lower() in lowered:
+            lowered = [ascii_lower(name) for name in names]
+            if ascii_lower(expr.name) in lowered:
                 if clause == "GROUP BY":
                     try:
                         scope.resolve(expr)
                         return None  # an input column wins over an alias in GROUP BY
                     except OperationalError:
                         pass
-                return lowered.index(expr.name.lower())
+                return lowered.index(ascii_lower(expr.name))
         return None
 
     def order_terms(self, stmt: Select, exprs: list[Expr], names: list[str], compiler: Compiler) -> tuple[list[OrderTerm], list[RowFunction]]:
@@ -1446,9 +1446,9 @@ class Executor:
             else:
                 for part in reversed(parts):
                     if isinstance(item.expr, Column) and item.expr.table is None:
-                        lowered = [name.lower() for name in part.names]
-                        if item.expr.name.lower() in lowered:
-                            index = lowered.index(item.expr.name.lower())
+                        lowered = [ascii_lower(name) for name in part.names]
+                        if ascii_lower(item.expr.name) in lowered:
+                            index = lowered.index(ascii_lower(item.expr.name))
                             break
                     if item.expr in part.exprs:
                         index = part.exprs.index(item.expr)
@@ -1863,7 +1863,7 @@ class PreparedUpdate(PreparedSingleTable):
         for name, expr in stmt.assignments:
             position = table.column_index(name)
             if position is None:
-                if name.lower() not in ROWID_NAMES:
+                if ascii_lower(name) not in ROWID_NAMES:
                     raise OperationalError(f"no such column: {name}")
                 position = width if table.rowid_column is None else table.rowid_column
             self.assignments.append((position, compiler.compile(expr)))
@@ -1962,11 +1962,11 @@ class DerivedSource:
         self.affinities = list(compiled.affinities)
         self.positions = {}
         for i, name in enumerate(compiled.names):
-            self.positions.setdefault(name.lower(), i)
+            self.positions.setdefault(ascii_lower(name), i)
         self.rows = []
 
     def column_index(self, name: str) -> int | None:
-        return self.positions.get(name.lower())
+        return self.positions.get(ascii_lower(name))
 
     def materialize(self) -> None:
         self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]

@@ -20,6 +20,13 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m pip install pytest
+      - uses: actions/cache@v4
+        with:
+          path: .reference-sqlite
+          key: reference-sqlite-${{ runner.os }}-${{ hashFiles('tools/reference_sqlite.py') }}
+      - name: Build the reference SQLite (plain SQLite from sqlite.org, pinned version)
+        shell: bash  # -eo pipefail: a failed build must fail the step
+        run: python tools/reference_sqlite.py | sed 's/^export //' >> "$GITHUB_ENV"
       - name: SQLite version used as the reference
         run: python -c "import sqlite3, sys; print(sys.version); print('SQLite', sqlite3.sqlite_version)"
       - run: python -m pytest
@@ -31,6 +38,13 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
+      - uses: actions/cache@v4
+        with:
+          path: .reference-sqlite
+          key: reference-sqlite-${{ runner.os }}-${{ hashFiles('tools/reference_sqlite.py') }}
+      - name: Build the reference SQLite (plain SQLite from sqlite.org, pinned version)
+        shell: bash  # -eo pipefail: a failed build must fail the step
+        run: python tools/reference_sqlite.py | sed 's/^export //' >> "$GITHUB_ENV"
       - name: Differential fuzzing against sqlite3 (fixed seeds)
         run: python tests/fuzz.py --seeds 0-299 --statements 400
       - name: Differential fuzzing with database files

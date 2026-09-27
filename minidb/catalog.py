@@ -28,7 +28,7 @@ from minidb.errors import DatabaseError, OperationalError
 from minidb.pager import Pager
 from minidb.parser import ColumnDef, CreateIndex, CreateTable, parse
 from minidb.record import decode_record, encode_record, encoded_size
-from minidb.values import SQLValue
+from minidb.values import SQLValue, ascii_lower
 
 SCHEMA_ROOT = 1
 RESERVED_PREFIX = "minidb_"
@@ -90,7 +90,7 @@ class TableInfo:
         self.indexes = []  # newest first, the order SQLite checks UNIQUE constraints in
         self.stat_rows = None  # row count from ANALYZE
         self.stat_key = None
-        self.positions = {column.name.lower(): i for i, column in enumerate(columns)}
+        self.positions = {ascii_lower(column.name): i for i, column in enumerate(columns)}
         # An INTEGER PRIMARY KEY column is an alias for the row id (as in SQLite).
         self.rowid_column = next(
             (i for i, c in enumerate(columns) if c.primary_key and c.type == "INTEGER"), None
@@ -98,7 +98,7 @@ class TableInfo:
         self.affinities = [values.INTEGER if c.type == "INTEGER" else values.TEXT for c in columns]
 
     def column_index(self, name: str) -> int | None:
-        return self.positions.get(name.lower())
+        return self.positions.get(ascii_lower(name))
 
     def auto_index_columns(self) -> list[str]:
         """Columns that need an automatic unique index, in column order."""
@@ -135,7 +135,7 @@ class IndexInfo:
 
     @property
     def is_auto(self) -> bool:
-        return self.name.lower().startswith(AUTO_INDEX_PREFIX)
+        return ascii_lower(self.name).startswith(AUTO_INDEX_PREFIX)
 
     def key(self, row: Sequence[SQLValue], rowid: int) -> IndexKey:
         return index_key([row[p] for p in self.positions], rowid)
@@ -166,34 +166,34 @@ class Catalog:
         for kind, name, _table_name, root, sql, key in entries:
             if kind == "table":
                 stmt = parse(sql)
-                self.tables[name.lower()] = TableInfo(name, stmt.columns, root, key)
+                self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key)
         for kind, name, table_name, root, sql, key in entries:
             if kind == "index":
                 stmt = parse(sql)
-                table = self.tables[table_name.lower()]
+                table = self.tables[ascii_lower(table_name)]
                 index = IndexInfo(name, table, stmt.columns, stmt.unique, root, key)
-                self.indexes[name.lower()] = index
+                self.indexes[ascii_lower(name)] = index
                 table.indexes.insert(0, index)
         for kind, name, _table_name, _root, sql, key in entries:
             if kind == "stat":
                 numbers = [float(n) for n in sql.split()]
-                if name.lower() in self.indexes:
-                    index = self.indexes[name.lower()]
+                if ascii_lower(name) in self.indexes:
+                    index = self.indexes[ascii_lower(name)]
                     index.stat_average, index.stat_key = numbers[1:], key
-                elif name.lower() in self.tables:
-                    table = self.tables[name.lower()]
+                elif ascii_lower(name) in self.tables:
+                    table = self.tables[ascii_lower(name)]
                     table.stat_rows, table.stat_key = int(numbers[0]), key
 
     # ---- lookups ----------------------------------------------------------
 
     def get_table(self, name: str) -> TableInfo:
-        table = self.tables.get(name.lower())
+        table = self.tables.get(ascii_lower(name))
         if table is None:
             raise OperationalError(f"no such table: {name}")
         return table
 
     def has_table(self, name: str) -> bool:
-        return name.lower() in self.tables
+        return ascii_lower(name) in self.tables
 
     def table_tree(self, table: TableInfo) -> BTree:
         return BTree(self.pager, table.root)
@@ -209,7 +209,7 @@ class Catalog:
         return key
 
     def _check_new_name(self, name: str) -> None:
-        lowered = name.lower()
+        lowered = ascii_lower(name)
         if lowered.startswith(RESERVED_PREFIX):
             raise OperationalError(f"object name reserved for internal use: {name}")
         if lowered in self.indexes:
@@ -223,16 +223,16 @@ class Catalog:
         self._check_new_name(stmt.name)
         seen = set()
         for column in stmt.columns:
-            if column.name.lower() in seen:
+            if ascii_lower(column.name) in seen:
                 raise OperationalError(f"duplicate column name: {column.name}")
-            seen.add(column.name.lower())
+            seen.add(ascii_lower(column.name))
         if sum(column.primary_key for column in stmt.columns) > 1:
             raise OperationalError(f'table "{stmt.name}" has more than one primary key')
         self.version += 1
         root = BTree.create(self.pager).root
         table = TableInfo(stmt.name, stmt.columns, root)
         table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql())
-        self.tables[stmt.name.lower()] = table
+        self.tables[ascii_lower(stmt.name)] = table
         for n, column in enumerate(table.auto_index_columns(), 1):
             name = f"{AUTO_INDEX_PREFIX}{table.name}_{n}"
             self._create_index(name, table, [column], unique=True)
@@ -244,18 +244,18 @@ class Catalog:
                 return
             raise OperationalError(f"no such table: {name}")
         self.version += 1
-        table = self.tables[name.lower()]
+        table = self.tables[ascii_lower(name)]
         for index in list(table.indexes):
             self._drop_index(index)
         if table.stat_key is not None:
             self.schema.delete(table.stat_key)
-        del self.tables[name.lower()]
+        del self.tables[ascii_lower(name)]
         self.table_tree(table).destroy()
         self.schema.delete(table.schema_key)
 
     def create_index(self, stmt: CreateIndex) -> IndexInfo | None:
         """Create an index; returns it (still empty) or None if it already exists."""
-        lowered = stmt.name.lower()
+        lowered = ascii_lower(stmt.name)
         if lowered in self.indexes:
             if stmt.if_not_exists:
                 return None
@@ -264,7 +264,7 @@ class Catalog:
             raise OperationalError(f"there is already a table named {stmt.name}")
         if lowered.startswith(RESERVED_PREFIX):
             raise OperationalError(f"object name reserved for internal use: {stmt.name}")
-        table = self.tables.get(stmt.table.lower())
+        table = self.tables.get(ascii_lower(stmt.table))
         if table is None:
             raise OperationalError(f"no such table: main.{stmt.table}")
         for column in stmt.columns:
@@ -277,12 +277,12 @@ class Catalog:
         root = BTree.create(self.pager, IndexKeyCodec).root
         index = IndexInfo(name, table, columns, unique, root)
         index.schema_key = self._add_entry("index", name, table.name, root, index.sql())
-        self.indexes[name.lower()] = index
+        self.indexes[ascii_lower(name)] = index
         table.indexes.insert(0, index)
         return index
 
     def drop_index(self, name: str, if_exists: bool = False) -> None:
-        index = self.indexes.get(name.lower())
+        index = self.indexes.get(ascii_lower(name))
         if index is None:
             if if_exists:
                 return
@@ -299,7 +299,7 @@ class Catalog:
         self.schema.delete(index.schema_key)
         if index.stat_key is not None:
             self.schema.delete(index.stat_key)
-        del self.indexes[index.name.lower()]
+        del self.indexes[ascii_lower(index.name)]
         index.table.indexes.remove(index)
 
     # ---- statistics ---------------------------------------------------------
@@ -308,10 +308,10 @@ class Catalog:
         """Gather statistics for one table (or the table of an index) or all."""
         if name is None:
             tables = list(self.tables.values())
-        elif name.lower() in self.tables:
-            tables = [self.tables[name.lower()]]
-        elif name.lower() in self.indexes:
-            tables = [self.indexes[name.lower()].table]
+        elif ascii_lower(name) in self.tables:
+            tables = [self.tables[ascii_lower(name)]]
+        elif ascii_lower(name) in self.indexes:
+            tables = [self.indexes[ascii_lower(name)].table]
         else:
             raise OperationalError(f"no such table or index: {name}")
         self.version += 1

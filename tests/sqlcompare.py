@@ -7,6 +7,19 @@ from minidb.database import Database
 from minidb.errors import Error, IntegrityError
 from minidb.values import sort_key, type_name
 
+# MiniDB follows SQLite as released by sqlite.org (tools/reference_sqlite.py
+# builds the pinned version).  A build with the ICU extension changes
+# upper(), lower() and LIKE, so comparing against it would be misleading.
+REFERENCE_VERSION = "3.53.4"
+_connection = sqlite3.connect(":memory:")
+_options = {row[0] for row in _connection.execute("PRAGMA compile_options")}
+_connection.close()
+if "ENABLE_ICU" in _options:
+    raise RuntimeError(
+        f"sqlite3 is linked against an ICU-enabled SQLite {sqlite3.sqlite_version}; "
+        'run eval "$(python tools/reference_sqlite.py)" first'
+    )
+
 
 def typed(row):
     """Make int/float differences visible when comparing rows (1 != 1.0)."""
