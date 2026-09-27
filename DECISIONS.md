@@ -367,3 +367,31 @@ rowid）；ORDER BY 全是第一张表的升序、NULLS FIRST 普通列且与之
 ## D65 与 SQLite 求值时机对齐
 - 多行 `INSERT ... VALUES` 先算完所有行再插入（SQLite 把其中的常量子查询在语句开始时算一次）。
 - 被 SQLite 解析器折叠成 0 的 `X AND 0` 不再编译其操作数，因此其中不存在的表/列不会报错。
+
+## D66 类型注解
+每个模块用 `from __future__ import annotations`（注解不在运行时求值，零开销，也能前向引用）。
+层与层之间传递的数据用别名说明：`SQLValue`、`Row`、`RowFunction`（编译后的表达式）、`Record`、
+`OrderTerm`、`Bound`；页、键编解码器、访问路径用 `Protocol` 描述（结构化类型，不需要改继承关系）。
+不引入 mypy（只用标准库）：`tests/test_annotations.py` 用 `typing.get_type_hints` 解析每个函数和
+方法的注解，缺注解或引用了不存在的名字都会失败。注解只做文档与静态检查，不做运行时校验。
+
+## D67 覆盖率只用标准库
+`tools/coverage.py` 在 `trace.Trace` 下运行 pytest，用 `ast` 找出每个模块的语句行（去掉文档字符串）
+做分母。只统计测试进程本身，子进程（多进程并发、CLI 测试）里执行的代码不计入，所以 CLI 入口另有
+进程内测试。剩下未覆盖的行记录在 PROGRESS.md，均为防御性分支。
+标准库 `trace` 的忽略列表按“模块短名”缓存判断结果，所有包的 `__init__.py` 共用 `__init__` 这个名字：
+先遇到的第三方包 `__init__` 被忽略后，我们的也被忽略。因此换成只按路径判断的忽略对象（只跟踪 `minidb/`）。
+
+## D68 多 Python 版本与参考行为
+- 支持 Python 3.11–3.14，CI 全部跑。对照参考是 Python 3.12+ 的 sqlite3：3.11 没有
+  `connect(autocommit=...)`，那里用 `isolation_level=None` 代替做与事务无关的对照，两组事务对照跳过。
+- 命名占位符用序列传参：3.12/3.13 的 sqlite3 只警告，3.14 报 `ProgrammingError`。MiniDB 采用 3.14
+  的规则（已废弃的行为不再模仿），3.14 以下的测试改为断言 MiniDB 的报错。
+- pytest 把警告视为错误（`filterwarnings = ["error"]`），能发现没关闭的文件和连接。测试里用到的
+  `Pair` 登记在一个集合里，由 conftest 的 autouse fixture 在每个测试后关闭（用强引用集合：弱引用在
+  测试函数返回时就被回收，连接没关闭就被释放，警告依旧）。
+
+## D69 CI
+GitHub Actions（`.github/workflows/tests.yml`），ubuntu-latest：3.11–3.14 矩阵跑全部测试并打印
+参考 SQLite 版本；fuzz 作业跑固定种子、文件模式种子，以及按 `GITHUB_RUN_NUMBER` 每次换一批的新种子
+（失败时日志里有种子号，可在本地复现）；每周定时运行一次，没有提交也能继续找新种子。

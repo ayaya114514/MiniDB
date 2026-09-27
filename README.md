@@ -1,9 +1,12 @@
 # MiniDB
 
+[![tests](https://github.com/ayaya114514/MiniDB/actions/workflows/tests.yml/badge.svg)](https://github.com/ayaya114514/MiniDB/actions/workflows/tests.yml)
+
 用 Python 从零实现的小型关系数据库，行为以 SQLite 为标准答案：解析并执行 SQL，数据按 4 KB
 页存在单个文件里，表和索引都是 B+ 树，提交通过预写日志（WAL）保证原子性和崩溃恢复。
 
-只依赖 Python 标准库（3.11+），测试用 pytest。约 4,200 行实现代码。
+只依赖 Python 标准库（3.11–3.14），测试用 pytest。约 5,400 行实现代码（不含空行和注释），
+全部带类型注解。
 
 ## 功能
 
@@ -74,6 +77,7 @@ with minidb.connect("app.db") as conn:             # ":memory:" 为内存数据�
 ```
 
 - 占位符：`?`、`?NNN`、`:name`、`@name`、`$name`；参数用序列（按位置）或字典（按名字）传入。
+  命名占位符只能用字典传参（与 Python 3.14 的 sqlite3 相同，更早的版本只是警告）。
   同一条 SQL 文本只解析一次（语句缓存），所以反复执行的语句请用参数而不是拼字符串。
 - 事务：`connect(..., autocommit=False)`（默认）时总有一个打开的事务，需要 `commit()`；
   `autocommit=True` 时每条语句自动提交，也可以在 SQL 里写 `BEGIN ... COMMIT`。
@@ -122,18 +126,27 @@ SQL 文本
 ## 测试
 
 ```sh
-.venv/bin/python -m pytest                                        # 全部测试（330+ 个）
+.venv/bin/python -m pytest                                        # 全部测试（580+ 个）
 .venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
 .venv/bin/python tests/benchmark.py --rows 100000                 # 性能测试
+.venv/bin/python tools/coverage.py                                # 行覆盖率（标准库 trace）
 ```
+
+GitHub Actions 在 Linux 上用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
+固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）。
 
 - **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
   且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
 - **模糊测试**（`tests/fuzz.py`）：随机 schema（约束、单列/多列/唯一索引）+ 随机增删改查、
   嵌套表达式、聚合、连接、事务、建删索引，每个种子结束时做 `integrity_check`。
 - **B+ 树**：上万次随机插入删除后校验不变量（有序、分隔键边界、同深度、填充率、兄弟链）。
-- **崩溃恢复**：在提交的每一步（写 WAL 帧、写提交记录、写数据页、fsync、删 WAL）模拟崩溃，
-  包括子进程里真实的 `os._exit`，以及截断/损坏的 WAL，重开后数据必须是事务前或事务后的完整状态。
+- **类型注解**：`tests/test_annotations.py` 要求每个函数和方法的参数与返回值都有注解，
+  并用 `typing.get_type_hints` 解析一遍（写错的名字会失败）。
+- **覆盖率**：`tools/coverage.py` 只用标准库 `trace` + `ast` 统计语句覆盖率，目前 99.2%；
+  没覆盖的主要是防御性分支（Windows 无 `fcntl`、不可能的内部状态）。
+- **崩溃恢复**：在提交的每一步（写 WAL 帧、写提交帧、fsync 日志）和 checkpoint 的每一步
+  （拷页、fsync、截断日志）模拟崩溃，包括子进程里真实的 `os._exit`，以及截断/损坏的 WAL，
+  重开后数据必须是事务前或事务后的完整状态。
 
 ## 性能
 
@@ -166,6 +179,7 @@ SQL 文本
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、常量表达式出错的求值时机），MiniDB 不保证选择相同。
 - 一直有读者时 checkpoint 做不成，日志会持续变长；Windows 上没有 `fcntl`，不加锁。
 - 数据库文件不会收缩（空闲页只复用）；目录里会保留（可能为空的）`-wal` 与 `-lock` 文件。
+- 与 sqlite3 对照时，Python 3.11 的 sqlite3 没有 `autocommit` 参数，两组事务行为对照测试在
+  3.11 上跳过（MiniDB 自身行为不随 Python 版本变化）。
 - 优化器是启发式代价模型，不支持 LEFT JOIN 的重排；只有第一张表的升序 ORDER BY 能利用
   索引/rowid 顺序免排序。
-- WAL 删除后没有 fsync 目录项；删除的持久性依赖文件系统。
