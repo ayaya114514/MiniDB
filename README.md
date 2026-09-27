@@ -126,17 +126,22 @@ SQL 文本
 ## 测试
 
 ```sh
+eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启用参考 SQLite（见下）
 .venv/bin/python -m pytest                                        # 全部测试（580+ 个）
 .venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
 .venv/bin/python tests/benchmark.py --rows 100000                 # 性能测试
 .venv/bin/python tools/coverage.py                                # 行覆盖率（标准库 trace）
 ```
 
-GitHub Actions 在 Linux 上用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
+GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
 固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）。
 
 - **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
   且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
+- **参考 SQLite**：标准答案是 sqlite.org 发布的 SQLite 3.53.4、默认编译选项。各发行版给 Python
+  链接的 SQLite 版本和选项不同（例如 conda-forge 开了 ICU，`upper('é')` 会变成 `'É'`），
+  `tools/reference_sqlite.py` 下载源码（校验 SHA3-256）、编译，并输出让 `sqlite3` 模块加载它的
+  环境变量；链接的 SQLite 带 ICU 时对照测试直接报错。需要 C 编译器。
 - **模糊测试**（`tests/fuzz.py`）：随机 schema（约束、单列/多列/唯一索引）+ 随机增删改查、
   嵌套表达式、聚合、连接、事务、建删索引，每个种子结束时做 `integrity_check`。
 - **B+ 树**：上万次随机插入删除后校验不变量（有序、分隔键边界、同深度、填充率、兄弟链）。
@@ -175,6 +180,7 @@ GitHub Actions 在 Linux 上用 Python 3.11–3.14 跑全部测试（警告视�
   `ALTER TABLE`、`RIGHT/FULL JOIN`、窗口函数、CTE（`WITH`）；子查询里不能使用外层查询的聚合函数。
 - REAL 转文本时，少数没有短十进制表示的值与 SQLite 在最后几位数字上不同（SQLite 用自己的近似
   转换算法），见 DECISIONS.md D20。
+- 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、常量表达式出错的求值时机），MiniDB 不保证选择相同。
 - 一直有读者时 checkpoint 做不成，日志会持续变长；Windows 上没有 `fcntl`，不加锁。

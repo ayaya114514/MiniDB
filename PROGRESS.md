@@ -145,5 +145,8 @@
 - 覆盖率（`tools/coverage.py`，标准库 `trace` + `ast`）：98.9% → 99.2%（4524 条语句，未覆盖 36 条）。修正了工具的一个 bug（`trace` 按模块短名缓存忽略判断，导致所有 `__init__.py` 被跳过）。新增进程内的 CLI 入口测试（子进程里执行的代码不计入覆盖率）和缺参数的对照测试。剩余未覆盖：`__main__.py`（只在子进程测试里运行）；`locking.py` 的 Windows 无 `fcntl` 分支和目录 fsync 的 OSError 分支；其余是防御性分支（不可能的内部状态、未知语句类型、页读取不足等）。
 - 多 Python 版本：本地用 mamba 建了 3.11/3.13/3.14 环境逐一跑全部测试。发现并处理：3.11 的 sqlite3 没有 `autocommit` 参数（对照改用 `isolation_level=None`，两组事务对照在 3.11 跳过）；3.14 的 sqlite3 对“命名占位符 + 序列参数”报错（MiniDB 改为同样报错，D68）；3.13+ 的 sqlite3 对未关闭连接发 ResourceWarning。
 - 测试把警告视为错误（`filterwarnings = ["error"]`）：修掉测试里遗留的未关闭文件/连接（崩溃测试释放崩溃连接的文件；`Pair` 由 autouse fixture 统一关闭）。
-- 测试：583 个。Python 3.12/3.13/3.14 全部通过；3.11 上 580 通过、3 跳过。3.11 上额外跑了 200 种子 × 400 的 fuzz，0 不一致。
-- CI：公开仓库 https://github.com/ayaya114514/MiniDB ，GitHub Actions 在 ubuntu-latest 上跑 3.11–3.14 测试矩阵 + fuzz（固定 300 种子、文件模式 100 种子、每次运行换 200 个新种子；每周定时一次）。上线前在本地按 CI 的参数跑过这三段 fuzz（含前两次运行会用到的新种子），0 不一致。
+- 第一次 CI 运行失败（Ubuntu 的 SQLite 3.45.1），追查发现本地的标准答案不标准：conda-forge 的 SQLite 开了 ICU、改了参数编号上限，MiniDB 一直对齐的是这些非默认行为（D70）。改为用 `tools/reference_sqlite.py` 编译 sqlite.org 的 SQLite 3.53.4（默认选项）做标准答案，本地和 CI 相同；MiniDB 的大小写规则改为只认 ASCII（`upper`/`lower`/`LIKE`/关键字/标识符/类型名，顺带修掉“表 É 与 é 是同一张表”“`ſelect` 当成 SELECT”），参数上限改为 32766。
+- 换参考库后的 fuzz 又发现 1 处真实差异：不引用任何表的 WHERE 项，SQLite 在循环前测试一次、为假就跳过整个循环（包括 FROM 子查询），MiniDB 以前逐行测试且先物化子查询（D71）。已修复，新增对照测试并用两个变异（不提前测试、先物化再测试）确认测试能发现。
+- 测试：584 个，在参考 SQLite 3.53.4 上：Python 3.12/3.13/3.14 全部通过；3.11 上 581 通过、3 跳过。
+- fuzz（参考 SQLite 3.53.4）：600 种子 × 500 + 150 种子 × 500（文件模式）+ 600 种子 × 400，0 不一致（修复 D71 之前是 1 个失败种子）。3.11 上另跑了 200 种子 × 400，0 不一致。
+- CI：公开仓库 https://github.com/ayaya114514/MiniDB ，GitHub Actions 在 ubuntu-latest 上跑 3.11–3.14 测试矩阵 + fuzz（固定 300 种子、文件模式 100 种子、每次运行换 200 个新种子；每周定时一次）。CI 先编译参考 SQLite（按脚本哈希缓存）再跑测试和 fuzz。
