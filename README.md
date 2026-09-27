@@ -16,9 +16,13 @@
 - `SELECT`：`*` / `t.*`、别名、`DISTINCT`、`WHERE`、`GROUP BY`、`HAVING`、
   `ORDER BY`（多列、`ASC`/`DESC`、`NULLS FIRST/LAST`、列序号、别名）、`LIMIT`/`OFFSET`、
   不带 `FROM` 的 `SELECT`。
-- 连接：`,`、`[INNER] JOIN`、`CROSS JOIN`、`LEFT [OUTER] JOIN ... ON`，任意多张表。
+- 连接：`,`、`[INNER] JOIN`、`CROSS JOIN`、`LEFT [OUTER] JOIN ... ON / USING (...)`、
+  `NATURAL [LEFT] JOIN`，任意多张表；FROM 里可以用子查询（derived table）。
+- 子查询：标量子查询、`[NOT] IN (SELECT ...)`、`[NOT] EXISTS (...)`，可以嵌套、可以引用外层查询的
+  列（相关子查询），能出现在 SELECT/WHERE/HAVING/ORDER BY/LIMIT 和 INSERT/UPDATE/DELETE 里。
+- 复合查询：`UNION [ALL]`、`INTERSECT`、`EXCEPT`，带整体的 `ORDER BY` / `LIMIT`。
 - 表达式：比较、`AND`/`OR`/`NOT`（三值逻辑）、`+ - * / %`、`||`、`IS [NOT]`、
-  `[NOT] IN (...)`、`[NOT] BETWEEN`、`[NOT] LIKE`。
+  `[NOT] IN (...)`、`[NOT] BETWEEN`、`[NOT] LIKE`、`CASE`、`CAST(x AS type)`、参数 `?` / `:name`。
 - 函数：`abs`、`length`、`lower`、`upper`、`coalesce`、`ifnull`、`nullif`、`typeof`、多参数
   `min`/`max`；聚合 `count`、`sum`、`avg`、`min`、`max`、`total`、`group_concat`（均支持 `DISTINCT`）。
 - 索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`，UNIQUE 列自动建索引；
@@ -149,8 +153,8 @@ SQL 文本
 
 ## 已知限制
 
-- 类型只有 `INTEGER`、`TEXT`（以及运算产生的 REAL）；没有 BLOB、`CAST`、`CASE`、子查询、
-  `UNION`、视图、触发器、`ALTER TABLE`、`JOIN ... USING`、`NATURAL JOIN`、`RIGHT/FULL JOIN`。
+- 列类型只有 `INTEGER`、`TEXT`（以及运算或 `CAST` 产生的 REAL）；没有 BLOB、视图、触发器、
+  `ALTER TABLE`、`RIGHT/FULL JOIN`、窗口函数、CTE（`WITH`）；子查询里不能使用外层查询的聚合函数。
 - REAL 转文本时，少数没有短十进制表示的值与 SQLite 在最后几位数字上不同（SQLite 用自己的近似
   转换算法），见 DECISIONS.md D20。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
