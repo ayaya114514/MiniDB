@@ -189,3 +189,7 @@ GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全�
   3.11 上跳过（MiniDB 自身行为不随 Python 版本变化）。
 - 优化器是启发式代价模型，不支持 LEFT JOIN 的重排；只有第一张表的升序 ORDER BY 能利用
   索引/rowid 顺序免排序。
+
+## License
+
+[MIT](LICENSE)
