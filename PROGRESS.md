@@ -102,6 +102,6 @@
 - `CASE`（简单/搜索）、`CAST`（任意类型名按 SQLite 亲和性规则）；标量子查询、`[NOT] IN (SELECT ...)`、`[NOT] EXISTS`，任意嵌套、可相关（引用外层查询的列），可用于 SELECT/WHERE/HAVING/ORDER BY/LIMIT/INSERT/UPDATE/DELETE；`UNION [ALL]`、`INTERSECT`、`EXCEPT`（带整体 ORDER BY/LIMIT）；`JOIN ... USING`、`NATURAL [LEFT] JOIN`；FROM 子查询（derived table）；`SELECT ALL`。
 - 执行器重构：SELECT 编译一次、`run()` 多次；作用域父链支持相关子查询；不相关子查询只算一次。
 - fuzzer 新增：CASE、CAST、三种子查询（半数相关）、复合查询、USING/NATURAL、FROM 子查询（60 个种子的统计里每种都有数十到上千条成功执行）。
-- 测试：531 个，全部通过。新增 `test_compare_subqueries.py`（20 种值 × 15 种类型名的 CAST 矩阵、CASE、标量/IN/EXISTS 子查询（含相关、嵌套、聚合中的相关子查询）、增删改里的子查询、复合查询、USING/NATURAL/derived table、错误信息逐字比对）；parser 新增 12 个测试。
+- 测试：529 个，全部通过。（提交阶段 11 时多进程压力测试间歇失败：原因是测试的不变量写错了——自动提交轮次里“计数 +1”和“写日志”是两次独立提交，读者可以合法地看到计数领先一步；已改为允许每个写进程领先至多一步，最终相等的检查不变，并确认去掉锁的变异版本仍然失败。）新增 `test_compare_subqueries.py`（20 种值 × 15 种类型名的 CAST 矩阵、CASE、标量/IN/EXISTS 子查询（含相关、嵌套、聚合中的相关子查询）、增删改里的子查询、复合查询、USING/NATURAL/derived table、错误信息逐字比对）；parser 新增 12 个测试。
 - fuzz：600 种子 × 500 + 150 种子 × 500（文件模式），0 不一致。
 - 已知问题：每条语句都要重新编译查询计划（点查比阶段 10 慢约 10%，阶段 12 处理）；外层聚合函数出现在子查询里（如 `(SELECT ... WHERE x = max(outer.col))`）不支持（报错）。
