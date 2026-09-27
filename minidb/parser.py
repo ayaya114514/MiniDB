@@ -100,6 +100,21 @@ class CreateTable:
 
 
 @dataclass
+class CreateIndex:
+    name: str
+    table: str
+    columns: list  # column names
+    unique: bool = False
+    if_not_exists: bool = False
+
+
+@dataclass
+class DropIndex:
+    name: str
+    if_exists: bool = False
+
+
+@dataclass
 class DropTable:
     name: str
     if_exists: bool = False
@@ -291,12 +306,10 @@ class Parser:
 
     def create(self):
         self.expect_keyword("CREATE")
+        if self.at_keyword("UNIQUE", "INDEX"):
+            return self.create_index()
         self.expect_keyword("TABLE")
-        if_not_exists = False
-        if self.accept_keyword("IF"):
-            self.expect_keyword("NOT")
-            self.expect_keyword("EXISTS")
-            if_not_exists = True
+        if_not_exists = self.if_not_exists()
         name = self.identifier("table name")
         self.expect_op("(")
         columns = [self.column_def()]
@@ -304,6 +317,33 @@ class Parser:
             columns.append(self.column_def())
         self.expect_op(")")
         return CreateTable(name, columns, if_not_exists)
+
+    def if_not_exists(self):
+        if self.accept_keyword("IF"):
+            self.expect_keyword("NOT")
+            self.expect_keyword("EXISTS")
+            return True
+        return False
+
+    def create_index(self):
+        unique = bool(self.accept_keyword("UNIQUE"))
+        self.expect_keyword("INDEX")
+        if_not_exists = self.if_not_exists()
+        name = self.identifier("index name")
+        self.expect_keyword("ON")
+        table = self.identifier("table name")
+        self.expect_op("(")
+        columns = [self.indexed_column()]
+        while self.accept_op(","):
+            columns.append(self.indexed_column())
+        self.expect_op(")")
+        return CreateIndex(name, table, columns, unique, if_not_exists)
+
+    def indexed_column(self):
+        name = self.identifier("column name")
+        if not self.accept_keyword("ASC"):
+            self.accept_keyword("DESC")  # accepted; the index order is always ascending
+        return name
 
     def column_def(self):
         name = self.identifier("column name")
@@ -328,12 +368,17 @@ class Parser:
 
     def drop(self):
         self.expect_keyword("DROP")
-        self.expect_keyword("TABLE")
+        if self.accept_keyword("INDEX"):
+            kind = DropIndex
+        else:
+            self.expect_keyword("TABLE")
+            kind = DropTable
         if_exists = False
         if self.accept_keyword("IF"):
             self.expect_keyword("EXISTS")
             if_exists = True
-        return DropTable(self.identifier("table name"), if_exists)
+        name = self.identifier("index name" if kind is DropIndex else "table name")
+        return kind(name, if_exists)
 
     def insert(self):
         self.expect_keyword("INSERT")
