@@ -20,7 +20,7 @@ HELP = """\
 .btree TABLE     Print the B+ tree of TABLE
 .exit            Exit this program
 .help            Show this message
-.schema [TABLE]  Show CREATE statements
+.schema [TABLE]  Show CREATE statements (tables and their indexes)
 .tables          List the tables"""
 
 
@@ -64,6 +64,9 @@ class Shell:
                 tables = [catalog.get_table(args[0])]
             for table in tables:
                 self.write(table.sql() + ";")
+                for index in reversed(table.indexes):
+                    if not index.is_auto:
+                        self.write(index.sql() + ";")
         elif command == ".btree":
             if len(args) != 1:
                 self.write("Usage: .btree TABLE")

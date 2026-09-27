@@ -33,3 +33,12 @@
 - `database.py`：`Database(path).execute(sql)`，语句级原子性 + 自动提交。Shell 改为真正的 SQL（多行语句、带位置和 `^` 的报错、元命令）。
 - 测试：192 个，全部通过。与 sqlite3 对照：17 种二元运算 × 19 种字面量两两组合（含 typeof）、一元运算与函数、3000 个随机优先级表达式、LIKE 模式、列亲和性存储与比较、CRUD 流程、约束错误、语句原子性、语义错误（部分核对报错文本）、rowid 各种访问路径、1500 步随机 CRUD。另有规划器测试（冷缓存下点查只读 ≤4 页）。
 - 已知问题：REAL→TEXT 在少数值上与 sqlite 末位数字不同（见 D20）；UNIQUE 检查暂为全表扫描（阶段 6 改索引）。
+
+## 阶段 6：查询功能扩展（完成）
+- `ORDER BY`（多列、ASC/DESC、NULLS FIRST/LAST、列序号、别名）、`LIMIT`/`OFFSET`（含 `LIMIT a, b`）。
+- 聚合：COUNT(*)/COUNT/SUM/AVG/MIN/MAX/TOTAL/GROUP_CONCAT、DISTINCT 聚合、`GROUP BY`（表达式/序号/别名）、`HAVING`；SUM/AVG 移植 sqlite 的补偿求和，浮点结果逐位一致。
+- 二级索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`；UNIQUE/非整数主键自动建索引；增删改自动维护；等值前缀 + 范围走索引；`EXPLAIN` 显示所用索引；`.schema` 显示索引。
+- 连接：`,`/`JOIN`/`CROSS JOIN`/`LEFT JOIN`，任意多表嵌套循环，谓词下推，内层表用 rowid/索引查找。
+- `Database.integrity_check()`。
+- 测试：236 个，全部通过。新增对照测试覆盖 ORDER BY/LIMIT 组合、每列全部聚合、随机浮点求和、GROUP BY/HAVING、类型相等分组、18 种连接查询、600 条随机查询；索引测试含 2500 步随机增删改（三个索引 + UNIQUE 列，定期 integrity_check）、类型混合的索引查询、索引错误信息逐字比对、持久化与删表回收。
+- 已知问题：不做连接重排和基于索引的排序；索引 key 长度受限（约 512 字节）。
