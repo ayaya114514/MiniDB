@@ -17,6 +17,7 @@ from minidb.values import INT_MAX, INT_MIN
 STATEMENT_CACHE_SIZE = 256
 SPILL_PAGES = 1000  # dirty pages a transaction may hold before they go to the log
 CACHE_PAGES_AFTER_SPILL = 2000
+CHECKPOINT_FRAMES = 1000  # try to checkpoint once the log holds this many committed frames
 WRITE_STATEMENTS = (Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex)
 
 
@@ -172,6 +173,8 @@ class Database:
     def _commit(self):
         try:
             self.pager.commit()
+            if self.pager.committed >= CHECKPOINT_FRAMES:
+                self.pager.checkpoint()  # keeps the log short; skipped while others read
         except LockTimeout:
             raise  # nothing was written; the transaction is intact
         except BaseException:
