@@ -1227,14 +1227,17 @@ class Executor:
             right.hidden.add(ascii_lower(name))
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
-    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False) -> list[JoinLevel]:
-        """Plan a nested loop over ``joins``; returns a list of ``JoinLevel``.
+    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False) -> tuple[list[JoinLevel], list[RowFunction]]:
+        """Plan a nested loop over ``joins``; returns (levels, constants).
 
         WHERE conjuncts and the ON conditions of inner joins form one pool of
         filters; each is checked at the first level where all the tables it
-        uses are bound.  A LEFT JOIN's ON condition decides which rows match
-        at its own level (and is the only thing its access path may use).
-        Without LEFT JOINs the tables are joined in the cheapest order.
+        uses are bound.  Conjuncts that use none of the tables (and no
+        subquery) are the ``constants``: like SQLite, callers test them once
+        before the loop starts and skip it entirely when one is false.  A LEFT
+        JOIN's ON condition decides which rows match at its own level (and is
+        the only thing its access path may use).  Without LEFT JOINs the
+        tables are joined in the cheapest order.
         """
         compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
         on_compiler = Compiler(scope, executor=self)
@@ -1243,6 +1246,8 @@ class Executor:
             if join.kind != "LEFT":
                 pool += split_conjuncts(fold_and(join.on))
         referenced = [(conjunct, tables_referenced(conjunct, scope)) for conjunct in pool]
+        constants = [compiler.compile(conjunct) for conjunct, tables in referenced if not tables]
+        referenced = [(conjunct, tables) for conjunct, tables in referenced if tables]
         order = list(range(len(joins)))
         if len(joins) > 1 and all(join.kind != "LEFT" for join in joins):
             order = self.join_order(scope, referenced, compiler)
@@ -1272,7 +1277,7 @@ class Executor:
                 access.cover_if_possible(scope, index)
             levels.append(JoinLevel(entry.table, entry.offset, access,
                                     join.kind == "LEFT", match, filters))
-        return levels
+        return levels, constants
 
     def join_order(self, scope: Scope, referenced: list[tuple[Expr, set[int]]], compiler: Compiler) -> list[int]:
         """The table order with the lowest estimated nested loop cost: every
@@ -1360,7 +1365,7 @@ class Executor:
         else:
             scope = Scope()
             joins, _ = self.build_from([Join(TableRef(stmt.table))], scope)
-            levels = self.plan_joins(scope, joins, stmt.where)
+            levels, _ = self.plan_joins(scope, joins, stmt.where)
         return Result(
             [(level.table.name, level.access.describe()) for level in levels], ["table", "plan"]
         )
@@ -1656,14 +1661,16 @@ class CompiledSelect:
         self.having = compiler.compile(stmt.having) if stmt.having is not None else None
         self.group_functions = executor.group_functions(stmt, self.exprs, self.names, scope)
         self.levels = None
-        self.condition = None
+        self.constants = []  # conditions tested once, before the loop
         order_columns = self.order_columns(stmt)
         if stmt.source:
             hint = order_columns[0] if order_columns and stmt.limit is not None else None
-            self.levels = executor.plan_joins(scope, joins, stmt.where, hint, covering=True)
+            self.levels, self.constants = executor.plan_joins(
+                scope, joins, stmt.where, hint, covering=True
+            )
         elif stmt.where is not None:
             where = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=executor)
-            self.condition = where.compile(stmt.where)
+            self.constants = [where.compile(stmt.where)]
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
         # True when the first table's access path already yields ORDER BY order.
@@ -1702,14 +1709,14 @@ class CompiledSelect:
     def run(self, max_rows: int | None = None) -> list[tuple]:
         """The result rows (tuples).  ``max_rows`` lets a caller that needs
         only the first rows (EXISTS, scalar subqueries) stop early."""
-        for source in self.derived:
-            source.materialize()
-        if self.levels is not None:
-            rows = self.executor.join_rows(self.scope, self.levels)
-        elif self.condition is None or values.truth(self.condition([])):
-            rows = [[]]
-        else:
+        if not passes_constants(self.constants, self.scope):
             rows = []
+        elif self.levels is not None:
+            for source in self.derived:
+                source.materialize()
+            rows = self.executor.join_rows(self.scope, self.levels)
+        else:
+            rows = [[]]
         outputs, order_functions = self.outputs, self.order_functions
         start, end = self.limit() if self.limit is not None else (0, None)
         if max_rows is not None and not self.order_terms and not self.distinct:
@@ -1733,6 +1740,14 @@ class CompiledSelect:
         else:
             records = order_records(records, self.order_terms, start, end)
         return [output for output, _ in records]
+
+
+def passes_constants(constants: list[RowFunction], scope: Scope) -> bool:
+    """Whether every condition that uses no table of ``scope`` is true."""
+    if not constants:
+        return True
+    row = [None] * scope.width
+    return all(values.truth(condition(row)) for condition in constants)
 
 
 def follows_order(wanted: list[int], provided: tuple[list[int], set[int]] | None) -> bool:
@@ -1845,12 +1860,14 @@ class PreparedSingleTable:
         self.tree = executor.catalog.table_tree(self.table)
         self.scope = Scope()
         joins, _ = executor.build_from([Join(TableRef(self.table.name))], self.scope)
-        self.levels = executor.plan_joins(self.scope, joins, where)
+        self.levels, self.constants = executor.plan_joins(self.scope, joins, where)
         self.rowid_slot = self.scope.rowid_slot(0)
 
     def matching_rows(self) -> list[tuple[int, Row]]:
         """(rowid, row copy) of every matching row, all found before any change."""
         slot = self.rowid_slot
+        if not passes_constants(self.constants, self.scope):
+            return []
         return [(row[slot], list(row)) for row in self.executor.join_rows(self.scope, self.levels)]
 
 
