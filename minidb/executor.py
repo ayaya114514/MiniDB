@@ -14,11 +14,12 @@ to every candidate, so planning can never change a query's result.
 from operator import itemgetter
 
 from minidb import values
-from minidb.btree import DuplicateKeyError
+from minidb.btree import BTreeError, DuplicateKeyError
+from minidb.catalog import HIGH
 from minidb.errors import IntegrityError, OperationalError
 from minidb.parser import (
-    Between, Binary, Call, Column, CreateTable, Delete, DropTable, Explain, InList, Insert,
-    Join, Like, Literal, Select, Star, TableRef, Unary, Update,
+    Between, Binary, Call, Column, CreateIndex, CreateTable, Delete, DropIndex, DropTable,
+    Explain, InList, Insert, Join, Like, Literal, Select, Star, TableRef, Unary, Update,
 )
 from minidb.record import decode_record, encode_record
 
@@ -462,50 +463,182 @@ class RowidRange:
         return "SEARCH USING ROWID (range)"
 
 
-def plan_access(scope, index, tree, conjuncts, compiler):
-    """Choose how to read table ``index`` of ``scope`` given the WHERE conjuncts.
+class IndexScan:
+    """Rows found through a secondary index: equality on a prefix of its
+    columns, optionally followed by a range on the next column."""
 
-    Only conjuncts comparing the table's row id with an expression over the
-    *earlier* tables (or constants) are usable.
+    def __init__(self, index, index_tree, table_tree, equal, lower, upper):
+        self.index = index
+        self.index_tree = index_tree
+        self.table_tree = table_tree
+        self.equal = equal  # key functions for the leading columns
+        self.lower = lower  # (key function, inclusive) or None
+        self.upper = upper
+
+    def candidates(self, row):
+        sort_key = values.sort_key
+        prefix = []
+        for key_function in self.equal:
+            value = key_function(row)
+            if value is None:
+                return  # col = NULL is never true
+            prefix.append(sort_key(value))
+        prefix = tuple(prefix)
+        start, start_inclusive = prefix, True
+        end, end_inclusive = prefix + (HIGH,), True
+        if self.lower or self.upper:
+            start, start_inclusive = prefix + ((0, 0), HIGH), False  # skip NULLs
+        if self.lower:
+            value = self.lower[0](row)
+            if value is None:
+                return
+            if self.lower[1]:
+                start, start_inclusive = prefix + (sort_key(value),), True
+            else:
+                start, start_inclusive = prefix + (sort_key(value), HIGH), False
+        if self.upper:
+            value = self.upper[0](row)
+            if value is None:
+                return
+            if self.upper[1]:
+                end = prefix + (sort_key(value), HIGH)
+            else:
+                end, end_inclusive = prefix + (sort_key(value),), False
+        get = self.table_tree.get
+        for key, _ in self.index_tree.scan(start, end, start_inclusive, end_inclusive):
+            rowid = key[-1][1]
+            yield rowid, get(rowid)
+
+    def describe(self):
+        names = self.index.column_names
+        parts = [f"{name}=?" for name in names[:len(self.equal)]]
+        if self.lower:
+            parts.append(f"{names[len(self.equal)]}>{'=' if self.lower[1] else ''}?")
+        if self.upper:
+            parts.append(f"{names[len(self.equal)]}<{'=' if self.upper[1] else ''}?")
+        return f"SEARCH USING INDEX {self.index.name} ({' AND '.join(parts)})"
+
+
+ROWID = -1  # column position standing for the row id in constraints
+
+
+class Constraint:
+    """A WHERE/ON conjunct of the form ``column op key`` usable by an access path."""
+
+    def __init__(self, position, op, key):
+        self.position = position  # column position in the table, or ROWID
+        self.op = op  # "=", "<", "<=", ">", ">=" or "IN"
+        self.key = key  # key function(s) evaluated on the outer row
+
+
+def find_constraints(scope, index, conjuncts, compiler):
+    """Constraints on table ``index`` whose other side only uses earlier tables.
+
+    Keys are converted with the comparison affinity SQLite would apply to
+    them; comparisons that would convert the *column* side are unusable.
     """
     _, table, offset = scope.entries[index]
-    rowid_slots = {scope.rowid_slot(index)}
-    if table.rowid_column is not None:
-        rowid_slots.add(offset + table.rowid_column)
+    rowid_slot = scope.rowid_slot(index)
     earlier = set(range(index))
-    equal, lower, upper = [], None, None
+    constraints = []
 
-    def is_rowid(expr):
-        return isinstance(expr, Column) and scope.resolve(expr)[0] in rowid_slots
+    def column_position(expr):
+        if not isinstance(expr, Column):
+            return None
+        slot, _, table_index = scope.resolve(expr)
+        if table_index != index:
+            return None
+        if slot == rowid_slot or slot - offset == table.rowid_column:
+            return ROWID
+        return slot - offset
 
-    def usable(expr):
-        return tables_referenced(expr, scope) <= earlier
+    def key_function(position, expr):
+        if tables_referenced(expr, scope) - earlier:
+            return None
+        function, affinity = compiler.compile_with_affinity(expr)
+        if position == ROWID:
+            return function  # row id lookups apply numeric affinity themselves
+        column_conversion, key_conversion = values.comparison_affinities(
+            table.affinities[position], affinity
+        )
+        if column_conversion is not None:
+            return None
+        convert = _AFFINITY_FUNCTIONS.get(key_conversion)
+        if convert is None:
+            return function
+        return lambda row: convert(function(row))
 
     for conjunct in conjuncts:
-        if isinstance(conjunct, InList) and not conjunct.negated and is_rowid(conjunct.expr):
-            if all(usable(item) for item in conjunct.items) and not equal:
-                equal = [compiler.compile(item) for item in conjunct.items]
+        if isinstance(conjunct, InList) and not conjunct.negated:
+            if column_position(conjunct.expr) == ROWID:
+                keys = [key_function(ROWID, item) for item in conjunct.items]
+                if all(keys):
+                    constraints.append(Constraint(ROWID, "IN", keys))
             continue
         if not isinstance(conjunct, Binary) or conjunct.op not in _FLIPPED or conjunct.op == "!=":
             continue
         op, left, right = conjunct.op, conjunct.left, conjunct.right
-        if is_rowid(right) and not is_rowid(left):
+        if column_position(left) is None and column_position(right) is not None:
             op, left, right = _FLIPPED[op], right, left
-        if not is_rowid(left) or not usable(right):
+        position = column_position(left)
+        if position is None:
             continue
-        key = compiler.compile(right)
-        if op == "=":
-            if not equal:
-                equal = [key]
-        elif op in (">", ">=") and lower is None:
-            lower = (key, op == ">=")
-        elif op in ("<", "<=") and upper is None:
-            upper = (key, op == "<=")
-    if equal:
-        return RowidLookup(tree, equal)
+        key = key_function(position, right)
+        if key is not None:
+            constraints.append(Constraint(position, op, key))
+    return constraints
+
+
+def _bounds(constraints, position):
+    """The first lower and upper bound constraints on ``position``."""
+    lower = upper = None
+    for c in constraints:
+        if c.position != position:
+            continue
+        if c.op in (">", ">=") and lower is None:
+            lower = (c.key, c.op == ">=")
+        elif c.op in ("<", "<=") and upper is None:
+            upper = (c.key, c.op == "<=")
+    return lower, upper
+
+
+def plan_access(scope, index, catalog, conjuncts, compiler):
+    """Choose how to read table ``index`` of ``scope`` given the usable conjuncts.
+
+    Preference: row id lookup, then the index matching the most leading
+    columns by equality (a fully matched UNIQUE index first), then a row id
+    range, then an index range, then a full scan.
+    """
+    table = scope.entries[index][1]
+    tree = catalog.table_tree(table)
+    constraints = find_constraints(scope, index, conjuncts, compiler)
+    for c in constraints:
+        if c.position == ROWID and c.op == "=":
+            return RowidLookup(tree, [c.key])
+        if c.position == ROWID and c.op == "IN":
+            return RowidLookup(tree, c.key)
+    best, best_score = FullScan(tree), 0
+    lower, upper = _bounds(constraints, ROWID)
     if lower or upper:
-        return RowidRange(tree, lower, upper)
-    return FullScan(tree)
+        best, best_score = RowidRange(tree, lower, upper), 3 + bool(lower and upper)
+    for info in table.indexes:
+        equal = []
+        for position in info.positions:
+            key = next((c.key for c in constraints if c.position == position and c.op == "="), None)
+            if key is None:
+                break
+            equal.append(key)
+        lower = upper = None
+        if len(equal) < len(info.positions):
+            lower, upper = _bounds(constraints, info.positions[len(equal)])
+        score = 10 * len(equal) + 2 * bool(lower) + 2 * bool(upper)
+        if info.unique and len(equal) == len(info.positions):
+            score += 500
+        if score > best_score:
+            index_tree = catalog.index_tree(info)
+            best = IndexScan(info, index_tree, tree, equal, lower, upper)
+            best_score = score
+    return best
 
 
 # ---- statements ------------------------------------------------------------------
@@ -529,6 +662,11 @@ class Executor:
             return Result()
         if isinstance(stmt, DropTable):
             self.catalog.drop_table(stmt.name, stmt.if_exists)
+            return Result()
+        if isinstance(stmt, CreateIndex):
+            return self.create_index(stmt)
+        if isinstance(stmt, DropIndex):
+            self.catalog.drop_index(stmt.name, stmt.if_exists)
             return Result()
         if isinstance(stmt, Explain):
             return self.explain(stmt.statement)
@@ -575,7 +713,6 @@ class Executor:
         levels = []
         for index, join in enumerate(joins):
             table = scope.entries[index][1]
-            tree = self.catalog.table_tree(table)
             if join.kind == "LEFT":
                 usable = split_conjuncts(join.on)
                 match = on_compiler.compile(join.on) if join.on is not None else None
@@ -588,7 +725,7 @@ class Executor:
             levels.append(JoinLevel(
                 table,
                 scope.entries[index][2],
-                plan_access(scope, index, tree, usable, compiler),
+                plan_access(scope, index, self.catalog, usable, compiler),
                 join.kind == "LEFT",
                 match,
                 [compiler.compile(f) for f in filters],
@@ -860,19 +997,34 @@ class Executor:
             raise IntegrityError("datatype mismatch")
         return rowid
 
-    def check_unique(self, table, tree, row, rowid):
-        for i in table.unique_columns():
-            value = row[i]
-            if value is None:
+    def check_unique(self, table, row, rowid):
+        """Raise if another row has the same values in a UNIQUE index.
+
+        NULLs never conflict.  Indexes are checked newest first, like SQLite.
+        """
+        sort_key = values.sort_key
+        for index in table.indexes:
+            if not index.unique:
                 continue
-            for other_rowid, record in tree.scan():
-                if other_rowid == rowid:
-                    continue
-                other = self.load_row(table, other_rowid, record)[i]
-                if other is not None and values.compare(value, other) == 0:
-                    raise IntegrityError(
-                        f"UNIQUE constraint failed: {table.name}.{table.columns[i].name}"
-                    )
+            key_values = [row[p] for p in index.positions]
+            if any(v is None for v in key_values):
+                continue
+            prefix = tuple(sort_key(v) for v in key_values)
+            for key, _ in self.catalog.index_tree(index).scan(prefix, prefix + (HIGH,)):
+                if key[-1][1] != rowid:
+                    columns = ", ".join(f"{table.name}.{c}" for c in index.column_names)
+                    raise IntegrityError(f"UNIQUE constraint failed: {columns}")
+
+    def add_index_entries(self, table, row, rowid):
+        for index in table.indexes:
+            try:
+                self.catalog.index_tree(index).insert(index.key(row, rowid), b"")
+            except BTreeError as exc:
+                raise OperationalError(f"index {index.name}: {exc}") from None
+
+    def remove_index_entries(self, table, row, rowid):
+        for index in table.indexes:
+            self.catalog.index_tree(index).delete(index.key(row, rowid))
 
     @staticmethod
     def encode(table, row):
@@ -890,11 +1042,11 @@ class Executor:
                 raise OperationalError("database or disk is full")
             if table.rowid_column is not None:
                 row[table.rowid_column] = rowid
-        self.check_unique(table, tree, row, rowid)
-        try:
-            tree.insert(rowid, self.encode(table, row))
-        except DuplicateKeyError:
-            raise self.rowid_conflict(table) from None
+        elif rowid in tree:
+            raise self.rowid_conflict(table)
+        self.check_unique(table, row, rowid)
+        tree.insert(rowid, self.encode(table, row))
+        self.add_index_entries(table, row, rowid)
         return rowid
 
     @staticmethod
@@ -935,12 +1087,14 @@ class Executor:
                 new_rowid = self.prepare_row(table, row)
                 if new_rowid is None:
                     raise IntegrityError("datatype mismatch")
-            self.check_unique(table, tree, row, rowid)
+            if new_rowid != rowid and new_rowid in tree:
+                raise self.rowid_conflict(table)
+            self.check_unique(table, row, rowid)
+            self.remove_index_entries(table, old, rowid)
             if new_rowid != rowid:
-                if new_rowid in tree:
-                    raise self.rowid_conflict(table)
                 tree.delete(rowid)
             tree.insert(new_rowid, self.encode(table, row), replace=True)
+            self.add_index_entries(table, row, new_rowid)
         return Result()
 
     # ---- DELETE --------------------------------------------------------------
@@ -950,9 +1104,30 @@ class Executor:
         tree = self.catalog.table_tree(table)
         if stmt.where is None:
             tree.clear()
+            for index in table.indexes:
+                self.catalog.index_tree(index).clear()
             return Result()
-        for rowid in [rowid for rowid, _ in self.matching_rows(table, stmt.where)]:
+        for rowid, row in list(self.matching_rows(table, stmt.where)):
+            self.remove_index_entries(table, row, rowid)
             tree.delete(rowid)
+        return Result()
+
+    # ---- indexes -------------------------------------------------------------
+
+    def create_index(self, stmt):
+        index = self.catalog.create_index(stmt)
+        if index is None:
+            return Result()
+        table = index.table
+        index_tree = self.catalog.index_tree(index)
+        for rowid, record in self.catalog.table_tree(table).scan():
+            row = self.load_row(table, rowid, record)
+            if index.unique:
+                self.check_unique(table, row, rowid)
+            try:
+                index_tree.insert(index.key(row, rowid), b"")
+            except BTreeError as exc:
+                raise OperationalError(f"index {index.name}: {exc}") from None
         return Result()
 
 

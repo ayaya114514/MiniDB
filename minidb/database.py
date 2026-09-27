@@ -44,6 +44,33 @@ class Database:
         self.pager.shrink_cache()
         return result
 
+    def integrity_check(self):
+        """Check every B+ tree and index; returns a list of problems (empty if OK)."""
+        problems = []
+        catalog = self.catalog
+        trees = [("schema", catalog.schema)]
+        for table in catalog.tables.values():
+            trees.append((f"table {table.name}", catalog.table_tree(table)))
+            for index in table.indexes:
+                trees.append((f"index {index.name}", catalog.index_tree(index)))
+        for name, tree in trees:
+            try:
+                tree.check()
+            except AssertionError as exc:
+                problems.append(f"{name}: {exc}")
+        if problems:
+            return problems
+        for table in catalog.tables.values():
+            rows = [
+                (rowid, self.executor.load_row(table, rowid, record))
+                for rowid, record in catalog.table_tree(table).scan()
+            ]
+            for index in table.indexes:
+                expected = sorted(index.key(row, rowid) for rowid, row in rows)
+                if catalog.index_tree(index).keys() != expected:
+                    problems.append(f"index {index.name} does not match table {table.name}")
+        return problems
+
     def close(self):
         self.pager.close()
 
