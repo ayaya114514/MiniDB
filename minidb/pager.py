@@ -8,6 +8,8 @@ modifying a page so the pager can track (and later journal) the change.
 
 Page 0 is the database header.  Freed pages form a singly linked free list.
 
+Transactions: see ``Pager`` for the write-ahead log that makes commits atomic.
+
 Statement journal: between ``begin_statement()`` and ``end_statement()`` the
 pager keeps a copy of every page as it was before the statement first touched
 it (every page class implements ``copy()``), so ``rollback_statement()`` can
@@ -19,11 +21,17 @@ on disk and needs no copy.
 import io
 import os
 import struct
+import zlib
 
 from minidb.errors import DatabaseError
 
 PAGE_SIZE = 4096
 MAGIC = b"MiniDB format 1\x00"
+WAL_MAGIC = b"MiniDB WAL 1\x00\x00\x00\x00"
+COMMIT_TAG = b"CMIT"
+
+_u32 = struct.Struct(">I")
+_wal_commit = struct.Struct(">I4sI")  # frame count, COMMIT_TAG, CRC32 of the frames
 
 
 class RawPage:
@@ -90,16 +98,38 @@ class Header:
 
 
 class Pager:
+    """Reads, caches and commits the pages of one database file.
+
+    Commit protocol (a redo log, "write-ahead"):
+
+    1. write every dirty page to ``<path>-wal`` followed by a commit record
+       holding the frame count and a CRC32 of the frames, then fsync it;
+    2. write the pages to the database file and fsync it;
+    3. delete the WAL file.
+
+    Dirty pages never reach the database file before step 2, so on open a
+    complete WAL (valid commit record) is replayed and an incomplete one is
+    discarded: either the whole transaction is applied or none of it.
+
+    ``crash_hook``, if set, is called as ``crash_hook(point, detail)`` at every
+    step of a commit so tests can simulate a crash there.
+    """
+
     def __init__(self, path=None):
         """Open (or create) the database file at ``path``; ``None`` means in memory."""
         self.path = path
+        self.wal_path = None if path is None else path + "-wal"
+        self.crash_hook = None
         if path is None:
             self.file = io.BytesIO()
         else:
-            self.file = open(path, "r+b" if os.path.exists(path) else "w+b")
+            if os.path.exists(self.wal_path):
+                self._recover()
+            self.file = open(path, "r+b" if os.path.exists(path) else "w+b", buffering=0)
         self.file.seek(0, io.SEEK_END)
         size = self.file.tell()
         if size % PAGE_SIZE:
+            self.file.close()
             raise DatabaseError("database file size is not a multiple of the page size")
         self.cache = {}
         self.dirty = set()
@@ -110,9 +140,14 @@ class Pager:
             self.cache[0] = self.header
             self.dirty.add(0)
         else:
-            self.header = Header.from_bytes(0, self._read(0))
+            try:
+                self.header = Header.from_bytes(0, self._read(0))
+            except DatabaseError:
+                self.file.close()
+                raise
             self.cache[0] = self.header
             if self.header.page_count > size // PAGE_SIZE:
+                self.file.close()
                 raise DatabaseError("database file is truncated")
 
     @property
@@ -166,6 +201,8 @@ class Pager:
         self.header = self.cache[0]
         self.end_statement()
 
+    # ---- allocation ---------------------------------------------------
+
     def allocate(self, page_class, *args):
         """Allocate a page (reusing the free list first) as ``page_class(pgno, *args)``."""
         header = self.header
@@ -205,19 +242,91 @@ class Pager:
                 pgno: page for pgno, page in self.cache.items() if pgno in self.dirty or pgno == 0
             }
 
-    def commit(self):
-        self.flush()
+    # ---- transactions -------------------------------------------------
 
-    def flush(self):
-        """Write every dirty page back to the file."""
-        for pgno in sorted(self.dirty):
+    def _crash_point(self, point, detail=None):
+        if self.crash_hook is not None:
+            self.crash_hook(point, detail)
+
+    def commit(self):
+        """Make every dirty page durable (see the class docstring)."""
+        if not self.dirty:
+            return
+        pages = [(pgno, self.cache[pgno].to_bytes()) for pgno in sorted(self.dirty)]
+        if self.wal_path is not None:
+            self._write_wal(pages)
+        for i, (pgno, data) in enumerate(pages):
+            self._crash_point("db_page", i)
             self.file.seek(pgno * PAGE_SIZE)
-            self.file.write(self.cache[pgno].to_bytes())
+            self.file.write(data)
+        if self.wal_path is not None:
+            self._crash_point("db_sync")
+            os.fsync(self.file.fileno())
+            self._crash_point("wal_delete")
+            os.remove(self.wal_path)
         self.dirty.clear()
-        self.file.flush()
+
+    def rollback(self):
+        """Discard every uncommitted change."""
+        for pgno in self.dirty:
+            self.cache.pop(pgno, None)
+        self.dirty.clear()
+        self.end_statement()
+        self.header = Header.from_bytes(0, self._read(0))
+        self.cache[0] = self.header
+
+    def _write_wal(self, pages):
+        with open(self.wal_path, "wb", buffering=0) as wal:
+            wal.write(WAL_MAGIC + _u32.pack(PAGE_SIZE))
+            checksum = 0
+            for i, (pgno, data) in enumerate(pages):
+                self._crash_point("wal_frame", i)
+                frame = _u32.pack(pgno) + data
+                wal.write(frame)
+                checksum = zlib.crc32(frame, checksum)
+            self._crash_point("wal_commit")
+            wal.write(_wal_commit.pack(len(pages), COMMIT_TAG, checksum))
+            self._crash_point("wal_sync")
+            os.fsync(wal.fileno())
+
+    def _recover(self):
+        """Replay a complete WAL into the database file; discard an incomplete one."""
+        frames = read_wal(self.wal_path)
+        if frames:
+            mode = "r+b" if os.path.exists(self.path) else "w+b"
+            with open(self.path, mode, buffering=0) as db:
+                for pgno, data in frames:
+                    db.seek(pgno * PAGE_SIZE)
+                    db.write(data)
+                os.fsync(db.fileno())
+        os.remove(self.wal_path)
 
     def close(self):
+        """Commit any dirty pages and close the file."""
         if self.file.closed:
             return
-        self.flush()
+        self.commit()
         self.file.close()
+
+
+def read_wal(path):
+    """Return the committed frames [(pgno, data)] of a WAL file, or [] if the
+    file is incomplete or corrupt."""
+    with open(path, "rb") as wal:
+        data = wal.read()
+    header_size = len(WAL_MAGIC) + 4
+    frame_size = 4 + PAGE_SIZE
+    body = len(data) - header_size - _wal_commit.size
+    if body < 0 or body % frame_size or not data.startswith(WAL_MAGIC):
+        return []
+    if _u32.unpack_from(data, len(WAL_MAGIC))[0] != PAGE_SIZE:
+        return []
+    count, tag, checksum = _wal_commit.unpack_from(data, len(data) - _wal_commit.size)
+    frames_bytes = data[header_size:header_size + body]
+    if tag != COMMIT_TAG or count != body // frame_size or zlib.crc32(frames_bytes) != checksum:
+        return []
+    frames = []
+    for i in range(count):
+        frame = frames_bytes[i * frame_size:(i + 1) * frame_size]
+        frames.append((_u32.unpack_from(frame)[0], frame[4:]))
+    return frames

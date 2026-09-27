@@ -161,3 +161,26 @@ UNIQUE 列和非整数 PRIMARY KEY 自动建唯一索引 `minidb_autoindex_<表>
 ## D33 integrity_check
 `Database.integrity_check()` 检查所有 B+ 树不变量，以及每个索引的内容是否恰好等于由表数据计算出的
 key 集合。测试和后面的模糊测试都用它兜底。
+
+## D34 WAL 是“重做日志”
+阶段 7 的 WAL 采用最简单可靠的重做日志：提交时 ① 把所有脏页（完整页镜像）写入 `<db>-wal`，
+末尾写提交记录（帧数 + `CMIT` + 全部帧的 CRC32），fsync；② 把页写回数据库文件，fsync；③ 删除 WAL。
+打开数据库时如果 WAL 存在：提交记录完整且校验通过就重放（幂等，重放中途崩溃下次再放一遍），
+否则整个丢弃。数据页在 WAL 落盘之前绝不写入数据库文件，所以任何时刻崩溃，结果要么是整个事务、
+要么完全没有。与 SQLite 的 WAL 模式不同：不支持并发读者从 WAL 读，也不需要 checkpoint。
+
+## D35 事务模型：no-steal + 语句级 journal
+未提交的脏页只留在内存（大事务占内存，列为限制），`ROLLBACK` 直接丢弃脏页并重读文件头、重载
+catalog。事务内某条语句失败只回滚这条语句（沿用阶段 5 的 statement journal），事务继续——
+与 sqlite 默认行为一致。`BEGIN` 嵌套、无事务时 `COMMIT/ROLLBACK` 的报错文字与 sqlite 相同。
+关闭数据库时未提交的事务回滚。
+
+## D36 数据库文件无缓冲 I/O 与崩溃钩子
+数据库文件和 WAL 用 `buffering=0` 打开，写入直接交给操作系统，进程崩溃时不会有 Python 缓冲区
+里的残留数据“事后写入”。pager 在提交的每一步调用 `crash_hook(point, detail)`（`wal_frame`、
+`wal_commit`、`wal_sync`、`db_page`、`db_sync`、`wal_delete`），测试据此在任意一步模拟崩溃：
+进程内抛异常，以及子进程里直接 `os._exit`。
+
+## D37 提交失败后连接作废
+提交途中出错（包括模拟崩溃）时，无法确定提交记录是否已经落盘，内存状态不可信。此时 `Database`
+关闭文件并拒绝后续操作，要求重新打开，由恢复流程决定事务是否生效。

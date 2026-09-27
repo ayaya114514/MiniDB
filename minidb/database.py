@@ -1,9 +1,10 @@
 """The public entry point: a connection to one database file."""
 
 from minidb.catalog import Catalog
+from minidb.errors import DatabaseError, OperationalError
 from minidb.executor import Executor, Result
 from minidb.pager import Pager
-from minidb.parser import parse_script
+from minidb.parser import Begin, Commit, Rollback, parse_script
 
 
 class Database:
@@ -11,14 +12,21 @@ class Database:
 
     ``execute`` runs one or more SQL statements and returns the result of the
     last one.  Every statement is atomic: if it fails, none of its changes
-    remain.  Outside an explicit transaction every statement commits at once.
+    remain.  Outside an explicit transaction (BEGIN ... COMMIT/ROLLBACK) every
+    statement commits at once.
     """
 
     def __init__(self, path=None):
         self.pager = Pager(path)
-        self.catalog = Catalog(self.pager)
-        self.pager.commit()
+        try:
+            self.catalog = Catalog(self.pager)
+            self.pager.commit()
+        except BaseException:
+            self.pager.file.close()
+            raise
         self.executor = Executor(self.catalog)
+        self.in_transaction = False
+        self.broken = False
 
     def execute(self, sql):
         result = Result()
@@ -32,6 +40,25 @@ class Database:
             yield self.execute_statement(stmt)
 
     def execute_statement(self, stmt):
+        if self.broken:
+            raise DatabaseError("a commit failed: reopen the database to recover")
+        if isinstance(stmt, Begin):
+            if self.in_transaction:
+                raise OperationalError("cannot start a transaction within a transaction")
+            self.in_transaction = True
+            return Result()
+        if isinstance(stmt, Commit):
+            if not self.in_transaction:
+                raise OperationalError("cannot commit - no transaction is active")
+            self.in_transaction = False
+            self._commit()
+            return Result()
+        if isinstance(stmt, Rollback):
+            if not self.in_transaction:
+                raise OperationalError("cannot rollback - no transaction is active")
+            self.in_transaction = False
+            self.rollback()
+            return Result()
         self.pager.begin_statement()
         try:
             result = self.executor.execute(stmt)
@@ -40,9 +67,26 @@ class Database:
             self.catalog.load()
             raise
         self.pager.end_statement()
-        self.pager.commit()
-        self.pager.shrink_cache()
+        if not self.in_transaction:
+            self._commit()
         return result
+
+    def _commit(self):
+        try:
+            self.pager.commit()
+        except BaseException:
+            # The commit may or may not have reached the WAL's commit record,
+            # so the in-memory state cannot be trusted.  Abandon it; reopening
+            # the file lets recovery decide.
+            self.broken = True
+            self.pager.file.close()
+            raise
+        self.pager.shrink_cache()
+
+    def rollback(self):
+        """Discard all uncommitted changes."""
+        self.pager.rollback()
+        self.catalog.load()
 
     def integrity_check(self):
         """Check every B+ tree and index; returns a list of problems (empty if OK)."""
@@ -72,6 +116,12 @@ class Database:
         return problems
 
     def close(self):
+        """Close the database; an open transaction is rolled back."""
+        if self.broken or self.pager.file.closed:
+            return
+        if self.in_transaction:
+            self.in_transaction = False
+            self.rollback()
         self.pager.close()
 
     def __enter__(self):
