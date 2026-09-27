@@ -28,6 +28,7 @@ Page layouts (all integers big-endian):
 import struct
 from bisect import bisect_left, bisect_right
 
+from minidb.errors import Error
 from minidb.pager import PAGE_SIZE
 
 LEAF, INTERNAL = 1, 2
@@ -42,7 +43,7 @@ _i64 = struct.Struct(">q")
 _overflow_ref = struct.Struct(">II")
 
 
-class BTreeError(Exception):
+class BTreeError(Error):
     pass
 
 
@@ -97,6 +98,9 @@ class Leaf:
             value_cell_size(v) for v in self.values
         )
 
+    def copy(self):
+        return Leaf(self.pgno, self.codec, list(self.keys), list(self.values), self.next_leaf)
+
     def to_bytes(self):
         out = bytearray(_header.pack(LEAF, len(self.keys), self.next_leaf))
         encode = self.codec.encode
@@ -124,6 +128,9 @@ class Internal:
     def recompute_size(self):
         size = self.codec.size
         self.size = HEADER_SIZE + sum(4 + size(k) for k in self.keys)
+
+    def copy(self):
+        return Internal(self.pgno, self.codec, list(self.keys), list(self.children))
 
     def to_bytes(self):
         out = bytearray(_header.pack(INTERNAL, len(self.keys), self.children[-1]))
@@ -182,6 +189,9 @@ class OverflowPage:
 
     def to_bytes(self):
         return (_u32.pack(self.next_page) + self.data).ljust(PAGE_SIZE, b"\x00")
+
+    def copy(self):
+        return OverflowPage(self.pgno, self.next_page, self.data)
 
 
 def _balanced_split(sizes, lo, hi):
