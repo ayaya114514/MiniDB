@@ -145,3 +145,16 @@ def test_corrupt_record_is_reported():
         decode_record(data[:-3])
     with pytest.raises(RecordError):
         decode_record(bytes([1, 9]))  # unknown type code
+
+
+def test_encoded_size_matches_encoding():
+    import random
+    from minidb.record import encoded_size
+    rng = random.Random(9)
+    for _ in range(3000):
+        values = [
+            rng.choice([None, 0, 1, rng.randint(-(2**63), 2**63 - 1), rng.randint(-40000, 40000),
+                        rng.random(), "".join(rng.choice("aé日") for _ in range(rng.randint(0, 400)))])
+            for _ in range(rng.randint(0, 300 if rng.random() < 0.05 else 8))
+        ]
+        assert encoded_size(values) == len(encode_record(values))

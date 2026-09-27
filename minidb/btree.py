@@ -105,14 +105,17 @@ def _write_key(out, encode, key, ref):
 class Leaf:
     is_leaf = True
 
-    def __init__(self, pgno, codec, keys=None, values=None, next_leaf=0, key_refs=None):
+    def __init__(self, pgno, codec, keys=None, values=None, next_leaf=0, key_refs=None, size=None):
         self.pgno = pgno
         self.codec = codec
         self.keys = keys if keys is not None else []
         self.values = values if values is not None else []
         self.key_refs = key_refs if key_refs is not None else [None] * len(self.keys)
         self.next_leaf = next_leaf
-        self.recompute_size()
+        if size is None:
+            self.recompute_size()
+        else:
+            self.size = size
 
     def cell_sizes(self):
         codec = self.codec
@@ -126,7 +129,7 @@ class Leaf:
 
     def copy(self):
         return Leaf(self.pgno, self.codec, list(self.keys), list(self.values), self.next_leaf,
-                    list(self.key_refs))
+                    list(self.key_refs), self.size)
 
     def to_bytes(self):
         out = bytearray(_header.pack(LEAF, len(self.keys), self.next_leaf))
@@ -145,13 +148,16 @@ class Leaf:
 class Internal:
     is_leaf = False
 
-    def __init__(self, pgno, codec, keys=None, children=None, key_refs=None):
+    def __init__(self, pgno, codec, keys=None, children=None, key_refs=None, size=None):
         self.pgno = pgno
         self.codec = codec
         self.keys = keys if keys is not None else []
         self.children = children if children is not None else []
         self.key_refs = key_refs if key_refs is not None else [None] * len(self.keys)
-        self.recompute_size()
+        if size is None:
+            self.recompute_size()
+        else:
+            self.size = size
 
     def cell_sizes(self):
         codec = self.codec
@@ -162,7 +168,7 @@ class Internal:
 
     def copy(self):
         return Internal(self.pgno, self.codec, list(self.keys), list(self.children),
-                        list(self.key_refs))
+                        list(self.key_refs), self.size)
 
     def to_bytes(self):
         out = bytearray(_header.pack(INTERNAL, len(self.keys), self.children[-1]))

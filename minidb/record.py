@@ -71,6 +71,30 @@ def encode_record(values):
     return b"\xff" + _u32.pack(len(header)) + bytes(header) + bytes(body)
 
 
+def encoded_size(values):
+    """``len(encode_record(values))`` without building the bytes."""
+    header = body = 0
+    for value in values:
+        header += 1
+        if value is None or value is True or value is False:
+            continue
+        if isinstance(value, int):
+            if value in (0, 1):
+                continue
+            for code, limit in _INT_LIMITS:
+                if -limit <= value < limit:
+                    body += 1 << (code - 1)
+                    break
+        elif isinstance(value, float):
+            body += 8
+        else:
+            length = len(value.encode("utf-8")) if not value.isascii() else len(value)
+            if length > MAX_SHORT_TEXT:
+                header += 4
+            body += length
+    return (1 if header < 0xFF else 5) + header + body
+
+
 _decoders = {}
 
 

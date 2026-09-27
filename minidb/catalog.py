@@ -17,7 +17,7 @@ from minidb import values
 from minidb.btree import BTree
 from minidb.errors import DatabaseError, OperationalError
 from minidb.parser import CreateIndex, CreateTable, parse
-from minidb.record import decode_record, encode_record
+from minidb.record import decode_record, encode_record, encoded_size
 
 SCHEMA_ROOT = 1
 RESERVED_PREFIX = "minidb_"
@@ -59,7 +59,7 @@ class IndexKeyCodec:
 
     @classmethod
     def size(cls, key):
-        return len(cls.encode(key))
+        return encoded_size([cls._plain(pair) for pair in key])
 
 
 # ---- schema objects ----------------------------------------------------------------
