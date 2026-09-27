@@ -42,13 +42,23 @@ def ranges(numbers):
     return ", ".join(parts)
 
 
+class OnlyPackage:
+    """Replaces ``trace``'s ignore list: trace the package and nothing else.
+    (The stock one caches its verdict by bare module name, so after skipping
+    some library's ``__init__.py`` it skipped ours as well.)"""
+
+    def names(self, filename, modulename):
+        return 0 if os.path.abspath(filename).startswith(PACKAGE + os.sep) else 1
+
+
 def main():
     import pytest
 
     sys.path.insert(0, ROOT)
-    tracer = trace.Trace(count=True, trace=False, ignoredirs=[sys.prefix, sys.exec_prefix])
+    tracer = trace.Trace(count=True, trace=False)
+    tracer.ignore = OnlyPackage()
     threading.settrace(tracer.globaltrace)
-    args = sys.argv[1:] or ["tests", "-q", "-p", "no:cacheprovider"]
+    args = sys.argv[1:] or ["tests", "-p", "no:cacheprovider"]
     code = tracer.runfunc(pytest.main, args)
     counts = tracer.results().counts
     ran = {}
