@@ -78,5 +78,5 @@ def test_errors_have_positions(text, message, line, column):
 
 def test_caret():
     with pytest.raises(SQLSyntaxError) as info:
-        tokenize("SELECT 1,\n  2 ? 3")
-    assert info.value.caret() == "  2 ? 3\n    ^"
+        tokenize("SELECT 1,\n  2 # 3")
+    assert info.value.caret() == "  2 # 3\n    ^"

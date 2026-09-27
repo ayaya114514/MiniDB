@@ -19,8 +19,9 @@ from minidb.btree import BTreeError, DuplicateKeyError
 from minidb.catalog import HIGH
 from minidb.errors import IntegrityError, OperationalError
 from minidb.parser import (
-    Between, Binary, Call, Column, CreateIndex, CreateTable, Delete, DropIndex, DropTable,
-    Explain, InList, Insert, Join, Like, Literal, Select, Star, TableRef, Unary, Update,
+    Between, Binary, Bound, Call, Column, CreateIndex, CreateTable, Delete, DropIndex,
+    DropTable, Explain, InList, Insert, Join, Like, Literal, Select, Star, TableRef, Unary,
+    Update,
 )
 from minidb.record import decode_record, encode_record
 
@@ -28,11 +29,15 @@ ROWID_NAMES = ("rowid", "oid", "_rowid_")
 
 
 class Result(list):
-    """Rows (a list of tuples) plus the result column names."""
+    """Rows (a list of tuples) plus the result column names.
 
-    def __init__(self, rows=(), columns=()):
+    ``rowcount`` is the number of rows an INSERT, UPDATE or DELETE changed
+    (-1 for other statements), as in sqlite3."""
+
+    def __init__(self, rows=(), columns=(), rowcount=-1):
         super().__init__(rows)
         self.columns = list(columns)
+        self.rowcount = rowcount
 
 
 # ---- name resolution --------------------------------------------------------
@@ -648,6 +653,7 @@ def plan_access(scope, index, catalog, conjuncts, compiler):
 class Executor:
     def __init__(self, catalog):
         self.catalog = catalog
+        self.last_insert_rowid = 0
 
     def execute(self, stmt):
         if isinstance(stmt, Select):
@@ -974,8 +980,8 @@ class Executor:
             row = [None] * width
             for position, function in zip(positions, functions):
                 row[position] = function([])
-            self.insert_row(table, tree, row)
-        return Result()
+            self.last_insert_rowid = self.insert_row(table, tree, row)
+        return Result(rowcount=len(rows))
 
     def prepare_row(self, table, row):
         """Apply column affinities and NOT NULL checks; returns the requested row id."""
@@ -1079,7 +1085,8 @@ class Executor:
                 position = width if table.rowid_column is None else table.rowid_column
             assignments.append((position, compiler.compile(expr)))
         tree = self.catalog.table_tree(table)
-        for rowid, old in list(self.matching_rows(table, stmt.where)):
+        matches = list(self.matching_rows(table, stmt.where))
+        for rowid, old in matches:
             new = list(old)
             for position, function in assignments:
                 new[position] = function(old)
@@ -1101,7 +1108,7 @@ class Executor:
                 tree.delete(rowid)
             tree.insert(new_rowid, self.encode(table, row), replace=True)
             self.add_index_entries(table, row, new_rowid)
-        return Result()
+        return Result(rowcount=len(matches))
 
     # ---- DELETE --------------------------------------------------------------
 
@@ -1109,14 +1116,16 @@ class Executor:
         table = self.catalog.get_table(stmt.table)
         tree = self.catalog.table_tree(table)
         if stmt.where is None:
+            count = len(tree)
             tree.clear()
             for index in table.indexes:
                 self.catalog.index_tree(index).clear()
-            return Result()
-        for rowid, row in list(self.matching_rows(table, stmt.where)):
+            return Result(rowcount=count)
+        matches = list(self.matching_rows(table, stmt.where))
+        for rowid, row in matches:
             self.remove_index_entries(table, row, rowid)
             tree.delete(rowid)
-        return Result()
+        return Result(rowcount=len(matches))
 
     # ---- indexes -------------------------------------------------------------
 
@@ -1157,6 +1166,8 @@ def folded_literal(expr):
     (looking through unary + and -).  Folded values are only observable
     through ORDER BY / GROUP BY column numbers.
     """
+    if isinstance(expr, Bound):
+        return None  # bound parameters are values, never folded or column numbers
     if isinstance(expr, Literal):
         return expr
     if isinstance(expr, Binary) and expr.op == "AND":

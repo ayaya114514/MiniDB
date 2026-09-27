@@ -53,6 +53,7 @@ class Generator:
         self.tables = []
         self.index_count = 0
         self.indexes = []
+        self.parameters = []  # values for the "?" placeholders of the current statement
 
     # ---- schema -------------------------------------------------------------
 
@@ -95,6 +96,14 @@ class Generator:
     # ---- values and expressions -------------------------------------------------
 
     def literal(self, text_safe=False):
+        text = self._literal(text_safe)
+        if self.rng.random() < 0.15:
+            # Bind the same value through a parameter instead.
+            self.parameters.append(eval(text.replace("NULL", "None")))  # noqa: S307 - our own literals
+            return "?"
+        return text
+
+    def _literal(self, text_safe=False):
         rng = self.rng
         kind = rng.random()
         if kind < 0.12:
@@ -177,12 +186,17 @@ class Generator:
             columns = table.column_names()
             prefix = f"INSERT INTO {table.name} VALUES "
         for _ in range(rng.randint(1, 4)):
-            values = [self.expr([], 2, True) for _ in columns]
-            # A row id of 2**63-1 makes SQLite pick later row ids at random.
-            values = [
-                v.replace("9223372036854775807", "7") if c == table.rowid_alias else v
-                for c, v in zip(columns, values)
-            ]
+            values = []
+            for column in columns:
+                first_parameter = len(self.parameters)
+                value = self.expr([], 2, True)
+                if column == table.rowid_alias:
+                    # A row id of 2**63-1 makes SQLite pick later row ids at random.
+                    value = value.replace("9223372036854775807", "7")
+                    self.parameters[first_parameter:] = [
+                        7 if p == 9223372036854775807 else p for p in self.parameters[first_parameter:]
+                    ]
+                values.append(value)
             rows.append("(" + ", ".join(values) + ")")
         return prefix + ", ".join(rows)
 
@@ -253,6 +267,12 @@ class Generator:
                 sql += f" HAVING {rng.choice(aggregates)} > {self.literal()}"
         return sql
 
+    def statement_with_parameters(self):
+        """A random statement and the values for its placeholders (or None)."""
+        self.parameters = []
+        sql = self.statement()
+        return sql, (list(self.parameters) if "?" in sql else None)
+
     def statement(self):
         rng = self.rng
         roll = rng.random()
@@ -279,12 +299,13 @@ def run_seed(seed, statements, path=None, verbose=False):
     pair = Pair(path, loose_numbers=True)
     history = []
     try:
-        setup = [generator.create_table() for _ in range(2)] + [generator.create_index()]
-        for sql in setup + [generator.statement() for _ in range(statements)]:
-            history.append(sql)
+        setup = [(generator.create_table(), None) for _ in range(2)]
+        setup.append((generator.create_index(), None))
+        for sql, parameters in setup + [generator.statement_with_parameters() for _ in range(statements)]:
+            history.append(sql if parameters is None else f"{sql}  -- parameters: {parameters!r}")
             if verbose:
-                print(sql)
-            pair.run(sql)
+                print(history[-1])
+            pair.run(sql, parameters=parameters)
         problems = pair.mini.integrity_check()
         if problems:
             raise AssertionError(f"integrity check failed: {problems}")

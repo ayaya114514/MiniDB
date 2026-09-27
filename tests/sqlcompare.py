@@ -35,19 +35,22 @@ class Pair:
         self.check_messages = check_messages
         self.normalize = loose if loose_numbers else typed
 
-    def run(self, sql, ordered=None):
+    def run(self, sql, ordered=None, parameters=None):
         """Execute ``sql`` on both; assert that both fail or both return the same rows.
 
         Rows are compared in order when ``ordered`` is true (default: when the
         statement has ORDER BY), otherwise as multisets.
         """
         try:
-            expected = [tuple(r) for r in self.lite.execute(sql).fetchall()]
+            if parameters is None:
+                expected = [tuple(r) for r in self.lite.execute(sql).fetchall()]
+            else:
+                expected = [tuple(r) for r in self.lite.execute(sql, parameters).fetchall()]
             lite_error = None
         except sqlite3.Error as exc:
             expected, lite_error = None, exc
         try:
-            actual = list(self.mini.execute(sql))
+            actual = list(self.mini.execute(sql, parameters))
             mini_error = None
         except Error as exc:
             actual, mini_error = None, exc

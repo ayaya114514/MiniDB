@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from minidb.errors import Error
+from minidb.errors import OperationalError
 
 KEYWORDS = {
     "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "COMMIT", "CREATE", "CROSS", "DELETE",
@@ -17,7 +17,7 @@ OPERATORS = ["<>", "<=", ">=", "==", "!=", "||", "<", ">", "=", "+", "-", "*", "
              "(", ")", ",", ";", "."]
 
 
-class SQLSyntaxError(Error):
+class SQLSyntaxError(OperationalError):
     """A lexical or syntax error at a position in the SQL text."""
 
     def __init__(self, message, text, pos):
@@ -38,8 +38,9 @@ class SQLSyntaxError(Error):
 
 @dataclass
 class Token:
-    kind: str     # KEYWORD, IDENT, INTEGER, FLOAT, STRING, OP or EOF
-    value: object  # keyword in upper case, identifier name, number, string, operator
+    kind: str     # KEYWORD, IDENT, INTEGER, FLOAT, STRING, OP, PARAM or EOF
+    value: object  # keyword in upper case, identifier name, number, string,
+                   # operator, or for PARAM the text after "?" / the whole ":name"
     pos: int
     text: str     # the exact source text of the token
 
@@ -80,6 +81,18 @@ def tokenize(text):
         if ch == "'":
             value, i = _quoted(text, i, "'")
             tokens.append(Token("STRING", value, start, text[start:i]))
+            continue
+        if ch == "?":
+            i += 1
+            while i < n and text[i].isdigit():
+                i += 1
+            tokens.append(Token("PARAM", text[start:i], start, text[start:i]))
+            continue
+        if ch in ":@$" and i + 1 < n and (text[i + 1].isalnum() or text[i + 1] == "_"):
+            i += 1
+            while i < n and (text[i].isalnum() or text[i] in "_$"):
+                i += 1
+            tokens.append(Token("PARAM", text[start:i], start, text[start:i]))
             continue
         if ch in "\"`[":
             value, i = _quoted(text, i, "]" if ch == "[" else ch)

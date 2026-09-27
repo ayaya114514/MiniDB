@@ -26,9 +26,27 @@ class Literal:
 
 
 @dataclass(frozen=True)
+class Bound(Literal):
+    """The value bound to a parameter.  Evaluates like a literal, but SQLite
+    never treats it as an ORDER BY column number or folds it at parse time."""
+
+
+@dataclass(frozen=True)
 class Column:
     name: str
     table: str | None = None
+
+
+@dataclass(frozen=True)
+class Parameter:
+    """A placeholder: ``?``, ``?NNN``, ``:name``, ``@name`` or ``$name``.
+
+    ``index`` is 1-based and numbered like SQLite: ``?NNN`` is NNN, a bare
+    ``?`` is one more than the largest index so far, and a name gets the next
+    index the first time it appears."""
+
+    index: int
+    name: str | None = None
 
 
 @dataclass(frozen=True)
@@ -207,6 +225,7 @@ class Delete:
 # ---- parser ------------------------------------------------------------
 
 TYPE_NAMES = {"INTEGER", "TEXT"}
+MAX_PARAMETER_INDEX = 250_000
 
 
 def parse(text):
@@ -292,13 +311,20 @@ class Parser:
     # ---- statements ---------------------------------------------------
 
     def parse_script(self):
+        """Parse all statements.  Each gets ``param_count`` (the largest
+        parameter index it uses) and ``param_names`` ({index: name})."""
         statements = []
         while True:
             while self.accept_op(";"):
                 pass
             if self.tok.kind == "EOF":
                 return statements
-            statements.append(self.statement())
+            self.param_count = 0
+            self.param_names = {}
+            stmt = self.statement()
+            stmt.param_count = self.param_count
+            stmt.param_names = self.param_names
+            statements.append(stmt)
             if self.tok.kind != "EOF" and not self.at_op(";"):
                 raise self.error('";" or end of statement')
 
@@ -659,6 +685,8 @@ class Parser:
             return Literal(token.value)
         if self.accept_keyword("NULL"):
             return Literal(None)
+        if token.kind == "PARAM":
+            return self.parameter()
         if self.accept_op("("):
             expr = self.expr()
             self.expect_op(")")
@@ -671,6 +699,29 @@ class Parser:
                 return Column(self.identifier("column name"), token.value)
             return Column(token.value)
         raise self.error("expression")
+
+    def parameter(self):
+        token = self.advance()
+        text = token.value
+        if text.startswith("?"):
+            if len(text) == 1:
+                index = self.param_count + 1
+            else:
+                index = int(text[1:])
+                if not 1 <= index <= MAX_PARAMETER_INDEX:
+                    raise SQLSyntaxError(
+                        f"variable number must be between ?1 and ?{MAX_PARAMETER_INDEX}",
+                        self.text, token.pos,
+                    )
+            name = None
+        else:
+            name = text
+            index = next((i for i, n in self.param_names.items() if n == name), None)
+            if index is None:
+                index = self.param_count + 1
+                self.param_names[index] = name
+        self.param_count = max(self.param_count, index)
+        return Parameter(index, name)
 
     def call(self, name):
         if self.accept_op("*"):
