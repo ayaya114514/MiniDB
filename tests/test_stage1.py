@@ -6,6 +6,7 @@ import sys
 import pytest
 
 from minidb.executor import ExecutionError, Table
+from minidb.pager import Pager
 from minidb.parser import ParseError, parse
 from minidb.repl import run
 
@@ -45,7 +46,7 @@ def test_parse_errors(text):
 
 
 def test_duplicate_id_rejected():
-    table = Table()
+    table = Table(Pager())
     table.execute(parse("insert 1 a 1"))
     with pytest.raises(ExecutionError):
         table.execute(parse("insert 1 b 2"))
@@ -72,7 +73,7 @@ def test_matches_sqlite():
     conn.executemany("INSERT INTO users VALUES (?, ?, ?)", rows)
     expected = conn.execute("SELECT * FROM users ORDER BY id").fetchall()
 
-    table = Table()
+    table = Table(Pager())
     for row in rows:
         table.execute(parse("insert %d %s %d" % row))
     assert table.execute(parse("select")) == expected
