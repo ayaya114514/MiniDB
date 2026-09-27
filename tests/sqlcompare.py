@@ -12,6 +12,11 @@ def typed(row):
     return tuple((type_name(v), v) for v in row)
 
 
+def loose(row):
+    """Compare numbers by value only (1 == 1.0 == 1.0, 0 == -0.0)."""
+    return tuple(("number", v) if isinstance(v, (int, float)) else (type_name(v), v) for v in row)
+
+
 def row_order_key(row):
     """A canonical order for comparing results as multisets (1 before 1.0)."""
     return tuple((sort_key(v), type_name(v)) for v in row)
@@ -20,10 +25,15 @@ def row_order_key(row):
 class Pair:
     """A MiniDB database and a sqlite3 database fed with identical SQL."""
 
-    def __init__(self, path=None, check_messages=False):
+    def __init__(self, path=None, check_messages=False, loose_numbers=False):
+        """``loose_numbers`` compares numbers by value only.  The fuzzer uses it:
+        when several rows hold equal values of different types (1 and 1.0),
+        which one DISTINCT, GROUP BY or MIN/MAX reports depends on the order
+        SQLite's query plan visits rows in."""
         self.mini = Database(path)
         self.lite = sqlite3.connect(":memory:", isolation_level=None)
         self.check_messages = check_messages
+        self.normalize = loose if loose_numbers else typed
 
     def run(self, sql, ordered=None):
         """Execute ``sql`` on both; assert that both fail or both return the same rows.
@@ -53,8 +63,8 @@ class Pair:
             return None
         if ordered is None:
             ordered = "ORDER BY" in sql.upper()
-        expected_rows = [typed(r) for r in expected]
-        actual_rows = [typed(r) for r in actual]
+        expected_rows = [self.normalize(r) for r in expected]
+        actual_rows = [self.normalize(r) for r in actual]
         if not ordered:
             expected_rows.sort(key=lambda r: row_order_key([v for _, v in r]))
             actual_rows.sort(key=lambda r: row_order_key([v for _, v in r]))

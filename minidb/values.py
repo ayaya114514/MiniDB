@@ -353,15 +353,25 @@ def _fn_nullif(a, b):
 
 
 def _fn_min(*values):
+    """Scalar MIN: among equal values (1 and 1.0) SQLite returns the last one."""
     if any(v is None for v in values):
         return None
-    return min(values, key=sort_key)
+    best = values[0]
+    for value in values[1:]:
+        if compare(best, value) >= 0:
+            best = value
+    return best
 
 
 def _fn_max(*values):
+    """Scalar MAX: among equal values SQLite returns the first one."""
     if any(v is None for v in values):
         return None
-    return max(values, key=sort_key)
+    best = values[0]
+    for value in values[1:]:
+        if compare(best, value) < 0:
+            best = value
+    return best
 
 
 # name -> (function, minimum argument count, maximum argument count or None)

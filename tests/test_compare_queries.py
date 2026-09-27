@@ -245,7 +245,11 @@ def test_constant_order_by_terms_follow_sqlite(pair):
     do not affect the order."""
     for term in ["1", "+1", "-1", "+(2)", "- -2", "-(-2)", "1+1", "(2 IS NULL)", "(2 IS NOT NULL)",
                  "('x' IS NULL)", "(-3 IS NOT NULL) DESC", "(NULL IS NULL)", "'1'", "1.0",
-                 "2147483647", "2147483648", "9223372036854775807", "(1 = 1)", "abs(2)"]:
+                 "2147483647", "2147483648", "9223372036854775807", "(1 = 1)", "abs(2)",
+                 "(salary AND 0)", "(0 AND salary)", "(salary AND 0.0)", "(salary AND -0)",
+                 "(abs(salary) AND 0)", "(name LIKE 'a' AND 0)", "((salary AND 0) AND id)",
+                 "(salary IN (1, 2) AND 0)", "(-(salary AND 0))", "((0 AND salary) IS NULL)",
+                 "((salary AND 0) OR 0)", "(salary AND 0) + 1", "(salary BETWEEN 1 AND 2 AND 0)"]:
         pair.run(f"SELECT name, id FROM emp ORDER BY {term}, id")
         pair.run(f"SELECT dept, count(*) FROM emp GROUP BY {term}")
 

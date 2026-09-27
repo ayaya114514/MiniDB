@@ -17,7 +17,10 @@ where MiniDB and sqlite3 are known to differ in unimportant ways:
 * Choices SQLite leaves to its query plan: row order without a total ORDER
   BY, bare columns in aggregates, GROUP_CONCAT order, and which row an
   UPDATE touching several rows processes first when that decides a UNIQUE
-  conflict.
+  conflict (UPDATEs of UNIQUE columns or the row id touch a single row).
+  Numbers are compared by value (``Pair(loose_numbers=True)``), because which
+  of two equal values 1 and 1.0 DISTINCT, GROUP BY or MIN/MAX returns also
+  depends on the order rows are visited in.
 """
 
 import argparse
@@ -38,6 +41,7 @@ class Table:
         self.name = name
         self.columns = columns  # [(name, type, constraints)]
         self.rowid_alias = rowid_alias  # column name or None
+        self.unique_columns = {c[0] for c in columns if c[2] == "UNIQUE"}
 
     def column_names(self):
         return [c[0] for c in self.columns]
@@ -77,6 +81,8 @@ class Generator:
         name = f"i{self.index_count}"
         self.indexes.append(name)
         unique = "UNIQUE " if rng.random() < 0.2 else ""
+        if unique:
+            table.unique_columns.update(columns)
         return f"CREATE {unique}INDEX {name} ON {table.name} ({', '.join(columns)})"
 
     def drop_index(self):
@@ -88,7 +94,7 @@ class Generator:
 
     # ---- values and expressions -------------------------------------------------
 
-    def literal(self):
+    def literal(self, text_safe=False):
         rng = self.rng
         kind = rng.random()
         if kind < 0.12:
@@ -97,8 +103,11 @@ class Generator:
             return str(rng.choice([0, 1, 2, 3, 5, 7, 10, -1, -4, rng.randint(-20, 40)]))
         if kind < 0.65:
             return repr(rng.randint(-40, 40) / 4)
-        if kind < 0.67:
-            return rng.choice(["9223372036854775807", "-9223372036854775808", "4611686018427387904"])
+        if kind < 0.67 and not text_safe:
+            # Large values overflow into REALs whose text form may differ (D20).
+            # -2**63 is left out: abs() of it raises an error, and SQLite's
+            # order of evaluating constant expressions decides whether it does.
+            return rng.choice(["9223372036854775807", "4611686018427387904"])
         return "'" + rng.choice(TEXTS).replace("'", "''") + "'"
 
     def column(self, scope):
@@ -110,7 +119,7 @@ class Generator:
         """A random expression over the tables in ``scope`` [(alias, Table)]."""
         rng = self.rng
         if depth >= 3 or rng.random() < 0.3:
-            return self.column(scope) if scope and rng.random() < 0.6 else self.literal()
+            return self.column(scope) if scope and rng.random() < 0.6 else self.literal(text_safe)
         kind = rng.random()
         sub = lambda safe=text_safe: self.expr(scope, depth + 1, safe)  # noqa: E731
         if kind < 0.35:
@@ -184,6 +193,9 @@ class Generator:
         names = [c for c in table.column_names() if c != table.rowid_alias]
         assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in rng.sample(names, rng.randint(1, len(names)))]
         where = self.condition(scope)
+        if any(a.split(" = ")[0] in table.unique_columns for a in assignments):
+            # Which row goes first could decide a UNIQUE conflict: one row only.
+            where = f"rowid = {rng.randint(1, 40)}"
         if table.rowid_alias and rng.random() < 0.15:
             # Changing the row id: keep it to one row so the processing order cannot matter.
             assignments = [f"id = {rng.randint(-5, 60)}"]
@@ -264,7 +276,7 @@ class Generator:
 def run_seed(seed, statements, path=None, verbose=False):
     """Run one fuzzing session; returns None or a failure description."""
     generator = Generator(seed)
-    pair = Pair(path)
+    pair = Pair(path, loose_numbers=True)
     history = []
     try:
         setup = [generator.create_table() for _ in range(2)] + [generator.create_index()]
