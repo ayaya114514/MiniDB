@@ -13,7 +13,8 @@ def typed(row):
 
 
 def row_order_key(row):
-    return tuple(sort_key(v) for v in row)
+    """A canonical order for comparing results as multisets (1 before 1.0)."""
+    return tuple((sort_key(v), type_name(v)) for v in row)
 
 
 class Pair:

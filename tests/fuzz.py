@@ -1,0 +1,317 @@
+"""Random SQL generator for differential fuzzing against sqlite3.
+
+Run a campaign from the command line:
+
+    .venv/bin/python tests/fuzz.py --seeds 0-199 --statements 400
+
+Every statement is executed on both MiniDB and sqlite3; any difference in
+results (or in whether an error happens) is reported with the seed and the
+statements that led to it.
+
+The generator stays inside the supported language and avoids the two places
+where MiniDB and sqlite3 are known to differ in unimportant ways:
+
+* REAL -> TEXT conversion of values without a short decimal form (see
+  DECISIONS.md D20): expressions whose value may be converted to text never
+  contain ``/``, and REAL literals are multiples of 1/4.
+* Choices SQLite leaves to its query plan: row order without a total ORDER
+  BY, bare columns in aggregates, GROUP_CONCAT order, and which row an
+  UPDATE touching several rows processes first when that decides a UNIQUE
+  conflict.
+"""
+
+import argparse
+import os
+import random
+import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from sqlcompare import Pair  # noqa: E402
+
+TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz"]
+
+
+class Table:
+    def __init__(self, name, columns, rowid_alias):
+        self.name = name
+        self.columns = columns  # [(name, type, constraints)]
+        self.rowid_alias = rowid_alias  # column name or None
+
+    def column_names(self):
+        return [c[0] for c in self.columns]
+
+
+class Generator:
+    def __init__(self, seed):
+        self.rng = random.Random(seed)
+        self.tables = []
+        self.index_count = 0
+        self.indexes = []
+
+    # ---- schema -------------------------------------------------------------
+
+    def create_table(self):
+        rng = self.rng
+        name = f"t{len(self.tables)}"
+        columns = []
+        rowid_alias = None
+        if rng.random() < 0.6:
+            rowid_alias = "id"
+            columns.append(("id", "INTEGER", "PRIMARY KEY"))
+        for i in range(rng.randint(2, 4)):
+            col_type = rng.choice(["INTEGER", "TEXT"])
+            constraint = rng.choice(["", "", "", "NOT NULL", "UNIQUE"])
+            columns.append((f"c{i}", col_type, constraint))
+        table = Table(name, columns, rowid_alias)
+        self.tables.append(table)
+        definitions = ", ".join(" ".join(p for p in c if p) for c in columns)
+        return f"CREATE TABLE {name} ({definitions})"
+
+    def create_index(self):
+        rng = self.rng
+        table = rng.choice(self.tables)
+        columns = rng.sample(table.column_names(), rng.randint(1, min(2, len(table.columns))))
+        self.index_count += 1
+        name = f"i{self.index_count}"
+        self.indexes.append(name)
+        unique = "UNIQUE " if rng.random() < 0.2 else ""
+        return f"CREATE {unique}INDEX {name} ON {table.name} ({', '.join(columns)})"
+
+    def drop_index(self):
+        if not self.indexes:
+            return self.create_index()
+        name = self.rng.choice(self.indexes)
+        self.indexes.remove(name)
+        return f"DROP INDEX {name}"
+
+    # ---- values and expressions -------------------------------------------------
+
+    def literal(self):
+        rng = self.rng
+        kind = rng.random()
+        if kind < 0.12:
+            return "NULL"
+        if kind < 0.55:
+            return str(rng.choice([0, 1, 2, 3, 5, 7, 10, -1, -4, rng.randint(-20, 40)]))
+        if kind < 0.65:
+            return repr(rng.randint(-40, 40) / 4)
+        if kind < 0.67:
+            return rng.choice(["9223372036854775807", "-9223372036854775808", "4611686018427387904"])
+        return "'" + rng.choice(TEXTS).replace("'", "''") + "'"
+
+    def column(self, scope):
+        alias, table = self.rng.choice(scope)
+        name = self.rng.choice(table.column_names() + ["rowid"] * (table.rowid_alias is None))
+        return f"{alias}.{name}" if len(scope) > 1 else name
+
+    def expr(self, scope, depth=0, text_safe=False):
+        """A random expression over the tables in ``scope`` [(alias, Table)]."""
+        rng = self.rng
+        if depth >= 3 or rng.random() < 0.3:
+            return self.column(scope) if scope and rng.random() < 0.6 else self.literal()
+        kind = rng.random()
+        sub = lambda safe=text_safe: self.expr(scope, depth + 1, safe)  # noqa: E731
+        if kind < 0.35:
+            ops = ["+", "-", "*", "%", "=", "!=", "<", "<=", ">", ">=", "AND", "OR", "IS", "IS NOT"]
+            if not text_safe:
+                ops.append("/")
+            op = rng.choice(ops)
+            return f"({sub()} {op} {sub()})"
+        if kind < 0.45:
+            return f"({sub(True)} || {sub(True)})"
+        if kind < 0.55:
+            return f"{rng.choice(['-', '+', 'NOT '])}({sub()})"
+        if kind < 0.62:
+            negated = rng.choice(["", "NOT "])
+            return f"({sub()} {negated}BETWEEN {sub()} AND {sub()})"
+        if kind < 0.70:
+            items = ", ".join(sub() for _ in range(rng.randint(1, 3)))
+            return f"({sub()} {rng.choice(['', 'NOT '])}IN ({items}))"
+        if kind < 0.76:
+            pattern = rng.choice(["'a%'", "'%b%'", "'_'", "'%'", "'1%'", "'A_C'", "'%.5'"])
+            return f"({sub(True)} {rng.choice(['', 'NOT '])}LIKE {pattern})"
+        if kind < 0.82:
+            return f"({sub()} IS {rng.choice(['', 'NOT '])}NULL)"
+        function = rng.choice(["abs", "length", "lower", "upper", "coalesce", "ifnull", "nullif",
+                               "typeof", "min", "max"])
+        if function in ("abs", "typeof"):
+            args = [sub()]
+        elif function in ("length", "lower", "upper"):
+            args = [sub(True)]
+        elif function in ("ifnull", "nullif"):
+            args = [sub(), sub()]
+        else:
+            args = [sub() for _ in range(rng.randint(2, 3))]
+        return f"{function}({', '.join(args)})"
+
+    def condition(self, scope):
+        rng = self.rng
+        parts = [self.expr(scope, 1) for _ in range(rng.randint(1, 2))]
+        # Simple comparisons with constants make the planner use rowids and indexes.
+        for _ in range(rng.randint(0, 2)):
+            op = rng.choice(["=", "=", "<", ">", "<=", ">="])
+            parts.append(f"{self.column(scope)} {op} {self.literal()}")
+        return " AND ".join(parts) if rng.random() < 0.7 else " OR ".join(parts)
+
+    # ---- statements -------------------------------------------------------------
+
+    def insert(self):
+        rng = self.rng
+        table = rng.choice(self.tables)
+        rows = []
+        if rng.random() < 0.5:
+            columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
+            prefix = f"INSERT INTO {table.name} ({', '.join(columns)}) VALUES "
+        else:
+            columns = table.column_names()
+            prefix = f"INSERT INTO {table.name} VALUES "
+        for _ in range(rng.randint(1, 4)):
+            values = [self.expr([], 2, True) for _ in columns]
+            # A row id of 2**63-1 makes SQLite pick later row ids at random.
+            values = [
+                v.replace("9223372036854775807", "7") if c == table.rowid_alias else v
+                for c, v in zip(columns, values)
+            ]
+            rows.append("(" + ", ".join(values) + ")")
+        return prefix + ", ".join(rows)
+
+    def update(self):
+        rng = self.rng
+        table = rng.choice(self.tables)
+        scope = [(table.name, table)]
+        names = [c for c in table.column_names() if c != table.rowid_alias]
+        assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in rng.sample(names, rng.randint(1, len(names)))]
+        where = self.condition(scope)
+        if table.rowid_alias and rng.random() < 0.15:
+            # Changing the row id: keep it to one row so the processing order cannot matter.
+            assignments = [f"id = {rng.randint(-5, 60)}"]
+            where = f"id = {rng.randint(-5, 60)}"
+        return f"UPDATE {table.name} SET {', '.join(assignments)} WHERE {where}"
+
+    def delete(self):
+        table = self.rng.choice(self.tables)
+        return f"DELETE FROM {table.name} WHERE {self.condition([(table.name, table)])}"
+
+    def select(self):
+        rng = self.rng
+        scope = [("a", rng.choice(self.tables))]
+        from_sql = f"{scope[0][1].name} AS a"
+        if rng.random() < 0.3 and len(self.tables) > 1:
+            other = rng.choice(self.tables)
+            scope.append(("b", other))
+            join = rng.choice(["JOIN", "LEFT JOIN", ","])
+            on = ""
+            if join != ",":
+                left, right = self.column(scope[:1]), self.column(scope[1:])
+                on = f" ON b.{right} = {left}" if rng.random() < 0.7 else f" ON {self.expr(scope, 1)}"
+                on = on.replace("b.b.", "b.")
+            from_sql += f" {join} {other.name} AS b{on}"
+        where = f" WHERE {self.condition(scope)}" if rng.random() < 0.7 else ""
+        if rng.random() < 0.3:
+            return self.aggregate_select(scope, from_sql, where)
+        items = [self.expr(scope, 1) for _ in range(rng.randint(1, 3))]
+        distinct = "DISTINCT " if rng.random() < 0.1 else ""
+        sql = f"SELECT {distinct}{', '.join(items)} FROM {from_sql}{where}"
+        if rng.random() < 0.4:
+            terms = [f"{self.expr(scope, 2)} {rng.choice(['ASC', 'DESC'])}" for _ in range(rng.randint(1, 2))]
+            if distinct:
+                terms = [str(rng.randint(1, len(items)))]
+            # All result columns as tie-breakers: the order is then total.
+            terms += [str(i + 1) for i in range(len(items))]
+            sql += " ORDER BY " + ", ".join(terms)
+            if rng.random() < 0.5:
+                sql += f" LIMIT {rng.randint(0, 5)} OFFSET {rng.randint(0, 3)}"
+        return sql
+
+    def aggregate_select(self, scope, from_sql, where):
+        rng = self.rng
+        groups = [self.column(scope) for _ in range(rng.randint(0, 2))]
+        aggregates = []
+        for _ in range(rng.randint(1, 3)):
+            function = rng.choice(["count", "sum", "avg", "min", "max", "total", "count"])
+            argument = "*" if function == "count" and rng.random() < 0.3 else self.expr(scope, 2)
+            distinct = "DISTINCT " if argument != "*" and rng.random() < 0.15 else ""
+            aggregates.append(f"{function}({distinct}{argument})")
+        sql = f"SELECT {', '.join(groups + aggregates)} FROM {from_sql}{where}"
+        if groups:
+            sql += f" GROUP BY {', '.join(groups)}"
+            if rng.random() < 0.3:
+                sql += f" HAVING {rng.choice(aggregates)} > {self.literal()}"
+        return sql
+
+    def statement(self):
+        rng = self.rng
+        roll = rng.random()
+        if roll < 0.02 and len(self.tables) < 3:
+            return self.create_table()
+        if roll < 0.05:
+            return self.create_index()
+        if roll < 0.06:
+            return self.drop_index()
+        if roll < 0.08:
+            return rng.choice(["BEGIN", "COMMIT", "ROLLBACK"])
+        if roll < 0.40:
+            return self.insert()
+        if roll < 0.50:
+            return self.update()
+        if roll < 0.56:
+            return self.delete()
+        return self.select()
+
+
+def run_seed(seed, statements, path=None, verbose=False):
+    """Run one fuzzing session; returns None or a failure description."""
+    generator = Generator(seed)
+    pair = Pair(path)
+    history = []
+    try:
+        setup = [generator.create_table() for _ in range(2)] + [generator.create_index()]
+        for sql in setup + [generator.statement() for _ in range(statements)]:
+            history.append(sql)
+            if verbose:
+                print(sql)
+            pair.run(sql)
+        problems = pair.mini.integrity_check()
+        if problems:
+            raise AssertionError(f"integrity check failed: {problems}")
+    except AssertionError as exc:
+        return f"seed {seed}, statement {len(history)}:\n{exc}\n--- history ---\n" + ";\n".join(history)
+    finally:
+        pair.close()
+    return None
+
+
+def parse_range(text):
+    if "-" in text:
+        start, end = text.split("-")
+        return range(int(start), int(end) + 1)
+    return [int(text)]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--seeds", default="0-99")
+    parser.add_argument("--statements", type=int, default=400)
+    parser.add_argument("--file", action="store_true", help="use database files instead of memory")
+    parser.add_argument("--verbose", action="store_true")
+    args = parser.parse_args()
+    import tempfile
+
+    failures = 0
+    seeds = parse_range(args.seeds)
+    with tempfile.TemporaryDirectory() as directory:
+        for seed in seeds:
+            path = os.path.join(directory, f"fuzz{seed}.db") if args.file else None
+            failure = run_seed(seed, args.statements, path, args.verbose)
+            if failure:
+                failures += 1
+                print(failure[:4000])
+                print("=" * 70)
+    print(f"{len(seeds)} seeds x {args.statements} statements: {failures} failing seeds")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

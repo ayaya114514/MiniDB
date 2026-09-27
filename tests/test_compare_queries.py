@@ -237,3 +237,27 @@ def test_random_queries_against_sqlite(pair):
             on = rng.choice(["e.dept = d.name", "e.id = d.floor", "e.salary > d.budget / 10"])
             pair.run(f"SELECT e.name, d.name, d.floor FROM emp e {join} dept d ON {on}"
                      + (f" WHERE e.{where}" if where and '(' not in where and ' AND ' not in where else ""))
+
+
+def test_constant_order_by_terms_follow_sqlite(pair):
+    """SQLite treats small integer constants (also under unary +/- and the
+    folded ``<literal> IS [NOT] NULL``) as column numbers; other constants
+    do not affect the order."""
+    for term in ["1", "+1", "-1", "+(2)", "- -2", "-(-2)", "1+1", "(2 IS NULL)", "(2 IS NOT NULL)",
+                 "('x' IS NULL)", "(-3 IS NOT NULL) DESC", "(NULL IS NULL)", "'1'", "1.0",
+                 "2147483647", "2147483648", "9223372036854775807", "(1 = 1)", "abs(2)"]:
+        pair.run(f"SELECT name, id FROM emp ORDER BY {term}, id")
+        pair.run(f"SELECT dept, count(*) FROM emp GROUP BY {term}")
+
+
+def test_rowid_after_maximum_is_random():
+    db_pair = Pair()
+    db_pair.script([
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)",
+        "INSERT INTO t VALUES (9223372036854775807, 'max')",
+    ])
+    db = db_pair.mini
+    db.execute("INSERT INTO t (v) VALUES ('a'), ('b')")
+    ids = [r[0] for r in db.execute("SELECT id FROM t WHERE v != 'max'")]
+    assert len(set(ids)) == 2 and all(0 < i <= 2**62 for i in ids)
+    db_pair.close()
