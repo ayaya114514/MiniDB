@@ -77,3 +77,12 @@
 - **README.md**：功能、架构、使用方法、测试、性能、已知限制。
 - 测试：302 个，全部通过。
 - 已知问题：见 README“已知限制”。
+
+## 阶段 9：API（完成）
+- 参数绑定：`?`、`?NNN`、`:name`、`@name`、`$name`，序列按位置、映射按名字；编号、报错信息与 sqlite3 一致；绑定值不做常量折叠。
+- `minidb.connect()` / `Connection` / `Cursor`：PEP 249 的模块属性、异常层次、`execute`/`executemany`/`executescript`/`fetchone`/`fetchmany`/`fetchall`/迭代、`rowcount`/`lastrowid`/`description`、`commit`/`rollback`/`close`、`with conn:`，事务语义照 Python 3.12 sqlite3 的 `autocommit`。
+- 语句缓存：按 SQL 文本缓存解析结果（LRU 256 条）。
+- fuzzer 以 15% 概率把字面量换成 `?` 参数。
+- 测试：336 个，全部通过；400 种子 × 500 语句的 fuzz（含参数绑定）0 不一致。新增 `test_dbapi.py`（34 个）：同一段 Python 代码分别对 sqlite3 模块和 minidb 执行，比较观察到的一切（行、rowcount、lastrowid、description、异常类别与原文、事务状态）。
+- 性能（10 万行）：逐条 INSERT 用 `?` 参数 1.93 s，拼 SQL 字面量 3.47 s（跳过解析，快 1.8 倍）；1 万次主键点查用参数 0.28 s，字面量 0.37 s。
+- 已知问题：同一文件的多个连接之间不同步缓存（D44，阶段 10 解决）；`bind()` 每次执行复制语法树，还有优化空间。

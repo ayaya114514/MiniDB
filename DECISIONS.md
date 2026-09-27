@@ -206,3 +206,30 @@ fuzzer 与 sqlite 对照时刻意避开“SQLite 的答案取决于它的查询�
   同样被当作列序号（因而报“ORDER BY term out of range”）。
 - 最大 rowid 已是 2^63-1 时，新行的 rowid 随机选取（最多尝试 100 次，否则 `database or disk is full`）。
 - 标量 `min()` 在相等值中返回最后一个，`max()` 返回第一个（与 sqlite 的 minmaxFunc 一致）。
+
+## D41 异常层次改为 PEP 249
+`Error` 下分 `InterfaceError` 和 `DatabaseError`，后者下分 `DataError`、`OperationalError`、
+`IntegrityError`、`InternalError`、`ProgrammingError`、`NotSupportedError`，另有 `Warning`。
+`SQLSyntaxError` 改为 `OperationalError` 的子类（sqlite3 对语法错误也抛 OperationalError），
+仍带行列号和 `caret()`。文件损坏仍是 `DatabaseError` 本身。
+
+## D42 参数绑定：解析期占位、执行期替换
+占位符 `?`、`?NNN`、`:name`、`@name`、`$name`，编号规则照 SQLite：裸 `?` 取当前最大编号 + 1，
+名字第一次出现时分配编号；编号范围 1..250000。解析结果按 SQL 文本缓存（LRU，256 条），
+执行时把 `Parameter` 节点替换成 `Bound` 值（`Literal` 的子类）得到新的语法树。`Bound` 与字面量
+求值完全相同（没有亲和性），但不参与解析期常量折叠、也不会被当作 ORDER BY 列序号——
+与 SQLite 一致（`ORDER BY ?` 绑定 1 是常量）。绑定值：None/int/float/str，bool 转 int，
+超出 64 位抛 `OverflowError`，其他类型（包括 bytes，MiniDB 没有 BLOB）抛 `ProgrammingError`。
+参数个数/名字不匹配的报错逐字照搬 sqlite3。
+
+## D43 DB-API 模块
+`minidb.connect(path_or_":memory:", autocommit=False)` 返回 `Connection`，接口照 Python 3.12
+sqlite3：`autocommit=False` 时连接建立即开事务、`commit()`/`rollback()` 后立即再开，SQL 里手写
+`COMMIT` 结束后不会自动重开；`autocommit=True` 时 `commit()`/`rollback()` 什么也不做。
+`with conn:` 成功提交、异常回滚；关闭时回滚未提交事务。Cursor 的 `rowcount`（DML 为影响行数，
+其余 -1）、`lastrowid`（连接的最后插入 rowid；executemany 不更新）、`description`、`fetchmany`
+的 `arraysize`、`executemany` 只接受 DML 等行为都与 sqlite3 对照测试。
+
+## D44 多个连接打开同一个文件（已知问题，阶段 10 解决）
+目前每个 `Database` 有自己的页缓存，另一个连接提交后本连接看不到新数据。阶段 10 用文件头里的
+变更计数器检测并清空缓存，同时加跨进程锁。

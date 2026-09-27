@@ -50,21 +50,28 @@ minidb> .exit
 语句以 `;` 结束，可以跨多行。元命令：`.tables`、`.schema [TABLE]`、`.btree TABLE`（打印 B+ 树
 结构）、`.help`、`.exit`。语法错误会给出行号、列号和 `^` 标记。
 
-Python API：
+Python API（PEP 249 / DB-API 2.0，用法与标准库 `sqlite3` 相同）：
 
 ```python
-from minidb.database import Database
+import minidb
 
-with Database("app.db") as db:          # Database() 为内存数据库
-    db.execute("CREATE TABLE t (a INTEGER, b TEXT)")
-    db.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")
-    result = db.execute("SELECT b, a * 10 FROM t ORDER BY a DESC")
-    print(result, result.columns)       # [('y', 20), ('x', 10)] ['b', 'a * 10']
-    print(db.integrity_check())         # [] 表示所有 B+ 树和索引都一致
+with minidb.connect("app.db") as conn:             # ":memory:" 为内存数据库
+    conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")
+    conn.executemany("INSERT INTO t VALUES (?, ?)", [(1, "x"), (2, "y")])
+    cur = conn.execute("SELECT b, a * 10 FROM t WHERE a >= :low ORDER BY a DESC", {"low": 1})
+    print(cur.fetchall(), [d[0] for d in cur.description])   # [('y', 20), ('x', 10)] ['b', 'a * 10']
+# 离开 with 块时提交；抛异常则回滚
 ```
 
-异常都继承自 `minidb.errors.Error`：`SQLSyntaxError`、`OperationalError`（找不到表/列等）、
-`IntegrityError`（约束违反）、`DatabaseError`（文件损坏）。
+- 占位符：`?`、`?NNN`、`:name`、`@name`、`$name`；参数用序列（按位置）或字典（按名字）传入。
+  同一条 SQL 文本只解析一次（语句缓存），所以反复执行的语句请用参数而不是拼字符串。
+- 事务：`connect(..., autocommit=False)`（默认）时总有一个打开的事务，需要 `commit()`；
+  `autocommit=True` 时每条语句自动提交，也可以在 SQL 里写 `BEGIN ... COMMIT`。
+- 更底层的 `minidb.Database(path)` 提供 `execute(sql, parameters)`（可执行多语句脚本，返回带
+  `columns`/`rowcount` 的结果列表）和 `integrity_check()`（检查所有 B+ 树和索引是否一致）。
+
+异常层次与 PEP 249 相同：`Error` → `InterfaceError`、`DatabaseError` → `OperationalError`
+（含语法错误 `SQLSyntaxError`）、`IntegrityError`、`ProgrammingError` 等。
 
 ## 架构
 
@@ -86,7 +93,7 @@ SQL 文本
 数据库文件 app.db（+ 提交过程中短暂存在的 app.db-wal）
 ```
 
-- **database.py** 是入口：`Database.execute()` 负责语句原子性、自动提交和事务状态。
+- **dbapi.py** 是 PEP 249 接口；**database.py** 的 `Database.execute()` 负责参数绑定、语句缓存、语句原子性、自动提交和事务状态。
 - **record.py** 负责行的序列化（类型标签 + 负载）。
 - **repl.py** 是命令行界面。
 
@@ -103,7 +110,7 @@ SQL 文本
 ## 测试
 
 ```sh
-.venv/bin/python -m pytest                                        # 全部测试（约 300 个）
+.venv/bin/python -m pytest                                        # 全部测试（330+ 个）
 .venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
 .venv/bin/python tests/benchmark.py --rows 100000                 # 性能测试
 ```

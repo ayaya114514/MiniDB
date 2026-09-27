@@ -33,7 +33,7 @@ class Engine:
             self.run = self.db.execute
         else:
             self.db = sqlite3.connect(self.path, isolation_level=None)
-            self.run = lambda sql: self.db.execute(sql).fetchall()
+            self.run = lambda sql, parameters=(): self.db.execute(sql, parameters).fetchall()
 
     def close(self):
         self.db.close()
@@ -68,6 +68,16 @@ def benchmark(engine, n, results):
 
     timed(results, f"insert {n:,} rows, one INSERT each, one transaction", engine, insert_single)
 
+    run("CREATE TABLE people3 (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, city TEXT)")
+
+    def insert_parameters():
+        run("BEGIN")
+        for row in data:
+            run("INSERT INTO people3 VALUES (?, ?, ?, ?)", row)
+        run("COMMIT")
+
+    timed(results, f"insert {n:,} rows, one INSERT each with ? parameters", engine, insert_parameters)
+
     run("CREATE TABLE people2 (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, city TEXT)")
 
     def insert_batched():
@@ -95,6 +105,12 @@ def benchmark(engine, n, results):
             assert len(run(f"SELECT name FROM people WHERE id = {key}")) == 1
 
     timed(results, "10,000 primary key lookups", engine, point_lookups)
+
+    def point_lookups_parameters():
+        for key in keys:
+            assert len(run("SELECT name FROM people WHERE id = ?", (key,))) == 1
+
+    timed(results, "10,000 primary key lookups with ? parameter", engine, point_lookups_parameters)
 
     def range_scans():
         for key in keys[:100]:
