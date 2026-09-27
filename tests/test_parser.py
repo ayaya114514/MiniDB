@@ -24,7 +24,7 @@ def lit(value):
 
 def test_create_table():
     assert parse(
-        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age int, email text UNIQUE NULL)"
+        "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age integer, email text UNIQUE NULL)"
     ) == CreateTable("users", [
         ColumnDef("id", "INTEGER", primary_key=True),
         ColumnDef("name", "TEXT", not_null=True),
@@ -68,6 +68,11 @@ def test_select():
         TableRef("t", "u"),
         Binary("=", a("a"), lit(1)),
     )
+
+
+def test_select_item_text():
+    items = parse("SELECT a+1 , count( * ) AS n, 'x'  FROM t").items
+    assert [item.text for item in items] == ["a+1", "count( * )", "'x'"]
 
 
 def test_select_without_from_and_distinct():
@@ -129,6 +134,15 @@ def test_not_binds_looser_than_comparison():
         "AND", Unary("NOT", Binary("=", a("a"), lit(1))), a("b")
     )
     assert where("NOT NOT a") == Unary("NOT", Unary("NOT", a("a")))
+
+
+def test_not_as_operand():
+    assert where("0 != NOT 1 AND b") == Binary(
+        "AND", Binary("!=", lit(0), Unary("NOT", lit(1))), a("b")
+    )
+    assert where("a + NOT b = c") == Binary(
+        "+", a("a"), Unary("NOT", Binary("=", a("b"), a("c")))
+    )
 
 
 def test_arithmetic_precedence():
@@ -203,6 +217,7 @@ def test_qualified_column():
         ("INSERT t VALUES (1)", 'syntax error near "t": expected INTO', 8),
         ("INSERT INTO t VALUES 1", 'syntax error near "1": expected "("', 22),
         ("CREATE TABLE t (a REAL)", 'syntax error near "REAL": expected column type INTEGER or TEXT', 19),
+        ("CREATE TABLE t (a INT)", 'syntax error near "INT": expected column type INTEGER or TEXT', 19),
         ("CREATE TABLE t (a INTEGER PRIMARY)", 'syntax error near ")": expected KEY', 34),
         ("CREATE TABLE t ()", 'syntax error near ")": expected column name', 17),
         ("UPDATE t SET a 1", 'syntax error near "1": expected "="', 16),

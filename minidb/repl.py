@@ -1,55 +1,121 @@
-"""Interactive command line interface."""
+"""Interactive command line interface.
+
+SQL statements end with ``;`` and may span several lines.  Lines starting
+with ``.`` are meta commands (see ``.help``).  Results are printed like the
+``sqlite3`` shell's default list mode: values separated by ``|``.
+"""
 
 import sys
 
-from minidb.executor import CommandError, ExecutionError, Table, parse_command
-from minidb.pager import DatabaseError, Pager
+from minidb.btree import BTree
+from minidb.database import Database
+from minidb.errors import Error
+from minidb.tokenizer import SQLSyntaxError, tokenize
+from minidb.values import to_text
 
 PROMPT = "minidb> "
+CONTINUATION_PROMPT = "   ...> "
+
+HELP = """\
+.btree TABLE     Print the B+ tree of TABLE
+.exit            Exit this program
+.help            Show this message
+.schema [TABLE]  Show CREATE statements
+.tables          List the tables"""
 
 
 def format_row(row):
-    return "|".join("" if value is None else str(value) for value in row)
+    return "|".join("" if value is None else to_text(value) for value in row)
+
+
+def statement_complete(text):
+    """Whether ``text`` ends with a ``;`` that is not inside a string or comment."""
+    try:
+        tokens = tokenize(text)
+    except SQLSyntaxError as exc:
+        return not exc.message.startswith("unterminated")
+    return len(tokens) > 1 and tokens[-2].kind == "OP" and tokens[-2].value == ";"
+
+
+class Shell:
+    def __init__(self, db, stdout):
+        self.db = db
+        self.out = stdout
+
+    def write(self, text):
+        self.out.write(text + "\n")
+
+    def meta_command(self, line):
+        """Run a meta command; returns False when the shell should exit."""
+        parts = line.split()
+        command, args = parts[0], parts[1:]
+        catalog = self.db.catalog
+        if command in (".exit", ".quit"):
+            return False
+        if command == ".help":
+            self.write(HELP)
+        elif command == ".tables":
+            names = sorted(t.name for t in catalog.tables.values())
+            if names:
+                self.write(" ".join(names))
+        elif command == ".schema":
+            tables = sorted(catalog.tables.values(), key=lambda t: t.name)
+            if args:
+                tables = [catalog.get_table(args[0])]
+            for table in tables:
+                self.write(table.sql() + ";")
+        elif command == ".btree":
+            if len(args) != 1:
+                self.write("Usage: .btree TABLE")
+            else:
+                table = catalog.get_table(args[0])
+                for text in BTree(self.db.pager, table.root).dump():
+                    self.write(text)
+        else:
+            self.write(f'Error: unknown command: {command}. Enter ".help" for help')
+        return True
+
+    def run_sql(self, text):
+        try:
+            for result in self.db.execute_each(text):
+                for row in result:
+                    self.write(format_row(row))
+        except SQLSyntaxError as exc:
+            self.write(f"Error: {exc}")
+            self.write(exc.caret())
+        except Error as exc:
+            self.write(f"Error: {exc}")
 
 
 def run(stdin=sys.stdin, stdout=sys.stdout, path=None, interactive=None):
-    """Run the REPL on the database file ``path`` (``None`` = in memory)."""
+    """Run the shell on the database file ``path`` (``None`` = in memory)."""
     if interactive is None:
         interactive = stdin.isatty()
-    pager = Pager(path)
-    try:
-        _loop(Table(pager), stdin, stdout, interactive)
-    finally:
-        pager.close()
-
-
-def _loop(table, stdin, stdout, interactive):
-    while True:
-        if interactive:
-            stdout.write(PROMPT)
-            stdout.flush()
-        line = stdin.readline()
-        if not line:
-            break
-        line = line.strip()
-        if not line:
-            continue
-        if line.startswith("."):
-            if line == ".exit":
+    with Database(path) as db:
+        shell = Shell(db, stdout)
+        buffer = ""
+        while True:
+            if interactive:
+                stdout.write(CONTINUATION_PROMPT if buffer else PROMPT)
+                stdout.flush()
+            line = stdin.readline()
+            if not line:
+                if buffer.strip():
+                    shell.run_sql(buffer)
                 break
-            if line == ".btree":
-                for text in table.tree.dump():
-                    stdout.write(text + "\n")
+            if not buffer and line.strip().startswith("."):
+                try:
+                    if not shell.meta_command(line.strip()):
+                        break
+                except Error as exc:
+                    shell.write(f"Error: {exc}")
                 continue
-            stdout.write(f"Error: unknown command: {line}\n")
-            continue
-        try:
-            rows = table.execute(parse_command(line))
-        except (CommandError, ExecutionError) as exc:
-            stdout.write(f"Error: {exc}\n")
-            continue
-        for row in rows:
-            stdout.write(format_row(row) + "\n")
+            buffer += line
+            if statement_complete(buffer):
+                shell.run_sql(buffer)
+                buffer = ""
+            elif not buffer.strip():
+                buffer = ""
 
 
 def main(argv):
@@ -58,7 +124,7 @@ def main(argv):
         return 2
     try:
         run(path=argv[0] if argv else None)
-    except DatabaseError as exc:
+    except Error as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1
     return 0
