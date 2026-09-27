@@ -11,6 +11,11 @@ statement; on open the statements are parsed again to rebuild the in-memory
 
 Every UNIQUE column and every PRIMARY KEY that is not an INTEGER PRIMARY KEY
 gets an automatic unique index named ``minidb_autoindex_<table>_<n>``.
+
+``ANALYZE`` stores planner statistics as entries of type "stat" (named after
+the table or index, sql = the numbers as text): a table's row count, and for
+an index the average number of rows per distinct value of each prefix of its
+columns (like SQLite's sqlite_stat1).
 """
 
 from minidb import values
@@ -74,6 +79,8 @@ class TableInfo:
         self.root = root
         self.schema_key = schema_key
         self.indexes = []  # newest first, the order SQLite checks UNIQUE constraints in
+        self.stat_rows = None  # row count from ANALYZE
+        self.stat_key = None
         self.positions = {column.name.lower(): i for i, column in enumerate(columns)}
         # An INTEGER PRIMARY KEY column is an alias for the row id (as in SQLite).
         self.rowid_column = next(
@@ -114,6 +121,8 @@ class IndexInfo:
         self.unique = unique
         self.root = root
         self.schema_key = schema_key
+        self.stat_average = None  # rows per distinct prefix value, from ANALYZE
+        self.stat_key = None
 
     @property
     def is_auto(self):
@@ -156,6 +165,15 @@ class Catalog:
                 index = IndexInfo(name, table, stmt.columns, stmt.unique, root, key)
                 self.indexes[name.lower()] = index
                 table.indexes.insert(0, index)
+        for kind, name, _table_name, _root, sql, key in entries:
+            if kind == "stat":
+                numbers = [float(n) for n in sql.split()]
+                if name.lower() in self.indexes:
+                    index = self.indexes[name.lower()]
+                    index.stat_average, index.stat_key = numbers[1:], key
+                elif name.lower() in self.tables:
+                    table = self.tables[name.lower()]
+                    table.stat_rows, table.stat_key = int(numbers[0]), key
 
     # ---- lookups ----------------------------------------------------------
 
@@ -220,6 +238,8 @@ class Catalog:
         table = self.tables[name.lower()]
         for index in list(table.indexes):
             self._drop_index(index)
+        if table.stat_key is not None:
+            self.schema.delete(table.stat_key)
         del self.tables[name.lower()]
         self.table_tree(table).destroy()
         self.schema.delete(table.schema_key)
@@ -268,5 +288,44 @@ class Catalog:
         self.version += 1
         self.index_tree(index).destroy()
         self.schema.delete(index.schema_key)
+        if index.stat_key is not None:
+            self.schema.delete(index.stat_key)
         del self.indexes[index.name.lower()]
         index.table.indexes.remove(index)
+
+    # ---- statistics ---------------------------------------------------------
+
+    def analyze(self, name=None):
+        """Gather statistics for one table (or the table of an index) or all."""
+        if name is None:
+            tables = list(self.tables.values())
+        elif name.lower() in self.tables:
+            tables = [self.tables[name.lower()]]
+        elif name.lower() in self.indexes:
+            tables = [self.indexes[name.lower()].table]
+        else:
+            raise OperationalError(f"no such table or index: {name}")
+        self.version += 1
+        for table in tables:
+            rows = len(self.table_tree(table))
+            self._set_stat(table, table.name, [rows])
+            table.stat_rows = rows
+            for index in table.indexes:
+                distinct = [0] * len(index.positions)
+                previous = None
+                for key in self.index_tree(index).keys():
+                    values = key[:-1]  # without the row id
+                    for depth in range(len(values)):
+                        if previous is None or previous[:depth + 1] != values[:depth + 1]:
+                            distinct[depth] += 1
+                    previous = values
+                average = [rows / d if d else 1.0 for d in distinct]
+                self._set_stat(index, index.name, [rows] + average)
+                index.stat_average = average
+
+    def _set_stat(self, owner, name, numbers):
+        if owner.stat_key is not None:
+            self.schema.delete(owner.stat_key)
+        text = " ".join(f"{n:g}" if isinstance(n, float) else str(n) for n in numbers)
+        table_name = owner.name if isinstance(owner, TableInfo) else owner.table.name
+        owner.stat_key = self._add_entry("stat", name, table_name, 0, text)

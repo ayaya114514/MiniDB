@@ -644,6 +644,15 @@ class BTree:
             self._free_value(ref)
         self.pager.write(Leaf(self.root, self.codec))
 
+    def estimated_count(self):
+        """A cheap estimate of the number of keys: the fan-out along the
+        leftmost path multiplied together (reads one page per level)."""
+        estimate, node = 1, self.node(self.root)
+        while not node.is_leaf:
+            estimate *= len(node.children)
+            node = self.node(node.children[0])
+        return max(1, estimate * len(node.keys))
+
     def depth(self):
         depth, node = 1, self.node(self.root)
         while not node.is_leaf:
