@@ -134,6 +134,13 @@ class Select:
 
 
 @dataclass
+class Explain:
+    """``EXPLAIN [QUERY PLAN] stmt``: describe how a statement would read its tables."""
+
+    statement: object
+
+
+@dataclass
 class Update:
     table: str
     assignments: list  # (column name, expression) pairs
@@ -240,6 +247,13 @@ class Parser:
                 raise self.error('";" or end of statement')
 
     def statement(self):
+        if self.accept_keyword("EXPLAIN"):
+            if self.tok.kind == "IDENT" and self.tok.text.upper() == "QUERY":
+                self.advance()
+                self.expect_word("PLAN")
+            if not self.at_keyword("SELECT", "UPDATE", "DELETE"):
+                raise self.error("SELECT, UPDATE or DELETE")
+            return Explain(self.statement())
         if self.at_keyword("SELECT"):
             return self.select()
         if self.at_keyword("INSERT"):
