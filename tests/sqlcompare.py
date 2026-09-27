@@ -17,9 +17,9 @@ def loose(row):
     return tuple(("number", v) if isinstance(v, (int, float)) else (type_name(v), v) for v in row)
 
 
-def row_order_key(row):
-    """A canonical order for comparing results as multisets (1 before 1.0)."""
-    return tuple((sort_key(v), type_name(v)) for v in row)
+def row_order_key(normalized_row):
+    """A canonical order for comparing normalized rows as multisets."""
+    return tuple((sort_key(value), kind) for kind, value in normalized_row)
 
 
 class Pair:
@@ -66,8 +66,8 @@ class Pair:
         expected_rows = [self.normalize(r) for r in expected]
         actual_rows = [self.normalize(r) for r in actual]
         if not ordered:
-            expected_rows.sort(key=lambda r: row_order_key([v for _, v in r]))
-            actual_rows.sort(key=lambda r: row_order_key([v for _, v in r]))
+            expected_rows.sort(key=row_order_key)
+            actual_rows.sort(key=row_order_key)
         assert actual_rows == expected_rows, f"{sql}\n  sqlite3: {expected}\n  minidb:  {actual}"
         return actual
 
