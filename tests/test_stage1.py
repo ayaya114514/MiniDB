@@ -38,7 +38,7 @@ def test_unknown_meta_command():
 
 @pytest.mark.parametrize(
     "text",
-    ["", "insert 1 a", "insert x a 1", "insert 1 a y", "insert -1 a 1", "select 1", "update"],
+    ["", "insert 1 a", "insert x a 1", "insert 1 a y", "insert -1 a 1", "select 1", "update", "delete", "delete x"],
 )
 def test_parse_errors(text):
     with pytest.raises(ParseError):

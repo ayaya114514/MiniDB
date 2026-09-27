@@ -1,12 +1,13 @@
 """Statement parsing.
 
-Stage 1 only understands two statements:
+Until the SQL parser exists, only these statements are understood:
 
     insert <id> <name> <age>
     select
+    delete <id>
 """
 
-from minidb.executor import InsertStatement, SelectStatement
+from minidb.executor import DeleteStatement, InsertStatement, SelectStatement
 
 
 class ParseError(Exception):
@@ -33,4 +34,8 @@ def parse(text):
         if len(words) != 1:
             raise ParseError("usage: select")
         return SelectStatement()
+    if keyword == "delete":
+        if len(words) != 2 or not words[1].lstrip("-").isdigit():
+            raise ParseError("usage: delete <id>")
+        return DeleteStatement(int(words[1]))
     raise ParseError(f"unrecognized statement: {words[0]}")

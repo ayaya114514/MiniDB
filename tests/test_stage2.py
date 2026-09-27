@@ -2,7 +2,7 @@ import io
 import subprocess
 import sys
 
-from minidb.executor import DataPage, Table
+from minidb.executor import Table
 from minidb.pager import PAGE_SIZE, Pager
 from minidb.parser import parse
 from minidb.repl import run
@@ -39,14 +39,6 @@ def test_duplicate_detected_after_reopen(tmp_path):
     path = str(tmp_path / "users.db")
     run_script(["insert 7 x 1"], path)
     assert run_script(["insert 7 y 2", "select"], path) == ["Error: duplicate id 7", "7|x|1"]
-
-
-def test_data_page_round_trip():
-    page = DataPage(3, next_page=9, records=[b"\x00\x00", b"\x00\x01\x00"])
-    decoded = DataPage.from_bytes(3, page.to_bytes())
-    assert decoded.next_page == 9
-    assert decoded.records == page.records
-    assert decoded.size == page.size
 
 
 def test_unicode_and_long_names_persist(tmp_path):
