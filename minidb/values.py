@@ -377,3 +377,186 @@ SCALAR_FUNCTIONS = {
     "TYPEOF": (type_name, 1, 1),
     "UPPER": (_fn_upper, 1, 1),
 }
+
+
+# ---- aggregate functions -----------------------------------------------------
+
+
+def numeric_type_value(value):
+    """SQLite's sqlite3_value_numeric_type() conversion: numeric-looking TEXT
+    becomes INTEGER or REAL (without turning '5.0' into 5); other values stay."""
+    if isinstance(value, str):
+        match = _WHOLE_NUMBER.match(value)
+        return _parse_number(match.group(1)) if match else value
+    return value
+
+
+_KBN_LIMIT = 4503599627370496  # 2**52
+
+
+def _c_remainder(a, b):
+    result = abs(a) % abs(b)
+    return -result if a < 0 else result
+
+
+class SumAccumulator:
+    """SUM/AVG/TOTAL state, ported from SQLite's func.c (Kahan-Babuska-Neumaier
+    summation once any value is not an integer, integer overflow detection)."""
+
+    def __init__(self):
+        self.count = 0
+        self.int_sum = 0
+        self.approx = False
+        self.overflow = False
+        self.real_sum = 0.0
+        self.error = 0.0
+
+    def _kbn_init(self, value):
+        if value <= -_KBN_LIMIT or value >= _KBN_LIMIT:
+            small = _c_remainder(value, 16384)
+            self.real_sum, self.error = float(value - small), float(small)
+        else:
+            self.real_sum, self.error = float(value), 0.0
+
+    def _kbn_step(self, r):
+        s = self.real_sum
+        t = s + r
+        if abs(s) > abs(r):
+            self.error += (s - t) + r
+        else:
+            self.error += (r - t) + s
+        self.real_sum = t
+
+    def _kbn_step_int(self, value):
+        if value <= -_KBN_LIMIT or value >= _KBN_LIMIT:
+            small = _c_remainder(value, 16384)
+            self._kbn_step(float(value - small))
+            self._kbn_step(float(small))
+        else:
+            self._kbn_step(float(value))
+
+    def step(self, value):
+        value = numeric_type_value(value)
+        if value is None:
+            return
+        self.count += 1
+        is_int = isinstance(value, int)
+        if not self.approx:
+            if not is_int:
+                self._kbn_init(self.int_sum)
+                self.approx = True
+                self._kbn_step(float(to_number(value)))
+            elif INT_MIN <= self.int_sum + value <= INT_MAX:
+                self.int_sum += value
+            else:
+                self.overflow = True
+                self._kbn_init(self.int_sum)
+                self.approx = True
+                self._kbn_step_int(value)
+        elif is_int:
+            self._kbn_step_int(value)
+        else:
+            self.overflow = False
+            self._kbn_step(float(to_number(value)))
+
+    def _real_total(self):
+        if not self.approx:
+            return float(self.int_sum)
+        if math.isinf(self.error) or math.isnan(self.error):
+            return self.real_sum
+        return self.real_sum + self.error
+
+
+class SumAggregate(SumAccumulator):
+    def result(self):
+        if self.count == 0:
+            return None
+        if not self.approx:
+            return self.int_sum
+        if self.overflow:
+            raise OperationalError("integer overflow")
+        return _real(self._real_total())
+
+
+class AvgAggregate(SumAccumulator):
+    def result(self):
+        if self.count == 0:
+            return None
+        return _real(self._real_total() / self.count)
+
+
+class TotalAggregate(SumAccumulator):
+    def result(self):
+        return _real(self._real_total())
+
+
+class CountAggregate:
+    def __init__(self):
+        self.count = 0
+
+    def step(self, value):
+        if value is not None:
+            self.count += 1
+
+    def result(self):
+        return self.count
+
+
+class CountStarAggregate(CountAggregate):
+    def step(self):
+        self.count += 1
+
+
+class MinMaxAggregate:
+    """MIN or MAX; ``step`` reports whether the current extreme changed."""
+
+    def __init__(self, want):
+        self.want = want  # -1 for MIN, 1 for MAX
+        self.value = None
+
+    def step(self, value):
+        if value is None:
+            return False
+        if self.value is None or compare(value, self.value) == self.want:
+            self.value = value
+            return True
+        return False
+
+    def result(self):
+        return self.value
+
+
+class GroupConcatAggregate:
+    def __init__(self):
+        self.text = None
+
+    def step(self, value, separator=","):
+        if value is None:
+            return
+        value = to_text(value)
+        if self.text is None:
+            self.text = value
+        else:
+            self.text += ("" if separator is None else to_text(separator)) + value
+
+    def result(self):
+        return self.text
+
+
+# name -> (factory, minimum argument count, maximum argument count)
+AGGREGATE_FUNCTIONS = {
+    "AVG": (AvgAggregate, 1, 1),
+    "COUNT": (CountAggregate, 0, 1),
+    "GROUP_CONCAT": (GroupConcatAggregate, 1, 2),
+    "MAX": (lambda: MinMaxAggregate(1), 1, 1),
+    "MIN": (lambda: MinMaxAggregate(-1), 1, 1),
+    "SUM": (SumAggregate, 1, 1),
+    "TOTAL": (TotalAggregate, 1, 1),
+}
+
+
+def is_aggregate_call(name, arg_count):
+    """MIN and MAX are aggregates with one argument and scalar with more."""
+    if name in ("MIN", "MAX"):
+        return arg_count == 1
+    return name in AGGREGATE_FUNCTIONS
