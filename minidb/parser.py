@@ -92,6 +92,40 @@ class Like:
 
 
 @dataclass(frozen=True)
+class Case:
+    """``CASE [base] WHEN a THEN b ... [ELSE c] END``."""
+
+    base: object  # None for a searched CASE
+    whens: tuple  # (condition or value, result) pairs
+    else_: object = None
+
+
+@dataclass(frozen=True)
+class Cast:
+    expr: object
+    type_name: str  # as written, e.g. "INTEGER" or "VARCHAR(10)"
+
+
+@dataclass(frozen=True)
+class Subquery:
+    """A scalar subquery ``(SELECT ...)``: the first column of the first row."""
+
+    query: object  # Select or Compound
+
+
+@dataclass(frozen=True)
+class InSelect:
+    expr: object
+    query: object
+    negated: bool = False
+
+
+@dataclass(frozen=True)
+class Exists:
+    query: object
+
+
+@dataclass(frozen=True)
 class Call:
     name: str  # upper case
     args: tuple
@@ -159,12 +193,22 @@ class TableRef:
 
 
 @dataclass
+class DerivedTable:
+    """A subquery in FROM: ``(SELECT ...) [AS] alias``."""
+
+    query: object
+    alias: str | None = None
+
+
+@dataclass
 class Join:
     """One table of a FROM clause and how it joins to the tables before it."""
 
-    table: TableRef
+    table: object  # TableRef or DerivedTable
     kind: str = "INNER"  # INNER (also for "," and CROSS JOIN) or LEFT
     on: object = None
+    using: list | None = None  # column names of USING (...)
+    natural: bool = False
 
 
 @dataclass
@@ -207,6 +251,18 @@ class Explain:
     """``EXPLAIN [QUERY PLAN] stmt``: describe how a statement would read its tables."""
 
     statement: object
+
+
+@dataclass
+class Compound:
+    """``select UNION [ALL] | INTERSECT | EXCEPT select ...`` evaluated left to
+    right; ORDER BY and LIMIT apply to the whole result."""
+
+    selects: list
+    operators: list  # "UNION", "UNION ALL", "INTERSECT" or "EXCEPT", one per join
+    order_by: list = field(default_factory=list)
+    limit: object = None
+    offset: object = None
 
 
 @dataclass
@@ -335,7 +391,7 @@ class Parser:
                 mode = self.advance().text.upper()
             self.accept_keyword("TRANSACTION")
             return Begin(mode)
-        if self.accept_keyword("COMMIT") or self._accept_word("END"):
+        if self.accept_keyword("COMMIT") or self.accept_keyword("END"):
             self.accept_keyword("TRANSACTION")
             return Commit()
         if self.accept_keyword("ROLLBACK"):
@@ -349,7 +405,7 @@ class Parser:
                 raise self.error("SELECT, UPDATE or DELETE")
             return Explain(self.statement())
         if self.at_keyword("SELECT"):
-            return self.select()
+            return self.query()
         if self.at_keyword("INSERT"):
             return self.insert()
         if self.at_keyword("UPDATE"):
@@ -460,9 +516,36 @@ class Parser:
         self.expect_op(")")
         return values
 
-    def select(self):
+    def query(self):
+        """A SELECT or a compound SELECT, with ORDER BY and LIMIT."""
+        selects = [self.select_core()]
+        operators = []
+        while self.at_keyword("UNION", "INTERSECT", "EXCEPT"):
+            operator = self.advance().value
+            if operator == "UNION" and self.accept_keyword("ALL"):
+                operator = "UNION ALL"
+            operators.append(operator)
+            selects.append(self.select_core())
+        stmt = selects[0] if not operators else Compound(selects, operators)
+        if self.accept_keyword("ORDER"):
+            self.expect_keyword("BY")
+            stmt.order_by = [self.order_item()]
+            while self.accept_op(","):
+                stmt.order_by.append(self.order_item())
+        if self.accept_keyword("LIMIT"):
+            stmt.limit = self.expr()
+            if self.accept_keyword("OFFSET"):
+                stmt.offset = self.expr()
+            elif self.accept_op(","):
+                # LIMIT <offset>, <count>
+                stmt.offset, stmt.limit = stmt.limit, self.expr()
+        return stmt
+
+    def select_core(self):
         self.expect_keyword("SELECT")
         distinct = bool(self.accept_keyword("DISTINCT"))
+        if not distinct:
+            self.accept_keyword("ALL")
         items = [self.select_item()]
         while self.accept_op(","):
             items.append(self.select_item())
@@ -476,18 +559,6 @@ class Parser:
             stmt.group_by = self.expr_list()
         if self.accept_keyword("HAVING"):
             stmt.having = self.expr()
-        if self.accept_keyword("ORDER"):
-            self.expect_keyword("BY")
-            stmt.order_by = [self.order_item()]
-            while self.accept_op(","):
-                stmt.order_by.append(self.order_item())
-        if self.accept_keyword("LIMIT"):
-            stmt.limit = self.expr()
-            if self.accept_keyword("OFFSET"):
-                stmt.offset = self.expr()
-            elif self.accept_op(","):
-                # LIMIT <offset>, <count>
-                stmt.offset, stmt.limit = stmt.limit, self.expr()
         return stmt
 
     def order_item(self):
@@ -533,6 +604,7 @@ class Parser:
             if self.accept_op(","):
                 joins.append(Join(self.table_ref()))
                 continue
+            natural = bool(self.accept_keyword("NATURAL"))
             if self.accept_keyword("LEFT"):
                 self.accept_keyword("OUTER")
                 kind = "LEFT"
@@ -540,15 +612,36 @@ class Parser:
                 kind = "INNER"
             elif self.at_keyword("JOIN"):
                 kind = "INNER"
+            elif natural:
+                raise self.error("JOIN")
             else:
                 return joins
             self.expect_keyword("JOIN")
-            join = Join(self.table_ref(), kind)
+            join = Join(self.table_ref(), kind, natural=natural)
+            if natural:  # NATURAL takes neither ON nor USING
+                joins.append(join)
+                continue
             if self.accept_keyword("ON"):
                 join.on = self.expr()
+            elif self.accept_keyword("USING"):
+                self.expect_op("(")
+                join.using = [self.identifier("column name")]
+                while self.accept_op(","):
+                    join.using.append(self.identifier("column name"))
+                self.expect_op(")")
             joins.append(join)
 
     def table_ref(self):
+        if self.at_op("(") and self.tokens[self.i + 1].kind == "KEYWORD" and self.tokens[self.i + 1].value == "SELECT":
+            self.advance()
+            query = self.query()
+            self.expect_op(")")
+            alias = None
+            if self.accept_keyword("AS"):
+                alias = self.identifier("alias")
+            elif self.tok.kind == "IDENT":
+                alias = self.advance().value
+            return DerivedTable(query, alias)
         name = self.identifier("table name")
         alias = None
         if self.accept_keyword("AS"):
@@ -626,9 +719,11 @@ class Parser:
                 keyword = self.advance().value
                 if keyword == "IN":
                     self.expect_op("(")
-                    items = tuple(self.expr_list())
+                    if self.at_keyword("SELECT"):
+                        left = InSelect(left, self.query(), negated)
+                    else:
+                        left = InList(left, tuple(self.expr_list()), negated)
                     self.expect_op(")")
-                    left = InList(left, items, negated)
                 elif keyword == "LIKE":
                     left = Like(left, self.comparison(), negated)
                 else:
@@ -689,9 +784,26 @@ class Parser:
         if token.kind == "PARAM":
             return self.parameter()
         if self.accept_op("("):
-            expr = self.expr()
+            if self.at_keyword("SELECT"):
+                expr = Subquery(self.query())
+            else:
+                expr = self.expr()
             self.expect_op(")")
             return expr
+        if self.accept_keyword("EXISTS"):
+            self.expect_op("(")
+            query = self.query()
+            self.expect_op(")")
+            return Exists(query)
+        if self.accept_keyword("CASE"):
+            return self.case()
+        if self.accept_keyword("CAST"):
+            self.expect_op("(")
+            expr = self.expr()
+            self.expect_keyword("AS")
+            type_name = self.type_name()
+            self.expect_op(")")
+            return Cast(expr, type_name)
         if token.kind == "IDENT":
             self.advance()
             if self.accept_op("("):
@@ -700,6 +812,37 @@ class Parser:
                 return Column(self.identifier("column name"), token.value)
             return Column(token.value)
         raise self.error("expression")
+
+    def case(self):
+        base = None if self.at_keyword("WHEN") else self.expr()
+        whens = []
+        while self.accept_keyword("WHEN"):
+            condition = self.expr()
+            self.expect_keyword("THEN")
+            whens.append((condition, self.expr()))
+        if not whens:
+            raise self.error("WHEN")
+        else_ = self.expr() if self.accept_keyword("ELSE") else None
+        self.expect_keyword("END")
+        return Case(base, tuple(whens), else_)
+
+    def type_name(self):
+        """A type name as SQLite accepts it: words, then an optional (n) or (n, m)."""
+        start = self.tok.pos
+        if self.tok.kind != "IDENT":
+            raise self.error("type name")
+        while self.tok.kind == "IDENT":
+            self.advance()
+        if self.accept_op("("):
+            for _ in range(2):
+                self.accept_op("-") or self.accept_op("+")
+                if self.tok.kind not in ("INTEGER", "FLOAT"):
+                    raise self.error("number")
+                self.advance()
+                if not self.accept_op(","):
+                    break
+            self.expect_op(")")
+        return " ".join(self.text[start:self.tok.pos].split())
 
     def parameter(self):
         token = self.advance()

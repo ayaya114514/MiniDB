@@ -42,6 +42,7 @@ class Table:
         self.columns = columns  # [(name, type, constraints)]
         self.rowid_alias = rowid_alias  # column name or None
         self.unique_columns = {c[0] for c in columns if c[2] == "UNIQUE"}
+        self.derived = False  # a subquery in FROM (no rowid)
 
     def column_names(self):
         return [c[0] for c in self.columns]
@@ -121,8 +122,34 @@ class Generator:
 
     def column(self, scope):
         alias, table = self.rng.choice(scope)
-        name = self.rng.choice(table.column_names() + ["rowid"] * (table.rowid_alias is None))
+        rowid = ["rowid"] if table.rowid_alias is None and not table.derived else []
+        name = self.rng.choice(table.column_names() + rowid)
         return f"{alias}.{name}" if len(scope) > 1 else name
+
+    def subquery(self, scope, depth, text_safe):
+        """A scalar, IN or EXISTS subquery, correlated with ``scope`` half the time.
+
+        Scalar subqueries always aggregate, so which row comes "first" never
+        matters."""
+        rng = self.rng
+        table = rng.choice([t for t in self.tables if not t.derived])
+        inner = [("s", table)]
+        condition = self.condition(inner, depth + 1)
+        if scope and rng.random() < 0.5:
+            alias, outer_table = rng.choice(scope)
+            outer = f"{alias}.{rng.choice(outer_table.column_names())}"
+            condition = f"({condition}) AND s.{rng.choice(table.column_names())} = {outer}"
+        where = f" WHERE {condition}" if rng.random() < 0.8 else ""
+        kind = rng.random()
+        if kind < 0.45:
+            function = rng.choice(["count", "max", "min", "sum", "total"] + ([] if text_safe else ["avg"]))
+            argument = self.expr(inner, depth + 2, text_safe)
+            return f"(SELECT {function}({argument}) FROM {table.name} AS s{where})"
+        if kind < 0.8:
+            value = self.expr(scope, depth + 1, text_safe)
+            column = self.column(inner)
+            return f"({value} {rng.choice(['', 'NOT '])}IN (SELECT {column} FROM {table.name} AS s{where}))"
+        return f"({rng.choice(['', 'NOT '])}EXISTS (SELECT 1 FROM {table.name} AS s{where}))"
 
     def expr(self, scope, depth=0, text_safe=False):
         """A random expression over the tables in ``scope`` [(alias, Table)]."""
@@ -150,8 +177,18 @@ class Generator:
         if kind < 0.76:
             pattern = rng.choice(["'a%'", "'%b%'", "'_'", "'%'", "'1%'", "'A_C'", "'%.5'"])
             return f"({sub(True)} {rng.choice(['', 'NOT '])}LIKE {pattern})"
-        if kind < 0.82:
+        if kind < 0.80:
             return f"({sub()} IS {rng.choice(['', 'NOT '])}NULL)"
+        if kind < 0.84:
+            if rng.random() < 0.5:
+                whens = " ".join(f"WHEN {sub()} THEN {sub()}" for _ in range(rng.randint(1, 3)))
+                return f"CASE {sub()} {whens} ELSE {sub()} END"
+            whens = " ".join(f"WHEN {sub()} THEN {sub()}" for _ in range(rng.randint(1, 3)))
+            return f"CASE {whens}{' ELSE ' + sub() if rng.random() < 0.5 else ''} END"
+        if kind < 0.87:
+            return f"CAST({sub()} AS {rng.choice(['INTEGER', 'TEXT', 'REAL', 'NUMERIC', 'VARCHAR(5)'])})"
+        if kind < 0.90 and depth < 2 and self.tables:
+            return self.subquery(scope, depth, text_safe)
         function = rng.choice(["abs", "length", "lower", "upper", "coalesce", "ifnull", "nullif",
                                "typeof", "min", "max"])
         if function in ("abs", "typeof"):
@@ -164,9 +201,9 @@ class Generator:
             args = [sub() for _ in range(rng.randint(2, 3))]
         return f"{function}({', '.join(args)})"
 
-    def condition(self, scope):
+    def condition(self, scope, depth=1):
         rng = self.rng
-        parts = [self.expr(scope, 1) for _ in range(rng.randint(1, 2))]
+        parts = [self.expr(scope, depth) for _ in range(rng.randint(1, 2))]
         # Simple comparisons with constants make the planner use rowids and indexes.
         for _ in range(rng.randint(0, 2)):
             op = rng.choice(["=", "=", "<", ">", "<=", ">="])
@@ -220,20 +257,67 @@ class Generator:
         table = self.rng.choice(self.tables)
         return f"DELETE FROM {table.name} WHERE {self.condition([(table.name, table)])}"
 
+    def derived_table(self):
+        """A subquery in FROM with columns x and y, and a Table describing it."""
+        rng = self.rng
+        base = rng.choice(self.tables)
+        inner = [("q", base)]
+        where = f" WHERE {self.condition(inner)}" if rng.random() < 0.6 else ""
+        sql = (f"(SELECT {self.expr(inner, 1, True)} AS x, {self.expr(inner, 1, True)} AS y "
+               f"FROM {base.name} AS q{where})")
+        table = Table("derived", [("x", "", ""), ("y", "", "")], None)
+        table.derived = True
+        return sql, table
+
+    def compound_select(self):
+        rng = self.rng
+        width = rng.randint(1, 2)
+        parts = []
+        for _ in range(rng.randint(2, 3)):
+            table = rng.choice(self.tables)
+            scope = [("a", table)]
+            items = ", ".join(self.expr(scope, 1) for _ in range(width))
+            where = f" WHERE {self.condition(scope)}" if rng.random() < 0.6 else ""
+            parts.append(f"SELECT {items} FROM {table.name} AS a{where}")
+        sql = parts[0]
+        for part in parts[1:]:
+            sql += f" {rng.choice(['UNION', 'UNION ALL', 'INTERSECT', 'EXCEPT'])} {part}"
+        if rng.random() < 0.5:
+            sql += " ORDER BY " + ", ".join(
+                f"{i + 1} {rng.choice(['ASC', 'DESC'])}" for i in range(width)
+            )
+            if rng.random() < 0.5:
+                sql += f" LIMIT {rng.randint(0, 4)} OFFSET {rng.randint(0, 2)}"
+        return sql
+
     def select(self):
         rng = self.rng
-        scope = [("a", rng.choice(self.tables))]
-        from_sql = f"{scope[0][1].name} AS a"
+        if rng.random() < 0.08:
+            return self.compound_select()
+        if rng.random() < 0.12:
+            derived_sql, derived = self.derived_table()
+            scope = [("a", derived)]
+            from_sql = f"{derived_sql} AS a"
+        else:
+            scope = [("a", rng.choice(self.tables))]
+            from_sql = f"{scope[0][1].name} AS a"
         if rng.random() < 0.3 and len(self.tables) > 1:
             other = rng.choice(self.tables)
             scope.append(("b", other))
-            join = rng.choice(["JOIN", "LEFT JOIN", ","])
-            on = ""
-            if join != ",":
-                left, right = self.column(scope[:1]), self.column(scope[1:])
-                on = f" ON b.{right} = {left}" if rng.random() < 0.7 else f" ON {self.expr(scope, 1)}"
-                on = on.replace("b.b.", "b.")
-            from_sql += f" {join} {other.name} AS b{on}"
+            join = rng.choice(["JOIN", "LEFT JOIN", ",", "USING", "NATURAL"])
+            if join == "USING" and scope[0][1].derived:
+                join = "JOIN"
+            if join == "USING":
+                from_sql += f" {rng.choice(['', 'LEFT '])}JOIN {other.name} AS b USING (c0)"
+            elif join == "NATURAL":
+                from_sql += f" NATURAL {rng.choice(['', 'LEFT '])}JOIN {other.name} AS b"
+            else:
+                on = ""
+                if join != ",":
+                    left, right = self.column(scope[:1]), self.column(scope[1:])
+                    on = f" ON b.{right} = {left}" if rng.random() < 0.7 else f" ON {self.expr(scope, 1)}"
+                    on = on.replace("b.b.", "b.")
+                from_sql += f" {join} {other.name} AS b{on}"
         where = f" WHERE {self.condition(scope)}" if rng.random() < 0.7 else ""
         if rng.random() < 0.3:
             return self.aggregate_select(scope, from_sql, where)

@@ -2,26 +2,33 @@
 
 Expressions are compiled into Python closures that take a *row*: a list
 holding, for every table in the query, its column values followed by its row
-id.  A ``Scope`` maps column names to positions in that list.
+id.  A ``Scope`` maps column names to positions in that list.  Scopes of
+subqueries have their enclosing query's scope as parent; a reference to an
+outer column reads the outer row that the subquery was invoked with.
 
 For each table the planner looks at the WHERE conjuncts and picks an access
 path: a lookup or range scan on the row id when a conjunct constrains the
-INTEGER PRIMARY KEY (or ``rowid``), otherwise a full scan.  The access path
-only narrows the candidate rows; the complete WHERE clause is still applied
-to every candidate, so planning can never change a query's result.
+INTEGER PRIMARY KEY (or ``rowid``), an index search, otherwise a full scan.
+The access path only narrows the candidate rows; the complete WHERE clause is
+still applied to every candidate, so planning can never change a result.
+
+A SELECT is compiled once into a ``CompiledSelect`` (or ``CompiledCompound``)
+whose ``run()`` can be called many times: a correlated subquery runs once per
+row of its outer query.
 """
 
+import dataclasses
 import random
 from operator import itemgetter
 
 from minidb import values
 from minidb.btree import BTreeError, DuplicateKeyError
 from minidb.catalog import HIGH
-from minidb.errors import IntegrityError, OperationalError
+from minidb.errors import IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
-    Between, Binary, Bound, Call, Column, CreateIndex, CreateTable, Delete, DropIndex,
-    DropTable, Explain, InList, Insert, Join, Like, Literal, Select, Star, TableRef, Unary,
-    Update,
+    Between, Binary, Bound, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
+    Delete, DerivedTable, DropIndex, DropTable, Exists, Explain, InList, InSelect, Insert, Join,
+    Like, Literal, Select, Star, Subquery, TableRef, Unary, Update,
 )
 from minidb.record import decode_record, encode_record
 
@@ -43,39 +50,76 @@ class Result(list):
 # ---- name resolution --------------------------------------------------------
 
 
+class ScopeEntry:
+    """One table (or derived table) of a FROM clause."""
+
+    __slots__ = ("name", "table", "offset", "hidden")
+
+    def __init__(self, name, table, offset):
+        self.name = name  # alias or table name, lower case
+        self.table = table
+        self.offset = offset  # position of its first column in a row
+        self.hidden = set()  # USING / NATURAL columns only reachable when qualified
+
+
 class Scope:
     """The tables visible to expressions and where their values sit in a row."""
 
-    def __init__(self):
-        self.entries = []  # (name, TableInfo, offset of its first column)
+    def __init__(self, parent=None):
+        self.entries = []
         self.width = 0
+        self.parent = parent  # scope of the enclosing query, for correlated subqueries
+        self.cell = [None]  # the row of this scope while one of its subqueries runs
+        self.uses_outer = False  # some expression here refers to an enclosing query
 
     def add(self, table, alias=None):
-        name = (alias or table.name).lower()
-        self.entries.append((name, table, self.width))
+        name = (alias if alias is not None else table.name).lower()
+        self.entries.append(ScopeEntry(name, table, self.width))
         self.width += len(table.columns) + 1
 
     def rowid_slot(self, index):
-        _, table, offset = self.entries[index]
-        return offset + len(table.columns)
+        entry = self.entries[index]
+        return entry.offset + len(entry.table.columns)
 
-    def resolve(self, column):
-        """Return (slot, affinity, table index) for a column reference."""
+    def _matches(self, column):
         matches = []
-        for index, (name, table, offset) in enumerate(self.entries):
-            if column.table is not None and column.table.lower() != name:
+        lowered = column.name.lower()
+        for index, entry in enumerate(self.entries):
+            if column.table is not None:
+                if column.table.lower() != entry.name:
+                    continue
+            elif lowered in entry.hidden:
                 continue
+            table = entry.table
             position = table.column_index(column.name)
             if position is not None:
-                matches.append((offset + position, table.affinities[position], index))
-            elif column.name.lower() in ROWID_NAMES:
-                matches.append((offset + len(table.columns), values.INTEGER, index))
-        if not matches:
-            full_name = f"{column.table}.{column.name}" if column.table else column.name
-            raise OperationalError(f"no such column: {full_name}")
-        if len(matches) > 1:
-            raise OperationalError(f"ambiguous column name: {column.name}")
-        return matches[0]
+                matches.append((entry.offset + position, table.affinities[position], index))
+            elif lowered in ROWID_NAMES and table.has_rowid:
+                matches.append((entry.offset + len(table.columns), values.INTEGER, index))
+        return matches
+
+    def resolve(self, column):
+        """Return (slot, affinity, table index, depth) for a column reference;
+        ``depth`` counts how many enclosing queries up the column was found."""
+        scope, depth, passed = self, 0, []
+        while scope is not None:
+            matches = scope._matches(column)
+            if len(matches) > 1:
+                raise OperationalError(f"ambiguous column name: {column.name}")
+            if matches:
+                for inner in passed:
+                    inner.uses_outer = True
+                return (*matches[0], depth)
+            passed.append(scope)
+            scope, depth = scope.parent, depth + 1
+        full_name = f"{column.table}.{column.name}" if column.table else column.name
+        raise OperationalError(f"no such column: {full_name}")
+
+    def ancestor(self, depth):
+        scope = self
+        for _ in range(depth):
+            scope = scope.parent
+        return scope
 
     def star_columns(self, table_name=None):
         """(table name, column name) pairs that ``*`` or ``table.*`` expands to."""
@@ -83,18 +127,21 @@ class Scope:
             raise OperationalError("no tables specified")
         result = []
         found = False
-        for name, table, offset in self.entries:
-            if table_name is not None and table_name.lower() != name:
+        for entry in self.entries:
+            if table_name is not None and table_name.lower() != entry.name:
                 continue
             found = True
-            result.extend((name, c.name) for c in table.columns)
+            for column in entry.table.columns:
+                if table_name is None and column.name.lower() in entry.hidden:
+                    continue
+                result.append((entry.name, column.name))
         if not found:
             raise OperationalError(f"no such table: {table_name}")
         return result
 
 
 def walk(expr):
-    """Yield ``expr`` and all of its sub-expressions."""
+    """Yield ``expr`` and all of its sub-expressions (not entering subqueries)."""
     yield expr
     if isinstance(expr, Unary):
         yield from walk(expr.operand)
@@ -108,16 +155,38 @@ def walk(expr):
         yield from walk(expr.expr)
         for item in expr.items:
             yield from walk(item)
+    elif isinstance(expr, InSelect):
+        yield from walk(expr.expr)
     elif isinstance(expr, Like):
         yield from walk(expr.expr)
         yield from walk(expr.pattern)
     elif isinstance(expr, Call):
         for arg in expr.args:
             yield from walk(arg)
+    elif isinstance(expr, Cast):
+        yield from walk(expr.expr)
+    elif isinstance(expr, Case):
+        if expr.base is not None:
+            yield from walk(expr.base)
+        for condition, result in expr.whens:
+            yield from walk(condition)
+            yield from walk(result)
+        if expr.else_ is not None:
+            yield from walk(expr.else_)
 
 
 def tables_referenced(expr, scope):
-    return {scope.resolve(e)[2] for e in walk(expr) if isinstance(e, Column)}
+    """Indexes of the tables of ``scope`` that ``expr`` uses.  An expression
+    with a subquery counts as using all of them (it may be correlated)."""
+    tables = set()
+    for e in walk(expr):
+        if isinstance(e, Column):
+            _, _, index, depth = scope.resolve(e)
+            if depth == 0:
+                tables.add(index)
+        elif isinstance(e, (Subquery, InSelect, Exists)):
+            return set(range(len(scope.entries)))
+    return tables
 
 
 def split_conjuncts(expr):
@@ -196,10 +265,12 @@ class Compiler:
     call is an error reported with ``misuse`` (formatted with the name).
     """
 
-    def __init__(self, scope, aggregates=None, misuse="misuse of aggregate function {name}()"):
+    def __init__(self, scope, aggregates=None, misuse="misuse of aggregate function {name}()",
+                 executor=None):
         self.scope = scope
         self.aggregates = aggregates
         self.misuse = misuse
+        self.executor = executor  # needed to compile subqueries
 
     def compile(self, expr):
         return self.compile_with_affinity(expr)[0]
@@ -210,8 +281,21 @@ class Compiler:
             value = expr.value
             return (lambda row: value), None
         if isinstance(expr, Column):
-            slot, affinity, _ = self.scope.resolve(expr)
-            return itemgetter(slot), affinity
+            slot, affinity, _, depth = self.scope.resolve(expr)
+            if depth == 0:
+                return itemgetter(slot), affinity
+            cell = self.scope.ancestor(depth).cell  # the enclosing query's current row
+            return (lambda row: cell[0][slot]), affinity
+        if isinstance(expr, Cast):
+            return self._cast(expr)
+        if isinstance(expr, Case):
+            return self._case(expr), None
+        if isinstance(expr, Subquery):
+            return self._scalar_subquery(expr)
+        if isinstance(expr, InSelect):
+            return self._in_select(expr), None
+        if isinstance(expr, Exists):
+            return self._exists(expr), None
         if isinstance(expr, Unary):
             return self._unary(expr), None
         if isinstance(expr, Binary):
@@ -318,6 +402,115 @@ class Compiler:
             return lambda row: logical_not(like(value(row), pattern(row)))
         return lambda row: like(value(row), pattern(row))
 
+    def _cast(self, expr):
+        target = values.type_affinity(expr.type_name)
+        if target == "BLOB":
+            raise NotSupportedError("MiniDB has no BLOB values: cannot CAST to BLOB")
+        operand = self.compile(expr.expr)
+        cast = values.cast
+        affinity = values.TEXT if target == "TEXT" else values.INTEGER
+        return (lambda row: cast(operand(row), target)), affinity
+
+    def _case(self, expr):
+        whens = []
+        truth = values.truth
+        if expr.base is None:
+            for condition, result in expr.whens:
+                whens.append((self.compile(condition), self.compile(result)))
+        else:
+            base, base_affinity = self.compile_with_affinity(expr.base)
+            for value, result in expr.whens:
+                value, value_affinity = self.compile_with_affinity(value)
+                whens.append(((value, value_comparator("=", base_affinity, value_affinity)),
+                              self.compile(result)))
+        otherwise = self.compile(expr.else_) if expr.else_ is not None else (lambda row: None)
+        if expr.base is None:
+            def searched_case(row):
+                for condition, result in whens:
+                    if truth(condition(row)):
+                        return result(row)
+                return otherwise(row)
+            return searched_case
+
+        def simple_case(row):
+            b = base(row)
+            for (value, equal), result in whens:
+                if equal(b, value(row)) == 1:
+                    return result(row)
+            return otherwise(row)
+        return simple_case
+
+    # ---- subqueries -------------------------------------------------------
+
+    def _subquery(self, query, columns=None):
+        """Compile ``query`` as a subquery of this scope; returns a function
+        ``rows(outer_row)`` and the compiled query.  Uncorrelated subqueries
+        run once; correlated ones run for every outer row."""
+        if self.executor is None:
+            raise OperationalError("subqueries are not allowed here")
+        compiled = self.executor.compile_query(query, parent=self.scope)
+        if columns is not None and len(compiled.names) != columns:
+            raise OperationalError(
+                f"sub-select returns {len(compiled.names)} columns - expected {columns}"
+            )
+        return compiled
+
+    def _runner(self, compiled, transform, max_rows=None):
+        """A function outer_row -> transform(rows of the subquery)."""
+        cell = self.scope.cell
+        if compiled.correlated:
+            def run_correlated(row):
+                cell[0] = row
+                return transform(compiled.run(max_rows))
+            return run_correlated
+        cache = []
+
+        def run_once(row):
+            if not cache:
+                cache.append(transform(compiled.run(max_rows)))
+            return cache[0]
+        return run_once
+
+    def _scalar_subquery(self, expr):
+        compiled = self._subquery(expr.query, columns=1)
+        run = self._runner(compiled, lambda rows: rows[0][0] if rows else None, max_rows=1)
+        return run, compiled.affinities[0]
+
+    def _exists(self, expr):
+        compiled = self._subquery(expr.query)
+        return self._runner(compiled, lambda rows: int(bool(rows)), max_rows=1)
+
+    def _in_select(self, expr):
+        compiled = self._subquery(expr.query, columns=1)
+        value, value_affinity = self.compile_with_affinity(expr.expr)
+        affinity = in_select_affinity(value_affinity, compiled.affinities[-1])
+        convert = _AFFINITY_FUNCTIONS.get(affinity)
+        sort_key = values.sort_key
+
+        def summarize(rows):
+            keys, has_null = set(), False
+            for (candidate,) in rows:
+                if candidate is None:
+                    has_null = True
+                    continue
+                keys.add(sort_key(convert(candidate) if convert else candidate))
+            return keys, has_null, bool(rows)
+
+        members = self._runner(compiled, summarize)
+        found, missing = (0, 1) if expr.negated else (1, 0)
+
+        def in_select(row):
+            keys, has_null, nonempty = members(row)
+            if not nonempty:
+                return missing  # x IN (empty) is false even for NULL x
+            v = value(row)
+            if v is None:
+                return None
+            if sort_key(convert(v) if convert else v) in keys:
+                return found
+            return None if has_null else missing
+        return in_select
+
     def call(self, expr):
         name = expr.name
         if values.is_aggregate_call(name, len(expr.args)):
@@ -346,9 +539,18 @@ class Compiler:
         if star or not expr.args:
             args = []  # COUNT(*) and COUNT()
         else:
-            inner = Compiler(self.scope)  # aggregates may not be nested
+            inner = Compiler(self.scope, executor=self.executor)  # aggregates may not be nested
             args = [inner.compile(arg) for arg in expr.args]
         return itemgetter(self.aggregates.add(name, args, expr.distinct))
+
+
+def in_select_affinity(left, right):
+    """Affinity for ``x IN (SELECT y ...)`` (SQLite's sqlite3CompareAffinity):
+    both columns: numeric if either is, else none; otherwise whichever exists.
+    It is applied to both sides."""
+    if left is not None and right is not None:
+        return values.INTEGER if values.INTEGER in (left, right) else None
+    return left if left is not None else right
 
 
 def contains_aggregate(expr):
@@ -405,6 +607,19 @@ class AggregateCollector:
 
 
 # ---- access paths --------------------------------------------------------------
+
+
+class DerivedScan:
+    """All rows of a derived table (a subquery in FROM), materialized per run."""
+
+    def __init__(self, source):
+        self.source = source
+
+    def candidates(self, row):
+        return ((r[-1], r) for r in self.source.rows)
+
+    def describe(self):
+        return "SCAN SUBQUERY"
 
 
 class FullScan:
@@ -543,7 +758,8 @@ def find_constraints(scope, index, conjuncts, compiler):
     Keys are converted with the comparison affinity SQLite would apply to
     them; comparisons that would convert the *column* side are unusable.
     """
-    _, table, offset = scope.entries[index]
+    entry = scope.entries[index]
+    table, offset = entry.table, entry.offset
     rowid_slot = scope.rowid_slot(index)
     earlier = set(range(index))
     constraints = []
@@ -551,8 +767,8 @@ def find_constraints(scope, index, conjuncts, compiler):
     def column_position(expr):
         if not isinstance(expr, Column):
             return None
-        slot, _, table_index = scope.resolve(expr)
-        if table_index != index:
+        slot, _, table_index, depth = scope.resolve(expr)
+        if depth or table_index != index:
             return None
         if slot == rowid_slot or slot - offset == table.rowid_column:
             return ROWID
@@ -615,7 +831,9 @@ def plan_access(scope, index, catalog, conjuncts, compiler):
     columns by equality (a fully matched UNIQUE index first), then a row id
     range, then an index range, then a full scan.
     """
-    table = scope.entries[index][1]
+    table = scope.entries[index].table
+    if isinstance(table, DerivedSource):
+        return DerivedScan(table)
     tree = catalog.table_tree(table)
     constraints = find_constraints(scope, index, conjuncts, compiler)
     for c in constraints:
@@ -656,7 +874,7 @@ class Executor:
         self.last_insert_rowid = 0
 
     def execute(self, stmt):
-        if isinstance(stmt, Select):
+        if isinstance(stmt, (Select, Compound)):
             return self.select(stmt)
         if isinstance(stmt, Insert):
             return self.insert(stmt)
@@ -689,11 +907,68 @@ class Executor:
         row.append(rowid)
         return row
 
-    def build_scope(self, joins):
-        scope = Scope()
-        for join in joins:
-            scope.add(self.catalog.get_table(join.table.name), join.table.alias)
-        return scope
+    def compile_query(self, stmt, parent=None):
+        """Compile a SELECT or compound SELECT (``parent``: the enclosing
+        query's scope when this is a subquery)."""
+        if isinstance(stmt, Compound):
+            return CompiledCompound(self, stmt, parent)
+        return CompiledSelect(self, stmt, parent)
+
+    def build_from(self, joins, scope):
+        """Add the FROM clause's tables to ``scope``.
+
+        Returns the joins with USING / NATURAL turned into ON conditions, and
+        the derived tables (which must be materialized before each run)."""
+        derived = []
+        normalized = []
+        for index, join in enumerate(joins):
+            ref = join.table
+            if isinstance(ref, DerivedTable):
+                # A subquery in FROM cannot see its sibling tables, only
+                # the queries enclosing this one.
+                compiled = self.compile_query(ref.query, parent=scope.parent)
+                if compiled.correlated:
+                    scope.uses_outer = True
+                source = DerivedSource(ref.alias or "", compiled)
+                derived.append(source)
+                scope.add(source, ref.alias or "")
+            else:
+                scope.add(self.catalog.get_table(ref.name), ref.alias)
+            if join.natural or join.using is not None:
+                join = self.using_condition(scope, index, join)
+            normalized.append(join)
+        return normalized, derived
+
+    @staticmethod
+    def using_condition(scope, index, join):
+        """``JOIN t USING (c, ...)`` / ``NATURAL JOIN t`` as an ON condition.
+        The right table's copies of the columns become reachable only by
+        qualified name, so ``c`` and ``*`` mean the left table's column."""
+        right = scope.entries[index]
+        left_entries = scope.entries[:index]
+
+        def left_with(name):
+            return next(
+                (e for e in left_entries
+                 if e.table.column_index(name) is not None and name.lower() not in e.hidden),
+                None,
+            )
+
+        if join.natural:
+            names = [c.name for c in right.table.columns if left_with(c.name) is not None]
+        else:
+            names = join.using
+        condition = None
+        for name in names:
+            left = left_with(name)
+            if left is None or right.table.column_index(name) is None:
+                raise OperationalError(
+                    f"cannot join using column {name} - column not present in both tables"
+                )
+            equal = Binary("=", Column(name, left.name), Column(name, right.name))
+            condition = equal if condition is None else Binary("AND", condition, equal)
+            right.hidden.add(name.lower())
+        return dataclasses.replace(join, on=condition, using=None, natural=False)
 
     def plan_joins(self, scope, joins, where):
         """Plan a nested loop over ``joins``; returns a list of ``JoinLevel``.
@@ -703,8 +978,8 @@ class Executor:
         uses are bound.  A LEFT JOIN's ON condition decides which rows match
         at its own level (and is the only thing its access path may use).
         """
-        compiler = Compiler(scope, misuse="misuse of aggregate: {name}()")
-        on_compiler = Compiler(scope)
+        compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
+        on_compiler = Compiler(scope, executor=self)
         pool = split_conjuncts(where)
         for join in joins:
             if join.kind != "LEFT":
@@ -719,7 +994,7 @@ class Executor:
                 constant.append(conjunct)
         levels = []
         for index, join in enumerate(joins):
-            table = scope.entries[index][1]
+            entry = scope.entries[index]
             if join.kind == "LEFT":
                 usable = split_conjuncts(join.on)
                 match = on_compiler.compile(join.on) if join.on is not None else None
@@ -730,8 +1005,8 @@ class Executor:
             if index == 0:
                 filters = constant + filters
             levels.append(JoinLevel(
-                table,
-                scope.entries[index][2],
+                entry.table,
+                entry.offset,
                 plan_access(scope, index, self.catalog, usable, compiler),
                 join.kind == "LEFT",
                 match,
@@ -745,7 +1020,6 @@ class Executor:
         yielded each time; callers must copy it to keep it."""
         row = [None] * scope.width
         truth = values.truth
-        load_row = Executor.load_row
         depth = len(levels)
 
         def passes(conditions):
@@ -760,9 +1034,10 @@ class Executor:
                 return
             level = levels[i]
             start, stop = level.offset, level.offset + len(level.table.columns) + 1
+            load = level.load
             matched = False
             for rowid, record in level.access.candidates(row):
-                row[start:stop] = load_row(level.table, rowid, record)
+                row[start:stop] = load(rowid, record)
                 if level.match is not None and not truth(level.match(row)):
                     continue
                 matched = True
@@ -777,8 +1052,8 @@ class Executor:
 
     def matching_rows(self, table, where):
         """Yield (rowid, row copy) for rows of a single table satisfying ``where``."""
-        joins = [Join(TableRef(table.name))]
-        scope = self.build_scope(joins)
+        scope = Scope()
+        joins, _ = self.build_from([Join(TableRef(table.name))], scope)
         levels = self.plan_joins(scope, joins, where)
         slot = scope.rowid_slot(0)
         for row in self.join_rows(scope, levels):
@@ -786,12 +1061,14 @@ class Executor:
 
     def explain(self, stmt):
         """One row (table, access path) per table the statement reads, in join order."""
-        if isinstance(stmt, Select):
-            joins, where = stmt.source, stmt.where
+        if isinstance(stmt, (Select, Compound)):
+            compiled = self.compile_query(stmt)
+            parts = compiled.parts if isinstance(compiled, CompiledCompound) else [compiled]
+            levels = [level for part in parts for level in (part.levels or [])]
         else:
-            joins, where = [Join(TableRef(stmt.table))], stmt.where
-        scope = self.build_scope(joins)
-        levels = self.plan_joins(scope, joins, where)
+            scope = Scope()
+            joins, _ = self.build_from([Join(TableRef(stmt.table))], scope)
+            levels = self.plan_joins(scope, joins, stmt.where)
         return Result(
             [(level.table.name, level.access.describe()) for level in levels], ["table", "plan"]
         )
@@ -799,48 +1076,8 @@ class Executor:
     # ---- SELECT -------------------------------------------------------------
 
     def select(self, stmt):
-        scope = self.build_scope(stmt.source)
-        exprs, names = self.expand_items(stmt, scope)
-        is_aggregate = bool(stmt.group_by) or any(
-            contains_aggregate(e)
-            for e in exprs + [stmt.having] + [item.expr for item in stmt.order_by]
-            if e is not None
-        )
-        if stmt.having is not None and not is_aggregate:
-            raise OperationalError("HAVING clause on a non-aggregate query")
-        aggregates = AggregateCollector(scope.width) if is_aggregate else None
-        compiler = Compiler(scope, aggregates)
-        outputs = [compiler.compile(e) for e in exprs]
-        order_terms, order_functions = self.order_terms(stmt, exprs, names, compiler)
-        having = compiler.compile(stmt.having) if stmt.having is not None else None
-        group_functions = self.group_functions(stmt, exprs, names, scope)
-        if stmt.source:
-            levels = self.plan_joins(scope, stmt.source, stmt.where)
-            rows = self.join_rows(scope, levels)
-        else:
-            where = Compiler(scope, misuse="misuse of aggregate: {name}()")
-            condition = where.compile(stmt.where) if stmt.where is not None else None
-            rows = [[]] if condition is None or values.truth(condition([])) else []
-
-        def record(row):
-            return (
-                tuple(f(row) for f in outputs),
-                tuple(f(row) for f in order_functions),
-            )
-
-        if not is_aggregate:
-            records = [record(row) for row in rows]
-        else:
-            records = []
-            truth = values.truth
-            for group_row in self.group_rows(rows, scope, group_functions, aggregates):
-                if having is None or truth(having(group_row)):
-                    records.append(record(group_row))
-        if stmt.distinct:
-            records = distinct_records(records)
-        records = sort_records(records, order_terms)
-        records = self.apply_limit(stmt, records)
-        return Result([out for out, _ in records], names)
+        compiled = self.compile_query(stmt)
+        return Result(compiled.run(), compiled.names)
 
     def expand_items(self, stmt, scope):
         """Select-list expressions with ``*`` expanded, and the column names."""
@@ -902,8 +1139,43 @@ class Executor:
                 functions.append(compiler.compile(item.expr))
         return terms, functions
 
+    @staticmethod
+    def compound_order_terms(stmt, parts):
+        """ORDER BY of a compound SELECT: every term must name a result column
+        (by number, by name or alias, or as the same expression)."""
+        terms = []
+        count = len(parts[0].names)
+        for position, item in enumerate(stmt.order_by, 1):
+            nulls_first = item.nulls_first if item.nulls_first is not None else not item.descending
+            index = constant_integer(item.expr)
+            if index is not None:
+                if not 1 <= index <= count:
+                    raise OperationalError(
+                        f"{ordinal(position)} ORDER BY term out of range - "
+                        f"should be between 1 and {count}"
+                    )
+                index -= 1
+            else:
+                for part in reversed(parts):
+                    if isinstance(item.expr, Column) and item.expr.table is None:
+                        lowered = [name.lower() for name in part.names]
+                        if item.expr.name.lower() in lowered:
+                            index = lowered.index(item.expr.name.lower())
+                            break
+                    if item.expr in part.exprs:
+                        index = part.exprs.index(item.expr)
+                        break
+                if index is None:
+                    raise OperationalError(
+                        f"{ordinal(position)} ORDER BY term does not match any column in the result set"
+                    )
+            terms.append(("output", index, item.descending, nulls_first))
+        return terms
+
     def group_functions(self, stmt, exprs, names, scope):
-        compiler = Compiler(scope, misuse="aggregate functions are not allowed in the GROUP BY clause")
+        compiler = Compiler(
+            scope, misuse="aggregate functions are not allowed in the GROUP BY clause", executor=self
+        )
         functions = []
         for position, expr in enumerate(stmt.group_by, 1):
             index = self.result_column_reference(expr, names, "GROUP BY", position, scope)
@@ -932,22 +1204,25 @@ class Executor:
             representative, state = groups[key]
             yield representative + aggregates.results(state)
 
-    @staticmethod
-    def apply_limit(stmt, records):
+    def compile_limit(self, stmt):
+        """Functions () -> (offset, end) for LIMIT/OFFSET, or None."""
         if stmt.limit is None:
-            return records
-        compiler = Compiler(Scope())
+            return None
+        compiler = Compiler(Scope(), executor=self)
+        limit = compiler.compile(stmt.limit)
+        offset = compiler.compile(stmt.offset) if stmt.offset is not None else None
 
-        def integer(expr):
-            value = values.numeric_affinity(compiler.compile(expr)([]))
+        def integer(function):
+            value = values.numeric_affinity(function([]))
             if not isinstance(value, int):
                 raise IntegrityError("datatype mismatch")
             return value
 
-        limit = integer(stmt.limit)
-        offset = max(integer(stmt.offset), 0) if stmt.offset is not None else 0
-        end = None if limit < 0 else offset + limit
-        return records[offset:end]
+        def bounds():
+            count = integer(limit)
+            start = max(integer(offset), 0) if offset is not None else 0
+            return start, None if count < 0 else start + count
+        return bounds
 
 
     # ---- INSERT --------------------------------------------------------------
@@ -964,7 +1239,7 @@ class Executor:
                 if position is None:
                     raise OperationalError(f"table {table.name} has no column named {name}")
                 positions.append(position)
-        compiler = Compiler(Scope())
+        compiler = Compiler(Scope(), executor=self)
         rows = []
         for exprs in stmt.rows:
             if len(exprs) != len(positions):
@@ -1075,7 +1350,7 @@ class Executor:
         width = len(table.columns)
         scope = Scope()
         scope.add(table)
-        compiler = Compiler(scope)
+        compiler = Compiler(scope, executor=self)
         assignments = []
         for name, expr in stmt.assignments:
             position = table.column_index(name)
@@ -1156,6 +1431,178 @@ class JoinLevel:
         self.outer = outer  # LEFT JOIN: emit a NULL row when nothing matches
         self.match = match  # LEFT JOIN ON condition
         self.filters = filters  # conditions checked once this table is bound
+        if isinstance(table, DerivedSource):
+            self.load = lambda rowid, row: row  # already a row
+        else:
+            load_row = Executor.load_row
+            self.load = lambda rowid, record: load_row(table, rowid, record)
+
+
+class CompiledSelect:
+    """A SELECT compiled once; ``run()`` evaluates it (again) and returns its rows."""
+
+    def __init__(self, executor, stmt, parent=None):
+        self.executor = executor
+        self.scope = scope = Scope(parent)
+        joins, self.derived = executor.build_from(stmt.source, scope)
+        self.exprs, self.names = executor.expand_items(stmt, scope)
+        self.is_aggregate = bool(stmt.group_by) or any(
+            contains_aggregate(e)
+            for e in self.exprs + [stmt.having] + [item.expr for item in stmt.order_by]
+            if e is not None
+        )
+        if stmt.having is not None and not self.is_aggregate:
+            raise OperationalError("HAVING clause on a non-aggregate query")
+        self.aggregates = AggregateCollector(scope.width) if self.is_aggregate else None
+        compiler = Compiler(scope, self.aggregates, executor=executor)
+        compiled = [compiler.compile_with_affinity(e) for e in self.exprs]
+        self.outputs = [function for function, _ in compiled]
+        self.affinities = [affinity for _, affinity in compiled]
+        self.order_terms, self.order_functions = executor.order_terms(
+            stmt, self.exprs, self.names, compiler
+        )
+        self.having = compiler.compile(stmt.having) if stmt.having is not None else None
+        self.group_functions = executor.group_functions(stmt, self.exprs, self.names, scope)
+        self.levels = None
+        self.condition = None
+        if stmt.source:
+            self.levels = executor.plan_joins(scope, joins, stmt.where)
+        elif stmt.where is not None:
+            where = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=executor)
+            self.condition = where.compile(stmt.where)
+        self.distinct = stmt.distinct
+        self.limit = executor.compile_limit(stmt)
+
+    @property
+    def correlated(self):
+        return self.scope.uses_outer
+
+    def run(self, max_rows=None):
+        """The result rows (tuples).  ``max_rows`` lets a caller that needs
+        only the first rows (EXISTS, scalar subqueries) stop early."""
+        for source in self.derived:
+            source.materialize()
+        if self.levels is not None:
+            rows = self.executor.join_rows(self.scope, self.levels)
+        elif self.condition is None or values.truth(self.condition([])):
+            rows = [[]]
+        else:
+            rows = []
+        outputs, order_functions = self.outputs, self.order_functions
+        records = []
+        if not self.is_aggregate:
+            stop = max_rows
+            if self.distinct or self.order_terms or self.limit is not None:
+                stop = None
+            for row in rows:
+                records.append((tuple(f(row) for f in outputs), tuple(f(row) for f in order_functions)))
+                if stop is not None and len(records) >= stop:
+                    break
+        else:
+            truth, having = values.truth, self.having
+            groups = self.executor.group_rows(rows, self.scope, self.group_functions, self.aggregates)
+            for group_row in groups:
+                if having is None or truth(having(group_row)):
+                    records.append((
+                        tuple(f(group_row) for f in outputs),
+                        tuple(f(group_row) for f in order_functions),
+                    ))
+        if self.distinct:
+            records = distinct_records(records)
+        records = sort_records(records, self.order_terms)
+        if self.limit is not None:
+            start, end = self.limit()
+            records = records[start:end]
+        return [output for output, _ in records]
+
+
+class CompiledCompound:
+    """``SELECT ... UNION [ALL] | INTERSECT | EXCEPT SELECT ...`` compiled once."""
+
+    def __init__(self, executor, stmt, parent=None):
+        self.parts = [CompiledSelect(executor, select, parent) for select in stmt.selects]
+        count = len(self.parts[0].names)
+        for operator, part in zip(stmt.operators, self.parts[1:]):
+            if len(part.names) != count:
+                raise OperationalError(
+                    f"SELECTs to the left and right of {operator} "
+                    "do not have the same number of result columns"
+                )
+        self.operators = stmt.operators
+        self.names = self.parts[0].names
+        # SQLite takes a compound's affinity from its last SELECT.
+        self.affinities = self.parts[-1].affinities
+        self.order_terms = executor.compound_order_terms(stmt, self.parts)
+        self.limit = executor.compile_limit(stmt)
+
+    @property
+    def correlated(self):
+        return any(part.correlated for part in self.parts)
+
+    def run(self, max_rows=None):
+        rows = self.parts[0].run()
+        for operator, part in zip(self.operators, self.parts[1:]):
+            rows = combine(operator, rows, part.run())
+        records = sort_records([(row, ()) for row in rows], self.order_terms)
+        if self.limit is not None:
+            start, end = self.limit()
+            records = records[start:end]
+        return [row for row, _ in records]
+
+
+def combine(operator, left, right):
+    """Apply a compound operator.  Like SQLite, the distinct forms return rows
+    in sorted order, and a later duplicate replaces an earlier one."""
+    if operator == "UNION ALL":
+        return left + right
+    sort_key = values.sort_key
+
+    def key(row):
+        return tuple(sort_key(v) for v in row)
+
+    kept = {}
+    if operator == "UNION":
+        for row in left + right:
+            kept[key(row)] = row
+    else:
+        right_keys = {key(row) for row in right}
+        want = operator == "INTERSECT"
+        for row in left:
+            k = key(row)
+            if (k in right_keys) == want:
+                kept[k] = row
+    return [kept[k] for k in sorted(kept)]
+
+
+class ColumnName:
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+
+class DerivedSource:
+    """A subquery in FROM, seen as a table whose rows are recomputed per run."""
+
+    has_rowid = False
+    rowid_column = None
+    indexes = ()
+
+    def __init__(self, name, compiled):
+        self.name = name or "subquery"
+        self.compiled = compiled
+        self.columns = [ColumnName(name) for name in compiled.names]
+        self.affinities = list(compiled.affinities)
+        self.positions = {}
+        for i, name in enumerate(compiled.names):
+            self.positions.setdefault(name.lower(), i)
+        self.rows = []
+
+    def column_index(self, name):
+        return self.positions.get(name.lower())
+
+    def materialize(self):
+        self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
 
 
 def folded_literal(expr):

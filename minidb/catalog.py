@@ -66,6 +66,8 @@ class IndexKeyCodec:
 
 
 class TableInfo:
+    has_rowid = True
+
     def __init__(self, name, columns, root, schema_key=None):
         self.name = name
         self.columns = columns

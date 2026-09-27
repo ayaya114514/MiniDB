@@ -570,3 +570,38 @@ def is_aggregate_call(name, arg_count):
     if name in ("MIN", "MAX"):
         return arg_count == 1
     return name in AGGREGATE_FUNCTIONS
+
+
+# ---- CAST ----------------------------------------------------------------------
+
+
+def type_affinity(type_name):
+    """SQLite's rules for the affinity of a declared type name."""
+    name = type_name.upper()
+    if "INT" in name:
+        return "INTEGER"
+    if "CHAR" in name or "CLOB" in name or "TEXT" in name:
+        return "TEXT"
+    if "BLOB" in name or not name:
+        return "BLOB"
+    if "REAL" in name or "FLOA" in name or "DOUB" in name:
+        return "REAL"
+    return "NUMERIC"
+
+
+def cast(value, target):
+    """``CAST(value AS <type with affinity target>)`` (not BLOB)."""
+    if value is None:
+        return None
+    if target == "INTEGER":
+        return to_int64(value)
+    if target == "REAL":
+        return float(to_number(value))
+    if target == "TEXT":
+        return to_text(value)
+    # NUMERIC: text is read by its numeric prefix; integral REALs read from
+    # text become INTEGERs, REAL values themselves stay REAL.
+    if isinstance(value, str):
+        number = to_number(value)
+        return _real_to_int_if_exact(number) if isinstance(number, float) else number
+    return value
