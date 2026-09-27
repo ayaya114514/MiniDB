@@ -291,8 +291,10 @@ def test_parse_requires_one_statement():
 def test_transaction_statements():
     from minidb.parser import Begin, Commit, Rollback
 
-    for sql in ["BEGIN", "begin transaction", "BEGIN IMMEDIATE", "BEGIN EXCLUSIVE TRANSACTION"]:
+    for sql in ["BEGIN", "begin transaction", "BEGIN deferred"]:
         assert parse(sql) == Begin()
+    assert parse("BEGIN IMMEDIATE") == Begin("IMMEDIATE")
+    assert parse("BEGIN EXCLUSIVE TRANSACTION") == Begin("EXCLUSIVE")
     for sql in ["COMMIT", "commit transaction", "END", "end transaction"]:
         assert parse(sql) == Commit()
     for sql in ["ROLLBACK", "rollback transaction"]:

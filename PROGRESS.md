@@ -86,3 +86,14 @@
 - 测试：336 个，全部通过；400 种子 × 500 语句的 fuzz（含参数绑定）0 不一致。新增 `test_dbapi.py`（34 个）：同一段 Python 代码分别对 sqlite3 模块和 minidb 执行，比较观察到的一切（行、rowcount、lastrowid、description、异常类别与原文、事务状态）。
 - 性能（10 万行）：逐条 INSERT 用 `?` 参数 1.93 s，拼 SQL 字面量 3.47 s（跳过解析，快 1.8 倍）；1 万次主键点查用参数 0.28 s，字面量 0.37 s。
 - 已知问题：同一文件的多个连接之间不同步缓存（D44，阶段 10 解决）；`bind()` 每次执行复制语法树，还有优化空间。
+
+## 阶段 10：健壮性（完成）
+- `locking.py`：SHARED / RESERVED / EXCLUSIVE 三种锁（flock），忙等超时报 `database is locked`，SQLite 式死锁规避，`BEGIN IMMEDIATE/EXCLUSIVE`；崩溃留下的 WAL 由后续任意连接在锁保护下恢复。
+- 变更计数器：别的连接/进程提交后，本连接下一个事务开始时自动丢弃过期缓存、重载 schema（修复阶段 9 记录的 D44）。
+- 每页 CRC32 校验，文件格式升到 2；损坏的页、截断的文件、非数据库文件都报 `DatabaseError`；`integrity_check()` 校验所有已提交页。
+- WAL 创建/删除与新建数据库后 fsync 目录。
+- 测试：508 个，全部通过。新增 `test_concurrency.py`（同进程多连接可见性与 schema 同步、单写者、提交等读者并可重试、死锁快速失败、BEGIN IMMEDIATE、存活连接替崩溃连接恢复、4 个写进程 × 60 轮 + 1 个并发读进程校验“计数不丢失、转账总额恒定、只看到完整提交”、死进程的锁自动释放）；`test_corruption.py`（150 组随机字节翻转：全部被查询或 integrity_check 发现，数据要么完全正确要么报 DatabaseError；截断、整页清零、空闲页损坏、非数据库文件、旧格式）。
+- 变异测试：去掉锁后 5 个并发测试失败（含多进程丢更新）；去掉校验和后约 60 个损坏用例失败（错误数据或 TypeError/IndexError/UnicodeDecodeError 泄漏）。
+- fuzz：200 种子 × 500（文件模式）+ 300 种子 × 500，0 不一致。
+- 性能（10 万行）：主键点查 0.37 → 0.47 s（每语句 flock + 读头页），自动提交 1000 行 0.18 → 0.29 s（目录 fsync），其余基本不变。
+- 已知问题：读者会阻塞写者提交（阶段 13 的 WAL 模式解决）；Windows 上没有 fcntl，不加锁。

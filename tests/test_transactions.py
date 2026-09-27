@@ -309,7 +309,7 @@ def test_crash_on_first_commit_of_new_database(tmp_path):
     pager.crash_hook = crash_at("db_page", 0)
     with pytest.raises(SimulatedCrash):
         pager.commit()
-    pager.file.close()
+    pager.close_files()  # a dead process releases its files and locks
     assert os.path.getsize(path) == 0
     db = Database(path)  # recovery writes the header page from the WAL
     db.execute("CREATE TABLE t (a INTEGER)")
@@ -369,4 +369,17 @@ def test_real_process_crash(tmp_path, point, detail, survives):
     else:
         assert snapshot(db) == before
     assert db.integrity_check() == []
+    db.close()
+
+
+def test_wal_creation_and_deletion_are_made_durable(tmp_path, monkeypatch):
+    import minidb.pager as pager_module
+
+    synced = []
+    monkeypatch.setattr(pager_module, "fsync_directory", lambda path: synced.append(path))
+    path = str(tmp_path / "db")
+    db = Database(path)
+    synced.clear()
+    db.execute("CREATE TABLE t (a INTEGER)")
+    assert synced == [path + "-wal", path + "-wal"]  # after creating and after deleting it
     db.close()

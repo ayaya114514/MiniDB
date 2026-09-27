@@ -189,7 +189,7 @@ class Select:
 
 @dataclass
 class Begin:
-    pass
+    mode: str = "DEFERRED"  # DEFERRED, IMMEDIATE or EXCLUSIVE
 
 
 @dataclass
@@ -330,10 +330,11 @@ class Parser:
 
     def statement(self):
         if self.accept_keyword("BEGIN"):
+            mode = "DEFERRED"
             if self.tok.kind == "IDENT" and self.tok.text.upper() in ("DEFERRED", "IMMEDIATE", "EXCLUSIVE"):
-                self.advance()
+                mode = self.advance().text.upper()
             self.accept_keyword("TRANSACTION")
-            return Begin()
+            return Begin(mode)
         if self.accept_keyword("COMMIT") or self._accept_word("END"):
             self.accept_keyword("TRANSACTION")
             return Commit()

@@ -233,3 +233,32 @@ sqlite3：`autocommit=False` 时连接建立即开事务、`commit()`/`rollback(
 ## D44 多个连接打开同一个文件（已知问题，阶段 10 解决）
 目前每个 `Database` 有自己的页缓存，另一个连接提交后本连接看不到新数据。阶段 10 用文件头里的
 变更计数器检测并清空缓存，同时加跨进程锁。
+
+## D45 锁协议：SQLite rollback-journal 模式的 SHARED / RESERVED / EXCLUSIVE
+- SHARED：读事务期间对数据库文件 `flock(LOCK_SH)`；RESERVED：写者对 `<db>-lock` 文件
+  `flock(LOCK_EX)`，同时只有一个写者；EXCLUSIVE：提交时对数据库文件 `flock(LOCK_EX)`，等读者结束。
+- 用 `flock` 而非 `fcntl` 字节锁：flock 属于“打开的文件”，同进程的两个连接也互斥，关闭一个 fd
+  不会误释放另一个连接的锁（POSIX 字节锁的著名缺陷）。进程死亡时操作系统自动释放。
+- 提交先拿 EXCLUSIVE 再写 WAL：拿锁超时（`LockTimeout`，即 "database is locked"）时什么都没写，
+  事务完整保留、可以重试 COMMIT，不会触发 D37 的“连接作废”。自动提交语句超时则撤销该语句。
+- 死锁规避照 SQLite：自动提交的写语句先 RESERVED 后 SHARED；显式事务里已持有 SHARED 时拿
+  RESERVED 不等待、直接报 locked（对方写者可能正等我们的 SHARED）。`BEGIN IMMEDIATE/EXCLUSIVE`
+  在 BEGIN 时就拿 RESERVED。默认忙等超时 5 秒（`Database(path, timeout=...)`）。
+- 崩溃留下的 WAL（“热日志”）：持有 SHARED 时 WAL 仍存在，说明写者已死；谁先拿到 RESERVED 谁在
+  EXCLUSIVE 下恢复，其他连接释放 SHARED 后重试（受超时限制）。
+- 阶段 13 改成 WAL 模式后读者不再阻塞写者，这里的锁工具、超时和变更计数器会沿用。
+
+## D46 变更计数器与缓存一致性
+文件头新增 u32 变更计数器，每次提交加 1。每个读事务开始时（已持有 SHARED）重读文件头，
+计数器或页数与缓存不同就清空页缓存并重载 catalog。代价是每条自动提交语句多一次 flock 和
+读头页（1 万次点查慢约 30%），换来多个连接/进程看到彼此已提交的数据。
+
+## D47 页校验和与文件格式 2
+每页最后 4 字节是前 4092 字节的 CRC32，读页时校验，不符报 `DatabaseError("database disk image
+is malformed ...")`；页解码时的任何异常也统一转成这个错误。B+ 树可用空间相应变为 4092 字节。
+文件格式版本升为 2（magic "MiniDB format 2"），旧文件明确报 "unsupported MiniDB file format"。
+`integrity_check()` 会读遍所有已提交页校验 checksum，因此空闲页上的损坏也能发现。
+
+## D48 目录 fsync
+创建数据库文件、创建和删除 WAL 后 fsync 所在目录，保证文件的出现/消失本身也持久。
+每次提交多两次 fsync（自动提交写入慢约 50%）。
