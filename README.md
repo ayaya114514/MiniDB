@@ -24,8 +24,12 @@
 - 索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`，UNIQUE 列自动建索引；
   执行器对“索引列前缀等值 + 下一列范围”使用索引，也用于连接的内层表。
   `EXPLAIN [QUERY PLAN]` 显示每张表的访问路径。
-- 事务：`BEGIN`、`COMMIT`/`END`、`ROLLBACK`；不在事务中时每条语句自动提交；每条语句都是原子的
-  （多行 `INSERT` 中途违反约束，整条语句不生效）。
+- 事务：`BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]`、`COMMIT`/`END`、`ROLLBACK`；不在事务中时每条语句
+  自动提交；每条语句都是原子的（多行 `INSERT` 中途违反约束，整条语句不生效）。
+- 并发：多个连接、多个进程可以同时打开同一个文件。读共享、写互斥（SQLite 式 SHARED / RESERVED /
+  EXCLUSIVE 文件锁），拿不到锁时忙等到超时报 `database is locked`；其他连接提交的数据自动可见。
+- 可靠性：每页带 CRC32 校验和，损坏的文件报 `DatabaseError` 而不是返回错误数据；提交经 WAL
+  原子化，崩溃后由下一个打开的连接自动恢复。
 
 **与 SQLite 一致的语义**（都有对照测试）：类型亲和性（`INTEGER` 列把 `'12'` 存成 12）、
 比较时的亲和性转换、NULL 三值逻辑、64 位整数溢出转 REAL、整数除法、`SUM`/`AVG` 的补偿求和
@@ -88,9 +92,10 @@ SQL 文本
   ▼
   │  btree.py       B+ 树：按字节大小分裂/合并/借位，叶子兄弟链，范围扫描，overflow 页
   ▼
-  │  pager.py       4 KB 页的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
+  │  pager.py       4 KB 页（带 CRC32）的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
+  │  locking.py     跨进程文件锁（flock）与忙等超时
   ▼
-数据库文件 app.db（+ 提交过程中短暂存在的 app.db-wal）
+数据库文件 app.db（+ 提交过程中短暂存在的 app.db-wal，锁文件 app.db-lock）
 ```
 
 - **dbapi.py** 是 PEP 249 接口；**database.py** 的 `Database.execute()` 负责参数绑定、语句缓存、语句原子性、自动提交和事务状态。
@@ -151,6 +156,7 @@ SQL 文本
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、常量表达式出错的求值时机），MiniDB 不保证选择相同。
 - 索引 key 不支持 overflow，单个索引项约 512 字节以内；超长时报错。
-- 单连接、无并发控制；大事务的脏页全部驻留内存；数据库文件不会收缩（空闲页只复用）。
+- 读者会阻塞写者的提交（写者提交时要等读事务结束）；Windows 上没有 `fcntl`，不加锁。
+- 大事务的脏页全部驻留内存；数据库文件不会收缩（空闲页只复用）。
 - 查询规划简单：不做连接重排，不用索引避免排序，没有覆盖索引。
 - WAL 删除后没有 fsync 目录项；删除的持久性依赖文件系统。
