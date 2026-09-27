@@ -193,3 +193,27 @@ def test_rollback_of_a_database_that_was_never_committed(tmp_path):
     assert pager.is_new and pager.page_count == 1
     assert not pager.checkpoint()  # nothing in the log yet
     pager.close_files()
+
+
+def test_shell_entry_point_in_process(tmp_path, capsys):
+    import io
+
+    from minidb import repl
+    assert repl.main(["a.db", "b.db"]) == 2
+    assert capsys.readouterr().err.startswith("usage:")
+    bad = tmp_path / "bad.db"
+    bad.write_bytes(b"not a database")
+    assert repl.main([str(bad)]) == 1
+    assert capsys.readouterr().err.startswith("Error:")
+    out = io.StringIO()
+    repl.run(io.StringIO("\n   \nSELECT 1;\n"), out)  # blank lines are skipped
+    assert out.getvalue() == "1\n"
+
+
+def test_missing_parameters_match_sqlite():
+    import sqlite3
+    for module in (sqlite3, minidb):
+        with pytest.raises(module.ProgrammingError, match="uses 1, and there are 0 supplied"):
+            module.connect(":memory:").execute("SELECT ?")
+    with pytest.raises(minidb.ProgrammingError, match="uses 1, and there are 0 supplied"):
+        Database().execute("SELECT ?")  # no parameters at all (None)
