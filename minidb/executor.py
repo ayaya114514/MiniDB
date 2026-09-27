@@ -11,6 +11,7 @@ only narrows the candidate rows; the complete WHERE clause is still applied
 to every candidate, so planning can never change a query's result.
 """
 
+import random
 from operator import itemgetter
 
 from minidb import values
@@ -859,14 +860,7 @@ class Executor:
 
         Returns the 0-based result column index, or None for a plain expression.
         """
-        number = None
-        if isinstance(expr, Literal) and isinstance(expr.value, int):
-            number = expr.value
-        elif (
-            isinstance(expr, Unary) and expr.op == "-"
-            and isinstance(expr.operand, Literal) and isinstance(expr.operand.value, int)
-        ):
-            number = -expr.operand.value
+        number = constant_integer(expr)
         if number is not None:
             if not 1 <= number <= len(names):
                 raise OperationalError(
@@ -1036,10 +1030,7 @@ class Executor:
     def insert_row(self, table, tree, row):
         rowid = self.prepare_row(table, row)
         if rowid is None:
-            last = tree.last_key()
-            rowid = 1 if last is None else last + 1
-            if rowid > values.INT_MAX:
-                raise OperationalError("database or disk is full")
+            rowid = self.new_rowid(tree)
             if table.rowid_column is not None:
                 row[table.rowid_column] = rowid
         elif rowid in tree:
@@ -1048,6 +1039,21 @@ class Executor:
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
         return rowid
+
+    @staticmethod
+    def new_rowid(tree):
+        """One more than the largest row id; if that is taken by the maximum
+        integer, try random ones like SQLite does."""
+        last = tree.last_key()
+        if last is None:
+            return 1
+        if last < values.INT_MAX:
+            return last + 1
+        for _ in range(100):
+            candidate = random.randint(1, 2**62)
+            if candidate not in tree:
+                return candidate
+        raise OperationalError("database or disk is full")
 
     @staticmethod
     def rowid_conflict(table):
@@ -1141,6 +1147,30 @@ class JoinLevel:
         self.outer = outer  # LEFT JOIN: emit a NULL row when nothing matches
         self.match = match  # LEFT JOIN ON condition
         self.filters = filters  # conditions checked once this table is bound
+
+
+def constant_integer(expr):
+    """The value of ``expr`` if SQLite would treat it as a column number in
+    ORDER BY / GROUP BY: an integer literal that fits in 32 bits under any
+    number of unary + and -, or ``<non-NULL literal> IS [NOT] NULL``, which
+    SQLite's parser folds to 0 or 1.  Otherwise None."""
+    if isinstance(expr, Literal):
+        value = expr.value
+        if isinstance(value, int) and 0 <= value <= 2**31 - 1:
+            return value
+        return None
+    if isinstance(expr, Unary) and expr.op in ("+", "-"):
+        value = constant_integer(expr.operand)
+        if value is None:
+            return None
+        return -value if expr.op == "-" else value
+    if isinstance(expr, Binary) and expr.op in ("IS", "IS NOT") and expr.right == Literal(None):
+        operand = expr.left
+        while isinstance(operand, Unary) and operand.op in ("+", "-"):
+            operand = operand.operand
+        if isinstance(operand, Literal) and operand.value is not None:
+            return int(expr.op == "IS NOT")
+    return None
 
 
 def ordinal(n):
