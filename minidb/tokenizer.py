@@ -6,7 +6,7 @@ from minidb.errors import Error
 
 KEYWORDS = {
     "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "COMMIT", "CREATE", "CROSS", "DELETE",
-    "DESC", "DISTINCT", "DROP", "EXISTS", "FROM", "GROUP", "HAVING", "IF", "IN", "INDEX",
+    "DESC", "DISTINCT", "DROP", "EXISTS", "EXPLAIN", "FROM", "GROUP", "HAVING", "IF", "IN", "INDEX",
     "INNER", "INSERT", "INTO", "IS", "JOIN", "LEFT", "LIKE", "LIMIT", "NOT", "NULL",
     "OFFSET", "ON", "OR", "ORDER", "OUTER", "PRIMARY", "ROLLBACK", "SELECT", "SET",
     "TABLE", "TRANSACTION", "UNIQUE", "UPDATE", "VALUES", "WHERE",

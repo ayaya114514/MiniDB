@@ -25,3 +25,11 @@
 - `parser.py`：语法树 dataclass；`CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`、`INSERT`（多行 VALUES、指定列）、`SELECT`（`*`、`t.*`、别名、`DISTINCT`、无 FROM）、`UPDATE`、`DELETE`；表达式含比较、`AND/OR/NOT`、括号、算术、`||`、`IS [NOT]`、`[NOT] IN`、`[NOT] LIKE`、`[NOT] BETWEEN`、函数调用（含 `COUNT(*)`、`DISTINCT`）；多语句脚本。
 - 测试：123 个，全部通过（新增 tokenizer 14 个、parser 39 个，覆盖优先级、各语句的语法树和带位置的报错）。
 - 已知问题：REPL 仍然走临时命令语法，阶段 5 接上 SQL 执行器。
+
+## 阶段 5：多表与执行器（完成）
+- `catalog.py`：schema 存在第 1 页的 B+ 树里（type, name, tbl_name, rootpage, sql），重开时重新解析 SQL；任意多张表；`CREATE TABLE [IF NOT EXISTS]` / `DROP TABLE [IF EXISTS]`（释放整棵树的页）。
+- `executor.py`：表达式编译成闭包；`INSERT`（多行、指定列、亲和性、自动 rowid）、`SELECT`（`*`、`t.*`、别名、`DISTINCT`、无 FROM）、`UPDATE`（含修改主键）、`DELETE`；约束 PRIMARY KEY / NOT NULL / UNIQUE / datatype mismatch；主键等值、`IN`、范围条件走 B+ 树（`EXPLAIN` 可查看），其他全表扫描。
+- `values.py`：SQLite 值语义与标量函数（abs/length/lower/upper/coalesce/ifnull/nullif/typeof/多参 min/max）。
+- `database.py`：`Database(path).execute(sql)`，语句级原子性 + 自动提交。Shell 改为真正的 SQL（多行语句、带位置和 `^` 的报错、元命令）。
+- 测试：192 个，全部通过。与 sqlite3 对照：17 种二元运算 × 19 种字面量两两组合（含 typeof）、一元运算与函数、3000 个随机优先级表达式、LIKE 模式、列亲和性存储与比较、CRUD 流程、约束错误、语句原子性、语义错误（部分核对报错文本）、rowid 各种访问路径、1500 步随机 CRUD。另有规划器测试（冷缓存下点查只读 ≤4 页）。
+- 已知问题：REAL→TEXT 在少数值上与 sqlite 末位数字不同（见 D20）；UNIQUE 检查暂为全表扫描（阶段 6 改索引）。

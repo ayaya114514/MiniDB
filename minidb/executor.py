@@ -17,8 +17,8 @@ from minidb import values
 from minidb.btree import DuplicateKeyError
 from minidb.errors import IntegrityError, OperationalError
 from minidb.parser import (
-    Between, Binary, Call, Column, CreateTable, Delete, DropTable, InList, Insert, Like,
-    Literal, Select, Star, Unary, Update,
+    Between, Binary, Call, Column, CreateTable, Delete, DropTable, Explain, InList, Insert,
+    Like, Literal, Select, Star, Unary, Update,
 )
 from minidb.record import decode_record, encode_record
 
@@ -390,12 +390,15 @@ def plan_access(scope, index, tree, conjuncts, compiler):
     Only conjuncts comparing the table's row id with an expression over the
     *earlier* tables (or constants) are usable.
     """
-    rowid_slot = scope.rowid_slot(index)
+    _, table, offset = scope.entries[index]
+    rowid_slots = {scope.rowid_slot(index)}
+    if table.rowid_column is not None:
+        rowid_slots.add(offset + table.rowid_column)
     earlier = set(range(index))
     equal, lower, upper = [], None, None
 
     def is_rowid(expr):
-        return isinstance(expr, Column) and scope.resolve(expr)[0] == rowid_slot
+        return isinstance(expr, Column) and scope.resolve(expr)[0] in rowid_slots
 
     def usable(expr):
         return tables_referenced(expr, scope) <= earlier
@@ -449,6 +452,8 @@ class Executor:
         if isinstance(stmt, DropTable):
             self.catalog.drop_table(stmt.name, stmt.if_exists)
             return Result()
+        if isinstance(stmt, Explain):
+            return self.explain(stmt.statement)
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
 
     # ---- reading rows ------------------------------------------------------
@@ -461,19 +466,33 @@ class Executor:
         row.append(rowid)
         return row
 
-    def matching_rows(self, table, where):
-        """Yield (rowid, row) for rows of a single table satisfying ``where``."""
+    def single_table_access(self, table, where):
         scope = Scope()
         scope.add(table)
         compiler = Compiler(scope)
-        condition = compiler.compile(where) if where is not None else None
         tree = self.catalog.table_tree(table)
-        access = plan_access(scope, 0, tree, split_conjuncts(where), compiler)
+        return scope, compiler, plan_access(scope, 0, tree, split_conjuncts(where), compiler)
+
+    def matching_rows(self, table, where):
+        """Yield (rowid, row) for rows of a single table satisfying ``where``."""
+        _, compiler, access = self.single_table_access(table, where)
+        condition = compiler.compile(where) if where is not None else None
         truth = values.truth
         for rowid, record in access.candidates(None):
             row = self.load_row(table, rowid, record)
             if condition is None or truth(condition(row)):
                 yield rowid, row
+
+    def explain(self, stmt):
+        """One row (table, access path) per table the statement reads."""
+        if isinstance(stmt, Select):
+            if stmt.source is None:
+                return Result([], ["table", "plan"])
+            table = self.catalog.get_table(stmt.source.name)
+        else:
+            table = self.catalog.get_table(stmt.table)
+        _, _, access = self.single_table_access(table, stmt.where)
+        return Result([(table.name, access.describe())], ["table", "plan"])
 
     # ---- SELECT -------------------------------------------------------------
 
