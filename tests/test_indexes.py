@@ -229,3 +229,30 @@ def test_delete_all_clears_indexes(db):
     assert db.execute("SELECT * FROM t WHERE a = 1") == []
     db.execute("INSERT INTO t VALUES (1, 1, 'b', 1)")
     assert db.execute("SELECT id FROM t WHERE b = 'b' AND c = 1") == [(1,)]
+
+
+def test_order_by_follows_index_or_rowid_order():
+    import itertools
+    pair = Pair()
+    pair.script([
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c INTEGER)",
+        "INSERT INTO o VALUES " + ", ".join(
+            f"({i}, {['NULL', i % 5, repr(i % 3 + 0.5), repr(str(i % 4))][i % 4]}, "
+            f"{['NULL', repr('b' + str(i % 6)), str(i % 2)][i % 3]}, {i % 9})"
+            for i in range(1, 120)
+        ),
+        "CREATE INDEX o_ab ON o (a, b)",
+        "CREATE INDEX o_c ON o (c)",
+    ])
+    db = pair.mini
+    presorted = 0
+    orders = ["id", "a", "a, b", "a, b, id", "c", "c, id", "b", "a DESC", "a NULLS LAST", "rowid"]
+    wheres = ["", " WHERE a = 2", " WHERE a > 1", " WHERE c = 3", " WHERE c BETWEEN 2 AND 5", " WHERE id > 50"]
+    for order, where, limit in itertools.product(orders, wheres, ["", " LIMIT 5", " LIMIT 3 OFFSET 4"]):
+        sql = f"SELECT id, a, b, c FROM o{where} ORDER BY {order}, id{limit}"
+        pair.run(sql)
+        presorted += db.executor.prepare(db.parse(sql)[0]).compiled.presorted
+    pair.run("SELECT o.id, p.id FROM o JOIN o AS p ON p.c = o.c ORDER BY o.id, p.id LIMIT 20")
+    pair.run("SELECT DISTINCT a FROM o ORDER BY a LIMIT 3")
+    assert presorted > 50  # most of these really skip the sort
+    pair.close()
