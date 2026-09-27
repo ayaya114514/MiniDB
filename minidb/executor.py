@@ -333,6 +333,10 @@ class Compiler:
 
     def _binary(self, expr):
         op = expr.op
+        if op == "AND" and folded_literal(expr) == Literal(0):
+            # SQLite's parser replaces this by 0: the operands are never
+            # resolved, so e.g. a missing table in a subquery there is no error.
+            return lambda row: 0
         left, left_affinity = self.compile_with_affinity(expr.left)
         right, right_affinity = self.compile_with_affinity(expr.right)
         truth = values.truth
@@ -1208,10 +1212,10 @@ class Executor:
         """
         compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
         on_compiler = Compiler(scope, executor=self)
-        pool = split_conjuncts(where)
+        pool = split_conjuncts(fold_and(where))
         for join in joins:
             if join.kind != "LEFT":
-                pool += split_conjuncts(join.on)
+                pool += split_conjuncts(fold_and(join.on))
         referenced = [(conjunct, tables_referenced(conjunct, scope)) for conjunct in pool]
         order = list(range(len(joins)))
         if len(joins) > 1 and all(join.kind != "LEFT" for join in joins):
@@ -1799,12 +1803,17 @@ class PreparedInsert:
 
     def run(self):
         executor, table, width = self.executor, self.table, len(self.table.columns)
+        # All VALUES are computed first: SQLite evaluates their (constant)
+        # subqueries once, before any row is inserted.
+        rows = []
         for functions in self.rows:
             row = [None] * width
             for position, function in zip(self.positions, functions):
                 row[position] = function([])
+            rows.append(row)
+        for row in rows:
             executor.last_insert_rowid = executor.insert_row(table, self.tree, row)
-        return Result(rowcount=len(self.rows))
+        return Result(rowcount=len(rows))
 
 
 class PreparedSingleTable:
@@ -1971,6 +1980,14 @@ def folded_literal(expr):
         if literal is not None and literal.value is not None:
             return Literal(int(expr.op == "IS NOT"))
     return None
+
+
+def fold_and(expr):
+    """``expr`` with every AND that SQLite's parser folds to 0 replaced by 0."""
+    if isinstance(expr, Binary) and expr.op == "AND":
+        folded = Binary("AND", fold_and(expr.left), fold_and(expr.right))
+        return Literal(0) if folded_literal(folded) == Literal(0) else folded
+    return expr
 
 
 def constant_integer(expr):
