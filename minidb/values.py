@@ -15,6 +15,19 @@ from functools import lru_cache
 
 from minidb.errors import OperationalError
 
+_TO_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+_TO_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+def ascii_lower(text: str) -> str:
+    """Lower case as SQLite understands it: ASCII letters only (lower(),
+    identifiers, keywords and type names alike; 'É' stays 'É')."""
+    return text.lower() if text.isascii() else text.translate(_TO_LOWER)
+
+
+def ascii_upper(text: str) -> str:
+    return text.upper() if text.isascii() else text.translate(_TO_UPPER)
+
 # A SQL value: NULL, INTEGER, REAL or TEXT.
 SQLValue = int | float | str | None
 
@@ -303,11 +316,12 @@ def _like_regex(pattern: str) -> re.Pattern:
             parts.append(".")
         else:
             parts.append(re.escape(ch))
-    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE)
+    return re.compile("".join(parts), re.DOTALL | re.IGNORECASE | re.ASCII)  # ASCII-only case folding
 
 
 def like(value: SQLValue, pattern: SQLValue) -> int | None:
-    """``value LIKE pattern``: case-insensitive, ``%`` and ``_`` wildcards."""
+    """``value LIKE pattern``: ``%`` and ``_`` wildcards, case-insensitive for
+    ASCII letters only (like SQLite without the ICU extension)."""
     if value is None or pattern is None:
         return None
     return int(_like_regex(to_text(pattern)).fullmatch(to_text(value)) is not None)
@@ -331,11 +345,11 @@ def _fn_length(value: SQLValue) -> int | None:
 
 
 def _fn_lower(value: SQLValue) -> str | None:
-    return None if value is None else to_text(value).lower()
+    return None if value is None else ascii_lower(to_text(value))
 
 
 def _fn_upper(value: SQLValue) -> str | None:
-    return None if value is None else to_text(value).upper()
+    return None if value is None else ascii_upper(to_text(value))
 
 
 def _fn_coalesce(*values: SQLValue) -> SQLValue:
@@ -574,7 +588,7 @@ def is_aggregate_call(name: str, arg_count: int) -> bool:
 
 def type_affinity(type_name: str) -> str:
     """SQLite's rules for the affinity of a declared type name."""
-    name = type_name.upper()
+    name = ascii_upper(type_name)
     if "INT" in name:
         return "INTEGER"
     if "CHAR" in name or "CLOB" in name or "TEXT" in name:

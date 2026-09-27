@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from minidb.errors import OperationalError
+from minidb.values import ascii_upper
 
 KEYWORDS = {
     "ALL", "ANALYZE", "AND", "AS", "ASC", "BEGIN", "BETWEEN", "BY", "CASE", "CAST", "COMMIT", "CREATE",
@@ -72,8 +73,8 @@ def tokenize(text: str) -> list[Token]:
             while i < n and (text[i].isalnum() or text[i] in "_$"):
                 i += 1
             word = text[start:i]
-            if word.upper() in KEYWORDS:
-                tokens.append(Token("KEYWORD", word.upper(), start, word))
+            if ascii_upper(word) in KEYWORDS:
+                tokens.append(Token("KEYWORD", ascii_upper(word), start, word))
             else:
                 tokens.append(Token("IDENT", word, start, word))
             continue

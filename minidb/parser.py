@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Union
 
 from minidb.tokenizer import SQLSyntaxError, Token, tokenize
+from minidb.values import ascii_upper
 
 # ---- expressions -------------------------------------------------------
 
@@ -296,7 +297,7 @@ Statement = Union[
 # ---- parser ------------------------------------------------------------
 
 TYPE_NAMES = {"INTEGER", "TEXT"}
-MAX_PARAMETER_INDEX = 250_000
+MAX_PARAMETER_INDEX = 32_766  # SQLITE_MAX_VARIABLE_NUMBER's default
 
 
 def parse(text: str) -> Statement:
@@ -365,7 +366,7 @@ class Parser:
 
     def expect_word(self, word: str) -> Token:
         """Expect a non-reserved word such as KEY (tokenized as an identifier)."""
-        if self.tok.kind == "IDENT" and self.tok.text.upper() == word:
+        if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == word:
             return self.advance()
         raise self.error(word)
 
@@ -397,8 +398,8 @@ class Parser:
     def statement(self) -> Statement:
         if self.accept_keyword("BEGIN"):
             mode = "DEFERRED"
-            if self.tok.kind == "IDENT" and self.tok.text.upper() in ("DEFERRED", "IMMEDIATE", "EXCLUSIVE"):
-                mode = self.advance().text.upper()
+            if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) in ("DEFERRED", "IMMEDIATE", "EXCLUSIVE"):
+                mode = ascii_upper(self.advance().text)
             self.accept_keyword("TRANSACTION")
             return Begin(mode)
         if self.accept_keyword("COMMIT") or self.accept_keyword("END"):
@@ -410,7 +411,7 @@ class Parser:
         if self.accept_keyword("ANALYZE"):
             return Analyze(self.identifier("table name") if self.tok.kind == "IDENT" else None)
         if self.accept_keyword("EXPLAIN"):
-            if self.tok.kind == "IDENT" and self.tok.text.upper() == "QUERY":
+            if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == "QUERY":
                 self.advance()
                 self.expect_word("PLAN")
             if not self.at_keyword("SELECT", "UPDATE", "DELETE"):
@@ -474,10 +475,10 @@ class Parser:
     def column_def(self) -> ColumnDef:
         name = self.identifier("column name")
         type_token = self.tok
-        if type_token.kind != "IDENT" or type_token.value.upper() not in TYPE_NAMES:
+        if type_token.kind != "IDENT" or ascii_upper(type_token.value) not in TYPE_NAMES:
             raise self.error("column type INTEGER or TEXT")
         self.advance()
-        column = ColumnDef(name, type_token.value.upper())
+        column = ColumnDef(name, ascii_upper(type_token.value))
         while True:
             if self.accept_keyword("PRIMARY"):
                 self.expect_word("KEY")
@@ -579,10 +580,10 @@ class Parser:
             item.descending = True
         else:
             self.accept_keyword("ASC")
-        if self.tok.kind == "IDENT" and self.tok.text.upper() == "NULLS":
+        if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == "NULLS":
             self.advance()
-            if self.tok.kind == "IDENT" and self.tok.text.upper() in ("FIRST", "LAST"):
-                item.nulls_first = self.advance().text.upper() == "FIRST"
+            if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) in ("FIRST", "LAST"):
+                item.nulls_first = ascii_upper(self.advance().text) == "FIRST"
             else:
                 raise self.error("FIRST or LAST")
         return item
@@ -819,7 +820,7 @@ class Parser:
         if token.kind == "IDENT":
             self.advance()
             if self.accept_op("("):
-                return self.call(token.value.upper())
+                return self.call(ascii_upper(token.value))
             if self.accept_op("."):
                 return Column(self.identifier("column name"), token.value)
             return Column(token.value)

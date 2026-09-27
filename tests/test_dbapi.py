@@ -106,7 +106,7 @@ def test_module_attributes():
     ("SELECT ?", {"a": 1}),
     ("SELECT ?1, ?1, ?2", (7, 8)),
     ("SELECT ?0", (1,)),
-    ("SELECT ?250001", (1,)),
+    ("SELECT ?32767", (1,)),
     ("SELECT ?", (True,)),
     ("SELECT ?", (2**63,)),
     ("SELECT ?", (-(2**63),)),
