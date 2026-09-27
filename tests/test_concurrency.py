@@ -76,44 +76,77 @@ def test_one_writer_at_a_time(path):
     b.close()
 
 
-def test_commit_waits_for_readers_and_can_be_retried(path):
+def test_readers_keep_their_snapshot_while_writers_commit(path):
     reader, writer = Database(path), Database(path, timeout=0.2)
     reader.execute("BEGIN")
-    reader.execute("SELECT * FROM t")  # reader holds SHARED
-    writer.execute("BEGIN")
-    writer.execute("INSERT INTO t VALUES (2, 'two')")
-    locked(lambda: writer.execute("COMMIT"))  # needs EXCLUSIVE
-    assert writer.in_transaction  # nothing was lost
     assert reader.execute("SELECT count(*) FROM t") == [(1,)]
+    for i in range(2, 50):
+        writer.execute("INSERT INTO t VALUES (?, 'w')", (i,))  # commits do not wait for readers
+    writer.execute("UPDATE t SET v = 'changed' WHERE id = 1")
+    assert reader.execute("SELECT count(*) FROM t") == [(1,)]  # same snapshot
+    assert reader.execute("SELECT v FROM t WHERE id = 1") == [("one",)]
     reader.execute("COMMIT")
-    writer.execute("COMMIT")
-    assert reader.execute("SELECT count(*) FROM t") == [(2,)]
-    # An autocommit statement whose commit times out is undone instead.
-    reader.execute("BEGIN")
-    reader.execute("SELECT 1 FROM t")
-    locked(lambda: writer.execute("INSERT INTO t VALUES (3, 'three')"))
-    reader.execute("ROLLBACK")
-    assert writer.execute("SELECT count(*) FROM t") == [(2,)]
-    assert writer.integrity_check() == []
+    assert reader.execute("SELECT count(*), max(v) FROM t") == [(49, "w")]
+    assert reader.integrity_check() == [] and writer.integrity_check() == []
     reader.close()
     writer.close()
 
 
-def test_deadlock_is_avoided_by_failing_fast(path):
+def test_checkpoint_waits_for_no_one(path):
+    reader, writer = Database(path), Database(path)
+    reader.execute("BEGIN")
+    reader.execute("SELECT * FROM t")
+    writer.execute("INSERT INTO t VALUES (2, 'two')")
+    assert not writer.pager.checkpoint()  # a reader is active: skipped, not waited for
+    assert os.path.getsize(path + "-wal") > 0
+    reader.execute("COMMIT")
+    assert writer.pager.checkpoint()
+    assert os.path.getsize(path + "-wal") == 0
+    assert reader.execute("SELECT count(*) FROM t") == [(2,)]
+    reader.close()
+    writer.close()
+
+
+def test_stale_snapshot_cannot_start_writing(path):
     a, b = Database(path, timeout=2), Database(path, timeout=0.2)
     a.execute("BEGIN")
     a.execute("SELECT * FROM t")
     b.execute("BEGIN")
     b.execute("SELECT * FROM t")
     b.execute("INSERT INTO t VALUES (2, 'b')")  # b is the writer
-    # a holds SHARED and wants RESERVED: waiting could deadlock, so it fails at once.
+    # a holds a snapshot and wants RESERVED: it fails at once instead of waiting.
     assert locked(lambda: a.execute("INSERT INTO t VALUES (3, 'a')")) < 0.5
-    locked(lambda: b.execute("COMMIT"))  # b waits for a's SHARED
+    b.execute("COMMIT")  # does not wait for a
+    # RESERVED is free now, but a's snapshot is older than b's commit.
+    locked(lambda: a.execute("INSERT INTO t VALUES (3, 'a')"))
+    assert a.execute("SELECT count(*) FROM t") == [(1,)]
     a.execute("ROLLBACK")
-    b.execute("COMMIT")
-    assert a.execute("SELECT * FROM t") == [(1, "one"), (2, "b")]
+    a.execute("INSERT INTO t VALUES (3, 'a')")
+    assert b.execute("SELECT * FROM t") == [(1, "one"), (2, "b"), (3, "a")]
     a.close()
     b.close()
+
+
+def test_large_transaction_spills_to_the_log(path):
+    db = Database(path)
+    db.execute("BEGIN")
+    for start in range(0, 40_000, 1000):
+        db.execute("INSERT INTO t (v) VALUES " + ", ".join(f"('{'x' * 200}{i}')" for i in range(start, start + 1000)))
+        assert len(db.pager.dirty) <= 1200  # spilled regularly
+    assert len(db.pager.cache) < 2 * 1200
+    assert db.execute("SELECT count(*), max(length(v)) FROM t") == [(40_001, 205)]
+    other = Database(path)
+    assert other.execute("SELECT count(*) FROM t") == [(1,)]  # uncommitted: invisible
+    db.execute("ROLLBACK")
+    assert db.execute("SELECT count(*) FROM t") == [(1,)]
+    db.execute("BEGIN")
+    db.execute("INSERT INTO t (v) VALUES " + ", ".join(f"('{i}')" for i in range(5000)))
+    db.pager.spill()
+    db.execute("COMMIT")
+    assert other.execute("SELECT count(*) FROM t") == [(5001,)]
+    assert db.integrity_check() == []
+    other.close()
+    db.close()
 
 
 def test_begin_immediate_reserves_at_once(path):
@@ -131,24 +164,24 @@ def test_begin_immediate_reserves_at_once(path):
     b.close()
 
 
-def test_open_connection_recovers_after_another_crashes(path):
+def test_open_connection_survives_another_crashing(path):
     a, b = Database(path), Database(path)
     b.execute("SELECT * FROM t")
 
     def crash(point, index):
-        if point == "db_page" and index == 1:
+        if point == "wal_sync":
             raise KeyboardInterrupt("simulated crash")
 
     a.execute("BEGIN")
     a.execute("INSERT INTO t VALUES " + ", ".join(f"({i}, '{'x' * 100}')" for i in range(2, 400)))
     a.pager.crash_hook = crash
     with pytest.raises(KeyboardInterrupt):
-        a.execute("COMMIT")  # the WAL is complete; the database file is half written
-    assert os.path.exists(path + "-wal")
-    assert b.execute("SELECT count(*) FROM t") == [(399,)]  # b replays the WAL first
-    assert not os.path.exists(path + "-wal")
+        a.execute("COMMIT")  # the commit frame was written, not yet synced
+    assert b.execute("SELECT count(*) FROM t") == [(399,)]
     assert b.integrity_check() == []
+    b.execute("DELETE FROM t WHERE id > 100")
     b.close()
+    assert Database(path).execute("SELECT count(*) FROM t") == [(100,)]
 
 
 def test_in_memory_databases_are_independent():
