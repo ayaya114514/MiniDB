@@ -342,7 +342,8 @@ def test_crash_on_first_commit_of_new_database(tmp_path):
         db = Database(path)  # an empty new database, or the logged header
         db.execute("CREATE TABLE t (a INTEGER)")
         db.close()
-        assert Database(path).execute("SELECT * FROM t") == []
+        with Database(path) as db:
+            assert db.execute("SELECT * FROM t") == []
 
 
 def test_uncommitted_frames_of_a_crashed_writer_are_ignored_and_dropped(tmp_path):

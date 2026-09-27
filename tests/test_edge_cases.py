@@ -213,7 +213,9 @@ def test_shell_entry_point_in_process(tmp_path, capsys):
 def test_missing_parameters_match_sqlite():
     import sqlite3
     for module in (sqlite3, minidb):
+        conn = module.connect(":memory:")
         with pytest.raises(module.ProgrammingError, match="uses 1, and there are 0 supplied"):
-            module.connect(":memory:").execute("SELECT ?")
+            conn.execute("SELECT ?")
+        conn.close()
     with pytest.raises(minidb.ProgrammingError, match="uses 1, and there are 0 supplied"):
         Database().execute("SELECT ?")  # no parameters at all (None)

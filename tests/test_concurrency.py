@@ -181,7 +181,9 @@ def test_open_connection_survives_another_crashing(path):
     assert b.integrity_check() == []
     b.execute("DELETE FROM t WHERE id > 100")
     b.close()
-    assert Database(path).execute("SELECT count(*) FROM t") == [(100,)]
+    a.pager.close_files()  # what the crashed process's exit would do
+    with Database(path) as db:
+        assert db.execute("SELECT count(*) FROM t") == [(100,)]
 
 
 def test_in_memory_databases_are_independent():

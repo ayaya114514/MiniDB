@@ -60,6 +60,7 @@ def test_page_cache_returns_same_object(tmp_path):
     pager.close()
     pager = Pager(str(tmp_path / "t.db"))
     assert pager.get(page.pgno, RawPage) is pager.get(page.pgno, RawPage)
+    pager.close()
 
 
 def test_free_list_reuses_pages():

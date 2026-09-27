@@ -41,6 +41,8 @@ def row_order_key(normalized_row):
 class Pair:
     """A MiniDB database and a sqlite3 database fed with identical SQL."""
 
+    open_pairs = set()  # not yet closed; conftest.py closes them after each test
+
     def __init__(self, path=None, check_messages=False, loose_numbers=False):
         """``loose_numbers`` compares numbers by value only.  The fuzzer uses it:
         when several rows hold equal values of different types (1 and 1.0),
@@ -48,6 +50,7 @@ class Pair:
         SQLite's query plan visits rows in."""
         self.mini = Database(path)
         self.lite = sqlite3.connect(":memory:", isolation_level=None)
+        Pair.open_pairs.add(self)
         self.check_messages = check_messages
         self.normalize = loose if loose_numbers else typed
 
@@ -97,3 +100,4 @@ class Pair:
     def close(self):
         self.mini.close()
         self.lite.close()
+        Pair.open_pairs.discard(self)
