@@ -7,11 +7,16 @@ from collections.abc import Mapping
 from minidb.catalog import Catalog
 from minidb.errors import DatabaseError, OperationalError, ProgrammingError
 from minidb.executor import Executor, Result
+from minidb.locking import LockTimeout
 from minidb.pager import Pager
-from minidb.parser import Begin, Bound, Commit, Parameter, Rollback, parse_script
+from minidb.parser import (
+    Begin, Bound, Commit, CreateIndex, CreateTable, Delete, DropIndex, DropTable, Insert,
+    Parameter, Rollback, Update, parse_script,
+)
 from minidb.values import INT_MAX, INT_MIN
 
 STATEMENT_CACHE_SIZE = 256
+WRITE_STATEMENTS = (Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex)
 
 
 class Database:
@@ -28,13 +33,20 @@ class Database:
     text, so executing the same SQL again skips tokenizing and parsing.
     """
 
-    def __init__(self, path=None):
-        self.pager = Pager(path)
+    def __init__(self, path=None, timeout=5.0):
+        """``timeout``: seconds to wait for a lock held by another connection."""
+        self.pager = Pager(path, timeout)  # starts inside a read transaction
         try:
+            if self.pager.is_new:
+                # Creating the file: become the writer first (RESERVED before SHARED).
+                self.pager.end_transaction()
+                self.pager.begin_write()
+                self.pager.begin_read()
             self.catalog = Catalog(self.pager)
             self.pager.commit()
+            self.pager.end_transaction()
         except BaseException:
-            self.pager.file.close()
+            self.pager.close_files()
             raise
         self.executor = Executor(self.catalog)
         self.in_transaction = False
@@ -75,48 +87,93 @@ class Database:
             yield self.execute_statement(stmt)
 
     def execute_statement(self, stmt):
+        """Run one parsed statement.
+
+        Locking: a statement or explicit transaction reads under SHARED.  A
+        writing statement outside a transaction takes RESERVED first (waiting
+        for another writer), then SHARED.  Inside a transaction, which already
+        holds SHARED, RESERVED is not waited for: that writer may itself be
+        waiting for our SHARED to go away, so we fail with "database is
+        locked" at once, as SQLite does.
+        """
         if self.broken:
             raise DatabaseError("a commit failed: reopen the database to recover")
+        pager = self.pager
         if isinstance(stmt, Begin):
             if self.in_transaction:
                 raise OperationalError("cannot start a transaction within a transaction")
+            try:
+                if stmt.mode != "DEFERRED":
+                    pager.begin_write()
+                self._begin_read()
+            except BaseException:
+                pager.end_transaction()
+                raise
             self.in_transaction = True
             return Result()
         if isinstance(stmt, Commit):
             if not self.in_transaction:
                 raise OperationalError("cannot commit - no transaction is active")
+            self._commit()  # a lock timeout leaves the transaction open
             self.in_transaction = False
-            self._commit()
+            pager.end_transaction()
             return Result()
         if isinstance(stmt, Rollback):
             if not self.in_transaction:
                 raise OperationalError("cannot rollback - no transaction is active")
             self.in_transaction = False
             self.rollback()
+            pager.end_transaction()
             return Result()
-        self.pager.begin_statement()
+        writes = isinstance(stmt, WRITE_STATEMENTS)
+        if not self.in_transaction:
+            try:
+                if writes:
+                    pager.begin_write()
+                self._begin_read()
+            except BaseException:
+                pager.end_transaction()
+                raise
+        elif writes:
+            pager.begin_write(wait=False)
+        pager.begin_statement()
         try:
             result = self.executor.execute(stmt)
         except BaseException:
-            self.pager.rollback_statement()
+            pager.rollback_statement()
             self.catalog.load()
+            if not self.in_transaction:
+                pager.end_transaction()
             raise
-        self.pager.end_statement()
+        pager.end_statement()
         if not self.in_transaction:
-            self._commit()
+            try:
+                self._commit()
+            except LockTimeout:
+                self.rollback()
+                raise
+            finally:
+                if not self.broken:
+                    pager.end_transaction()
         if result.rowcount > 0:
             self.total_changes += result.rowcount
         return result
 
+    def _begin_read(self):
+        if self.pager.begin_read():
+            self.catalog.load()  # another connection committed: the schema may differ
+
     def _commit(self):
         try:
             self.pager.commit()
+        except LockTimeout:
+            raise  # nothing was written; the transaction is intact
         except BaseException:
             # The commit may or may not have reached the WAL's commit record,
             # so the in-memory state cannot be trusted.  Abandon it; reopening
             # the file lets recovery decide.
             self.broken = True
-            self.pager.file.close()
+            self.pager.close_files()
             raise
         self.pager.shrink_cache()
 
@@ -126,8 +183,20 @@ class Database:
         self.catalog.load()
 
     def integrity_check(self):
-        """Check every B+ tree and index; returns a list of problems (empty if OK)."""
-        problems = []
+        """Check page checksums, every B+ tree and every index; returns a list
+        of problems (empty if all is well)."""
+        if self.in_transaction:
+            return self._integrity_check()
+        self._begin_read()
+        try:
+            return self._integrity_check()
+        finally:
+            self.pager.end_transaction()
+
+    def _integrity_check(self):
+        problems = [f"page {pgno}: bad checksum" for pgno in self.pager.check_checksums()]
+        if problems:
+            return problems
         catalog = self.catalog
         trees = [("schema", catalog.schema)]
         for table in catalog.tables.values():
@@ -159,7 +228,7 @@ class Database:
         if self.in_transaction:
             self.in_transaction = False
             self.rollback()
-        self.pager.close()
+        self.pager.close_files()
 
     def __enter__(self):
         return self

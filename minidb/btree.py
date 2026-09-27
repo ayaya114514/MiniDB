@@ -29,12 +29,12 @@ import struct
 from bisect import bisect_left, bisect_right
 
 from minidb.errors import Error
-from minidb.pager import PAGE_SIZE
+from minidb.pager import USABLE_SIZE
 
 LEAF, INTERNAL = 1, 2
 HEADER_SIZE = 7
 OVERFLOW_MARK = 0xFFFF
-OVERFLOW_DATA_SIZE = PAGE_SIZE - 4
+OVERFLOW_DATA_SIZE = USABLE_SIZE - 4
 
 _header = struct.Struct(">BHI")
 _u16 = struct.Struct(">H")
@@ -112,7 +112,7 @@ class Leaf:
             else:
                 out += _u16.pack(len(value))
                 out += value
-        return bytes(out.ljust(PAGE_SIZE, b"\x00"))
+        return bytes(out.ljust(USABLE_SIZE, b"\x00"))
 
 
 class Internal:
@@ -138,7 +138,7 @@ class Internal:
         for child, key in zip(self.children, self.keys):
             out += _u32.pack(child)
             out += encode(key)
-        return bytes(out.ljust(PAGE_SIZE, b"\x00"))
+        return bytes(out.ljust(USABLE_SIZE, b"\x00"))
 
 
 class NodeReader:
@@ -188,7 +188,7 @@ class OverflowPage:
         return cls(pgno, _u32.unpack_from(data)[0], bytes(data[4:]))
 
     def to_bytes(self):
-        return (_u32.pack(self.next_page) + self.data).ljust(PAGE_SIZE, b"\x00")
+        return (_u32.pack(self.next_page) + self.data).ljust(USABLE_SIZE, b"\x00")
 
     def copy(self):
         return OverflowPage(self.pgno, self.next_page, self.data)
@@ -218,7 +218,7 @@ def _balanced_split(sizes, lo, hi):
 
 
 class BTree:
-    def __init__(self, pager, root, codec=IntKey, capacity=PAGE_SIZE):
+    def __init__(self, pager, root, codec=IntKey, capacity=USABLE_SIZE):
         self.pager = pager
         self.root = root
         self.codec = codec
@@ -229,7 +229,7 @@ class BTree:
         self.max_leaf_cell = capacity // 5
 
     @classmethod
-    def create(cls, pager, codec=IntKey, capacity=PAGE_SIZE):
+    def create(cls, pager, codec=IntKey, capacity=USABLE_SIZE):
         """Allocate an empty tree and return it."""
         root = pager.allocate(Leaf, codec)
         return cls(pager, root.pgno, codec, capacity)
