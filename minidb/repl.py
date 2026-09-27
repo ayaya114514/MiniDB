@@ -38,6 +38,10 @@ def _loop(table, stdin, stdout, interactive):
         if line.startswith("."):
             if line == ".exit":
                 break
+            if line == ".btree":
+                for text in table.tree.dump():
+                    stdout.write(text + "\n")
+                continue
             stdout.write(f"Error: unknown command: {line}\n")
             continue
         try:
