@@ -11,6 +11,7 @@ from sqlcompare import Pair
 LITERALS = [
     "NULL", "0", "1", "-1", "2", "7", "1.5", "-2.5", "0.0", "'1'", "'1.0'", "'abc'", "''",
     "' 12'", "'12abc'", "'ABC'", "9223372036854775807", "-9223372036854775808", "'1e2'",
+    "x''", "x'61'", "x'3132'", "x'ff00'",
 ]
 
 BINARY_OPERATORS = [
@@ -364,3 +365,24 @@ def test_random_crud_against_sqlite():
             pair.run(f"SELECT * FROM t WHERE {condition}")
     pair.run("SELECT * FROM t")
     pair.close()
+
+
+def test_blobs_and_text_with_nul(pair):
+    """BLOBs read as text; SQLite's C string functions (LIKE, length) stop at
+    a NUL character, and its numeric conversion makes text with a NUL a REAL."""
+    text = "CAST(x'610062' AS TEXT)"
+    for expr in [
+        "x'00' + 0", "x'0035' + 0", "x'35002e35' + 0", "x'352e3500' + 0", "x'2d3500' + 0",
+        "x'61620035' + 0", "x'3500' * 2", "-x'3500'", "x'3500' % 2", "x'3500' / 2", "x'3500' | 0",
+        "x'3500' AND 1", "sum(x'3500')", "'5' || x'00' + 0", "CAST(x'3500' AS INTEGER)",
+        "x'3500' + x'3600'", "typeof(x'3500' + 0)", f"{text} LIKE 'a'", f"{text} LIKE 'a%'",
+        f"'a' LIKE {text}", f"length({text})", "length(x'610062')", f"upper({text})", f"{text} = 'a'",
+        f"length({text} || 'z')", f"total({text})", "avg(x'3500')", "CAST(x'ff' AS TEXT)",
+        "CAST(CAST(x'ff80' AS TEXT) AS BLOB)", "length(CAST(x'ff80c3' AS TEXT))",
+        "x'0102' < x'010203'", "x'' < 'a'", "'zzz' < x''", "max(x'01', 'a', 2)",
+    ]:
+        pair.run(f"SELECT {expr}")
+    pair.run("CREATE TABLE t (b BLOB, s TEXT, n NUMERIC)")
+    pair.run("INSERT INTO t VALUES (x'3132', x'3132', x'3132'), ('12', '12', '12'), (12, 12, 12)")
+    pair.run("SELECT typeof(b), typeof(s), typeof(n), b = s, s = 12, n = 12, b = '12' FROM t")
+    pair.run("SELECT count(DISTINCT b), count(DISTINCT s), max(b), min(s) FROM t")

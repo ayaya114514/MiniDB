@@ -110,7 +110,10 @@ class Generator:
         text = self._literal(text_safe)
         if self.rng.random() < 0.15 and not self.no_parameters:
             # Bind the same value through a parameter instead.
-            self.parameters.append(eval(text.replace("NULL", "None")))  # noqa: S307 - our own literals
+            if text.startswith("x'"):
+                self.parameters.append(bytes.fromhex(text[2:-1]))
+            else:
+                self.parameters.append(eval(text.replace("NULL", "None")))  # noqa: S307 - our own literals
             return "?"
         return text
 
@@ -128,6 +131,8 @@ class Generator:
             # -2**63 is left out: abs() of it raises an error, and SQLite's
             # order of evaluating constant expressions decides whether it does.
             return rng.choice(["9223372036854775807", "4611686018427387904"])
+        if kind < 0.71:
+            return rng.choice(["x''", "x'61'", "x'3130'", "x'00'", "x'ff'", "x'4142'"])
         return "'" + rng.choice(TEXTS).replace("'", "''") + "'"
 
     def column(self, scope):

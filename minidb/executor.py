@@ -458,8 +458,6 @@ class Compiler:
 
     def _cast(self, expr: Cast) -> tuple[RowFunction, str | None]:
         target = values.type_affinity(expr.type_name)
-        if target == "BLOB":
-            raise NotSupportedError("MiniDB has no BLOB values: cannot CAST to BLOB")
         operand = self.compile(expr.expr)
         cast = values.cast
         return (lambda row: cast(operand(row), target)), target
@@ -763,15 +761,15 @@ class RowidRange:
         start_inclusive = end_inclusive = True
         if self.lower:
             start = values.numeric_affinity(self.lower[0](row))
-            if start is None or isinstance(start, str):
-                return iter(())  # rowid > NULL or rowid > 'text' is never true
+            if start is None or isinstance(start, (str, bytes)):
+                return iter(())  # rowid > NULL, 'text' or a BLOB is never true
             start_inclusive = self.lower[1]
         if self.upper:
             end = values.numeric_affinity(self.upper[0](row))
             if end is None:
                 return iter(())
-            if isinstance(end, str):
-                end = None  # every number is below any text
+            if isinstance(end, (str, bytes)):
+                end = None  # every number is below any text or BLOB
             end_inclusive = self.upper[1]
         return self.tree.scan(start, end, start_inclusive, end_inclusive)
 

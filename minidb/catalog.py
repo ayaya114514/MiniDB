@@ -48,7 +48,7 @@ IndexKey = tuple
 
 # Sentinels that sort below / above every (rank, value) pair of an index key.
 LOW = (-1,)
-HIGH = (3,)
+HIGH = (4,)
 
 
 def index_key(key_values: Sequence[SQLValue], rowid: int) -> IndexKey:

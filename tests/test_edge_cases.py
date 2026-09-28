@@ -10,7 +10,7 @@ import minidb
 import minidb.executor as executor_module
 from minidb.btree import BTree
 from minidb.database import Database
-from minidb.errors import DatabaseError, IntegrityError, NotSupportedError, OperationalError
+from minidb.errors import DatabaseError, IntegrityError, OperationalError
 from minidb.pager import PAGE_SIZE, USABLE_SIZE, Pager
 from minidb.record import RecordError, decode_record
 from minidb.tokenizer import SQLSyntaxError
@@ -35,9 +35,10 @@ def test_values_at_the_limits_match_sqlite():
     pair.close()
 
 
-def test_cast_to_blob_is_not_supported():
-    with pytest.raises(NotSupportedError):
-        Database().execute("SELECT CAST(1 AS BLOB)")
+def test_cast_to_blob():
+    assert Database().execute("SELECT CAST(1 AS BLOB), CAST('é' AS BLOB), CAST(x'00' AS BLOB)") == [
+        (b"1", "é".encode(), b"\x00")
+    ]
 
 
 def test_explain_needs_a_query():

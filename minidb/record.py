@@ -9,6 +9,7 @@ code per value:
     5          REAL, 8-byte IEEE double
     6, 7       the INTEGERs 0 and 1 (no body bytes)
     8          TEXT whose UTF-8 length follows in the header as a u32
+    9          BLOB whose length follows in the header as a u32
     16..255    TEXT of (code - 16) UTF-8 bytes
 
 The body holds the payloads in order.  Because the header determines the
@@ -24,7 +25,7 @@ from collections.abc import Callable
 
 from minidb.values import SQLValue
 
-NULL_CODE, REAL_CODE, ZERO_CODE, ONE_CODE, LONG_TEXT_CODE, SHORT_TEXT_BASE = 0, 5, 6, 7, 8, 16
+NULL_CODE, REAL_CODE, ZERO_CODE, ONE_CODE, LONG_TEXT_CODE, BLOB_CODE, SHORT_TEXT_BASE = 0, 5, 6, 7, 8, 9, 16
 MAX_SHORT_TEXT = 255 - SHORT_TEXT_BASE
 _INT_FORMATS = {1: "b", 2: "h", 3: "i", 4: "q"}
 _INT_LIMITS = [(1, 2**7), (2, 2**15), (3, 2**31), (4, 2**63)]
@@ -62,13 +63,17 @@ def encode_record(values: list[SQLValue]) -> bytes:
             header.append(REAL_CODE)
             body += _real.pack(value)
         elif isinstance(value, str):
-            data = value.encode("utf-8")
+            data = value.encode("utf-8", "surrogateescape")
             if len(data) <= MAX_SHORT_TEXT:
                 header.append(SHORT_TEXT_BASE + len(data))
             else:
                 header.append(LONG_TEXT_CODE)
                 header += _u32.pack(len(data))
             body += data
+        elif isinstance(value, bytes):
+            header.append(BLOB_CODE)
+            header += _u32.pack(len(value))
+            body += value
         else:
             raise RecordError(f"cannot store value of type {type(value).__name__}")
     if len(header) < 0xFF:
@@ -92,8 +97,11 @@ def encoded_size(values: list[SQLValue]) -> int:
                     break
         elif isinstance(value, float):
             body += 8
+        elif isinstance(value, bytes):
+            header += 4
+            body += len(value)
         else:
-            length = len(value.encode("utf-8")) if not value.isascii() else len(value)
+            length = len(value.encode("utf-8", "surrogateescape")) if not value.isascii() else len(value)
             if length > MAX_SHORT_TEXT:
                 header += 4
             body += length
@@ -126,6 +134,14 @@ def _compile(header: bytes) -> tuple[struct.Struct, Callable[[tuple], list[SQLVa
             fmt.append("d")
             parts.append(f"f[{field}]")
             field += 1
+        elif code == BLOB_CODE:
+            if i + 4 > len(header):
+                raise RecordError("truncated record header")
+            length = _u32.unpack_from(header, i)[0]
+            i += 4
+            fmt.append(f"{length}s")
+            parts.append(f"f[{field}]")
+            field += 1
         elif code == LONG_TEXT_CODE or code >= SHORT_TEXT_BASE:
             if code == LONG_TEXT_CODE:
                 if i + 4 > len(header):
@@ -135,7 +151,7 @@ def _compile(header: bytes) -> tuple[struct.Struct, Callable[[tuple], list[SQLVa
             else:
                 length = code - SHORT_TEXT_BASE
             fmt.append(f"{length}s")
-            parts.append(f"f[{field}].decode()")
+            parts.append(f"f[{field}].decode('utf-8', 'surrogateescape')")
             field += 1
         else:
             raise RecordError(f"bad type code {code}")

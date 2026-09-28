@@ -1,7 +1,7 @@
 """SQL value semantics, following SQLite.
 
 Values are Python ``None`` (NULL), ``int`` (INTEGER, 64-bit), ``float``
-(REAL) and ``str`` (TEXT).  This module implements type affinity, the
+(REAL), ``str`` (TEXT) and ``bytes`` (BLOB).  This module implements type affinity, the
 three-valued comparison and logic rules, arithmetic with SQLite's overflow
 and division rules, conversions to text, and the scalar functions.
 """
@@ -28,8 +28,8 @@ def ascii_lower(text: str) -> str:
 def ascii_upper(text: str) -> str:
     return text.upper() if text.isascii() else text.translate(_TO_UPPER)
 
-# A SQL value: NULL, INTEGER, REAL or TEXT.
-SQLValue = int | float | str | None
+# A SQL value: NULL, INTEGER, REAL, TEXT or BLOB.
+SQLValue = int | float | str | bytes | None
 
 INT_MIN = -(2**63)
 INT_MAX = 2**63 - 1
@@ -75,12 +75,19 @@ def _real_to_int_if_exact(value: float) -> int | float:
 
 
 def numeric_affinity(value: SQLValue) -> SQLValue:
-    """Apply INTEGER (numeric) affinity: well-formed numeric text becomes a number."""
+    """Apply INTEGER (numeric) affinity: well-formed numeric text becomes a
+    number.  Of text with a NUL character SQLite reads only what comes
+    before the NUL, and as a REAL (then made an INTEGER if exact)."""
     if isinstance(value, str):
-        match = _WHOLE_NUMBER.match(value)
+        text = value
+        if "\x00" in text:
+            text = text.split("\x00", 1)[0]
+        match = _WHOLE_NUMBER.match(text)
         if not match:
             return value
         number = _parse_number(match.group(1))
+        if text is not value:
+            number = float(number)
         return _real_to_int_if_exact(number) if isinstance(number, float) else number
     if isinstance(value, float):
         return _real_to_int_if_exact(value)
@@ -160,11 +167,40 @@ def to_text(value: SQLValue) -> str | None:
         return value
     if isinstance(value, float):
         return format_real(value)
+    if isinstance(value, bytes):
+        # SQLite reads the bytes as UTF-8 text; invalid bytes are kept (as
+        # lone surrogates) so that converting back gives the same BLOB.
+        return value.decode("utf-8", "surrogateescape")
     return str(value)
 
 
+def to_blob(value: SQLValue) -> bytes | None:
+    """``CAST(value AS BLOB)``: the bytes of its text."""
+    if value is None or isinstance(value, bytes):
+        return value
+    return to_text(value).encode("utf-8", "surrogateescape")
+
+
 def to_number(value: SQLValue) -> int | float | None:
-    """Lenient numeric conversion used by arithmetic: text uses its numeric prefix."""
+    """Lenient numeric conversion used by arithmetic: text (and a BLOB, read
+    as text) uses its numeric prefix."""
+    if isinstance(value, bytes):
+        value = to_text(value)
+    if not isinstance(value, str):
+        return value
+    match = _NUMBER_PREFIX.match(value)
+    if not match:
+        return 0
+    number = _parse_number(match.group(1))
+    # SQLite's conversion sees a number in text with a NUL character as a
+    # REAL ('5\0' + 0 is 5.0).
+    return float(number) if "\x00" in value else number
+
+
+def numeric_prefix(value: SQLValue) -> int | float | None:
+    """The number that text (or a BLOB, read as text) starts with; 0 if none."""
+    if isinstance(value, bytes):
+        value = to_text(value)
     if not isinstance(value, str):
         return value
     match = _NUMBER_PREFIX.match(value)
@@ -177,6 +213,8 @@ _INTEGER_PREFIX = re.compile(rf"[{_SPACE}]*([+-]?[0-9]+)")
 def to_int64(value: SQLValue) -> int:
     """Convert to a 64-bit integer as SQLite does: REALs truncate and saturate,
     TEXT uses its leading integer digits ('1e2' -> 1)."""
+    if isinstance(value, bytes):
+        value = to_text(value)
     if isinstance(value, str):
         match = _INTEGER_PREFIX.match(value)
         if not match:
@@ -207,6 +245,8 @@ def type_name(value: SQLValue) -> str:
         return "integer"
     if isinstance(value, float):
         return "real"
+    if isinstance(value, bytes):
+        return "blob"
     return "text"
 
 
@@ -214,20 +254,26 @@ def type_name(value: SQLValue) -> str:
 
 
 def sort_key(value: SQLValue) -> tuple:
-    """Key ordering values like SQLite: NULL < numbers < text."""
+    """Key ordering values like SQLite: NULL < numbers < text < BLOBs."""
     if value is None:
         return (0, 0)
     if isinstance(value, str):
         return (2, value)
+    if isinstance(value, bytes):
+        return (3, value)
     return (1, value)
 
 
-def compare(a: int | float | str, b: int | float | str) -> int:
-    """Three-way comparison of two non-NULL values (-1, 0 or 1): numbers < text."""
+def compare(a: int | float | str | bytes, b: int | float | str | bytes) -> int:
+    """Three-way comparison of two non-NULL values (-1, 0 or 1):
+    numbers < text < BLOBs, BLOBs byte by byte."""
     a_text, b_text = type(a) is str, type(b) is str
-    if a_text == b_text:
+    if a_text and b_text:
         return (a > b) - (a < b)
-    return 1 if a_text else -1
+    a_blob, b_blob = type(a) is bytes, type(b) is bytes
+    if a_text == b_text and a_blob == b_blob:
+        return (a > b) - (a < b)  # two numbers or two BLOBs
+    return 1 if (a_blob or a_text and not b_blob) else -1
 
 
 # ---- operators ---------------------------------------------------------------
@@ -386,7 +432,13 @@ def like(value: SQLValue, pattern: SQLValue) -> int | None:
     ASCII letters only (like SQLite without the ICU extension)."""
     if value is None or pattern is None:
         return None
-    return int(_like_regex(to_text(pattern)).fullmatch(to_text(value)) is not None)
+    return int(_like_regex(_c_string(to_text(pattern))).fullmatch(_c_string(to_text(value))) is not None)
+
+
+def _c_string(text: str) -> str:
+    """The text up to its first NUL character, where SQLite's C string
+    functions (LIKE, length) stop."""
+    return text.split("\x00", 1)[0] if "\x00" in text else text
 
 
 # ---- scalar functions ----------------------------------------------------------
@@ -403,7 +455,27 @@ def _fn_abs(value: SQLValue) -> SQLValue:
 
 
 def _fn_length(value: SQLValue) -> int | None:
-    return None if value is None else len(to_text(value))
+    """Characters of text (up to a NUL character); bytes of a BLOB."""
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        return len(value)
+    text = _c_string(to_text(value))
+    if text.isascii():
+        return len(text)
+    data = text.encode("utf-8", "surrogateescape")
+    # SQLite counts every byte below 0xC0 as a character and lets a byte
+    # from 0xC0 up take the continuation bytes (0x80-0xBF) after it: the
+    # number of characters for valid UTF-8, also defined for invalid bytes.
+    count, i = 0, 0
+    while i < len(data):
+        byte = data[i]
+        i += 1
+        if byte >= 0xC0:
+            while i < len(data) and data[i] & 0xC0 == 0x80:
+                i += 1
+        count += 1
+    return count
 
 
 def _fn_lower(value: SQLValue) -> str | None:
@@ -663,7 +735,7 @@ def type_affinity(type_name: str) -> str:
 
 
 def cast(value: SQLValue, target: str) -> SQLValue:
-    """``CAST(value AS <type with affinity target>)`` (not BLOB)."""
+    """``CAST(value AS <type with affinity target>)``."""
     if value is None:
         return None
     if target == "INTEGER":
@@ -672,9 +744,11 @@ def cast(value: SQLValue, target: str) -> SQLValue:
         return float(to_number(value))
     if target == "TEXT":
         return to_text(value)
+    if target == "BLOB":
+        return to_blob(value)
     # NUMERIC: text is read by its numeric prefix; integral REALs read from
     # text become INTEGERs, REAL values themselves stay REAL.
-    if isinstance(value, str):
-        number = to_number(value)
+    if isinstance(value, (str, bytes)):
+        number = numeric_prefix(value)
         return _real_to_int_if_exact(number) if isinstance(number, float) else number
     return value

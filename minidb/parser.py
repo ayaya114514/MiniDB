@@ -992,7 +992,7 @@ class Parser:
 
     def primary(self) -> Expr:
         token = self.tok
-        if token.kind in ("INTEGER", "FLOAT", "STRING"):
+        if token.kind in ("INTEGER", "FLOAT", "STRING", "BLOB"):
             self.advance()
             return Literal(token.value)
         if self.accept_keyword("NULL"):
