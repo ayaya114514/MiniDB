@@ -444,3 +444,32 @@ sqllogictest 是 SQLite 自己的、与引擎无关的测试集（约 600 万条
   这些比较按数值相等。REAL 的 SUM 与加法顺序有关，不比较。
 - 只用随机字面量时，条件很少恰好落在表中已有值上，rowid 下界的差一变异 60 个种子只发现 2 个；
   加入“列 比较 表中实际存在的值”的条件后发现 33 个。
+
+## D74 任意类型名与五种亲和性
+以前列类型只能是 `INTEGER` / `TEXT`，sqllogictest 的 622 个文件里有 225 个第一条 `CREATE TABLE`
+就因 `FLOAT` / `VARCHAR(n)` 失败。现在类型名照 SQLite 语法：若干个词加可选的 `(n)` / `(n, m)`，也可以
+省略；亲和性按 SQLite 的子串规则（`values.type_affinity`，原来只给 CAST 用）：
+- 存储：INTEGER / NUMERIC 把像数字的文本转成数（整数优先），REAL 在此基础上把整数转成 REAL，
+  TEXT 把数转成文本，BLOB（含无类型）不转换。SQLite 的 REAL 列在磁盘上可能存整数、读出时再转 REAL，
+  MiniDB 直接存 REAL，外部看到的值相同。
+- 比较：三种数值亲和性行为相同（都对另一侧应用 NUMERIC）；BLOB 列算“有亲和性”，
+  所以 TEXT 列与 BLOB 列比较时两边都不转换（与“无亲和性”的表达式不同）。
+- 只有类型名恰好是 `INTEGER` 的主键是 rowid 别名；`INT PRIMARY KEY`、`BIGINT PRIMARY KEY` 是普通列
+  （带自动唯一索引），与 SQLite 相同。
+- 类型名存大写、空白规范化（catalog 重新生成 CREATE 语句）；BLOB 值本身还不支持（阶段 16 后面做）。
+
+## D75 FROM 里的括号连接按左结合展开
+`FROM (a CROSS JOIN b)` 在语料中出现约 4,600 次，全部位于 FROM 的第一项。连接左结合，所以第一项的括号
+可以直接去掉；在后面、且与前面用逗号或不带条件的内连接相连时，`x, (a LEFT JOIN b ON p)` 也等价于
+`x, a LEFT JOIN b ON p`（p 只引用组内的表，内连接的 ON 只是过滤）。`x LEFT JOIN (a JOIN b)`、
+外层带 ON / USING / NATURAL 的情况展开后语义会变，直接报 `NotSupportedError`，不给错误结果。
+
+## D76 视图
+- 存在 schema 里（type = 'view'，rootpage = 0，sql 保留原文），与表、索引共用命名空间；打开时重新解析。
+- FROM 中的视图编译成一个看不到外层查询的子查询（`DerivedSource`），和 FROM 子查询一样先物化再扫描；
+  没有做视图展平（flattening），所以视图上的条件不会下推到底层表的索引——语料里视图查询的规模下够用，
+  性能问题留到阶段 17。
+- 与 SQLite 一致：创建时不检查 SELECT（可以引用还不存在的表，声明的列数不对也要到使用时才报错），
+  使用时缺表报 `no such table: main.x`；自引用报 `view v is circularly defined`；
+  视图不能增删改、不能建索引、不能带参数；DROP TABLE / DROP VIEW 用错对象时给出 SQLite 的提示。
+- 子查询和视图的重复列名照 SQLite 加 `:1`、`:2` 后缀（SQLite 在第 4 个以后改用随机数，不模仿）。
