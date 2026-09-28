@@ -363,8 +363,12 @@ class Compiler:
     def _unary(self, expr: Unary) -> RowFunction:
         operand = self.compile(expr.operand)
         if expr.op == "-":
-            negate = values.negate
-            return lambda row: negate(operand(row))
+            if isinstance(expr.operand, Literal) and type(expr.operand.value) in (int, float):
+                value = values.negate(expr.operand.value)  # a negative literal (-0.0 stays -0.0)
+                return lambda row: value
+            # SQLite computes -X as 0 - X, which never gives -0.0.
+            subtract = values.subtract
+            return lambda row: subtract(0, operand(row))
         if expr.op == "+":
             return operand
         if expr.op == "~":

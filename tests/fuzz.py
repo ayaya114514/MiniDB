@@ -8,13 +8,10 @@ Every statement is executed on both MiniDB and sqlite3; any difference in
 results (or in whether an error happens) is reported with the seed and the
 statements that led to it.
 
-The generator stays inside the supported language and avoids the two places
-where MiniDB and sqlite3 are known to differ in unimportant ways:
+The generator stays inside the supported language and avoids the places
+where the result depends on choices SQLite leaves to its query plan:
 
-* REAL -> TEXT conversion of values without a short decimal form (see
-  DECISIONS.md D20): expressions whose value may be converted to text never
-  contain ``/``, and REAL literals are multiples of 1/4.
-* Choices SQLite leaves to its query plan: row order without a total ORDER
+* Row order without a total ORDER
   BY, bare columns in aggregates, GROUP_CONCAT order, and which row an
   UPDATE touching several rows processes first when that decides a UNIQUE
   conflict (UPDATEs of UNIQUE columns or the row id touch a single row).
@@ -31,6 +28,14 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+FUNCTIONS = [
+    "abs", "length", "lower", "upper", "coalesce", "ifnull", "nullif", "typeof", "min", "max",
+    "substr", "replace", "trim", "ltrim", "rtrim", "instr", "round", "hex", "quote", "unicode",
+    "sign", "octet_length", "char", "iif", "concat", "concat_ws", "printf", "glob", "ceil", "floor",
+    "trunc", "sqrt", "ln", "exp", "mod", "pow", "atan2",
+]
+PRINTF_FORMATS = ["'%d'", "'%5.2f'", "'%s|%x'", "'%.3e'", "'%-6s|'", "'%q'", "'%c'", "'%,d'", "'%g'",
+                  "'%!.17g'", "'%05.1f'", "'%X-%o'"]
 TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz"]
 
 
@@ -124,13 +129,15 @@ class Generator:
             return "NULL"
         if kind < 0.55:
             return str(rng.choice([0, 1, 2, 3, 5, 7, 10, -1, -4, rng.randint(-20, 40)]))
-        if kind < 0.65:
+        if kind < 0.61:
             return repr(rng.randint(-40, 40) / 4)
-        if kind < 0.67 and not text_safe:
-            # Large values overflow into REALs whose text form may differ (D20).
+        if kind < 0.65:
+            return repr(rng.choice([rng.uniform(-100, 100), rng.random() / 3, 1e20, 1.5e-7, 0.1,
+                                    round(rng.uniform(-10, 10), rng.randint(1, 4))]))
+        if kind < 0.67:
             # -2**63 is left out: abs() of it raises an error, and SQLite's
             # order of evaluating constant expressions decides whether it does.
-            return rng.choice(["9223372036854775807", "4611686018427387904"])
+            return rng.choice(["9223372036854775807", "4611686018427387904", "0x7f", "-0x10"])
         if kind < 0.71:
             return rng.choice(["x''", "x'61'", "x'3130'", "x'00'", "x'ff'", "x'4142'"])
         return "'" + rng.choice(TEXTS).replace("'", "''") + "'"
@@ -157,7 +164,7 @@ class Generator:
         where = f" WHERE {condition}" if rng.random() < 0.8 else ""
         kind = rng.random()
         if kind < 0.45:
-            function = rng.choice(["count", "max", "min", "sum", "total"] + ([] if text_safe else ["avg"]))
+            function = rng.choice(["count", "max", "min", "sum", "total", "avg"])
             argument = self.expr(inner, depth + 2, text_safe)
             return f"(SELECT {function}({argument}) FROM {table.name} AS s{where})"
         if kind < 0.8:
@@ -174,11 +181,8 @@ class Generator:
         kind = rng.random()
         sub = lambda safe=text_safe: self.expr(scope, depth + 1, safe)  # noqa: E731
         if kind < 0.35:
-            ops = ["+", "-", "*", "%", "=", "!=", "<", "<=", ">", ">=", "AND", "OR", "IS", "IS NOT",
-                   "&", "|", "<<", ">>"]
-            if not text_safe:
-                ops.append("/")
-            op = rng.choice(ops)
+            op = rng.choice(["+", "-", "*", "/", "%", "=", "!=", "<", "<=", ">", ">=", "AND", "OR", "IS",
+                             "IS NOT", "&", "|", "<<", ">>"])
             return f"({sub()} {op} {sub()})"
         if kind < 0.45:
             return f"({sub(True)} || {sub(True)})"
@@ -191,6 +195,9 @@ class Generator:
             items = ", ".join(sub() for _ in range(rng.randint(1, 3)))
             return f"({sub()} {rng.choice(['', 'NOT '])}IN ({items}))"
         if kind < 0.76:
+            if rng.random() < 0.3:
+                pattern = rng.choice(["'a*'", "'*b*'", "'?'", "'*'", "'[0-9]*'", "'[^a]*'", "'*.5'"])
+                return f"({sub(True)} {rng.choice(['', 'NOT '])}GLOB {pattern})"
             pattern = rng.choice(["'a%'", "'%b%'", "'_'", "'%'", "'1%'", "'A_C'", "'%.5'"])
             return f"({sub(True)} {rng.choice(['', 'NOT '])}LIKE {pattern})"
         if kind < 0.80:
@@ -205,15 +212,24 @@ class Generator:
             return f"CAST({sub()} AS {rng.choice(['INTEGER', 'TEXT', 'REAL', 'NUMERIC', 'VARCHAR(5)'])})"
         if kind < 0.90 and depth < 2 and self.tables:
             return self.subquery(scope, depth, text_safe)
-        function = rng.choice(["abs", "length", "lower", "upper", "coalesce", "ifnull", "nullif",
-                               "typeof", "min", "max"])
-        if function in ("abs", "typeof"):
+        function = rng.choice(FUNCTIONS)
+        small = lambda: str(rng.randint(-4, 6))  # noqa: E731
+        if function in ("abs", "typeof", "hex", "quote", "unicode", "sign", "octet_length", "ceil",
+                        "floor", "trunc", "sqrt", "ln", "exp", "length", "lower", "upper"):
             args = [sub()]
-        elif function in ("length", "lower", "upper"):
-            args = [sub(True)]
-        elif function in ("ifnull", "nullif"):
+        elif function in ("ifnull", "nullif", "instr", "glob", "mod", "pow", "atan2"):
             args = [sub(), sub()]
-        else:
+        elif function in ("trim", "ltrim", "rtrim", "round"):
+            args = [sub()] + ([sub() if function != "round" else small()] if rng.random() < 0.5 else [])
+        elif function == "substr":
+            args = [sub(), small()] + ([small()] if rng.random() < 0.6 else [])
+        elif function in ("replace", "iif"):
+            args = [sub(), sub(), sub()]
+        elif function == "char":
+            args = [str(rng.choice([65, 97, 233, 0x10FFFF, 0, 48])) for _ in range(rng.randint(1, 3))]
+        elif function == "printf":
+            args = [rng.choice(PRINTF_FORMATS)] + [sub() for _ in range(rng.randint(1, 2))]
+        else:  # coalesce, min, max, concat, concat_ws
             args = [sub() for _ in range(rng.randint(2, 3))]
         return f"{function}({', '.join(args)})"
 
