@@ -5,6 +5,7 @@ import random
 
 import pytest
 
+from minidb import Database
 from sqlcompare import Pair
 
 LITERALS = [
@@ -86,6 +87,71 @@ def test_comparisons_with_column_affinity(pair):
                  "i BETWEEN '1' AND '9'", "s BETWEEN 1 AND 9", "+i = '5'", "i || '' = '5'",
                  "s LIKE 5", "i LIKE '5%'"]:
         pair.run(f"SELECT id FROM t WHERE {expr}")
+
+
+TYPE_NAMES = [
+    "INTEGER", "INT", "TINYINT", "UNSIGNED BIG INT", "INT8", "TEXT", "VARCHAR(30)",
+    "CHARACTER(20)", "NATIVE CHARACTER(70)", "CLOB", "BLOB", "", "REAL", "DOUBLE",
+    "DOUBLE PRECISION", "FLOAT", "NUMERIC", "DECIMAL(10,5)", "BOOLEAN", "DATE", "DATETIME",
+    "STRING", "FLOATING POINT", "POINT",  # "FLOATING POINT" has INT in it: INTEGER affinity
+]
+
+
+@pytest.mark.parametrize("type_name", TYPE_NAMES)
+def test_affinity_of_declared_types(pair, type_name):
+    pair.run(f"CREATE TABLE t (id INTEGER PRIMARY KEY, v {type_name})")
+    values = LITERALS + ["'  7  '", "'3.0'", "3.0", "'-0.0'", "'.5'", "'1.'", "1e18", "'0x10'",
+                         "'1e400'", "9.2e18", "'99999999999999999999'", "4.5", "'4.5'"]
+    for value in values:
+        pair.run(f"INSERT INTO t (v) VALUES ({value})")
+    pair.run("SELECT id, v, typeof(v) FROM t ORDER BY id")
+    pair.run("UPDATE t SET v = v || '' WHERE id % 3 = 0")
+    pair.run("UPDATE t SET v = id * 2 WHERE id % 3 = 1")
+    pair.run("SELECT id, v, typeof(v) FROM t ORDER BY id")
+    for literal in ["5", "'5'", "'5.0'", "4.5", "'4.5'", "'abc'", "10", "'10'"]:
+        pair.run(f"SELECT id FROM t WHERE v = {literal} ORDER BY id")
+        pair.run(f"SELECT id FROM t WHERE v < {literal} ORDER BY id")
+    pair.run("CREATE INDEX tv ON t (v)")
+    for literal in ["5", "'5'", "'5.0'", "4.5", "'abc'", "'10'"]:
+        pair.run(f"SELECT id FROM t WHERE v = {literal} ORDER BY id")
+        pair.run(f"SELECT id FROM t WHERE v >= {literal} ORDER BY id")
+        pair.run(f"SELECT id FROM t WHERE v IN ({literal}, 7) ORDER BY id")
+    pair.run("SELECT v, count(*) FROM t GROUP BY v ORDER BY 1")
+
+
+def test_comparisons_between_affinities(pair):
+    pair.run("CREATE TABLE t (id INTEGER PRIMARY KEY, i INTEGER, r REAL, n NUMERIC, s TEXT, b BLOB, x)")
+    for value in ["5", "'5'", "'5.0'", "2.5", "'2.5'", "'abc'", "NULL", "''", "'007'"]:
+        pair.run(f"INSERT INTO t (i, r, n, s, b, x) VALUES ({value}, {value}, {value}, {value}, {value}, {value})")
+    columns = ["i", "r", "n", "s", "b", "x", "CAST(s AS REAL)", "CAST(b AS TEXT)", "+r"]
+    for left, right in itertools.product(columns, repeat=2):
+        pair.run(f"SELECT id FROM t WHERE {left} = {right} ORDER BY id")
+    for column in columns:
+        for literal in ["5", "'5'", "'5.0'", "'abc'", "2.5"]:
+            pair.run(f"SELECT id FROM t WHERE {column} = {literal} ORDER BY id")
+            pair.run(f"SELECT id FROM t WHERE {column} IN ({literal}) ORDER BY id")
+        pair.run(f"SELECT id FROM t WHERE {column} IN (SELECT s FROM t) ORDER BY id")
+        pair.run(f"SELECT id FROM t WHERE s IN (SELECT {column} FROM t) ORDER BY id")
+
+
+def test_only_integer_primary_key_is_the_row_id(pair):
+    for type_name in ["INTEGER", "integer", "INT", "BIGINT", "INTEGER(8)"]:
+        pair.run(f"DROP TABLE IF EXISTS t")
+        pair.run(f"CREATE TABLE t (k {type_name} PRIMARY KEY, v TEXT)")
+        pair.run("INSERT INTO t (k, v) VALUES (5, 'a'), ('7', 'b'), (NULL, 'c')")
+        pair.run("SELECT rowid, k, typeof(k), v FROM t ORDER BY v")
+        pair.run("INSERT INTO t (k, v) VALUES ('x', 'd')")
+
+
+def test_declared_types_survive_reopening(tmp_path):
+    pair = Pair(str(tmp_path / "types.db"))
+    pair.run("CREATE TABLE t (a FLOAT, b VARCHAR(10), c, d DECIMAL(10, -2), e DOUBLE PRECISION NOT NULL)")
+    pair.run("INSERT INTO t VALUES ('1', 2, '3', '4.0', 5)")
+    pair.mini.close()
+    pair.mini = Database(str(tmp_path / "types.db"))  # sqlite3's side stays open in memory
+    pair.run("INSERT INTO t VALUES ('1', 2, '3', '4.0', 5)")
+    pair.run("SELECT a, typeof(a), b, typeof(b), c, typeof(c), d, typeof(d), e, typeof(e) FROM t")
+    pair.run("INSERT INTO t (a) VALUES (1)")  # NOT NULL survived too
 
 
 def test_crud_workflow(pair):

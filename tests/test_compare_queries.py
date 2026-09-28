@@ -265,3 +265,34 @@ def test_rowid_after_maximum_is_random():
     ids = [r[0] for r in db.execute("SELECT id FROM t WHERE v != 'max'")]
     assert len(set(ids)) == 2 and all(0 < i <= 2**62 for i in ids)
     db_pair.close()
+
+
+def test_sqllogictest_syntax(pair):
+    """Forms that SQLite's sqllogictest corpus uses: aggregate(ALL x), empty
+    IN lists, x IN table, and parenthesized joins in FROM."""
+    pair.run("CREATE TABLE t (a INTEGER, b TEXT)")
+    pair.run("CREATE TABLE u (a INTEGER, c REAL)")
+    pair.run("CREATE INDEX ua ON u (a)")
+    pair.run("INSERT INTO t VALUES (1, 'x'), (2, NULL), (NULL, 'z'), (3, 'x')")
+    pair.run("INSERT INTO u VALUES (1, 1.5), (3, 2), (NULL, 0)")
+    for sql in [
+        "SELECT 1 IN (), 1 NOT IN (), NULL IN (), NULL NOT IN (), typeof(NULL IN ())",
+        "SELECT a FROM t WHERE a IN ()", "SELECT a FROM t WHERE a NOT IN ()",
+        "SELECT a FROM t WHERE rowid IN ()", "SELECT a FROM u WHERE a IN () OR a = 3",
+        "SELECT count(ALL a), sum(ALL a), max(ALL b), count(DISTINCT a), total(ALL a) FROM t",
+        "SELECT b, count(ALL a) FROM t GROUP BY b HAVING count(ALL b) > 0",
+        "SELECT abs(ALL -3), coalesce(ALL NULL, 2)",
+        "SELECT a, 1 IN u, a IN u, a NOT IN u FROM t",
+        "SELECT a FROM t WHERE a IN u", "SELECT a FROM t WHERE a NOT IN u",
+        "SELECT * FROM (t CROSS JOIN u)",
+        "SELECT * FROM (t AS x CROSS JOIN u y) WHERE x.a = y.a",
+        "SELECT * FROM (t x JOIN u y ON x.a = y.a)",
+        "SELECT * FROM (t x LEFT JOIN u y ON x.a = y.a)",
+        "SELECT * FROM (t x LEFT JOIN u y ON x.a = y.a), u z",
+        "SELECT * FROM u z, (t x LEFT JOIN u y ON x.a = y.a)",
+        "SELECT * FROM u z JOIN (t x LEFT JOIN u y ON x.a = y.a) WHERE z.a = 1",
+        "SELECT * FROM ((t))", "SELECT * FROM (t)",
+        "SELECT * FROM ((t x CROSS JOIN u) CROSS JOIN u z)",
+        "SELECT x.a, count(*) FROM (t x CROSS JOIN u) GROUP BY x.a",
+    ]:
+        pair.run(sql)

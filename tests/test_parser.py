@@ -1,10 +1,11 @@
 import pytest
 
 from minidb.parser import (
-    Between, Binary, Call, Column, ColumnDef, CreateTable, Delete, DropTable, InList, Insert,
-    Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef, Unary, Update, parse,
+    Between, Binary, Call, Column, ColumnDef, CreateTable, Delete, DropTable, InList, InSelect,
+    Insert, Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef, Unary, Update, parse,
     parse_script,
 )
+from minidb.errors import NotSupportedError
 from minidb.tokenizer import SQLSyntaxError
 
 
@@ -32,6 +33,18 @@ def test_create_table():
         ColumnDef("age", "INTEGER"),
         ColumnDef("email", "TEXT", unique=True),
     ])
+
+
+def test_declared_type_names():
+    stmt = parse(
+        "CREATE TABLE t (a VARCHAR ( 30 ), b unsigned  big int, c, d DECIMAL(10, -2) NOT NULL, "
+        "e DOUBLE PRECISION PRIMARY KEY, f INT UNIQUE)"
+    )
+    assert [(c.name, c.type) for c in stmt.columns] == [
+        ("a", "VARCHAR ( 30 )"), ("b", "UNSIGNED BIG INT"), ("c", ""), ("d", "DECIMAL(10, -2)"),
+        ("e", "DOUBLE PRECISION"), ("f", "INT"),
+    ]
+    assert stmt.columns[3].not_null and stmt.columns[4].primary_key and stmt.columns[5].unique
 
 
 def test_create_table_if_not_exists_and_quoted_names():
@@ -250,8 +263,7 @@ def test_qualified_column():
         ("SELECT (a FROM t", 'syntax error near "FROM": expected ")"', 11),
         ("INSERT t VALUES (1)", 'syntax error near "t": expected INTO', 8),
         ("INSERT INTO t VALUES 1", 'syntax error near "1": expected "("', 22),
-        ("CREATE TABLE t (a REAL)", 'syntax error near "REAL": expected column type INTEGER or TEXT', 19),
-        ("CREATE TABLE t (a INT)", 'syntax error near "INT": expected column type INTEGER or TEXT', 19),
+        ("CREATE TABLE t (a VARCHAR(x))", 'syntax error near "x": expected number', 27),
         ("CREATE TABLE t (a INTEGER PRIMARY)", 'syntax error near ")": expected KEY', 34),
         ("CREATE TABLE t ()", 'syntax error near ")": expected column name', 17),
         ("UPDATE t SET a 1", 'syntax error near "1": expected "="', 16),
@@ -354,3 +366,21 @@ def test_new_syntax_errors(sql, message):
     with pytest.raises(SQLSyntaxError) as info:
         parse(sql)
     assert info.value.message == message
+
+
+def test_parenthesized_joins():
+    assert parse("SELECT * FROM (a CROSS JOIN b)").source == parse("SELECT * FROM a CROSS JOIN b").source
+    assert parse("SELECT * FROM x, (a LEFT JOIN b ON 1)").source == parse(
+        "SELECT * FROM x, a LEFT JOIN b ON 1").source
+    for sql in ["SELECT * FROM t LEFT JOIN (a JOIN b)", "SELECT * FROM t JOIN (a JOIN b) ON 1",
+                "SELECT * FROM t NATURAL JOIN (a JOIN b)"]:
+        with pytest.raises(NotSupportedError):
+            parse(sql)
+
+
+def test_in_table_and_empty_in():
+    stmt = parse("SELECT 1 IN t, 2 NOT IN ()")
+    first, second = (item.expr for item in stmt.items)
+    assert first == InSelect(Literal(1), Select([SelectItem(Star())], [Join(TableRef("t"))]))
+    assert second == InList(Literal(2), (), negated=True)
+    assert parse("SELECT count(ALL x)").items[0].expr == parse("SELECT count(x)").items[0].expr

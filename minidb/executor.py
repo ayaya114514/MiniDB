@@ -249,7 +249,11 @@ _ARITHMETIC = {
     "||": values.concat,
 }
 
-_AFFINITY_FUNCTIONS = {values.INTEGER: values.numeric_affinity, values.TEXT: values.text_affinity}
+# Conversions for comparisons: the numeric affinities all convert text to numbers.
+_AFFINITY_FUNCTIONS = {
+    values.INTEGER: values.numeric_affinity, values.REAL: values.numeric_affinity,
+    values.NUMERIC: values.numeric_affinity, values.TEXT: values.text_affinity,
+}
 
 _FLIPPED = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
@@ -410,6 +414,9 @@ class Compiler:
 
     def _in_list(self, expr: InList) -> RowFunction:
         value, affinity = self.compile_with_affinity(expr.expr)
+        if not expr.items:  # x IN (): false even when x is NULL, as in SQLite
+            result = int(expr.negated)
+            return lambda row: result
         items = [self.compile(item) for item in expr.items]
         convert = _AFFINITY_FUNCTIONS.get(affinity)
         compare = values.compare
@@ -447,8 +454,7 @@ class Compiler:
             raise NotSupportedError("MiniDB has no BLOB values: cannot CAST to BLOB")
         operand = self.compile(expr.expr)
         cast = values.cast
-        affinity = values.TEXT if target == "TEXT" else values.INTEGER
-        return (lambda row: cast(operand(row), target)), affinity
+        return (lambda row: cast(operand(row), target)), target
 
     def _case(self, expr: Case) -> RowFunction:
         whens = []
@@ -589,7 +595,8 @@ def in_select_affinity(left: str | None, right: str | None) -> str | None:
     both columns: numeric if either is, else none; otherwise whichever exists.
     It is applied to both sides."""
     if left is not None and right is not None:
-        return values.INTEGER if values.INTEGER in (left, right) else None
+        numeric = left in values.NUMERIC_AFFINITIES or right in values.NUMERIC_AFFINITIES
+        return values.NUMERIC if numeric else None
     return left if left is not None else right
 
 
