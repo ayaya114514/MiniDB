@@ -367,20 +367,42 @@ def report(outcomes: list[Outcome], top: int) -> dict:
     records = sum(o.records for o in outcomes)
     passed = sum(o.passed for o in outcomes)
     reasons = collections.Counter(reason for o in outcomes for _, reason, _ in o.failures)
+    # A missing feature usually fails a file's CREATE TABLE and then every
+    # later record; the first failure of each file shows the root causes.
+    first = collections.Counter(o.failures[0][1] for o in outcomes if o.failures)
+    examples = collections.defaultdict(list)
+    bugs = []  # wrong results and crashes: not missing features
+    for o in outcomes:
+        for line, reason, sql in o.failures:
+            if len(examples[reason]) < 5:
+                examples[reason].append(f"{o.path}:{line}")
+            if reason == "wrong result" or reason.startswith(("crash", "expected an error", "wrong column")):
+                bugs.append((f"{o.path}:{line}", reason, sql))
     clean = sum(1 for o in outcomes if not o.failures)
     print(f"{len(outcomes)} files, {clean} without failures")
     print(f"{passed} / {records} records passed ({100 * passed / max(records, 1):.2f}%)")
     print(f"{sum(o.seconds for o in outcomes):.1f} s of execution")
+    if first:
+        print(f"\nfirst failure of each file ({sum(first.values())} files):")
+        for reason, count in first.most_common(top):
+            print(f"{count:9d}  {reason}")
     if reasons:
         print(f"\nmost common failures (of {sum(reasons.values())}):")
         for reason, count in reasons.most_common(top):
             print(f"{count:9d}  {reason}")
+    if bugs:
+        print(f"\nwrong results and crashes ({len(bugs)}):")
+        for where, reason, sql in bugs[:top]:
+            print(f"  {where}: {reason}\n    {' '.join(sql.split())[:200]}")
     return {
         "files": len(outcomes),
         "clean_files": clean,
         "records": records,
         "passed": passed,
+        "first_failures": first.most_common(),
         "reasons": reasons.most_common(),
+        "examples": dict(examples),
+        "bugs": bugs,
         "per_file": {o.path: [o.passed, o.records] for o in outcomes},
     }
 
