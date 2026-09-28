@@ -151,12 +151,37 @@ class Database:
         pager.begin_statement()
         try:
             result = self.executor.execute(stmt, parameters)
-        except BaseException:
+        except BaseException as exc:
+            # A constraint violation under INSERT/UPDATE OR FAIL keeps the
+            # statement's earlier changes; OR ROLLBACK ends the transaction.
+            # Inside a transaction, SQLite undoes a statement that failed for
+            # another reason only if it compiled it with a statement journal
+            # (Executor.statement_journal); otherwise the changes stay.
+            resolution = getattr(exc, "resolution", None)
+            if resolution == "FAIL":
+                self.total_changes += exc.changes  # SQLite counts them only for FAIL
+            elif resolution is None and self.in_transaction and not self.executor.statement_journal:
+                resolution = "FAIL"
+            if resolution == "FAIL":
+                self._end_statement()
+                raise
             pager.rollback_statement()
             self.catalog.load()
-            if not self.in_transaction:
+            if resolution == "ROLLBACK" and self.in_transaction:
+                self.in_transaction = False
+                self.rollback()
+                pager.end_transaction()
+            elif not self.in_transaction:
                 pager.end_transaction()
             raise
+        self._end_statement()
+        if result.rowcount > 0:
+            self.total_changes += result.rowcount
+        return result
+
+    def _end_statement(self) -> None:
+        """Keep a statement's changes; outside a transaction, commit them."""
+        pager = self.pager
         pager.end_statement()
         if self.in_transaction and len(pager.dirty) > SPILL_PAGES:
             # Keep big transactions out of memory: move their pages to the log.
@@ -171,9 +196,6 @@ class Database:
             finally:
                 if not self.broken:
                     pager.end_transaction()
-        if result.rowcount > 0:
-            self.total_changes += result.rowcount
-        return result
 
     def _begin_read(self) -> None:
         if self.pager.begin_read():

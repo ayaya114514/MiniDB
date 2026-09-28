@@ -30,11 +30,12 @@ from typing import Any, Protocol, Union
 from minidb import values
 from minidb.btree import BTree
 from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo, ViewInfo
-from minidb.errors import IntegrityError, NotSupportedError, OperationalError
+from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
     Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
-    CreateView, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList, InSelect, Insert, Join, Like,
-    Literal, Parameter, Select, Star, Subquery, TableRef, Unary, Update,
+    CreateView, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
+    InSelect, Insert, Join, Like, Literal, Parameter, Select, SelectItem, Star, Subquery, TableRef,
+    Unary, Update, Upsert,
 )
 from minidb.parser import Expr, Statement
 from minidb.values import SQLValue, ascii_lower
@@ -1115,15 +1116,18 @@ class Executor:
         self.parameters = []  # values of ?-parameters; compiled plans read this list
         self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
         self.expanding = []  # views being compiled (to detect a view that uses itself)
+        self.statement_journal = True  # see PreparedInsert.statement_journal
 
     def execute(self, stmt: Statement, parameters: Sequence[SQLValue] = ()) -> Result:
         """Execute a parsed statement with the given parameter values (a list
         indexed by parameter number - 1)."""
         self.parameters[:] = parameters
+        self.statement_journal = True
         if isinstance(stmt, (Select, Compound, Insert, Update, Delete)):
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
                 cache.clear()
+            self.statement_journal = getattr(plan, "statement_journal", True)
             return plan.run()
         if isinstance(stmt, CreateTable):
             self.catalog.create_table(stmt)
@@ -1557,18 +1561,54 @@ class Executor:
     # ---- INSERT --------------------------------------------------------------
 
     def prepare_row(self, table: TableInfo, row: Row) -> int | None:
-        """Apply column affinities and NOT NULL checks; returns the requested row id."""
+        """Apply column affinities; returns the requested row id."""
         for i, affinity in enumerate(table.affinities):
             row[i] = values.apply_affinity(row[i], affinity)
-        for i, column in enumerate(table.columns):
-            if column.not_null and row[i] is None:
-                raise IntegrityError(f"NOT NULL constraint failed: {table.name}.{column.name}")
         if table.rowid_column is None:
             return None
         rowid = row[table.rowid_column]
         if rowid is not None and not isinstance(rowid, int):
             raise IntegrityError("datatype mismatch")
         return rowid
+
+    @staticmethod
+    def not_null_violation(table: TableInfo, row: Row) -> str | None:
+        for i, column in enumerate(table.columns):
+            if column.not_null and row[i] is None:
+                return f"NOT NULL constraint failed: {table.name}.{column.name}"
+        return None
+
+    @staticmethod
+    def constraint_error(message: str, conflict: str) -> IntegrityError:
+        """A constraint violation under the statement's conflict resolution:
+        Database keeps the statement's earlier changes for FAIL and rolls
+        back the whole transaction for ROLLBACK (ABORT: just the statement)."""
+        error = IntegrityError(message)
+        error.resolution = conflict
+        return error
+
+    def find_conflict(self, index: IndexInfo, row: Row, own_rowid: int | None) -> int | None:
+        """The row id of a row that ``row`` collides with in UNIQUE ``index``
+        (not counting row ``own_rowid``: the row being updated)."""
+        key_values = [row[p] for p in index.positions]
+        if any(v is None for v in key_values):
+            return None  # NULLs never conflict
+        prefix = tuple(values.sort_key(v) for v in key_values)
+        for key, _ in self.catalog.index_tree(index).scan(prefix, prefix + (HIGH,)):
+            if key[-1][1] != own_rowid:
+                return key[-1][1]
+        return None
+
+    @staticmethod
+    def unique_error(table: TableInfo, index: IndexInfo) -> str:
+        return "UNIQUE constraint failed: " + ", ".join(f"{table.name}.{c}" for c in index.column_names)
+
+    def delete_row(self, table: TableInfo, tree: BTree, rowid: int) -> Row:
+        """Delete a row and its index entries; returns it (with its row id)."""
+        row = self.load_row(table, rowid, tree.get(rowid))
+        self.remove_index_entries(table, row, rowid)
+        tree.delete(rowid)
+        return row
 
     def check_unique(self, table: TableInfo, row: Row, rowid: int) -> None:
         """Raise if another row has the same values in a UNIQUE index.
@@ -1603,18 +1643,99 @@ class Executor:
             stored[table.rowid_column] = None  # kept in the key, not the record
         return encode_record(stored)
 
-    def insert_row(self, table: TableInfo, tree: BTree, row: Row) -> int:
+    def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str = "ABORT", upserts: Sequence[PreparedUpsert] = ()) -> tuple[str, Row] | None:
+        """Insert ``row`` under a conflict resolution (INSERT OR ...) and the
+        statement's ON CONFLICT clauses.  Returns ("insert", row + [rowid]),
+        ("update", row + [rowid]) when an upsert updated an existing row, or
+        None when nothing changed (IGNORE, DO NOTHING, DO UPDATE ... WHERE false).
+
+        As in SQLite: NOT NULL is checked first, then the upsert targets in
+        clause order, then the row id and the other UNIQUE indexes (newest
+        first).  REPLACE deletes each conflicting row and goes on."""
         rowid = self.prepare_row(table, row)
+        violation = self.not_null_violation(table, row)
+        if violation is not None:
+            if conflict == "IGNORE":
+                return None
+            raise self.constraint_error(violation, conflict)
         if rowid is None:
             rowid = self.new_rowid(tree)
             if table.rowid_column is not None:
                 row[table.rowid_column] = rowid
-        elif rowid in tree:
-            raise self.rowid_conflict(table)
-        self.check_unique(table, row, rowid)
+        constraints = [u.constraint for u in upserts if u.constraint is not None]
+        constraints += [c for c in ["rowid"] + [i for i in table.indexes if i.unique] if c not in constraints]
+        for constraint in constraints:
+            if constraint == "rowid":
+                other = rowid if rowid in tree else None
+            else:
+                other = self.find_conflict(constraint, row, None)
+            if other is None:
+                continue
+            upsert = next((u for u in upserts if u.constraint in (constraint, None)), None)
+            if upsert is not None:
+                return upsert.apply(tree, other, row + [rowid])
+            if conflict == "IGNORE":
+                return None
+            if conflict == "REPLACE":
+                self.delete_row(table, tree, other)
+                continue
+            message = self.rowid_conflict(table).args[0] if constraint == "rowid" else self.unique_error(table, constraint)
+            raise self.constraint_error(message, conflict)
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
-        return rowid
+        return "insert", row + [rowid]
+
+    def update_row(self, table: TableInfo, tree: BTree, rowid: int, old: Row, new: Row, conflict: str = "ABORT") -> Row | None:
+        """Replace row ``rowid`` (``old``: its values and row id) with ``new``
+        (values and row id).  Returns the stored row with its row id, or
+        None if IGNORE skipped it."""
+        width = len(table.columns)
+        row = new[:width]
+        if table.rowid_column is None:
+            new_rowid = values.numeric_affinity(new[width])
+            if not isinstance(new_rowid, int):
+                raise IntegrityError("datatype mismatch")
+            self.prepare_row(table, row)
+        else:
+            new_rowid = self.prepare_row(table, row)
+            if new_rowid is None:
+                raise IntegrityError("datatype mismatch")
+        violation = self.not_null_violation(table, row)
+        if violation is not None:
+            if conflict == "IGNORE":
+                return None
+            raise self.constraint_error(violation, conflict)
+        if new_rowid != rowid and new_rowid in tree:
+            if conflict == "IGNORE":
+                return None
+            if conflict != "REPLACE":
+                raise self.constraint_error(self.rowid_conflict(table).args[0], conflict)
+            self.delete_row(table, tree, new_rowid)
+        for index in table.indexes:
+            if not index.unique:
+                continue
+            other = self.find_conflict(index, row, rowid)
+            if other is None:
+                continue
+            if conflict == "IGNORE":
+                return None
+            if conflict != "REPLACE":
+                raise self.constraint_error(self.unique_error(table, index), conflict)
+            self.delete_row(table, tree, other)
+        self.remove_index_entries(table, old, rowid)
+        if new_rowid != rowid:
+            tree.delete(rowid)
+        tree.insert(new_rowid, self.encode(table, row), replace=True)
+        self.add_index_entries(table, row, new_rowid)
+        return row + [new_rowid]
+
+    def compile_returning(self, items: list[SelectItem] | None, scope: Scope) -> tuple[list[RowFunction], list[str]] | None:
+        """RETURNING: functions of a changed row (its values and row id) and the column names."""
+        if items is None:
+            return None
+        exprs, names = self.expand_items(Select(items), scope)
+        compiler = Compiler(scope, executor=self)
+        return [compiler.compile(e) for e in exprs], names
 
     @staticmethod
     def new_rowid(tree: BTree) -> int:
@@ -1860,6 +1981,11 @@ class PreparedInsert:
                     raise OperationalError(f"table {table.name} has no column named {name}")
                 self.positions.append(position)
         compiler = Compiler(Scope(), executor=executor)
+        self.conflict = stmt.conflict
+        self.upserts = [PreparedUpsert(executor, table, clause) for clause in stmt.upsert]
+        scope = Scope()
+        scope.add(table)
+        self.returning = executor.compile_returning(stmt.returning, scope)
         self.rows = []
         self.query = None
         if stmt.query is not None:
@@ -1869,6 +1995,34 @@ class PreparedInsert:
             self.check_count(stmt, len(exprs))
             self.rows.append([compiler.compile(e) for e in exprs])
         self.tree = executor.catalog.table_tree(table)
+        multi_write = self.query is not None or len(self.rows) > 1
+        self.statement_journal = multi_write and (self.may_abort() or calls_function(stmt))
+
+    def may_abort(self) -> bool:
+        """Whether a constraint check could abort the statement.
+
+        SQLite decides when compiling whether a statement might abort: a
+        constraint checked under ABORT, or a call of a (not inlined)
+        function, which may raise an error.  Only then, and when it writes
+        several rows, does it keep a statement journal; so only then does an
+        error inside a transaction that is not a constraint violation (such
+        as a datatype mismatch) undo the rows the statement already wrote.
+        Otherwise they stay (see Database.execute_statement)."""
+        table, conflict = self.table, self.conflict
+        if conflict in ("ABORT", "REPLACE") and any(c.not_null for c in table.columns):
+            return True  # REPLACE fixes NOT NULL with a default value; MiniDB has none
+
+        def handled(constraint):
+            return conflict != "ABORT" or any(u.constraint in (constraint, None) for u in self.upserts)
+
+        if table.rowid_column is not None and table.rowid_column in self.positions and not handled("rowid"):
+            return True
+        if any(index.unique and not handled(index) for index in table.indexes):
+            return True
+        checked = {i for i, c in enumerate(table.columns) if c.not_null}
+        checked.update(p for index in table.indexes if index.unique for p in index.positions)
+        checked.update((table.rowid_column, len(table.columns)))
+        return any(u.assignments and any(p in checked for p, _ in u.assignments) for u in self.upserts)
 
     def check_count(self, stmt: Insert, count: int) -> None:
         if count != len(self.positions):
@@ -1893,9 +2047,19 @@ class PreparedInsert:
             for position, value in zip(self.positions, source):
                 row[position] = value
             rows.append(row)
-        for row in rows:
-            executor.last_insert_rowid = executor.insert_row(table, self.tree, row)
-        return Result(rowcount=len(rows))
+        changed = []  # rows inserted or updated by an upsert, with their row ids
+        try:
+            for row in rows:
+                outcome = executor.insert_row(table, self.tree, row, self.conflict, self.upserts)
+                if outcome is not None:
+                    kind, stored = outcome
+                    if kind == "insert":
+                        executor.last_insert_rowid = stored[-1]
+                    changed.append(stored)
+        except Error as exc:
+            exc.changes = len(changed)  # the rows that FAIL (or no statement journal) keeps
+            raise
+        return returning_result(self.returning, changed)
 
 
 class PreparedSingleTable:
@@ -1931,40 +2095,43 @@ class PreparedUpdate(PreparedSingleTable):
                     raise OperationalError(f"no such column: {name}")
                 position = width if table.rowid_column is None else table.rowid_column
             self.assignments.append((position, compiler.compile(expr)))
+        self.conflict = stmt.conflict
+        self.returning = executor.compile_returning(stmt.returning, self.scope)
+        # Like PreparedInsert.may_abort: the constraints the changed columns
+        # take part in, under ABORT (REPLACE, for NOT NULL).
+        changed = {p for p, _ in self.assignments}
+        width = len(table.columns)
+        rowid_changed = bool(changed & {width, table.rowid_column})
+        self.statement_journal = calls_function(stmt) or (
+            stmt.conflict in ("ABORT", "REPLACE") and any(table.columns[p].not_null for p in changed if p < width)
+        ) or (stmt.conflict == "ABORT" and (rowid_changed or any(
+            index.unique and changed & set(index.positions) for index in table.indexes
+        )))
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
-        width = len(table.columns)
-        matches = self.matching_rows()
-        for rowid, old in matches:
-            new = list(old)
-            for position, function in self.assignments:
-                new[position] = function(old)
-            row = new[:width]
-            if table.rowid_column is None:
-                new_rowid = values.numeric_affinity(new[width])
-                if not isinstance(new_rowid, int):
-                    raise IntegrityError("datatype mismatch")
-                executor.prepare_row(table, row)
-            else:
-                new_rowid = executor.prepare_row(table, row)
-                if new_rowid is None:
-                    raise IntegrityError("datatype mismatch")
-            if new_rowid != rowid and new_rowid in tree:
-                raise executor.rowid_conflict(table)
-            executor.check_unique(table, row, rowid)
-            executor.remove_index_entries(table, old, rowid)
-            if new_rowid != rowid:
-                tree.delete(rowid)
-            tree.insert(new_rowid, executor.encode(table, row), replace=True)
-            executor.add_index_entries(table, row, new_rowid)
-        return Result(rowcount=len(matches))
+        changed = []
+        try:
+            for rowid, old in self.matching_rows():
+                if self.conflict == "REPLACE" and rowid not in tree:
+                    continue  # an earlier row's REPLACE deleted it
+                new = list(old)
+                for position, function in self.assignments:
+                    new[position] = function(old)
+                stored = executor.update_row(table, tree, rowid, old, new, self.conflict)
+                if stored is not None:
+                    changed.append(stored)
+        except Error as exc:
+            exc.changes = len(changed)
+            raise
+        return returning_result(self.returning, changed)
 
 
 class PreparedDelete(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Delete) -> None:
         super().__init__(executor, stmt.table, stmt.where)
-        self.delete_all = stmt.where is None
+        self.returning = executor.compile_returning(stmt.returning, self.scope)
+        self.delete_all = stmt.where is None and self.returning is None
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
@@ -1978,7 +2145,98 @@ class PreparedDelete(PreparedSingleTable):
         for rowid, row in matches:
             executor.remove_index_entries(table, row, rowid)
             tree.delete(rowid)
-        return Result(rowcount=len(matches))
+        return returning_result(self.returning, [row for _, row in matches])
+
+
+class PreparedUpsert:
+    """One ON CONFLICT clause of an INSERT."""
+
+    def __init__(self, executor: Executor, table: TableInfo, clause: Upsert) -> None:
+        self.executor = executor
+        self.table = table
+        self.constraint = self.find_constraint(table, clause)  # None: any uniqueness constraint
+        self.assignments = None  # None: DO NOTHING
+        if clause.assignments is not None:
+            # SET and WHERE see the existing row (by the table's name) and "excluded".
+            self.scope = Scope()
+            self.scope.add(table)
+            self.scope.add(table, "excluded")
+            # An unqualified name is the existing row's column; excluded.x must be qualified.
+            self.scope.entries[1].hidden.update(ascii_lower(c.name) for c in table.columns)
+            compiler = Compiler(self.scope, executor=executor)
+            width = len(table.columns)
+            self.assignments = []
+            for name, expr in clause.assignments:
+                position = table.column_index(name)
+                if position is None:
+                    if ascii_lower(name) not in ROWID_NAMES:
+                        raise OperationalError(f"no such column: {name}")
+                    position = width if table.rowid_column is None else table.rowid_column
+                self.assignments.append((position, compiler.compile(expr)))
+            self.where = compiler.compile(clause.where) if clause.where is not None else None
+
+    @staticmethod
+    def find_constraint(table: TableInfo, clause: Upsert) -> IndexInfo | str | None:
+        if clause.columns is None:
+            return None
+        if clause.target_where is None:
+            # As in SQLite, the INTEGER PRIMARY KEY (or rowid) matches only
+            # on its own: a UNIQUE index that includes it never matches.
+            alias = None if table.rowid_column is None else ascii_lower(table.columns[table.rowid_column].name)
+            wanted = [ascii_lower(c) for c in clause.columns]
+            for name in clause.columns:
+                if table.column_index(name) is None and ascii_lower(name) not in ROWID_NAMES:
+                    raise OperationalError(f"no such column: {name}")
+            if len(wanted) == 1 and wanted[0] in (alias, *ROWID_NAMES):
+                return "rowid"
+            for index in table.indexes:
+                names = [ascii_lower(c) for c in index.column_names]
+                if (index.unique and alias not in names and len(names) == len(wanted)
+                        and set(names) == set(wanted)):
+                    return index
+        raise OperationalError("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
+
+    def apply(self, tree: BTree, rowid: int, excluded: Row) -> tuple[str, Row] | None:
+        """Handle a conflict with existing row ``rowid``; ``excluded`` is the
+        row that could not be inserted (with its row id)."""
+        if self.assignments is None:
+            return None
+        executor, table = self.executor, self.table
+        old = executor.load_row(table, rowid, tree.get(rowid))
+        context = old + excluded
+        if self.where is not None and not values.truth(self.where(context)):
+            return None
+        new = list(old)
+        for position, function in self.assignments:
+            new[position] = function(context)
+        return "update", executor.update_row(table, tree, rowid, old, new)
+
+
+# Functions SQLite compiles inline (no function call that could raise an error).
+INLINE_FUNCTIONS = frozenset(("COALESCE", "IFNULL", "IIF", "IF", "LIKELY", "UNLIKELY", "LIKELIHOOD"))
+
+
+def calls_function(node: object) -> bool:
+    """Whether a statement calls a scalar function (LIKE included) anywhere,
+    subqueries too: SQLite then assumes it may abort (PreparedInsert.may_abort)."""
+    if isinstance(node, Like):
+        return True
+    if isinstance(node, Call):
+        if node.name not in INLINE_FUNCTIONS and not values.is_aggregate_call(node.name, len(node.args)):
+            return True
+    if isinstance(node, (list, tuple)):
+        return any(calls_function(item) for item in node)
+    if dataclasses.is_dataclass(node):
+        return any(calls_function(getattr(node, f.name)) for f in dataclasses.fields(node))
+    return False
+
+
+def returning_result(returning: tuple[list[RowFunction], list[str]] | None, rows: list[Row]) -> Result:
+    """The result of an INSERT, UPDATE or DELETE: its RETURNING rows, if any."""
+    if returning is None:
+        return Result(rowcount=len(rows))
+    functions, names = returning
+    return Result([tuple(f(row) for f in functions) for row in rows], names, rowcount=len(rows))
 
 
 def combine(operator: str, left: list[tuple], right: list[tuple]) -> list[tuple]:

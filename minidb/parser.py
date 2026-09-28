@@ -187,11 +187,24 @@ class DropTable:
 
 
 @dataclass
+class Upsert:
+    """``ON CONFLICT [(columns)] DO NOTHING | DO UPDATE SET ... [WHERE ...]``."""
+
+    columns: list | None  # the conflict target; None matches any uniqueness constraint
+    assignments: list | None = None  # (column name, expression) pairs; None for DO NOTHING
+    where: object = None
+    target_where: object = None  # would name a partial index (MiniDB has none)
+
+
+@dataclass
 class Insert:
     table: str
     columns: list | None
     rows: list  # list of lists of expressions (VALUES)
     query: object = None  # or a Select / Compound (INSERT ... SELECT)
+    conflict: str = "ABORT"  # INSERT OR <conflict>: ABORT, FAIL, IGNORE, REPLACE or ROLLBACK
+    upsert: list = field(default_factory=list)  # Upsert clauses, in order
+    returning: list | None = None  # SelectItems of RETURNING
 
 
 @dataclass
@@ -292,12 +305,15 @@ class Update:
     table: str
     assignments: list  # (column name, expression) pairs
     where: object = None
+    conflict: str = "ABORT"
+    returning: list | None = None
 
 
 @dataclass
 class Delete:
     table: str
     where: object = None
+    returning: list | None = None
 
 
 # Any expression node, and any statement.
@@ -441,7 +457,7 @@ class Parser:
             return Explain(self.statement())
         if self.at_keyword("SELECT"):
             return self.query()
-        if self.at_keyword("INSERT"):
+        if self.at_keyword("INSERT") or self.at_word("REPLACE"):
             return self.insert()
         if self.at_keyword("UPDATE"):
             return self.update()
@@ -548,8 +564,61 @@ class Parser:
         what = {DropIndex: "index name", DropView: "view name", DropTable: "table name"}[kind]
         return kind(self.identifier(what), if_exists)
 
+    def conflict_clause(self) -> str:
+        """``OR <resolution>`` after INSERT or UPDATE (ABORT if absent)."""
+        if not self.accept_keyword("OR"):
+            return "ABORT"
+        if self.accept_keyword("ROLLBACK"):
+            return "ROLLBACK"
+        for word in ("ABORT", "FAIL", "IGNORE", "REPLACE"):
+            if self.at_word(word):
+                self.advance()
+                return word
+        raise self.error("ROLLBACK, ABORT, FAIL, IGNORE or REPLACE")
+
+    def returning(self) -> list[SelectItem] | None:
+        if not self.at_word("RETURNING"):
+            return None
+        self.advance()
+        items = [self.select_item()]
+        while self.accept_op(","):
+            items.append(self.select_item())
+        return items
+
+    def upsert_clauses(self) -> list[Upsert]:
+        clauses = []
+        while self.at_keyword("ON"):
+            self.advance()
+            self.expect_word("CONFLICT")
+            clause = Upsert(None)
+            if self.accept_op("("):
+                clause.columns = [self.indexed_column()]
+                while self.accept_op(","):
+                    clause.columns.append(self.indexed_column())
+                self.expect_op(")")
+                if self.accept_keyword("WHERE"):
+                    clause.target_where = self.expr()
+            self.expect_word("DO")
+            if self.at_word("NOTHING"):
+                self.advance()
+            else:
+                self.expect_keyword("UPDATE")
+                self.expect_keyword("SET")
+                clause.assignments = [self.assignment()]
+                while self.accept_op(","):
+                    clause.assignments.append(self.assignment())
+                if self.accept_keyword("WHERE"):
+                    clause.where = self.expr()
+            clauses.append(clause)
+        return clauses
+
     def insert(self) -> Insert:
-        self.expect_keyword("INSERT")
+        if self.at_word("REPLACE"):
+            self.advance()
+            conflict = "REPLACE"
+        else:
+            self.expect_keyword("INSERT")
+            conflict = self.conflict_clause()
         self.expect_keyword("INTO")
         table = self.identifier("table name")
         columns = None
@@ -559,12 +628,19 @@ class Parser:
                 columns.append(self.identifier("column name"))
             self.expect_op(")")
         if self.at_keyword("SELECT"):
-            return Insert(table, columns, [], self.query())
-        self.expect_keyword("VALUES")
-        rows = [self.value_row()]
-        while self.accept_op(","):
-            rows.append(self.value_row())
-        return Insert(table, columns, rows)
+            stmt = Insert(table, columns, [], self.query(), conflict)
+        else:
+            self.expect_keyword("VALUES")
+            rows = [self.value_row()]
+            while self.accept_op(","):
+                rows.append(self.value_row())
+            stmt = Insert(table, columns, rows, None, conflict)
+        stmt.upsert = self.upsert_clauses()
+        for clause in stmt.upsert[:-1]:
+            if clause.columns is None:
+                raise OperationalError("a conflict target is required on all but the last ON CONFLICT clause")
+        stmt.returning = self.returning()
+        return stmt
 
     def value_row(self) -> list[Expr]:
         self.expect_op("(")
@@ -740,13 +816,14 @@ class Parser:
 
     def update(self) -> Update:
         self.expect_keyword("UPDATE")
+        conflict = self.conflict_clause()
         table = self.identifier("table name")
         self.expect_keyword("SET")
         assignments = [self.assignment()]
         while self.accept_op(","):
             assignments.append(self.assignment())
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Update(table, assignments, where)
+        return Update(table, assignments, where, conflict, self.returning())
 
     def assignment(self) -> tuple[str, Expr]:
         name = self.identifier("column name")
@@ -758,7 +835,7 @@ class Parser:
         self.expect_keyword("FROM")
         table = self.identifier("table name")
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Delete(table, where)
+        return Delete(table, where, self.returning())
 
     # ---- expressions --------------------------------------------------
 

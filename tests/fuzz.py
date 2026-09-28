@@ -40,6 +40,8 @@ class Table:
         self.columns = columns  # [(name, type, constraints)]
         self.rowid_alias = rowid_alias  # column name or None
         self.unique_columns = {c[0] for c in columns if c[2] == "UNIQUE"}
+        # Column tuples of uniqueness constraints: valid ON CONFLICT targets.
+        self.unique_targets = [(c[0],) for c in columns if c[2] in ("UNIQUE", "PRIMARY KEY")]
         self.derived = False  # a subquery in FROM (no rowid)
 
     def column_names(self):
@@ -52,6 +54,7 @@ class Generator:
         self.tables = []
         self.index_count = 0
         self.indexes = []
+        self.index_info = {}  # name -> (table, columns, unique)
         self.parameters = []  # values for the "?" placeholders of the current statement
         self.views = []  # Tables describing the views (columns x and y)
         self.no_parameters = False  # views may not contain parameters
@@ -87,6 +90,8 @@ class Generator:
         unique = "UNIQUE " if rng.random() < 0.2 else ""
         if unique:
             table.unique_columns.update(columns)
+            table.unique_targets.append(tuple(columns))
+        self.index_info[name] = (table, tuple(columns), bool(unique))
         return f"CREATE {unique}INDEX {name} ON {table.name} ({', '.join(columns)})"
 
     def drop_index(self):
@@ -94,6 +99,9 @@ class Generator:
             return self.create_index()
         name = self.rng.choice(self.indexes)
         self.indexes.remove(name)
+        table, columns, unique = self.index_info.pop(name)
+        if unique:
+            table.unique_targets.remove(columns)
         return f"DROP INDEX {name}"
 
     # ---- values and expressions -------------------------------------------------
@@ -214,18 +222,55 @@ class Generator:
 
     # ---- statements -------------------------------------------------------------
 
+    def conflict(self):
+        """An optional ``OR <resolution>`` for INSERT or UPDATE."""
+        if self.rng.random() < 0.7:
+            return ""
+        return "OR " + self.rng.choice(["IGNORE", "REPLACE", "FAIL", "ABORT", "ROLLBACK"]) + " "
+
+    def returning(self, table):
+        """An optional RETURNING clause (no subqueries: nothing to depend on
+        the order rows are changed in)."""
+        if self.rng.random() < 0.85:
+            return ""
+        scope = [(table.name, table)]
+        items = ["*"] if self.rng.random() < 0.2 else [
+            self.expr(scope, 2) for _ in range(self.rng.randint(1, 2))
+        ]
+        return " RETURNING " + ", ".join(items)
+
+    def upsert(self, table):
+        """An optional ON CONFLICT clause (only with a valid target, or none)."""
+        rng = self.rng
+        if rng.random() < 0.8:
+            return ""
+        target = ""
+        if table.unique_targets and rng.random() < 0.8:
+            target = "(" + ", ".join(rng.choice(table.unique_targets)) + ") "
+        if rng.random() < 0.4:
+            return f" ON CONFLICT {target}DO NOTHING"
+        excluded = Table("excluded", table.columns, None)
+        excluded.derived = True  # no excluded.rowid
+        scope = [(table.name, table), ("excluded", excluded)]
+        names = [c for c in table.column_names() if c != table.rowid_alias]
+        assignments = [f"{c} = {self.expr(scope, 2, True)}"
+                       for c in rng.sample(names, rng.randint(1, min(2, len(names))))]
+        where = f" WHERE {self.expr(scope, 2)}" if rng.random() < 0.3 else ""
+        return f" ON CONFLICT {target}DO UPDATE SET {', '.join(assignments)}{where}"
+
     def insert(self):
         rng = self.rng
         table = rng.choice(self.tables)
         if rng.random() < 0.15:
             return self.insert_select(table)
         rows = []
+        verb = "REPLACE " if rng.random() < 0.05 else f"INSERT {self.conflict()}"
         if rng.random() < 0.5:
             columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
-            prefix = f"INSERT INTO {table.name} ({', '.join(columns)}) VALUES "
+            prefix = f"{verb}INTO {table.name} ({', '.join(columns)}) VALUES "
         else:
             columns = table.column_names()
-            prefix = f"INSERT INTO {table.name} VALUES "
+            prefix = f"{verb}INTO {table.name} VALUES "
         for _ in range(rng.randint(1, 4)):
             values = []
             for column in columns:
@@ -239,7 +284,7 @@ class Generator:
                     ]
                 values.append(value)
             rows.append("(" + ", ".join(values) + ")")
-        return prefix + ", ".join(rows)
+        return prefix + ", ".join(rows) + self.upsert(table) + self.returning(table)
 
     def insert_select(self, table):
         """INSERT ... SELECT.  New rows get row ids in the order the SELECT
@@ -253,7 +298,7 @@ class Generator:
         items = [self.expr(scope, 2, True) for _ in columns]
         where = f" WHERE {self.condition(scope)}" if rng.random() < 0.6 else ""
         order = ", ".join([str(i + 1) for i in range(len(items))] + ["s.rowid"])
-        return (f"INSERT INTO {table.name} ({', '.join(columns)}) SELECT {', '.join(items)} "
+        return (f"INSERT {self.conflict()}INTO {table.name} ({', '.join(columns)}) SELECT {', '.join(items)} "
                 f"FROM {source.name} AS s{where} ORDER BY {order} LIMIT {rng.randint(0, 6)}")
 
     def update(self):
@@ -273,11 +318,16 @@ class Generator:
             # Changing the row id: keep it to one row so the processing order cannot matter.
             assignments = [f"id = {rng.randint(-5, 60)}"]
             where = f"id = {rng.randint(-5, 60)}"
-        return f"UPDATE {table.name} SET {', '.join(assignments)} WHERE {where}"
+        conflict = self.conflict()
+        if conflict:
+            # IGNORE / REPLACE / FAIL outcomes depend on which row goes first.
+            where = f"rowid = {rng.randint(1, 40)}"
+        return f"UPDATE {conflict}{table.name} SET {', '.join(assignments)} WHERE {where}{self.returning(table)}"
 
     def delete(self):
         table = self.rng.choice(self.tables)
-        return f"DELETE FROM {table.name} WHERE {self.condition([(table.name, table)])}"
+        where = self.condition([(table.name, table)])
+        return f"DELETE FROM {table.name} WHERE {where}{self.returning(table)}"
 
     def derived_table(self):
         """A subquery in FROM with columns x and y, and a Table describing it."""

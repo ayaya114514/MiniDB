@@ -128,6 +128,7 @@ class Cursor:
         self.lastrowid = None
         self._rows = []
         self._position = 0
+        self._pending_rowcount = None  # see execute()
         self._closed = False
 
     def _database(self) -> Database:
@@ -146,6 +147,7 @@ class Cursor:
         self.rowcount = -1
         self._rows = []
         self._position = 0
+        self._pending_rowcount = None
 
     def execute(self, sql: str, parameters: Parameters = ()) -> Cursor:
         statement = self._single_statement(sql)
@@ -158,6 +160,10 @@ class Cursor:
         if result.columns:
             self.description = tuple((name, None, None, None, None, None, None) for name in result.columns)
         self.rowcount = result.rowcount
+        if result.columns and self._rows and isinstance(statement, (Insert, Update, Delete)):
+            # RETURNING: sqlite3 reports the count only once the last row has
+            # been fetched (when the statement has run to completion).
+            self.rowcount, self._pending_rowcount = 0, result.rowcount
         self.lastrowid = db.last_insert_rowid
         return self
 
@@ -188,21 +194,26 @@ class Cursor:
         if self._position >= len(self._rows):
             return None
         row = self._rows[self._position]
-        self._position += 1
+        self._advance(1)
         return row
 
     def fetchmany(self, size: int | None = None) -> list[tuple]:
         self._database()
         size = self.arraysize if size is None else size
         rows = self._rows[self._position:self._position + size]
-        self._position += len(rows)
+        self._advance(len(rows))
         return rows
 
     def fetchall(self) -> list[tuple]:
         self._database()
         rows = self._rows[self._position:]
-        self._position = len(self._rows)
+        self._advance(len(rows))
         return rows
+
+    def _advance(self, count: int) -> None:
+        self._position += count
+        if self._pending_rowcount is not None and self._position >= len(self._rows):
+            self.rowcount, self._pending_rowcount = self._pending_rowcount, None
 
     def __iter__(self) -> Cursor:
         return self
