@@ -53,3 +53,24 @@ jobs:
         run: |
           start=$((100000 + GITHUB_RUN_NUMBER * 200))
           python tests/fuzz.py --seeds "$start-$((start + 199))" --statements 400
+      - name: Metamorphic testing, TLP and NoREC (no reference database)
+        run: |
+          python tests/metamorphic.py --seeds 0-199 --queries 300
+          start=$((100000 + GITHUB_RUN_NUMBER * 100))
+          python tests/metamorphic.py --file --seeds "$start-$((start + 99))" --queries 300
+
+  sqllogictest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/cache@v4
+        with:
+          path: .sqllogictest
+          key: sqllogictest-${{ hashFiles('tools/sqllogictest.sha3') }}
+      - name: Fetch SQLite's sqllogictest corpus (pinned, hash-checked)
+        run: test -d .sqllogictest/test || python tools/sqllogictest.py --fetch
+      - name: Run the corpus; fail if fewer records pass than the recorded baseline
+        run: python tools/sqllogictest.py --jobs 4 --min-passed 3743727
