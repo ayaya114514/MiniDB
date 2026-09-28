@@ -65,7 +65,9 @@ class Generator:
             rowid_alias = "id"
             columns.append(("id", "INTEGER", "PRIMARY KEY"))
         for i in range(rng.randint(2, 4)):
-            col_type = rng.choice(["INTEGER", "TEXT"])
+            # Every affinity: INTEGER, TEXT, REAL, NUMERIC and BLOB (also no type at all).
+            col_type = rng.choice(["INTEGER", "TEXT", "INTEGER", "TEXT", "REAL", "NUMERIC", "",
+                                   "BLOB", "VARCHAR(5)", "INT", "FLOAT"])
             constraint = rng.choice(["", "", "", "NOT NULL", "UNIQUE"])
             columns.append((f"c{i}", col_type, constraint))
         table = Table(name, columns, rowid_alias)

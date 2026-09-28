@@ -94,8 +94,8 @@ class TableInfo:
         # An INTEGER PRIMARY KEY column is an alias for the row id (as in SQLite).
         self.rowid_column = next(
             (i for i, c in enumerate(columns) if c.primary_key and c.type == "INTEGER"), None
-        )
-        self.affinities = [values.INTEGER if c.type == "INTEGER" else values.TEXT for c in columns]
+        )  # only the type name INTEGER itself: "INT PRIMARY KEY" is an ordinary column
+        self.affinities = [values.type_affinity(c.type) for c in columns]
 
     def column_index(self, name: str) -> int | None:
         return self.positions.get(ascii_lower(name))
@@ -110,7 +110,7 @@ class TableInfo:
     def sql(self) -> str:
         parts = []
         for column in self.columns:
-            text = f"{quote(column.name)} {column.type}"
+            text = f"{quote(column.name)} {column.type}".rstrip()
             if column.primary_key:
                 text += " PRIMARY KEY"
             if column.not_null:

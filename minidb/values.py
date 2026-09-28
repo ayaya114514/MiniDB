@@ -34,9 +34,15 @@ SQLValue = int | float | str | None
 INT_MIN = -(2**63)
 INT_MAX = 2**63 - 1
 
-# Column affinities.  Expressions that are not column references have none.
+# Column affinities (from the declared type, see type_affinity).  Expressions
+# that are not column references or CASTs have none (None).  In comparisons
+# the three numeric affinities act alike; BLOB means "convert nothing".
 INTEGER = "INTEGER"
+REAL = "REAL"
+NUMERIC = "NUMERIC"
 TEXT = "TEXT"
+BLOB = "BLOB"
+NUMERIC_AFFINITIES = frozenset((INTEGER, REAL, NUMERIC))
 
 _SPACE = " \t\n\v\f\r"
 _NUMBER = r"[+-]?(?:[0-9]+\.?[0-9]*|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
@@ -88,20 +94,32 @@ def text_affinity(value: SQLValue) -> SQLValue:
     return value
 
 
+def real_affinity(value: SQLValue) -> SQLValue:
+    """Apply REAL affinity: like NUMERIC, but numbers end up as REALs."""
+    value = numeric_affinity(value)
+    return float(value) if isinstance(value, int) else value
+
+
 def apply_affinity(value: SQLValue, affinity: str | None) -> SQLValue:
-    if affinity == INTEGER:
+    """Convert a value stored in a column with ``affinity``."""
+    if affinity == INTEGER or affinity == NUMERIC:
         return numeric_affinity(value)
     if affinity == TEXT:
         return text_affinity(value)
+    if affinity == REAL:
+        return real_affinity(value)
     return value
 
 
 def comparison_affinities(left: str | None, right: str | None) -> tuple[str | None, str | None]:
-    """Which affinity to apply to each operand of a comparison (SQLite rules)."""
-    if left == INTEGER and right != INTEGER:
-        return None, INTEGER
-    if right == INTEGER and left != INTEGER:
-        return INTEGER, None
+    """Which affinity to apply to each operand of a comparison (SQLite rules):
+    NUMERIC to the other operand of a numeric column, TEXT to an operand
+    without affinity compared with a TEXT column."""
+    left_numeric, right_numeric = left in NUMERIC_AFFINITIES, right in NUMERIC_AFFINITIES
+    if left_numeric and not right_numeric:
+        return None, NUMERIC
+    if right_numeric and not left_numeric:
+        return NUMERIC, None
     if left == TEXT and right is None:
         return None, TEXT
     if right == TEXT and left is None:

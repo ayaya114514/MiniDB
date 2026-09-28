@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Union
 
+from minidb.errors import NotSupportedError
 from minidb.tokenizer import SQLSyntaxError, Token, tokenize
 from minidb.values import ascii_upper
 
@@ -136,7 +137,7 @@ class Call:
 @dataclass
 class ColumnDef:
     name: str
-    type: str  # "INTEGER" or "TEXT"
+    type: str  # the declared type in upper case, e.g. "INTEGER", "VARCHAR(30)", "" for none
     primary_key: bool = False
     not_null: bool = False
     unique: bool = False
@@ -296,7 +297,8 @@ Statement = Union[
 
 # ---- parser ------------------------------------------------------------
 
-TYPE_NAMES = {"INTEGER", "TEXT"}
+# Words that start a column constraint and so end a type name.
+CONSTRAINT_WORDS = {"CONSTRAINT", "CHECK", "DEFAULT", "REFERENCES", "COLLATE", "GENERATED"}
 MAX_PARAMETER_INDEX = 32_766  # SQLITE_MAX_VARIABLE_NUMBER's default
 
 
@@ -474,11 +476,7 @@ class Parser:
 
     def column_def(self) -> ColumnDef:
         name = self.identifier("column name")
-        type_token = self.tok
-        if type_token.kind != "IDENT" or ascii_upper(type_token.value) not in TYPE_NAMES:
-            raise self.error("column type INTEGER or TEXT")
-        self.advance()
-        column = ColumnDef(name, ascii_upper(type_token.value))
+        column = ColumnDef(name, ascii_upper(self.type_name(required=False)))
         while True:
             if self.accept_keyword("PRIMARY"):
                 self.expect_word("KEY")
@@ -612,10 +610,11 @@ class Parser:
         return SelectItem(expr, alias, text)
 
     def from_clause(self) -> list[Join]:
-        joins = [Join(self.table_ref())]
+        first = self.table_or_group()
+        joins = first if isinstance(first, list) else [Join(first)]
         while True:
             if self.accept_op(","):
-                joins.append(Join(self.table_ref()))
+                joins.extend(self.joined(self.table_or_group(), "INNER"))
                 continue
             natural = bool(self.accept_keyword("NATURAL"))
             if self.accept_keyword("LEFT"):
@@ -630,7 +629,13 @@ class Parser:
             else:
                 return joins
             self.expect_keyword("JOIN")
-            join = Join(self.table_ref(), kind, natural=natural)
+            source = self.table_or_group()
+            if isinstance(source, list):
+                if natural or self.at_keyword("ON", "USING"):
+                    raise NotSupportedError("a parenthesized join with NATURAL, ON or USING is not supported")
+                joins.extend(self.joined(source, kind))
+                continue
+            join = Join(source, kind, natural=natural)
             if natural:  # NATURAL takes neither ON nor USING
                 joins.append(join)
                 continue
@@ -643,6 +648,31 @@ class Parser:
                     join.using.append(self.identifier("column name"))
                 self.expect_op(")")
             joins.append(join)
+
+    def table_or_group(self) -> TableRef | DerivedTable | list[Join]:
+        """A table, or a parenthesized join ``(a JOIN b ...)`` as a list of Joins."""
+        if self.at_op("(") and not (self.tokens[self.i + 1].kind == "KEYWORD"
+                                    and self.tokens[self.i + 1].value == "SELECT"):
+            self.advance()
+            group = self.from_clause()
+            self.expect_op(")")
+            return group[0].table if len(group) == 1 else group
+        return self.table_ref()
+
+    @staticmethod
+    def joined(source: TableRef | DerivedTable | list[Join], kind: str) -> list[Join]:
+        """Joins for ``source`` joined with ``kind`` to the tables before it.
+
+        Joins associate to the left, so a parenthesized join first in FROM is
+        the same as without parentheses.  Later, ``x, (a JOIN b ON p)`` is
+        ``x, a JOIN b ON p`` as long as the join to the group is an inner one
+        without a condition (an inner join's ON is a filter on the result);
+        ``x LEFT JOIN (a JOIN b)`` is not, and is refused."""
+        if not isinstance(source, list):
+            return [Join(source, kind)]
+        if kind != "INNER":
+            raise NotSupportedError("LEFT JOIN of a parenthesized join is not supported")
+        return source
 
     def table_ref(self) -> TableRef | DerivedTable:
         if self.at_op("(") and self.tokens[self.i + 1].kind == "KEYWORD" and self.tokens[self.i + 1].value == "SELECT":
@@ -731,9 +761,15 @@ class Parser:
                 negated = bool(self.accept_keyword("NOT"))
                 keyword = self.advance().value
                 if keyword == "IN":
+                    if self.tok.kind == "IDENT":  # x IN table: x IN (SELECT * FROM table)
+                        table = TableRef(self.advance().value)
+                        left = InSelect(left, Select([SelectItem(Star())], [Join(table)]), negated)
+                        continue
                     self.expect_op("(")
                     if self.at_keyword("SELECT"):
                         left = InSelect(left, self.query(), negated)
+                    elif self.at_op(")"):
+                        left = InList(left, (), negated)  # always false (true with NOT)
                     else:
                         left = InList(left, tuple(self.expr_list()), negated)
                     self.expect_op(")")
@@ -839,12 +875,16 @@ class Parser:
         self.expect_keyword("END")
         return Case(base, tuple(whens), else_)
 
-    def type_name(self) -> str:
-        """A type name as SQLite accepts it: words, then an optional (n) or (n, m)."""
+    def type_name(self, required: bool = True) -> str:
+        """A type name as SQLite accepts it: words, then an optional (n) or (n, m).
+        Any name is allowed; its affinity follows SQLite's rules
+        (values.type_affinity).  A column definition may leave it out."""
         start = self.tok.pos
-        if self.tok.kind != "IDENT":
-            raise self.error("type name")
-        while self.tok.kind == "IDENT":
+        if not self.at_type_word():
+            if required:
+                raise self.error("type name")
+            return ""
+        while self.at_type_word():
             self.advance()
         if self.accept_op("("):
             for _ in range(2):
@@ -856,6 +896,9 @@ class Parser:
                     break
             self.expect_op(")")
         return " ".join(self.text[start:self.tok.pos].split())
+
+    def at_type_word(self) -> bool:
+        return self.tok.kind == "IDENT" and ascii_upper(self.tok.text) not in CONSTRAINT_WORDS
 
     def parameter(self) -> Parameter:
         token = self.advance()
@@ -887,6 +930,8 @@ class Parser:
         if self.accept_op(")"):
             return Call(name, ())
         distinct = bool(self.accept_keyword("DISTINCT"))
+        if not distinct:
+            self.accept_keyword("ALL")  # the default: count(ALL x) is count(x)
         args = tuple(self.expr_list())
         self.expect_op(")")
         return Call(name, args, distinct)
