@@ -29,11 +29,11 @@ from typing import Any, Protocol, Union
 
 from minidb import values
 from minidb.btree import BTree
-from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo
+from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo, ViewInfo
 from minidb.errors import IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
-    Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable, Delete,
-    DerivedTable, DropIndex, DropTable, Exists, Explain, InList, InSelect, Insert, Join, Like,
+    Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
+    CreateView, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList, InSelect, Insert, Join, Like,
     Literal, Parameter, Select, Star, Subquery, TableRef, Unary, Update,
 )
 from minidb.parser import Expr, Statement
@@ -1114,6 +1114,7 @@ class Executor:
         self.last_insert_rowid = 0
         self.parameters = []  # values of ?-parameters; compiled plans read this list
         self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
+        self.expanding = []  # views being compiled (to detect a view that uses itself)
 
     def execute(self, stmt: Statement, parameters: Sequence[SQLValue] = ()) -> Result:
         """Execute a parsed statement with the given parameter values (a list
@@ -1134,6 +1135,12 @@ class Executor:
             return self.create_index(stmt)
         if isinstance(stmt, DropIndex):
             self.catalog.drop_index(stmt.name, stmt.if_exists)
+            return Result()
+        if isinstance(stmt, CreateView):
+            self.catalog.create_view(stmt)
+            return Result()
+        if isinstance(stmt, DropView):
+            self.catalog.drop_view(stmt.name, stmt.if_exists)
             return Result()
         if isinstance(stmt, Explain):
             return self.explain(stmt.statement)
@@ -1178,6 +1185,24 @@ class Executor:
             return CompiledCompound(self, stmt, parent)
         return CompiledSelect(self, stmt, parent)
 
+    def view_source(self, view: ViewInfo) -> DerivedSource:
+        """A view used in FROM: its SELECT, compiled as a subquery that sees
+        no enclosing query."""
+        if view in self.expanding:
+            raise OperationalError(f"view {view.name} is circularly defined")
+        self.expanding.append(view)
+        try:
+            compiled = self.compile_query(view.query)
+        except OperationalError as exc:
+            message = str(exc)
+            if message.startswith("no such table: ") and "." not in message:
+                # The view's tables are looked up in the main schema.
+                raise OperationalError(message.replace(": ", ": main.", 1)) from None
+            raise
+        finally:
+            self.expanding.pop()
+        return DerivedSource(view.name, compiled, view.columns)
+
     def build_from(self, joins: list[Join], scope: Scope) -> tuple[list[Join], list[DerivedSource]]:
         """Add the FROM clause's tables to ``scope``.
 
@@ -1196,6 +1221,10 @@ class Executor:
                 source = DerivedSource(ref.alias or "", compiled)
                 derived.append(source)
                 scope.add(source, ref.alias or "")
+            elif ascii_lower(ref.name) in self.catalog.views:
+                source = self.view_source(self.catalog.views[ascii_lower(ref.name)])
+                derived.append(source)
+                scope.add(source, ref.alias)
             else:
                 scope.add(self.catalog.get_table(ref.name), ref.alias)
             if join.natural or join.using is not None:
@@ -1819,7 +1848,7 @@ class PreparedSelect:
 class PreparedInsert:
     def __init__(self, executor: Executor, stmt: Insert) -> None:
         self.executor = executor
-        table = self.table = executor.catalog.get_table(stmt.table)
+        table = self.table = executor.catalog.table_to_modify(stmt.table)
         width = len(table.columns)
         if stmt.columns is None:
             self.positions = list(range(width))
@@ -1832,26 +1861,37 @@ class PreparedInsert:
                 self.positions.append(position)
         compiler = Compiler(Scope(), executor=executor)
         self.rows = []
+        self.query = None
+        if stmt.query is not None:
+            self.query = executor.compile_query(stmt.query)
+            self.check_count(stmt, len(self.query.names))
         for exprs in stmt.rows:
-            if len(exprs) != len(self.positions):
-                if stmt.columns is None:
-                    raise OperationalError(
-                        f"table {table.name} has {width} columns "
-                        f"but {len(exprs)} values were supplied"
-                    )
-                raise OperationalError(f"{len(exprs)} values for {len(self.positions)} columns")
+            self.check_count(stmt, len(exprs))
             self.rows.append([compiler.compile(e) for e in exprs])
         self.tree = executor.catalog.table_tree(table)
 
+    def check_count(self, stmt: Insert, count: int) -> None:
+        if count != len(self.positions):
+            if stmt.columns is None:
+                raise OperationalError(
+                    f"table {self.table.name} has {len(self.table.columns)} columns "
+                    f"but {count} values were supplied"
+                )
+            raise OperationalError(f"{count} values for {len(self.positions)} columns")
+
     def run(self) -> Result:
         executor, table, width = self.executor, self.table, len(self.table.columns)
-        # All VALUES are computed first: SQLite evaluates their (constant)
-        # subqueries once, before any row is inserted.
+        # All rows are computed first: SQLite evaluates the (constant)
+        # subqueries of VALUES once, and a SELECT from the table being
+        # inserted into does not see the new rows.
         rows = []
-        for functions in self.rows:
+        sources = self.query.run() if self.query is not None else (
+            [function([]) for function in functions] for functions in self.rows
+        )
+        for source in sources:
             row = [None] * width
-            for position, function in zip(self.positions, functions):
-                row[position] = function([])
+            for position, value in zip(self.positions, source):
+                row[position] = value
             rows.append(row)
         for row in rows:
             executor.last_insert_rowid = executor.insert_row(table, self.tree, row)
@@ -1863,7 +1903,7 @@ class PreparedSingleTable:
 
     def __init__(self, executor: Executor, table_name: str, where: Expr | None) -> None:
         self.executor = executor
-        self.table = executor.catalog.get_table(table_name)
+        self.table = executor.catalog.table_to_modify(table_name)
         self.tree = executor.catalog.table_tree(self.table)
         self.scope = Scope()
         joins, _ = executor.build_from([Join(TableRef(self.table.name))], self.scope)
@@ -1979,14 +2019,21 @@ class DerivedSource:
     rowid_column = None
     indexes = ()
 
-    def __init__(self, name: str, compiled: CompiledQuery) -> None:
+    def __init__(self, name: str, compiled: CompiledQuery, names: list[str] | None = None) -> None:
+        """``names``: the column names a view declares, if any."""
         self.name = name or "subquery"
         self.compiled = compiled
-        self.columns = [ColumnName(name) for name in compiled.names]
+        if names is None:
+            names = unique_names(compiled.names)
+        elif len(names) != len(compiled.names):
+            raise OperationalError(
+                f"expected {len(names)} columns for '{name}' but got {len(compiled.names)}"
+            )
+        self.columns = [ColumnName(n) for n in names]
         self.affinities = list(compiled.affinities)
         self.positions = {}
-        for i, name in enumerate(compiled.names):
-            self.positions.setdefault(ascii_lower(name), i)
+        for i, n in enumerate(names):
+            self.positions.setdefault(ascii_lower(n), i)
         self.rows = []
 
     def column_index(self, name: str) -> int | None:
@@ -1994,6 +2041,21 @@ class DerivedSource:
 
     def materialize(self) -> None:
         self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+
+
+def unique_names(names: list[str]) -> list[str]:
+    """Column names of a subquery or view as SQLite makes them unique: a
+    repeated name gets ":1", ":2", ... (ignoring case)."""
+    seen = set()
+    result = []
+    for name in names:
+        base, count = name, 0
+        while ascii_lower(name) in seen:
+            count += 1
+            name = f"{base}:{count}"
+        seen.add(ascii_lower(name))
+        result.append(name)
+    return result
 
 
 def folded_literal(expr: Expr) -> Literal | None:

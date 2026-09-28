@@ -127,3 +127,15 @@ def test_command_line_rejects_bad_file(tmp_path):
     )
     assert result.returncode == 1
     assert result.stderr.startswith("Error:")
+
+
+def test_views_in_tables_and_schema():
+    output = run_script(
+        "CREATE TABLE t (a INTEGER);\nCREATE VIEW v AS SELECT a FROM t;\n.tables\n.schema\n.schema v\n"
+    )
+    assert output == [
+        "t v",
+        'CREATE TABLE "t" ("a" INTEGER);',
+        "CREATE VIEW v AS SELECT a FROM t;",
+        "CREATE VIEW v AS SELECT a FROM t;",
+    ]

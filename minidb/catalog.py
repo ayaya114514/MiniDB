@@ -5,9 +5,11 @@ The schema lives in the database file itself, in a B+ tree rooted at page 1
 
     (type, name, table name, root page, sql)
 
-where ``type`` is "table" or "index" and ``sql`` is the canonical CREATE
-statement; on open the statements are parsed again to rebuild the in-memory
-``TableInfo`` and ``IndexInfo`` objects.
+where ``type`` is "table", "index" or "view" and ``sql`` is the CREATE
+statement (canonical for tables and indexes, as written for views); on open
+the statements are parsed again to rebuild the in-memory ``TableInfo``,
+``IndexInfo`` and ``ViewInfo`` objects.  Tables, views and indexes share one
+namespace.
 
 Every UNIQUE column and every PRIMARY KEY that is not an INTEGER PRIMARY KEY
 gets an automatic unique index named ``minidb_autoindex_<table>_<n>``.
@@ -26,7 +28,7 @@ from minidb import values
 from minidb.btree import BTree
 from minidb.errors import DatabaseError, OperationalError
 from minidb.pager import Pager
-from minidb.parser import ColumnDef, CreateIndex, CreateTable, parse
+from minidb.parser import ColumnDef, CreateIndex, CreateTable, CreateView, parse
 from minidb.record import decode_record, encode_record, encoded_size
 from minidb.values import SQLValue, ascii_lower
 
@@ -146,6 +148,17 @@ class IndexInfo:
         return f"CREATE {unique}INDEX {quote(self.name)} ON {quote(self.table.name)} ({columns})"
 
 
+class ViewInfo:
+    """A view: a stored SELECT, expanded where the view is used."""
+
+    def __init__(self, stmt: CreateView, schema_key: int | None = None) -> None:
+        self.name = stmt.name
+        self.columns = stmt.columns  # declared column names, or None
+        self.query = stmt.query
+        self.sql = stmt.sql
+        self.schema_key = schema_key
+
+
 class Catalog:
     def __init__(self, pager: Pager) -> None:
         self.pager = pager
@@ -162,11 +175,14 @@ class Catalog:
         self.version += 1
         self.tables = {}
         self.indexes = {}
+        self.views = {}
         entries = [decode_record(value)[0] + [key] for key, value in self.schema.scan()]
         for kind, name, _table_name, root, sql, key in entries:
             if kind == "table":
                 stmt = parse(sql)
                 self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key)
+            elif kind == "view":
+                self.views[ascii_lower(name)] = ViewInfo(parse(sql), key)
         for kind, name, table_name, root, sql, key in entries:
             if kind == "index":
                 stmt = parse(sql)
@@ -195,6 +211,12 @@ class Catalog:
     def has_table(self, name: str) -> bool:
         return ascii_lower(name) in self.tables
 
+    def table_to_modify(self, name: str) -> TableInfo:
+        """The table an INSERT, UPDATE or DELETE changes (not a view)."""
+        if ascii_lower(name) in self.views:
+            raise OperationalError(f"cannot modify {name} because it is a view")
+        return self.get_table(name)
+
     def table_tree(self, table: TableInfo) -> BTree:
         return BTree(self.pager, table.root)
 
@@ -215,11 +237,20 @@ class Catalog:
         if lowered in self.indexes:
             raise OperationalError(f"there is already an index named {name}")
 
+    def _exists(self, name: str, if_not_exists: bool) -> bool:
+        """Whether a table or view called ``name`` exists (an error unless
+        IF NOT EXISTS was given)."""
+        lowered = ascii_lower(name)
+        if lowered not in self.tables and lowered not in self.views:
+            return False
+        if if_not_exists:
+            return True
+        kind = "table" if lowered in self.tables else "view"
+        raise OperationalError(f"{kind} {name} already exists")
+
     def create_table(self, stmt: CreateTable) -> TableInfo | None:
-        if self.has_table(stmt.name):
-            if stmt.if_not_exists:
-                return None
-            raise OperationalError(f"table {stmt.name} already exists")
+        if self._exists(stmt.name, stmt.if_not_exists):
+            return None
         self._check_new_name(stmt.name)
         seen = set()
         for column in stmt.columns:
@@ -238,7 +269,32 @@ class Catalog:
             self._create_index(name, table, [column], unique=True)
         return table
 
+    def create_view(self, stmt: CreateView) -> None:
+        """Store a view.  Like SQLite, the SELECT is not checked until the
+        view is used (it may name tables that do not exist yet)."""
+        if self._exists(stmt.name, stmt.if_not_exists):
+            return
+        self._check_new_name(stmt.name)
+        self.version += 1
+        view = ViewInfo(stmt)
+        view.schema_key = self._add_entry("view", stmt.name, stmt.name, 0, stmt.sql)
+        self.views[ascii_lower(stmt.name)] = view
+
+    def drop_view(self, name: str, if_exists: bool = False) -> None:
+        if ascii_lower(name) in self.tables:
+            raise OperationalError(f"use DROP TABLE to delete table {name}")
+        view = self.views.get(ascii_lower(name))
+        if view is None:
+            if if_exists:
+                return
+            raise OperationalError(f"no such view: {name}")
+        self.version += 1
+        self.schema.delete(view.schema_key)
+        del self.views[ascii_lower(name)]
+
     def drop_table(self, name: str, if_exists: bool = False) -> None:
+        if ascii_lower(name) in self.views:
+            raise OperationalError(f"use DROP VIEW to delete view {name}")
         if not self.has_table(name):
             if if_exists:
                 return
@@ -260,12 +316,14 @@ class Catalog:
             if stmt.if_not_exists:
                 return None
             raise OperationalError(f"index {stmt.name} already exists")
-        if lowered in self.tables:
+        if lowered in self.tables or lowered in self.views:
             raise OperationalError(f"there is already a table named {stmt.name}")
         if lowered.startswith(RESERVED_PREFIX):
             raise OperationalError(f"object name reserved for internal use: {stmt.name}")
         table = self.tables.get(ascii_lower(stmt.table))
         if table is None:
+            if ascii_lower(stmt.table) in self.views:
+                raise OperationalError("views may not be indexed")
             raise OperationalError(f"no such table: main.{stmt.table}")
         for column in stmt.columns:
             if table.column_index(column) is None:

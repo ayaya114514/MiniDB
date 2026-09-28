@@ -53,6 +53,8 @@ class Generator:
         self.index_count = 0
         self.indexes = []
         self.parameters = []  # values for the "?" placeholders of the current statement
+        self.views = []  # Tables describing the views (columns x and y)
+        self.no_parameters = False  # views may not contain parameters
 
     # ---- schema -------------------------------------------------------------
 
@@ -98,7 +100,7 @@ class Generator:
 
     def literal(self, text_safe=False):
         text = self._literal(text_safe)
-        if self.rng.random() < 0.15:
+        if self.rng.random() < 0.15 and not self.no_parameters:
             # Bind the same value through a parameter instead.
             self.parameters.append(eval(text.replace("NULL", "None")))  # noqa: S307 - our own literals
             return "?"
@@ -215,6 +217,8 @@ class Generator:
     def insert(self):
         rng = self.rng
         table = rng.choice(self.tables)
+        if rng.random() < 0.15:
+            return self.insert_select(table)
         rows = []
         if rng.random() < 0.5:
             columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
@@ -236,6 +240,21 @@ class Generator:
                 values.append(value)
             rows.append("(" + ", ".join(values) + ")")
         return prefix + ", ".join(rows)
+
+    def insert_select(self, table):
+        """INSERT ... SELECT.  New rows get row ids in the order the SELECT
+        returns them, so the order is made total with ORDER BY, ending with
+        the source row id: equal values such as 0 and 0.0 tie in ORDER BY,
+        yet store differently (as '0' and '0.0' in a TEXT column)."""
+        rng = self.rng
+        source = rng.choice([t for t in self.tables if not t.derived])
+        scope = [("s", source)]
+        columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
+        items = [self.expr(scope, 2, True) for _ in columns]
+        where = f" WHERE {self.condition(scope)}" if rng.random() < 0.6 else ""
+        order = ", ".join([str(i + 1) for i in range(len(items))] + ["s.rowid"])
+        return (f"INSERT INTO {table.name} ({', '.join(columns)}) SELECT {', '.join(items)} "
+                f"FROM {source.name} AS s{where} ORDER BY {order} LIMIT {rng.randint(0, 6)}")
 
     def update(self):
         rng = self.rng
@@ -272,6 +291,24 @@ class Generator:
         table.derived = True
         return sql, table
 
+    def create_view(self):
+        """A view over one table, with columns x and y (like derived_table)."""
+        self.no_parameters = True
+        try:
+            sql, table = self.derived_table()
+        finally:
+            self.no_parameters = False
+        table.name = f"v{len(self.views) + 1}"
+        self.views.append(table)
+        return f"CREATE VIEW {table.name} AS {sql[1:-1]}"
+
+    def drop_view(self):
+        if not self.views:
+            return self.create_view()
+        view = self.rng.choice(self.views)
+        self.views.remove(view)
+        return f"DROP VIEW {view.name}"
+
     def compound_select(self):
         rng = self.rng
         width = rng.randint(1, 2)
@@ -297,7 +334,11 @@ class Generator:
         rng = self.rng
         if rng.random() < 0.08:
             return self.compound_select()
-        if rng.random() < 0.12:
+        if rng.random() < 0.1 and self.views:
+            view = rng.choice(self.views)
+            scope = [("a", view)]
+            from_sql = f"{view.name} AS a"
+        elif rng.random() < 0.12:
             derived_sql, derived = self.derived_table()
             scope = [("a", derived)]
             from_sql = f"{derived_sql} AS a"
@@ -373,6 +414,8 @@ class Generator:
             return rng.choice(["BEGIN", "COMMIT", "ROLLBACK"])
         if roll < 0.085:
             return "ANALYZE"  # statistics change later plans, never results
+        if roll < 0.095:
+            return self.create_view() if rng.random() < 0.7 else self.drop_view()
         if roll < 0.40:
             return self.insert()
         if roll < 0.50:
