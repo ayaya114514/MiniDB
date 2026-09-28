@@ -65,7 +65,7 @@ def test_token_positions():
         ("SELECT\n  \"abc", "unterminated identifier", 2, 3),
         ("SELECT 1 /* x", "unterminated comment", 1, 10),
         ("SELECT a # b", "unrecognized character '#'", 1, 10),
-        ("SELECT 12abc", "malformed number", 1, 8),
+        ("SELECT 12abc", "unrecognized token: \"12abc\"", 1, 8),
     ],
 )
 def test_errors_have_positions(text, message, line, column):

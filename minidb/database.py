@@ -158,8 +158,12 @@ class Database:
             # another reason only if it compiled it with a statement journal
             # (Executor.statement_journal); otherwise the changes stay.
             resolution = getattr(exc, "resolution", None)
+            if isinstance(stmt, (Insert, Update, Delete)):
+                self.executor.changes = 0
             if resolution == "FAIL":
                 self.total_changes += exc.changes  # SQLite counts them only for FAIL
+                self.executor.changes = exc.changes
+                self.executor.total_changes = self.total_changes
             elif resolution is None and self.in_transaction and not self.executor.statement_journal:
                 resolution = "FAIL"
             if resolution == "FAIL":
@@ -177,6 +181,9 @@ class Database:
         self._end_statement()
         if result.rowcount > 0:
             self.total_changes += result.rowcount
+        if isinstance(stmt, (Insert, Update, Delete)):
+            self.executor.changes = max(result.rowcount, 0)
+            self.executor.total_changes = self.total_changes
         return result
 
     def _end_statement(self) -> None:

@@ -88,6 +88,8 @@ class Like:
     expr: object
     pattern: object
     negated: bool = False
+    escape: object = None  # LIKE ... ESCAPE <expr>
+    op: str = "LIKE"  # or "GLOB"
 
 
 @dataclass(frozen=True)
@@ -913,6 +915,13 @@ class Parser:
             elif self.accept_keyword("IS"):
                 op = "IS NOT" if self.accept_keyword("NOT") else "IS"
                 left = Binary(op, left, self.comparison())
+            elif self.at_word("GLOB") or (
+                self.at_keyword("NOT") and self.tokens[self.i + 1].kind == "IDENT"
+                and ascii_upper(self.tokens[self.i + 1].text) == "GLOB"
+            ):
+                negated = bool(self.accept_keyword("NOT"))
+                self.advance()
+                left = Like(left, self.comparison(), negated, op="GLOB")
             elif self.at_keyword("IN", "LIKE", "BETWEEN") or (
                 self.at_keyword("NOT")
                 and self.tokens[self.i + 1].kind == "KEYWORD"
@@ -934,7 +943,12 @@ class Parser:
                         left = InList(left, tuple(self.expr_list()), negated)
                     self.expect_op(")")
                 elif keyword == "LIKE":
-                    left = Like(left, self.comparison(), negated)
+                    pattern = self.comparison()
+                    escape = None
+                    if self.at_word("ESCAPE"):
+                        self.advance()
+                        escape = self.comparison()
+                    left = Like(left, pattern, negated, escape)
                 else:
                     low = self.comparison()
                     self.expect_keyword("AND")
@@ -1020,6 +1034,10 @@ class Parser:
             type_name = self.type_name()
             self.expect_op(")")
             return Cast(expr, type_name)
+        if token.kind == "KEYWORD" and token.value in ("LIKE", "IF") and self.tokens[self.i + 1].text == "(":
+            self.advance()  # the functions like() and if() are spelled like keywords
+            self.advance()
+            return self.call(token.value)
         if token.kind == "IDENT":
             self.advance()
             if self.accept_op("("):

@@ -14,6 +14,8 @@ from collections.abc import Callable
 from functools import lru_cache
 
 from minidb.errors import OperationalError
+from minidb.fp import atof
+from minidb.fp import format_real as fp_format_real
 
 _TO_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _TO_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -57,7 +59,7 @@ def _parse_number(literal: str) -> int | float:
         value = int(literal)
         if INT_MIN <= value <= INT_MAX:
             return value
-    return float(literal)
+    return atof(literal)
 
 
 def _real(value: float) -> float | None:
@@ -138,28 +140,8 @@ def comparison_affinities(left: str | None, right: str | None) -> tuple[str | No
 
 
 def format_real(value: float) -> str:
-    """Render a REAL as text like SQLite: 15 significant digits if they
-    round-trip, otherwise 17; always with a '.'; exponent form below 1e-4 and
-    from 1e17.  (SQLite's own digit generation is approximate, so a few
-    values still differ in the last digits.)"""
-    if math.isinf(value):
-        return "Inf" if value > 0 else "-Inf"
-    if value == 0:
-        return "0.0"
-    text = f"{value:.14e}"
-    if float(text) != value:
-        text = f"{value:.16e}"
-    mantissa, exponent = text.split("e")
-    exponent = int(exponent)
-    sign = "-" if mantissa.startswith("-") else ""
-    digits = mantissa.lstrip("-").replace(".", "").rstrip("0")
-    if exponent < -4 or exponent >= 17:
-        sign_char = "+" if exponent >= 0 else "-"
-        return f"{sign}{digits[0]}.{digits[1:] or '0'}e{sign_char}{abs(exponent):02d}"
-    if exponent >= 0:
-        whole = digits[:exponent + 1].ljust(exponent + 1, "0")
-        return f"{sign}{whole}.{digits[exponent + 1:] or '0'}"
-    return f"{sign}0.{'0' * (-exponent - 1)}{digits}"
+    """Render a REAL as text like SQLite: printf("%!.17g"), see fp.format_real."""
+    return fp_format_real(value)
 
 
 def to_text(value: SQLValue) -> str | None:
