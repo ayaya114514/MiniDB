@@ -119,6 +119,21 @@ class Connection:
         return False
 
 
+def check_utf8(rows: list[tuple], columns: list[str]) -> None:
+    """Fail like sqlite3 on text that is not valid UTF-8 (made from a BLOB):
+    inside MiniDB such bytes are kept as lone surrogates."""
+    for row in rows:
+        for name, value in zip(columns, row):
+            if type(value) is str and not value.isascii():
+                try:
+                    value.encode("utf-8")
+                except UnicodeEncodeError:
+                    shown = value.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+                    raise OperationalError(
+                        f"Could not decode to UTF-8 column '{name}' with text '{shown}'"
+                    ) from None
+
+
 class Cursor:
     def __init__(self, connection: Connection) -> None:
         self.connection = connection
@@ -157,6 +172,7 @@ class Cursor:
         db = self._database()
         result = db.execute(sql, parameters)
         self._rows = list(result)
+        check_utf8(self._rows, result.columns)
         if result.columns:
             self.description = tuple((name, None, None, None, None, None, None) for name in result.columns)
         self.rowcount = result.rowcount

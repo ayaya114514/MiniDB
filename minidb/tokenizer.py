@@ -42,7 +42,7 @@ class SQLSyntaxError(OperationalError):
 
 @dataclass
 class Token:
-    kind: str     # KEYWORD, IDENT, INTEGER, FLOAT, STRING, OP, PARAM or EOF
+    kind: str     # KEYWORD, IDENT, INTEGER, FLOAT, STRING, BLOB, OP, PARAM or EOF
     value: object  # keyword in upper case, identifier name, number, string,
                    # operator, or for PARAM the text after "?" / the whole ":name"
     pos: int
@@ -69,6 +69,15 @@ def tokenize(text: str) -> list[Token]:
             i = end + 2
             continue
         start = i
+        if ch in "xX" and text.startswith("'", i + 1):  # BLOB literal x'hex'
+            end = text.find("'", i + 2)
+            digits = text[i + 2:end] if end != -1 else ""
+            if end == -1 or len(digits) % 2 or any(c not in "0123456789abcdefABCDEF" for c in digits):
+                bad = text[start:end + 1] if end != -1 else text[start:]
+                raise SQLSyntaxError(f'unrecognized token: "{bad}"', text, start)
+            i = end + 1
+            tokens.append(Token("BLOB", bytes.fromhex(digits), start, text[start:i]))
+            continue
         if ch.isalpha() or ch == "_":
             while i < n and (text[i].isalnum() or text[i] in "_$"):
                 i += 1

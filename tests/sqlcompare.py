@@ -63,6 +63,9 @@ class Pair:
         SQLite's query plan visits rows in."""
         self.mini = Database(path)
         self.lite = sqlite3.connect(":memory:", isolation_level=None)
+        # Text made from a BLOB may not be valid UTF-8: keep the bytes, as
+        # MiniDB does (sqlite3 would fail to decode it; see minidb.dbapi).
+        self.lite.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
         Pair.open_pairs.add(self)
         self.check_messages = check_messages
         self.normalize = loose if loose_numbers else typed

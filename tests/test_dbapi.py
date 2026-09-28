@@ -417,3 +417,17 @@ def test_returning_rowcount_appears_after_the_last_row():
         note(conn.execute("SELECT count(*) FROM t").fetchall())
 
     same_behaviour(script)
+
+
+def test_blobs_match_sqlite3():
+    def script(conn, note):
+        conn.execute("CREATE TABLE t (a BLOB, b)")
+        conn.executemany("INSERT INTO t VALUES (?, ?)", [
+            (b"\x00\x01", bytearray(b"ab")), (memoryview(b"xyz"), b""), (b"\xff", "text"),
+        ])
+        note(conn.execute("SELECT a, b, typeof(a), typeof(b), length(a) FROM t").fetchall())
+        note(conn.execute("SELECT count(*) FROM t WHERE a = ?", (b"xyz",)).fetchall())
+        note(conn.execute("SELECT CAST(a AS TEXT) FROM t WHERE a = x'0001'").fetchall())
+        conn.execute("SELECT CAST(a AS TEXT) FROM t WHERE a = x'ff'").fetchall()  # not UTF-8
+
+    same_behaviour(script)

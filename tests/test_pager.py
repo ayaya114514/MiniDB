@@ -13,6 +13,7 @@ from minidb.record import RecordError, decode_record, encode_record
         [1.5, -0.0, 1e300],
         ["", "hello", "日本語", "a|b'c"],
         [1, "x", None, 2.5],
+        [b"", b"\x00\xff", b"blob" * 1000, "\udcff", "a\udc80b"],  # BLOBs; text with invalid UTF-8
     ],
 )
 def test_record_round_trip(values):
@@ -26,7 +27,7 @@ def test_record_rejects_unsupported_values():
     with pytest.raises(RecordError):
         encode_record([2**63])
     with pytest.raises(RecordError):
-        encode_record([b"bytes"])
+        encode_record([bytearray(b"bytes")])
     with pytest.raises(RecordError):
         encode_record([True])
 
@@ -128,7 +129,8 @@ def test_record_round_trip_random():
     for _ in range(3000):
         values = [
             rng.choice([None, rng.randint(-(2**63), 2**63 - 1), rng.randint(-300, 300),
-                        rng.random() * 1e6, "".join(rng.choice("aé日") for _ in range(rng.randint(0, 300)))])
+                        rng.random() * 1e6, "".join(rng.choice("aé日") for _ in range(rng.randint(0, 300))),
+                        rng.randbytes(rng.randint(0, 300))])
             for _ in range(rng.randint(0, 12))
         ]
         data = encode_record(values)

@@ -287,8 +287,10 @@ class Database:
 
 def adapt(value: object, position: int) -> SQLValue:
     """Check a bound Python value and convert it to a SQL value."""
-    if value is None or isinstance(value, (float, str)):
+    if value is None or isinstance(value, (float, str, bytes)):
         return value
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
     if isinstance(value, bool):
         return int(value)
     if isinstance(value, int):
