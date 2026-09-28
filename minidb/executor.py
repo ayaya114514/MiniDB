@@ -34,8 +34,8 @@ from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalE
 from minidb.parser import (
     Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
     CreateView, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
-    InSelect, Insert, Join, Like, Literal, Parameter, Select, SelectItem, Star, Subquery, TableRef,
-    Unary, Update, Upsert,
+    InSelect, Insert, Join, Like, Literal, Parameter, Reindex, Select, SelectItem, Star, Subquery,
+    TableRef, Unary, Update, Upsert,
 )
 from minidb.parser import Expr, Statement
 from minidb.values import SQLValue, ascii_lower
@@ -248,6 +248,10 @@ _ARITHMETIC = {
     "/": values.divide,
     "%": values.remainder,
     "||": values.concat,
+    "&": values.bit_and,
+    "|": values.bit_or,
+    "<<": values.shift_left,
+    ">>": values.shift_right,
 }
 
 # Conversions for comparisons: the numeric affinities all convert text to numbers.
@@ -359,6 +363,9 @@ class Compiler:
             return lambda row: negate(operand(row))
         if expr.op == "+":
             return operand
+        if expr.op == "~":
+            bit_not = values.bit_not
+            return lambda row: bit_not(operand(row))
         logical_not = values.logical_not
         return lambda row: logical_not(operand(row))
 
@@ -565,9 +572,8 @@ class Compiler:
         if name not in values.SCALAR_FUNCTIONS:
             raise OperationalError(f"no such function: {ascii_lower(name)}")
         function, min_args, max_args = values.SCALAR_FUNCTIONS[name]
-        if expr.distinct or len(expr.args) < min_args or (
-            max_args is not None and len(expr.args) > max_args
-        ):
+        # DISTINCT means nothing to a scalar function; SQLite ignores it.
+        if len(expr.args) < min_args or (max_args is not None and len(expr.args) > max_args):
             raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
         args = [self.compile(arg) for arg in expr.args]
         if len(args) == 1:
@@ -583,6 +589,8 @@ class Compiler:
         star = expr.args == (Star(),)
         if star and name != "COUNT" or not min_args <= len(expr.args) <= max_args:
             raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
+        if expr.distinct and len(expr.args) != 1:
+            raise OperationalError("DISTINCT aggregates must have exactly one argument")
         if star or not expr.args:
             args = []  # COUNT(*) and COUNT()
         else:
@@ -1143,6 +1151,8 @@ class Executor:
         if isinstance(stmt, CreateView):
             self.catalog.create_view(stmt)
             return Result()
+        if isinstance(stmt, Reindex):
+            return self.reindex(stmt.name)
         if isinstance(stmt, DropView):
             self.catalog.drop_view(stmt.name, stmt.if_exists)
             return Result()
@@ -1225,12 +1235,14 @@ class Executor:
                 source = DerivedSource(ref.alias or "", compiled)
                 derived.append(source)
                 scope.add(source, ref.alias or "")
-            elif ascii_lower(ref.name) in self.catalog.views:
-                source = self.view_source(self.catalog.views[ascii_lower(ref.name)])
+            elif self.catalog.find_view(ref.name) is not None:
+                source = self.view_source(self.catalog.find_view(ref.name))
                 derived.append(source)
                 scope.add(source, ref.alias)
             else:
-                scope.add(self.catalog.get_table(ref.name), ref.alias)
+                table = self.catalog.get_table(ref.name)
+                self.catalog.check_index_hint(table, ref.indexed_by)
+                scope.add(table, ref.alias)
             if join.natural or join.using is not None:
                 join = self.using_condition(scope, index, join)
             normalized.append(join)
@@ -1652,6 +1664,7 @@ class Executor:
         As in SQLite: NOT NULL is checked first, then the upsert targets in
         clause order, then the row id and the other UNIQUE indexes (newest
         first).  REPLACE deletes each conflicting row and goes on."""
+        raw = list(row)  # the values before column affinities (see below)
         rowid = self.prepare_row(table, row)
         violation = self.not_null_violation(table, row)
         if violation is not None:
@@ -1660,20 +1673,25 @@ class Executor:
             raise self.constraint_error(violation, conflict)
         if rowid is None:
             rowid = self.new_rowid(tree)
-            if table.rowid_column is not None:
-                row[table.rowid_column] = rowid
+        if table.rowid_column is not None:
+            row[table.rowid_column] = raw[table.rowid_column] = rowid
         constraints = [u.constraint for u in upserts if u.constraint is not None]
         constraints += [c for c in ["rowid"] + [i for i in table.indexes if i.unique] if c not in constraints]
+        # SQLite applies the column affinities to the new values in place when
+        # it checks the first index; an upsert's "excluded" row shows them
+        # converted only if the conflict was found after that.
+        converted = False
         for constraint in constraints:
             if constraint == "rowid":
                 other = rowid if rowid in tree else None
             else:
+                converted = True
                 other = self.find_conflict(constraint, row, None)
             if other is None:
                 continue
             upsert = next((u for u in upserts if u.constraint in (constraint, None)), None)
             if upsert is not None:
-                return upsert.apply(tree, other, row + [rowid])
+                return upsert.apply(tree, other, (row if converted else raw) + [rowid])
             if conflict == "IGNORE":
                 return None
             if conflict == "REPLACE":
@@ -1760,6 +1778,28 @@ class Executor:
         return IntegrityError(f"UNIQUE constraint failed: {table.name}.{name}")
 
     # ---- indexes -------------------------------------------------------------
+
+    def reindex(self, name: str | None) -> Result:
+        """Rebuild the indexes of ``name`` (an index, a table, or the default
+        collation BINARY), or all of them."""
+        catalog = self.catalog
+        lowered = None if name is None else ascii_lower(name)
+        if lowered is None or lowered == "binary":
+            indexes = list(catalog.indexes.values())
+        elif lowered in catalog.indexes:
+            indexes = [catalog.indexes[lowered]]
+        elif lowered in catalog.tables:
+            indexes = list(catalog.tables[lowered].indexes)
+        elif lowered in ("nocase", "rtrim"):
+            indexes = []  # no index uses these collations
+        else:
+            raise OperationalError("unable to identify the object to be reindexed")
+        for index in indexes:
+            tree = catalog.index_tree(index)
+            tree.clear()
+            for rowid, record in catalog.table_tree(index.table).scan():
+                tree.insert(index.key(self.load_row(index.table, rowid, record), rowid), b"")
+        return Result()
 
     def create_index(self, stmt: CreateIndex) -> Result:
         index = self.catalog.create_index(stmt)
@@ -2065,9 +2105,10 @@ class PreparedInsert:
 class PreparedSingleTable:
     """The part of UPDATE / DELETE that finds the rows matching WHERE."""
 
-    def __init__(self, executor: Executor, table_name: str, where: Expr | None) -> None:
+    def __init__(self, executor: Executor, table_name: str, where: Expr | None, indexed_by: str | None = None) -> None:
         self.executor = executor
         self.table = executor.catalog.table_to_modify(table_name)
+        executor.catalog.check_index_hint(self.table, indexed_by)
         self.tree = executor.catalog.table_tree(self.table)
         self.scope = Scope()
         joins, _ = executor.build_from([Join(TableRef(self.table.name))], self.scope)
@@ -2084,7 +2125,7 @@ class PreparedSingleTable:
 
 class PreparedUpdate(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Update) -> None:
-        super().__init__(executor, stmt.table, stmt.where)
+        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by)
         table, width = self.table, len(self.table.columns)
         compiler = Compiler(self.scope, executor=executor)
         self.assignments = []
@@ -2129,7 +2170,7 @@ class PreparedUpdate(PreparedSingleTable):
 
 class PreparedDelete(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Delete) -> None:
-        super().__init__(executor, stmt.table, stmt.where)
+        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by)
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         self.delete_all = stmt.where is None and self.returning is None
 
@@ -2160,7 +2201,7 @@ class PreparedUpsert:
             # SET and WHERE see the existing row (by the table's name) and "excluded".
             self.scope = Scope()
             self.scope.add(table)
-            self.scope.add(table, "excluded")
+            self.scope.add(ExcludedSource(table))
             # An unqualified name is the existing row's column; excluded.x must be qualified.
             self.scope.entries[1].hidden.update(ascii_lower(c.name) for c in table.columns)
             compiler = Compiler(self.scope, executor=executor)
@@ -2261,6 +2302,22 @@ def combine(operator: str, left: list[tuple], right: list[tuple]) -> list[tuple]
             if (k in right_keys) == want:
                 kept[k] = row
     return [kept[k] for k in sorted(kept)]
+
+
+class ExcludedSource:
+    """The ``excluded`` row of an upsert: the table's columns without
+    affinities (as in SQLite; its values may not be converted either, see
+    Executor.insert_row)."""
+
+    has_rowid = True
+    indexes = ()
+
+    def __init__(self, table: TableInfo) -> None:
+        self.name = "excluded"
+        self.columns = table.columns
+        self.rowid_column = table.rowid_column
+        self.affinities = [None] * len(table.columns)
+        self.column_index = table.column_index
 
 
 class ColumnName:

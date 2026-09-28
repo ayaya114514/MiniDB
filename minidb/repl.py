@@ -15,7 +15,7 @@ from minidb.btree import BTree
 from minidb.database import Database
 from minidb.errors import Error
 from minidb.tokenizer import SQLSyntaxError, tokenize
-from minidb.values import SQLValue, ascii_lower, to_text
+from minidb.values import SQLValue, to_text
 
 PROMPT = "minidb> "
 CONTINUATION_PROMPT = "   ...> "
@@ -59,14 +59,15 @@ class Shell:
         if command == ".help":
             self.write(HELP)
         elif command == ".tables":
-            names = sorted([t.name for t in catalog.tables.values()] + [v.name for v in catalog.views.values()])
+            names = sorted([t.name for t in catalog.tables.values()] + [v.name for v in catalog.views.values()]
+                           + [f"temp.{v.name}" for v in catalog.temp_views.values()])
             if names:
                 self.write(" ".join(names))
         elif command == ".schema":
             tables = sorted(catalog.tables.values(), key=lambda t: t.name)
-            views = sorted(catalog.views.values(), key=lambda v: v.name)
+            views = sorted([*catalog.views.values(), *catalog.temp_views.values()], key=lambda v: v.name)
             if args:
-                view = catalog.views.get(ascii_lower(args[0]))
+                view = catalog.find_view(args[0])
                 tables, views = ([], [view]) if view else ([catalog.get_table(args[0])], [])
             for table in tables:
                 self.write(table.sql() + ";")

@@ -15,7 +15,7 @@ LITERALS = [
 
 BINARY_OPERATORS = [
     "+", "-", "*", "/", "%", "||", "=", "!=", "<", "<=", ">", ">=", "IS", "IS NOT",
-    "AND", "OR", "LIKE",
+    "AND", "OR", "LIKE", "&", "|", "<<", ">>",
 ]
 
 
@@ -34,7 +34,8 @@ def test_binary_operators_on_literals(pair, op):
 
 @pytest.mark.parametrize("value", LITERALS)
 def test_unary_operators_and_functions(pair, value):
-    for expr in ["-{v}", "+{v}", "NOT {v}", "- -{v}", "abs({v})", "length({v})", "lower({v})",
+    for expr in ["-{v}", "+{v}", "NOT {v}", "- -{v}", "~{v}", "~~{v}", "{v} << 63", "{v} >> 70",
+                 "{v} << -2", "-1 >> {v}", "1 << {v}", "abs({v})", "length({v})", "lower({v})",
                  "upper({v})", "typeof({v})", "coalesce({v}, 'x')", "ifnull({v}, 3)",
                  "nullif({v}, 1)", "min({v}, 1)", "max({v}, 'a', 2)", "{v} IS NULL",
                  "{v} IN (1, 'abc', NULL)", "{v} NOT IN (1, 2)", "{v} IN (1, 2)",

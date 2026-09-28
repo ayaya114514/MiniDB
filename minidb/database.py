@@ -13,7 +13,7 @@ from minidb.locking import LockTimeout
 from minidb.pager import Pager
 from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, CreateView, Delete, DropIndex, DropTable,
-    DropView, Insert, Rollback, Update, parse_script,
+    DropView, Insert, Reindex, Rollback, Update, parse_script,
 )
 from minidb.values import INT_MAX, INT_MIN, SQLValue
 
@@ -26,7 +26,7 @@ CACHE_PAGES_AFTER_SPILL = 2000
 CHECKPOINT_FRAMES = 1000  # try to checkpoint once the log holds this many committed frames
 WRITE_STATEMENTS = (
     Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex, CreateView, DropView,
-    Analyze,
+    Analyze, Reindex,
 )
 
 

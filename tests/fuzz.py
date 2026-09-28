@@ -169,7 +169,8 @@ class Generator:
         kind = rng.random()
         sub = lambda safe=text_safe: self.expr(scope, depth + 1, safe)  # noqa: E731
         if kind < 0.35:
-            ops = ["+", "-", "*", "%", "=", "!=", "<", "<=", ">", ">=", "AND", "OR", "IS", "IS NOT"]
+            ops = ["+", "-", "*", "%", "=", "!=", "<", "<=", ">", ">=", "AND", "OR", "IS", "IS NOT",
+                   "&", "|", "<<", ">>"]
             if not text_safe:
                 ops.append("/")
             op = rng.choice(ops)
@@ -177,7 +178,7 @@ class Generator:
         if kind < 0.45:
             return f"({sub(True)} || {sub(True)})"
         if kind < 0.55:
-            return f"{rng.choice(['-', '+', 'NOT '])}({sub()})"
+            return f"{rng.choice(['-', '+', 'NOT ', '~'])}({sub()})"
         if kind < 0.62:
             negated = rng.choice(["", "NOT "])
             return f"({sub()} {negated}BETWEEN {sub()} AND {sub()})"

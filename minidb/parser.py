@@ -57,13 +57,13 @@ class Star:
 
 @dataclass(frozen=True)
 class Unary:
-    op: str  # "-", "+" or "NOT"
+    op: str  # "-", "+", "~" or "NOT"
     operand: object
 
 
 @dataclass(frozen=True)
 class Binary:
-    op: str  # OR AND = != < <= > >= IS "IS NOT" + - * / % ||
+    op: str  # OR AND = != < <= > >= IS "IS NOT" + - * / % || & | << >>
     left: object
     right: object
 
@@ -166,6 +166,7 @@ class CreateView:
     query: object  # Select or Compound
     if_not_exists: bool = False
     sql: str = ""  # the statement's text, stored in the schema as SQLite does
+    temp: bool = False  # CREATE TEMP VIEW: kept in memory by this connection only
 
 
 @dataclass
@@ -218,6 +219,7 @@ class SelectItem:
 class TableRef:
     name: str
     alias: str | None = None
+    indexed_by: str | None = None  # INDEXED BY <index>: must exist; only checked
 
 
 @dataclass
@@ -307,6 +309,7 @@ class Update:
     where: object = None
     conflict: str = "ABORT"
     returning: list | None = None
+    indexed_by: str | None = None
 
 
 @dataclass
@@ -314,6 +317,12 @@ class Delete:
     table: str
     where: object = None
     returning: list | None = None
+    indexed_by: str | None = None
+
+
+@dataclass
+class Reindex:
+    name: str | None = None  # an index, a table or a collation; None: every index
 
 
 # Any expression node, and any statement.
@@ -322,7 +331,7 @@ Expr = Union[
     Subquery, InSelect, Exists, Call,
 ]
 Statement = Union[
-    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Insert, Select, Compound, Update, Delete,
+    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Insert, Select, Compound, Update, Delete,
     Begin, Commit, Rollback, Analyze, Explain,
 ]
 
@@ -467,14 +476,27 @@ class Parser:
             return self.create()
         if self.at_keyword("DROP"):
             return self.drop()
+        if self.at_word("REINDEX"):
+            self.advance()
+            if self.tok.kind != "IDENT":
+                return Reindex()
+            name = self.advance().value
+            if self.accept_op("."):  # schema.name: only the main schema exists
+                name = self.identifier("index or table name")
+            return Reindex(name)
         raise self.error("a statement")
 
     def create(self) -> CreateTable | CreateIndex | CreateView:
         create = self.expect_keyword("CREATE")
         if self.at_keyword("UNIQUE", "INDEX"):
             return self.create_index()
+        temp = self.at_word("TEMP") or self.at_word("TEMPORARY")
+        if temp:
+            self.advance()
         if self.at_word("VIEW"):
-            return self.create_view(create.pos)
+            return self.create_view(create.pos, temp)
+        if temp:
+            raise NotSupportedError("temporary tables are not supported")
         self.expect_keyword("TABLE")
         if_not_exists = self.if_not_exists()
         name = self.identifier("table name")
@@ -492,7 +514,7 @@ class Parser:
             return True
         return False
 
-    def create_view(self, start: int) -> CreateView:
+    def create_view(self, start: int, temp: bool = False) -> CreateView:
         self.advance()  # VIEW
         if_not_exists = self.if_not_exists()
         name = self.identifier("view name")
@@ -508,7 +530,8 @@ class Parser:
         if self.param_count != parameters:
             raise OperationalError("parameters are not allowed in views")
         last = self.tokens[self.i - 1]
-        return CreateView(name, columns, query, if_not_exists, self.text[start:last.pos + len(last.text)])
+        sql = self.text[start:last.pos + len(last.text)]
+        return CreateView(name, columns, query, if_not_exists, sql, temp)
 
     def create_index(self) -> CreateIndex:
         unique = bool(self.accept_keyword("UNIQUE"))
@@ -810,20 +833,34 @@ class Parser:
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
-        elif self.tok.kind == "IDENT":
+        elif self.tok.kind == "IDENT" and not self.at_word("INDEXED"):
             alias = self.advance().value
-        return TableRef(name, alias)
+        return TableRef(name, alias, self.index_hint())
+
+    def index_hint(self) -> str | None:
+        """``INDEXED BY <index>`` (returned) or ``NOT INDEXED`` (None).  They
+        are checked but do not steer the planner."""
+        if self.at_word("INDEXED"):
+            self.advance()
+            self.expect_keyword("BY")
+            return self.identifier("index name")
+        if self.at_keyword("NOT") and self.tokens[self.i + 1].kind == "IDENT" \
+                and ascii_upper(self.tokens[self.i + 1].text) == "INDEXED":
+            self.advance()
+            self.advance()
+        return None
 
     def update(self) -> Update:
         self.expect_keyword("UPDATE")
         conflict = self.conflict_clause()
         table = self.identifier("table name")
+        indexed_by = self.index_hint()
         self.expect_keyword("SET")
         assignments = [self.assignment()]
         while self.accept_op(","):
             assignments.append(self.assignment())
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Update(table, assignments, where, conflict, self.returning())
+        return Update(table, assignments, where, conflict, self.returning(), indexed_by)
 
     def assignment(self) -> tuple[str, Expr]:
         name = self.identifier("column name")
@@ -834,8 +871,9 @@ class Parser:
         self.expect_keyword("DELETE")
         self.expect_keyword("FROM")
         table = self.identifier("table name")
+        indexed_by = self.index_hint()
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Delete(table, where, self.returning())
+        return Delete(table, where, self.returning(), indexed_by)
 
     # ---- expressions --------------------------------------------------
 
@@ -905,8 +943,15 @@ class Parser:
                 return left
 
     def comparison(self) -> Expr:
-        left = self.additive()
+        left = self.bitwise()
         while self.at_op("<", "<=", ">", ">="):
+            op = self.advance().value
+            left = Binary(op, left, self.bitwise())
+        return left
+
+    def bitwise(self) -> Expr:
+        left = self.additive()
+        while self.at_op("&", "|", "<<", ">>"):
             op = self.advance().value
             left = Binary(op, left, self.additive())
         return left
@@ -936,7 +981,7 @@ class Parser:
             # As in SQLite's grammar, NOT may start an operand; it takes
             # everything that binds tighter than NOT.
             return Unary("NOT", self.not_expr())
-        if self.at_op("-", "+"):
+        if self.at_op("-", "+", "~"):
             op = self.advance().value
             token = self.tok
             if op == "-" and token.kind == "FLOAT" and token.text == "9223372036854775808":
