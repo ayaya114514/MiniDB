@@ -150,3 +150,23 @@
 - 测试：584 个，在参考 SQLite 3.53.4 上：Python 3.12/3.13/3.14 全部通过；3.11 上 581 通过、3 跳过。
 - fuzz（参考 SQLite 3.53.4）：600 种子 × 500 + 150 种子 × 500（文件模式）+ 600 种子 × 400，0 不一致（修复 D71 之前是 1 个失败种子）。3.11 上另跑了 200 种子 × 400，0 不一致。
 - CI：公开仓库 https://github.com/ayaya114514/MiniDB ，GitHub Actions 在 ubuntu-latest 上跑 3.11–3.14 测试矩阵 + fuzz（固定 300 种子、文件模式 100 种子、每次运行换 200 个新种子；每周定时一次）。CI 先编译参考 SQLite（按脚本哈希缓存）再跑测试和 fuzz。
+
+## 阶段 15：外部基准与变形测试（完成）
+- **sqllogictest**（`tools/sqllogictest.py`）：`.test` 格式 runner（`statement ok/error`、`query` 的类型串 / `nosort`/`rowsort`/`valuesort` / 标签 / MD5 哈希结果、`hash-threshold`、`skipif`/`onlyif`、`halt`），结果格式化照官方 C runner；多进程并行；`--json` 输出；`--min-passed` 做回归门槛。语料 622 个文件、1 GB，不入库：sqlite.org 的 Fossil 只对登录用户提供下载，改从 git 镜像按固定提交下载，`tools/sqllogictest.sha3` 固定每个文件的哈希（D72）。
+- **基线**（参考 SQLite 规则，MiniDB 阶段 14 的功能）：622 个文件中 140 个全部通过；**5,939,879 条记录通过 3,743,727 条（63.03%）**，10 进程约 75 s（CPU 713 s）。按每个文件的第一个失败归类（482 个文件）：
+  | 根因 | 文件数 | 例子 |
+  |---|---:|---|
+  | 聚合函数参数前的 `ALL` | 250 | `AVG(ALL col3)` |
+  | 列类型 `FLOAT` | 213 | `CREATE TABLE tab0(pk INTEGER PRIMARY KEY, col0 INTEGER, col1 FLOAT, ...)` |
+  | 列类型 `VARCHAR` | 12 | `CREATE TABLE t1(a INTEGER, b VARCHAR(30))` |
+  | FROM 里带括号的连接 | 5 | `FROM (tab0 AS cor0 CROSS JOIN tab0)` |
+  | 空的 IN 列表 | 2 | `SELECT 1 IN ()` |
+
+  文件内部后续还缺：`CREATE VIEW`（4.4 万条记录）、`INSERT ... SELECT`（5 千条）、`x IN table`、`CREATE TRIGGER`。28 条“结果错误”全部在 `evidence/in1.test`，查明是前面的 `INSERT INTO t5 SELECT * FROM t4` 不支持导致表为空，不是已有功能的错误；**全量语料没有发现崩溃，也没有发现已支持功能的错误结果**。阶段 16 按此排序：列类型亲和性（REAL/NUMERIC/BLOB，任意类型名）、`f(ALL x)`、`IN ()`、括号连接、`INSERT ... SELECT`、`VIEW`、`IN table`，再做其余计划项。
+- **变形测试**（`tests/metamorphic.py`，不依赖 sqlite3）：TLP where / distinct / min / max / count / sum / having 与 NoREC；复用 fuzz 的生成器（改为只生成字面量）；谓词里约三分之一是“列 比较 表中实际存在的值”（D73）。
+  - 两轮：400 种子 × 300 查询（内存）+ 150 种子 × 300（文件模式），共比较 135,330 次（另有 26,696 次因出错跳过），0 不一致。
+  - 变异测试（手工改 `executor.py` 后运行 60 种子 × 200 查询，再还原）：rowid 范围下界总是开区间 → 33 个种子失败（只用随机字面量时仅 2 个，据此加入了边界值条件）；索引 `<=` 上界漏掉等于边界值的行 → 27 个种子失败（NoREC、TLP where、TLP sum 都有发现）。`tests/test_metamorphic.py` 里固定了一个变异（值 3 的真值当成 NULL）必须被发现。
+- `fuzz.py` 只在需要时导入 `sqlcompare`，生成器可以在没有参考 SQLite 的环境里使用。
+- CI：fuzz 作业增加变形测试（固定 200 种子 + 每次换 100 个新种子的文件模式）；新增 sqllogictest 作业（语料按清单哈希缓存，`--min-passed 3743727`）。CI 上的这两项尚未实际运行（本阶段未 push）。
+- 测试：619 个，全部通过（新增 `test_sqllogictest.py` 21 个、`test_metamorphic.py` 14 个）。
+- 已知问题：sqllogictest 的 `label` 只解析不交叉核对（每条记录本身都有期望结果，不影响判定）。

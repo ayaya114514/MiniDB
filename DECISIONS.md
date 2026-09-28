@@ -420,3 +420,27 @@ SQLite 把不引用本层 FROM 中任何表、且不含子查询和非确定函�
 `... WHERE (+(y) IS NULL) AND 0 ...`（整体折叠为 0）时 MiniDB 报了 SQLite 不会报的溢出错误。
 现在 `plan_joins` 把这些项单独返回，SELECT、UPDATE、DELETE 在物化子查询和进入循环之前测试它们。
 （没有被 SQLite 展平的 FROM 子查询，SQLite 可能先物化再测试；这种情况下出错时机仍可能不同。）
+
+## D72 sqllogictest 作为外部基准
+sqllogictest 是 SQLite 自己的、与引擎无关的测试集（约 600 万条记录，期望结果由 SQLite 产生并与
+其他数据库交叉核对），用例不是我们写的，能暴露我们没想到的 SQL 写法。
+- 语料约 1 GB，不入库。sqlite.org 的 Fossil 只对登录用户提供 tarball / raw 下载（匿名登录要过验证码），
+  所以从 git 镜像 `github.com/gregrahn/sqllogictest` 下载，固定到与 Fossil trunk check-in db57eba95d
+  （2026-04-15）对应的提交；镜像不是官方的，因此 `tools/sqllogictest.sha3` 固定每个文件的 SHA3-256，
+  `--fetch` 逐个核对。
+- runner 按官方 C runner 的规则格式化结果（`I` 按 `sqlite3_column_int64` 转换、`R` 用 `%.3f`、
+  `T` 里非可打印 ASCII 变 `@`、空串 `(empty)`），`rowsort`/`valuesort` 按格式化后的文本排序，
+  超过 `hash-threshold` 比较 MD5。按 `sqlite` 引擎处理 `skipif`/`onlyif`。
+- 缺一个功能时，文件开头的 `CREATE TABLE` 失败，后面每条都报 `no such table`，所以报告按“每个文件的
+  第一个失败”统计根因；错误结果和崩溃单独列出（这些不是缺功能而是 bug）。
+- CI 用 `--min-passed` 防止通过数倒退；每补一个功能就调高基线。
+
+## D73 变形测试（TLP、NoREC）
+差分 fuzz 依赖 sqlite3 给答案；TLP / NoREC（SQLancer）只靠 MiniDB 自己：同一查询的两种写法必须一致，
+与存储、索引、计划无关，专门针对优化器（访问路径、多路索引、连接重排）。
+- 查询出错就跳过：规划器可以合法地不在某些行上求值谓词（例如索引范围已经排除了这些行），
+  所以一边出错另一边不出错不算不一致。约 15% 的查询因此跳过。
+- 比较多重集时区分 1 和 1.0；DISTINCT、GROUP BY、MIN/MAX 保留相等的 1 / 1.0 中哪一个取决于访问顺序，
+  这些比较按数值相等。REAL 的 SUM 与加法顺序有关，不比较。
+- 只用随机字面量时，条件很少恰好落在表中已有值上，rowid 下界的差一变异 60 个种子只发现 2 个；
+  加入“列 比较 表中实际存在的值”的条件后发现 33 个。

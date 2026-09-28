@@ -127,14 +127,18 @@ SQL 文本
 
 ```sh
 eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启用参考 SQLite（见下）
-.venv/bin/python -m pytest                                        # 全部测试（580+ 个）
+.venv/bin/python -m pytest                                        # 全部测试（610+ 个）
 .venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
+.venv/bin/python tests/metamorphic.py --seeds 0-399 --queries 300 # 变形测试（不需要 sqlite3）
+.venv/bin/python tools/sqllogictest.py --fetch                    # 下载 SQLite 官方 sqllogictest 语料
+.venv/bin/python tools/sqllogictest.py --jobs 8                   # 跑语料，输出通过率与失败根因
 .venv/bin/python tests/benchmark.py --rows 100000                 # 性能测试
 .venv/bin/python tools/coverage.py                                # 行覆盖率（标准库 trace）
 ```
 
 GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
-固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）。
+固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）；另外跑变形测试和
+sqllogictest 全量语料（通过数低于基线即失败）。
 
 - **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
   且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
@@ -144,6 +148,12 @@ GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全�
   环境变量；链接的 SQLite 带 ICU 时对照测试直接报错。需要 C 编译器。
 - **模糊测试**（`tests/fuzz.py`）：随机 schema（约束、单列/多列/唯一索引）+ 随机增删改查、
   嵌套表达式、聚合、连接、事务、建删索引，每个种子结束时做 `integrity_check`。
+- **sqllogictest**（`tools/sqllogictest.py`）：SQLite 官方的引擎无关测试集，约 594 万条记录。
+  语料按固定版本下载、逐文件校验 SHA3-256，不入库；报告按每个文件的第一个失败归类根因（缺功能时
+  后面的记录会连锁失败），错误结果和崩溃单独列出。当前通过率见 PROGRESS.md。
+- **变形测试**（`tests/metamorphic.py`）：SQLancer 的 TLP（WHERE / DISTINCT / 聚合 / HAVING 按
+  `p`、`NOT p`、`p IS NULL` 三分）和 NoREC（优化器可利用的 WHERE 与逐行求值的 CASE 比较），
+  不依赖 sqlite3，专找优化器 bug；条件里用表中实际存在的值，打在 rowid 和索引范围的边界上。
 - **B+ 树**：上万次随机插入删除后校验不变量（有序、分隔键边界、同深度、填充率、兄弟链）。
 - **类型注解**：`tests/test_annotations.py` 要求每个函数和方法的参数与返回值都有注解，
   并用 `typing.get_type_hints` 解析一遍（写错的名字会失败）。
