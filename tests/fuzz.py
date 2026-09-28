@@ -31,8 +31,6 @@ import sys
 sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from sqlcompare import Pair  # noqa: E402
-
 TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz"]
 
 
@@ -384,6 +382,8 @@ class Generator:
 
 def run_seed(seed, statements, path=None, verbose=False):
     """Run one fuzzing session; returns None or a failure description."""
+    from sqlcompare import Pair  # only here: the generator itself (metamorphic.py) needs no sqlite3
+
     generator = Generator(seed)
     pair = Pair(path, loose_numbers=True)
     history = []
