@@ -4,6 +4,7 @@
     python tools/sqllogictest.py                       # run every file, print a summary
     python tools/sqllogictest.py test/select1.test -v  # one file, show each failure
     python tools/sqllogictest.py --jobs 8 --json out.json
+    python tools/sqllogictest.py --min-passed 3743727    # fail on a regression (CI)
 
 sqllogictest (https://www.sqlite.org/sqllogictest/) is SQLite's own
 engine-independent test suite: a few million queries whose expected results
@@ -416,6 +417,8 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, default=1, help="files to run in parallel")
     parser.add_argument("--top", type=int, default=40, help="failure categories to list")
     parser.add_argument("--json", metavar="PATH", help="write the summary as JSON")
+    parser.add_argument("--min-passed", type=int, default=0,
+                        help="exit with an error if fewer records pass (a regression check)")
     args = parser.parse_args()
     if args.pin:
         fetch(args.pin, pin=True)
@@ -435,6 +438,8 @@ def main() -> None:
     if args.json:
         with open(args.json, "w") as f:
             json.dump(summary, f, indent=1)
+    if summary["passed"] < args.min_passed:
+        sys.exit(f"only {summary['passed']} records passed, expected at least {args.min_passed}")
 
 
 if __name__ == "__main__":
