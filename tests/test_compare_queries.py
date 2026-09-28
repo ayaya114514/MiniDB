@@ -6,6 +6,7 @@ import random
 import pytest
 
 from minidb import Database
+from minidb.errors import NotSupportedError, OperationalError
 from sqlcompare import Pair
 
 SETUP = [
@@ -511,4 +512,77 @@ def test_function_calls_make_sqlite_keep_a_statement_journal(table, sql):
     for step in [table, "INSERT INTO t VALUES (1, 1), (3, 3)", "BEGIN", sql, "SELECT rowid, * FROM t",
                  "COMMIT", "SELECT rowid, * FROM t"]:
         pair.run(step)
+    pair.close()
+
+
+def test_bitwise_precedence_distinct_and_index_hints():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "SELECT 5 & 3, 5 | 3, 1 << 2 + 1, (1 << 2) + 1, 6 & 3 = 2, ~0, - ~1, 2 | 1 < 3, 1 || 2 << 1, 3 * 2 << 1",
+        "SELECT 1 << 63, 1 << 64, -8 >> 1, -1 >> 70, 1 << -1, 2 << 1.5, '5' & 1.9, NULL | 1, ~NULL, ~'7'",
+        "SELECT 4 & 6 | 1, 4 | 6 & 1, 1 << 2 << 3, 256 >> 2 >> 3, ~5 & 7, NOT 1 & 0",
+        "CREATE TABLE t (a, b)", "CREATE INDEX ta ON t (a)", "CREATE TABLE u (x)", "CREATE INDEX ux ON u (x)",
+        "INSERT INTO t VALUES (1, 2), (3, 4), (1, 5)",
+        "SELECT abs(DISTINCT a) FROM t", "SELECT count(DISTINCT a, b) FROM t", "SELECT max(DISTINCT a, b) FROM t",
+        "SELECT group_concat(DISTINCT a, '-') FROM t", "SELECT coalesce(DISTINCT a, b) FROM t",
+        "SELECT total(DISTINCT a), sum(DISTINCT a), avg(DISTINCT a), count(DISTINCT a) FROM t",
+        "SELECT a FROM t INDEXED BY ta WHERE a > 0", "SELECT a FROM t AS x INDEXED BY ta",
+        "SELECT a FROM t INDEXED BY ux", "SELECT a FROM t INDEXED BY nope", "SELECT a FROM t NOT INDEXED WHERE a = 1",
+        "UPDATE t INDEXED BY ta SET b = 5 WHERE a = 1", "DELETE FROM t NOT INDEXED WHERE a = 9",
+        "UPDATE t INDEXED BY ux SET b = 5", "SELECT * FROM t",
+        "REINDEX", "REINDEX t", "REINDEX ta", "REINDEX nocase", "REINDEX binary", "REINDEX nope", "REINDEX main.t",
+        "SELECT * FROM t WHERE a = 1",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_temporary_views():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (a, b)", "INSERT INTO t VALUES (1, 2), (3, 4)",
+        "CREATE TEMP VIEW tv AS SELECT a FROM t", "SELECT * FROM tv",
+        "CREATE VIEW tv AS SELECT 1", "SELECT * FROM tv",  # the temporary view wins
+        "CREATE TEMP VIEW t AS SELECT 5", "SELECT * FROM t", "INSERT INTO t VALUES (9, 9)", "DROP TABLE t",
+        "DROP VIEW t", "SELECT * FROM t", "DROP VIEW tv", "SELECT * FROM tv", "DROP VIEW tv", "SELECT * FROM tv",
+        "CREATE TEMPORARY VIEW IF NOT EXISTS w AS SELECT 2", "CREATE TEMP VIEW w AS SELECT 3", "SELECT * FROM w",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_temporary_views_are_not_stored(tmp_path):
+    path = str(tmp_path / "temp.db")
+    db = Database(path)
+    db.execute("CREATE TABLE t (a); CREATE TEMP VIEW v AS SELECT a FROM t")
+    assert db.execute("SELECT * FROM v") == []
+    db.close()
+    db = Database(path)
+    with pytest.raises(OperationalError, match="no such table: v"):
+        db.execute("SELECT * FROM v")
+    db.close()
+    with pytest.raises(NotSupportedError):
+        Database(None).execute("CREATE TEMP TABLE x (a)")
+
+
+@pytest.mark.parametrize("table", [
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB, s TEXT UNIQUE, i INTEGER, r)",
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB, s TEXT UNIQUE, i INTEGER UNIQUE, r)",
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB, s TEXT, i INTEGER, r)",
+])
+@pytest.mark.parametrize("target", ["(id)", "(s)", "", "(i)"])
+def test_upsert_excluded_values(table, target):
+    """excluded.x has no affinity, and its value is converted by the column's
+    affinity only if SQLite found the conflict after checking an index."""
+    pair = Pair(check_messages=True)
+    pair.run(table)
+    pair.run("INSERT INTO t VALUES (1, 0, '0', 5, 7)")
+    for expr in ["t.s = excluded.b", "excluded.s = 0", "excluded.i = '5'", "typeof(excluded.s)",
+                 "excluded.i < '10'", "typeof(excluded.id)", "excluded.id", "excluded.rowid",
+                 "typeof(excluded.i) || typeof(excluded.r)"]:
+        pair.run("UPDATE t SET r = 7 WHERE id = 1")
+        pair.run(f"INSERT INTO t VALUES ('1', 0, 0, '5', 7) ON CONFLICT {target} DO UPDATE SET r = ({expr})")
+        pair.run("SELECT r FROM t ORDER BY rowid")
+        pair.run(f"INSERT INTO t (s, i) VALUES (0, '5') ON CONFLICT {target} DO UPDATE SET r = ({expr})")
+        pair.run("SELECT r FROM t ORDER BY rowid")
     pair.close()

@@ -163,6 +163,7 @@ class Catalog:
     def __init__(self, pager: Pager) -> None:
         self.pager = pager
         self.version = 0  # bumped by every schema change; prepared plans check it
+        self.temp_views = {}  # CREATE TEMP VIEW: this connection only, never stored
         if pager.page_count == 1:
             tree = BTree.create(pager)
             if tree.root != SCHEMA_ROOT:
@@ -211,11 +212,24 @@ class Catalog:
     def has_table(self, name: str) -> bool:
         return ascii_lower(name) in self.tables
 
+    def find_view(self, name: str) -> ViewInfo | None:
+        """The view called ``name``: temporary views come first, as SQLite
+        searches the temp schema before main."""
+        lowered = ascii_lower(name)
+        return self.temp_views.get(lowered) or self.views.get(lowered)
+
     def table_to_modify(self, name: str) -> TableInfo:
         """The table an INSERT, UPDATE or DELETE changes (not a view)."""
-        if ascii_lower(name) in self.views:
+        if self.find_view(name) is not None:
             raise OperationalError(f"cannot modify {name} because it is a view")
         return self.get_table(name)
+
+    def check_index_hint(self, table: TableInfo, index_name: str | None) -> None:
+        """INDEXED BY must name an index of the table."""
+        if index_name is not None:
+            index = self.indexes.get(ascii_lower(index_name))
+            if index is None or index.table is not table:
+                raise OperationalError(f"no such index: {index_name}")
 
     def table_tree(self, table: TableInfo) -> BTree:
         return BTree(self.pager, table.root)
@@ -272,6 +286,14 @@ class Catalog:
     def create_view(self, stmt: CreateView) -> None:
         """Store a view.  Like SQLite, the SELECT is not checked until the
         view is used (it may name tables that do not exist yet)."""
+        if stmt.temp:
+            if ascii_lower(stmt.name) in self.temp_views:
+                if stmt.if_not_exists:
+                    return
+                raise OperationalError(f"view {stmt.name} already exists")
+            self.version += 1
+            self.temp_views[ascii_lower(stmt.name)] = ViewInfo(stmt)
+            return
         if self._exists(stmt.name, stmt.if_not_exists):
             return
         self._check_new_name(stmt.name)
@@ -281,6 +303,10 @@ class Catalog:
         self.views[ascii_lower(stmt.name)] = view
 
     def drop_view(self, name: str, if_exists: bool = False) -> None:
+        if ascii_lower(name) in self.temp_views:
+            self.version += 1
+            del self.temp_views[ascii_lower(name)]
+            return
         if ascii_lower(name) in self.tables:
             raise OperationalError(f"use DROP TABLE to delete table {name}")
         view = self.views.get(ascii_lower(name))
@@ -293,7 +319,7 @@ class Catalog:
         del self.views[ascii_lower(name)]
 
     def drop_table(self, name: str, if_exists: bool = False) -> None:
-        if ascii_lower(name) in self.views:
+        if self.find_view(name) is not None:
             raise OperationalError(f"use DROP VIEW to delete view {name}")
         if not self.has_table(name):
             if if_exists:

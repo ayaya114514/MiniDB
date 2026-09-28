@@ -304,6 +304,50 @@ def negate(a: SQLValue) -> SQLValue:
     return -a
 
 
+def _signed(value: int) -> int:
+    """Wrap to a signed 64-bit integer."""
+    value &= 0xFFFFFFFFFFFFFFFF
+    return value - (1 << 64) if value > INT_MAX else value
+
+
+def bit_and(a: SQLValue, b: SQLValue) -> int | None:
+    if a is None or b is None:
+        return None
+    return to_int64(a) & to_int64(b)
+
+
+def bit_or(a: SQLValue, b: SQLValue) -> int | None:
+    if a is None or b is None:
+        return None
+    return to_int64(a) | to_int64(b)
+
+
+def bit_not(a: SQLValue) -> int | None:
+    return None if a is None else ~to_int64(a)
+
+
+def shift(a: SQLValue, b: SQLValue, left: bool) -> int | None:
+    """``a << b`` (``left``) or ``a >> b`` as SQLite computes them: a negative
+    amount shifts the other way, 64 or more gives 0 (or -1 shifting a
+    negative number right), and left shifts wrap around."""
+    if a is None or b is None:
+        return None
+    value, amount = to_int64(a), to_int64(b)
+    if amount < 0:
+        left, amount = not left, -amount
+    if amount >= 64:
+        return 0 if value >= 0 or left else -1
+    return _signed(value << amount) if left else value >> amount
+
+
+def shift_left(a: SQLValue, b: SQLValue) -> int | None:
+    return shift(a, b, True)
+
+
+def shift_right(a: SQLValue, b: SQLValue) -> int | None:
+    return shift(a, b, False)
+
+
 def concat(a: SQLValue, b: SQLValue) -> SQLValue:
     if a is None or b is None:
         return None
