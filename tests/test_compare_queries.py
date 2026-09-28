@@ -5,6 +5,7 @@ import random
 
 import pytest
 
+from minidb import Database
 from sqlcompare import Pair
 
 SETUP = [
@@ -296,3 +297,79 @@ def test_sqllogictest_syntax(pair):
         "SELECT x.a, count(*) FROM (t x CROSS JOIN u) GROUP BY x.a",
     ]:
         pair.run(sql)
+
+
+def test_insert_select():
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c REAL)")
+    pair.run("CREATE TABLE u (x INTEGER, y TEXT UNIQUE)")
+    pair.run("INSERT INTO t VALUES (1, 'x', 1), (2, '2', 2.5), (5, NULL, '3')")
+    for sql in [
+        "INSERT INTO u SELECT a, b FROM t", "SELECT * FROM u",
+        "INSERT INTO u SELECT a, b FROM t",  # UNIQUE: the whole statement fails
+        "SELECT * FROM u",
+        "INSERT INTO t SELECT a + 10, b, c FROM t",  # reads the table it inserts into
+        "INSERT INTO t (b) SELECT b FROM t WHERE a > 3",  # new row ids after the largest
+        "SELECT *, typeof(c) FROM t",
+        "INSERT INTO t SELECT a FROM t", "INSERT INTO t (a, b) SELECT a FROM t",
+        "INSERT INTO u (y, x) SELECT 'k' || a, count(*) FROM t GROUP BY a HAVING a < 3 ORDER BY 1 LIMIT 1",
+        "INSERT INTO u SELECT 1, 'z' UNION ALL SELECT 2, 'w'",
+        "INSERT INTO u SELECT * FROM (SELECT 3, 'v') WHERE 0",
+        "INSERT INTO u SELECT x, y || '!' FROM u WHERE x IN (SELECT a FROM t)",
+        "SELECT * FROM u",
+        "INSERT INTO t SELECT * FROM t WHERE a = 1",
+        "INSERT INTO nowhere SELECT 1", "INSERT INTO u (nope) SELECT 1",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_views():
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (a INTEGER, b TEXT)")
+    pair.run("INSERT INTO t VALUES (1, 'x'), (3, 'y'), (2, NULL)")
+    for sql in [
+        "CREATE VIEW v AS SELECT a, b || '!' FROM t", "SELECT * FROM v ORDER BY a",
+        "CREATE VIEW v AS SELECT 1", "CREATE VIEW t AS SELECT 1", "CREATE TABLE v (x)",
+        "CREATE VIEW IF NOT EXISTS v AS SELECT 1", "CREATE TABLE IF NOT EXISTS v (x)",
+        "CREATE VIEW w (x, y) AS SELECT a, b FROM t WHERE a > 1", "SELECT x, y FROM w ORDER BY x",
+        "CREATE VIEW w2 (x) AS SELECT a, b FROM t", "SELECT * FROM w2",  # error only when used
+        "CREATE VIEW bad AS SELECT * FROM nosuch", "SELECT * FROM bad",
+        "INSERT INTO v VALUES (1, 2)", "UPDATE v SET a = 1", "DELETE FROM v",
+        "DROP TABLE v", "DROP VIEW t", "DROP VIEW nosuch", "DROP VIEW IF EXISTS nosuch",
+        "CREATE INDEX i ON v (a)", "CREATE INDEX v ON t (a)",
+        "CREATE VIEW dup AS SELECT a, a, A AS a FROM t", "SELECT * FROM dup ORDER BY 1",
+        "SELECT * FROM (SELECT a, a FROM t) ORDER BY 1",
+        "CREATE VIEW top AS SELECT a AS q FROM t ORDER BY a DESC LIMIT 1", "SELECT * FROM top",
+        "SELECT * FROM top JOIN w ON q = x", "SELECT v.a, x.a FROM v, v AS x WHERE v.a < x.a ORDER BY 1, 2",
+        "SELECT q, (SELECT count(*) FROM v) FROM top WHERE q IN (SELECT a FROM v)",
+        "SELECT count(*), sum(a), max(\"b || '!'\") FROM v", "SELECT 3 IN top, 4 IN top",
+        "SELECT b, count(*) FROM w GROUP BY b ORDER BY 1",
+        "UPDATE t SET a = a + 10 WHERE a IN (SELECT q FROM top)",
+        "DELETE FROM t WHERE EXISTS (SELECT 1 FROM w WHERE w.x = t.a AND w.y IS NULL)",
+        "SELECT * FROM t ORDER BY a", "INSERT INTO t SELECT a + 100, b FROM v", "SELECT * FROM v ORDER BY a",
+        "CREATE VIEW c1 AS SELECT * FROM c2", "CREATE VIEW c2 AS SELECT * FROM c1", "SELECT * FROM c1",
+        "CREATE VIEW self AS SELECT * FROM self", "SELECT * FROM self",
+        "DROP VIEW v", "SELECT * FROM v", "CREATE VIEW v AS SELECT a * 2 AS a FROM t", "SELECT * FROM v ORDER BY a",
+        "CREATE VIEW nested AS SELECT a FROM v WHERE a > 4", "SELECT * FROM nested ORDER BY a",
+        "DROP TABLE t", "SELECT * FROM v", "SELECT * FROM nested",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_views_are_stored(tmp_path):
+    path = str(tmp_path / "views.db")
+    db = Database(path)
+    db.execute("CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (5), (-1);"
+               "CREATE VIEW v (x) AS SELECT a + 1 FROM t WHERE a > 0")
+    db.close()
+    db = Database(path)
+    result = db.execute("SELECT * FROM v")
+    assert result == [(6,)] and result.columns == ["x"]
+    assert db.catalog.views["v"].sql == "CREATE VIEW v (x) AS SELECT a + 1 FROM t WHERE a > 0"
+    db.execute("DROP VIEW v")
+    db.close()
+    db = Database(path)
+    assert db.catalog.views == {} and db.integrity_check() == []
+    db.close()

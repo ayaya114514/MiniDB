@@ -1,11 +1,11 @@
 import pytest
 
 from minidb.parser import (
-    Between, Binary, Call, Column, ColumnDef, CreateTable, Delete, DropTable, InList, InSelect,
+    Between, Binary, Call, Column, ColumnDef, Compound, CreateTable, Delete, DropTable, DropView, InList, InSelect,
     Insert, Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef, Unary, Update, parse,
     parse_script,
 )
-from minidb.errors import NotSupportedError
+from minidb.errors import NotSupportedError, OperationalError
 from minidb.tokenizer import SQLSyntaxError
 
 
@@ -384,3 +384,21 @@ def test_in_table_and_empty_in():
     assert first == InSelect(Literal(1), Select([SelectItem(Star())], [Join(TableRef("t"))]))
     assert second == InList(Literal(2), (), negated=True)
     assert parse("SELECT count(ALL x)").items[0].expr == parse("SELECT count(x)").items[0].expr
+
+
+def test_insert_select():
+    stmt = parse("INSERT INTO t (a, b) SELECT x, y FROM u WHERE x > 1")
+    assert stmt.table == "t" and stmt.columns == ["a", "b"] and stmt.rows == []
+    assert isinstance(stmt.query, Select) and stmt.query.where == Binary(">", Column("x"), Literal(1))
+    assert isinstance(parse("INSERT INTO t SELECT 1 UNION SELECT 2").query, Compound)
+
+
+def test_create_and_drop_view():
+    stmt = parse("CREATE VIEW IF NOT EXISTS v (x, y) AS SELECT a, b FROM t;")
+    assert (stmt.name, stmt.columns, stmt.if_not_exists) == ("v", ["x", "y"], True)
+    assert stmt.sql == "CREATE VIEW IF NOT EXISTS v (x, y) AS SELECT a, b FROM t"
+    assert isinstance(stmt.query, Select)
+    assert parse("DROP VIEW IF EXISTS v") == DropView("v", True)
+    assert parse("CREATE TABLE view (view TEXT)").columns[0].name == "view"  # not reserved
+    with pytest.raises(OperationalError, match="parameters are not allowed in views"):
+        parse("CREATE VIEW v AS SELECT ?")

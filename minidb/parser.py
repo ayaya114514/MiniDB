@@ -18,7 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Union
 
-from minidb.errors import NotSupportedError
+from minidb.errors import NotSupportedError, OperationalError
 from minidb.tokenizer import SQLSyntaxError, Token, tokenize
 from minidb.values import ascii_upper
 
@@ -160,6 +160,21 @@ class CreateIndex:
 
 
 @dataclass
+class CreateView:
+    name: str
+    columns: list | None  # the optional column names: CREATE VIEW v(a, b) AS ...
+    query: object  # Select or Compound
+    if_not_exists: bool = False
+    sql: str = ""  # the statement's text, stored in the schema as SQLite does
+
+
+@dataclass
+class DropView:
+    name: str
+    if_exists: bool = False
+
+
+@dataclass
 class DropIndex:
     name: str
     if_exists: bool = False
@@ -175,7 +190,8 @@ class DropTable:
 class Insert:
     table: str
     columns: list | None
-    rows: list  # list of lists of expressions
+    rows: list  # list of lists of expressions (VALUES)
+    query: object = None  # or a Select / Compound (INSERT ... SELECT)
 
 
 @dataclass
@@ -290,7 +306,7 @@ Expr = Union[
     Subquery, InSelect, Exists, Call,
 ]
 Statement = Union[
-    CreateTable, CreateIndex, DropTable, DropIndex, Insert, Select, Compound, Update, Delete,
+    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Insert, Select, Compound, Update, Delete,
     Begin, Commit, Rollback, Analyze, Explain,
 ]
 
@@ -366,6 +382,10 @@ class Parser:
             raise self.error(f'"{op}"')
         return self.advance()
 
+    def at_word(self, word: str) -> bool:
+        """At a non-reserved word such as VIEW (tokenized as an identifier)?"""
+        return self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == word
+
     def expect_word(self, word: str) -> Token:
         """Expect a non-reserved word such as KEY (tokenized as an identifier)."""
         if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == word:
@@ -433,10 +453,12 @@ class Parser:
             return self.drop()
         raise self.error("a statement")
 
-    def create(self) -> CreateTable | CreateIndex:
-        self.expect_keyword("CREATE")
+    def create(self) -> CreateTable | CreateIndex | CreateView:
+        create = self.expect_keyword("CREATE")
         if self.at_keyword("UNIQUE", "INDEX"):
             return self.create_index()
+        if self.at_word("VIEW"):
+            return self.create_view(create.pos)
         self.expect_keyword("TABLE")
         if_not_exists = self.if_not_exists()
         name = self.identifier("table name")
@@ -453,6 +475,24 @@ class Parser:
             self.expect_keyword("EXISTS")
             return True
         return False
+
+    def create_view(self, start: int) -> CreateView:
+        self.advance()  # VIEW
+        if_not_exists = self.if_not_exists()
+        name = self.identifier("view name")
+        columns = None
+        if self.accept_op("("):
+            columns = [self.identifier("column name")]
+            while self.accept_op(","):
+                columns.append(self.identifier("column name"))
+            self.expect_op(")")
+        self.expect_keyword("AS")
+        parameters = self.param_count
+        query = self.query()
+        if self.param_count != parameters:
+            raise OperationalError("parameters are not allowed in views")
+        last = self.tokens[self.i - 1]
+        return CreateView(name, columns, query, if_not_exists, self.text[start:last.pos + len(last.text)])
 
     def create_index(self) -> CreateIndex:
         unique = bool(self.accept_keyword("UNIQUE"))
@@ -491,10 +531,13 @@ class Parser:
             else:
                 return column
 
-    def drop(self) -> DropTable | DropIndex:
+    def drop(self) -> DropTable | DropIndex | DropView:
         self.expect_keyword("DROP")
         if self.accept_keyword("INDEX"):
             kind = DropIndex
+        elif self.at_word("VIEW"):
+            self.advance()
+            kind = DropView
         else:
             self.expect_keyword("TABLE")
             kind = DropTable
@@ -502,8 +545,8 @@ class Parser:
         if self.accept_keyword("IF"):
             self.expect_keyword("EXISTS")
             if_exists = True
-        name = self.identifier("index name" if kind is DropIndex else "table name")
-        return kind(name, if_exists)
+        what = {DropIndex: "index name", DropView: "view name", DropTable: "table name"}[kind]
+        return kind(self.identifier(what), if_exists)
 
     def insert(self) -> Insert:
         self.expect_keyword("INSERT")
@@ -515,6 +558,8 @@ class Parser:
             while self.accept_op(","):
                 columns.append(self.identifier("column name"))
             self.expect_op(")")
+        if self.at_keyword("SELECT"):
+            return Insert(table, columns, [], self.query())
         self.expect_keyword("VALUES")
         rows = [self.value_row()]
         while self.accept_op(","):
