@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
 
-from minidb import values
+from minidb import functions, values
 from minidb.btree import BTree
 from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo, ViewInfo
 from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
@@ -42,6 +42,10 @@ from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, encode_record
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")
+# Functions that read the connection's state: name -> Executor attribute.
+CONNECTION_FUNCTIONS = {
+    "LAST_INSERT_ROWID": "last_insert_rowid", "CHANGES": "changes", "TOTAL_CHANGES": "total_changes",
+}
 
 Row = list  # the values of every table of a query, each followed by its row id
 RowFunction = Callable[[Row], Any]  # a compiled expression
@@ -451,10 +455,19 @@ class Compiler:
     def _like(self, expr: Like) -> RowFunction:
         value = self.compile(expr.expr)
         pattern = self.compile(expr.pattern)
-        like, logical_not = values.like, values.logical_not
+        logical_not = values.logical_not
+        if expr.op == "GLOB":
+            glob = functions.glob
+            match = lambda row: glob(pattern(row), value(row))  # noqa: E731
+        elif expr.escape is not None:
+            escape, like_escape = self.compile(expr.escape), functions.like_escape
+            match = lambda row: like_escape(value(row), pattern(row), escape(row))  # noqa: E731
+        else:
+            like = values.like
+            match = lambda row: like(value(row), pattern(row))  # noqa: E731
         if expr.negated:
-            return lambda row: logical_not(like(value(row), pattern(row)))
-        return lambda row: like(value(row), pattern(row))
+            return lambda row: logical_not(match(row))
+        return match
 
     def _cast(self, expr: Cast) -> tuple[RowFunction, str | None]:
         target = values.type_affinity(expr.type_name)
@@ -567,13 +580,20 @@ class Compiler:
         name = expr.name
         if values.is_aggregate_call(name, len(expr.args)):
             return self._aggregate(expr)
-        if name not in values.SCALAR_FUNCTIONS:
+        if name in CONNECTION_FUNCTIONS:
+            if expr.args:
+                raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
+            executor, attribute = self.executor, CONNECTION_FUNCTIONS[name]
+            return lambda row: getattr(executor, attribute)
+        if name not in functions.SCALAR_FUNCTIONS:
             raise OperationalError(f"no such function: {ascii_lower(name)}")
-        function, min_args, max_args = values.SCALAR_FUNCTIONS[name]
+        function, min_args, max_args = functions.SCALAR_FUNCTIONS[name]
         # DISTINCT means nothing to a scalar function; SQLite ignores it.
         if len(expr.args) < min_args or (max_args is not None and len(expr.args) > max_args):
             raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
         args = [self.compile(arg) for arg in expr.args]
+        if not args:
+            return lambda row: function()
         if len(args) == 1:
             (arg,) = args
             return lambda row: function(arg(row))
@@ -1123,6 +1143,8 @@ class Executor:
         self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
         self.expanding = []  # views being compiled (to detect a view that uses itself)
         self.statement_journal = True  # see PreparedInsert.statement_journal
+        self.changes = 0  # changes() and total_changes(), kept up to date by Database
+        self.total_changes = 0
 
     def execute(self, stmt: Statement, parameters: Sequence[SQLValue] = ()) -> Result:
         """Execute a parsed statement with the given parameter values (a list

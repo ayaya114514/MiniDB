@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from minidb.errors import OperationalError
+from minidb.fp import atof
 from minidb.values import ascii_upper
 
 KEYWORDS = {
@@ -122,9 +123,28 @@ def tokenize(text: str) -> list[Token]:
     return tokens
 
 
+def _unrecognized(text: str, start: int, i: int) -> None:
+    """A number run into letters (12abc, 1e, 0xg): SQLite's error names the
+    whole run."""
+    while i < len(text) and (text[i].isalnum() or text[i] in "_$"):
+        i += 1
+    raise SQLSyntaxError(f'unrecognized token: "{text[start:i]}"', text, start)
+
+
 def _number(text: str, start: int) -> Token:
     i = start
     n = len(text)
+    if text.startswith(("0x", "0X"), start):
+        i = start + 2
+        while i < n and text[i] in "0123456789abcdefABCDEF":
+            i += 1
+        literal = text[start:i]
+        if i == start + 2 or (i < n and (text[i].isalnum() or text[i] in "_$")):
+            _unrecognized(text, start, i)
+        if len(literal[2:].lstrip("0")) > 16:
+            raise SQLSyntaxError(f"hex literal too big: {literal}", text, start)
+        value = int(literal[2:], 16)
+        return Token("INTEGER", value - (1 << 64) if value >= 1 << 63 else value, start, literal)
     while i < n and text[i].isdigit():
         i += 1
     is_float = False
@@ -143,14 +163,14 @@ def _number(text: str, start: int) -> Token:
             while i < n and text[i].isdigit():
                 i += 1
     if i < n and (text[i].isalpha() or text[i] == "_"):
-        raise SQLSyntaxError("malformed number", text, start)
+        _unrecognized(text, start, i)
     literal = text[start:i]
     if is_float:
-        return Token("FLOAT", float(literal), start, literal)
+        return Token("FLOAT", atof(literal), start, literal)
     value = int(literal)
     if value >= 2**63:
         # Like SQLite, integer literals too large for 64 bits become REAL.
-        return Token("FLOAT", float(literal), start, literal)
+        return Token("FLOAT", atof(literal), start, literal)
     return Token("INTEGER", value, start, literal)
 
 
