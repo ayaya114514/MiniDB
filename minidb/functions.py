@@ -17,6 +17,7 @@ from functools import lru_cache
 
 from minidb import values
 from minidb.errors import OperationalError
+from minidb.dates import DATE_FUNCTIONS
 from minidb.fp import atof
 from minidb.values import INT_MAX, INT_MIN, SQLValue, numeric_type_value, to_int64, to_text
 
@@ -70,11 +71,15 @@ def substr(value: SQLValue, start: SQLValue, length: SQLValue = LENGTH_LIMIT) ->
 
 
 def replace(value: SQLValue, pattern: SQLValue, replacement: SQLValue) -> SQLValue:
-    if value is None or pattern is None or replacement is None:
+    """In SQLite's order: an empty pattern returns X (as text) even when the
+    replacement is NULL."""
+    if value is None or pattern is None:
         return None
     pattern_text = to_text(pattern)
     if pattern_text == "":
-        return to_text(value)  # unchanged (but as text: SQLite has read it as text)
+        return to_text(value)
+    if replacement is None:
+        return None
     return to_text(value).replace(pattern_text, to_text(replacement))
 
 
@@ -504,6 +509,7 @@ def _printf(*args: SQLValue) -> str | None:
 SCALAR_FUNCTIONS = {
     **values.SCALAR_FUNCTIONS,
     **MATH_FUNCTIONS,
+    **DATE_FUNCTIONS,
     "CHAR": (char, 0, None),
     "CONCAT": (concat, 1, None),
     "CONCAT_WS": (concat_ws, 2, None),
