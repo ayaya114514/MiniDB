@@ -27,7 +27,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
 
-from minidb import functions, values
+from minidb import dates, functions, values
 from minidb.btree import BTree
 from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo, ViewInfo
 from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
@@ -1155,6 +1155,7 @@ class Executor:
         indexed by parameter number - 1)."""
         self.parameters[:] = parameters
         self.statement_journal = True
+        dates.statement_time[0] = None  # 'now' is fixed for the length of a statement
         if isinstance(stmt, (Select, Compound, Insert, Update, Delete)):
             plan = self.prepare(stmt)
             for cache in plan.once_caches:

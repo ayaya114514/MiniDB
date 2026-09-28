@@ -149,3 +149,51 @@ def test_real_to_text_and_back_match_sqlite(pair):
         chunk = literals[i:i + 100]
         pair.run("SELECT " + ", ".join(chunk))
         pair.run("SELECT " + ", ".join(f"CAST('{lit}' AS REAL)" for lit in chunk))
+
+
+TIMES = [
+    "'2024-02-29'", "'2023-02-29'", "'2024-01-31 12:34:56'", "'2024-01-31T12:34:56.789'", "'12:34:56'",
+    "'12:34'", "'12:34:56.1234567'", "'2024-12-31 23:59:59.999'", "'0000-01-01'", "'-0100-03-01'",
+    "'9999-12-31 23:59:59'", "'2024-06-15 10:00:00+05:30'", "'2024-06-15 10:00:00Z'", "2460000.5", "0",
+    "1700000000", "-1", "'2460000.25'", "'abc'", "NULL", "'2024-13-01'", "'24:00'", "x'323032342d30312d3031'",
+]
+MODIFIERS = [
+    "'+1 day'", "'-1 days'", "'+1.5 hours'", "'-90 seconds'", "'+1 month'", "'+13 months'", "'-1 year'",
+    "'+0.5 year'", "'start of month'", "'start of year'", "'start of day'", "'weekday 0'", "'weekday 3'",
+    "'weekday 6.5'", "'unixepoch'", "'julianday'", "'auto'", "'subsec'", "'floor'", "'ceiling'",
+    "'+1-02-03'", "'-0001-01-01 12:00'", "'+12:30'", "'-01:15:30.5'", "'bogus'", "NULL", "'+1 DAY'",
+    "'+10000 years'", "'+1 days '", "'localtime'", "'utc'",
+]
+
+
+@pytest.mark.parametrize("value", TIMES)
+def test_date_and_time_functions(pair, value):
+    for template in ["date({t})", "time({t})", "datetime({t})", "julianday({t})", "unixepoch({t})",
+                     "strftime('%Y|%m|%d|%H|%M|%S|%f|%j|%J|%s|%w|%u|%W|%U|%V|%G|%g|%e|%k|%l|%I|%p|%P|%F|%R|%T|%%', {t})"]:
+        pair.run("SELECT " + template.format(t=value))
+    for modifier in MODIFIERS:
+        pair.run(f"SELECT datetime({value}, {modifier}), julianday({value}, {modifier}), "
+                 f"unixepoch({value}, {modifier}), date({value}, {modifier}, '+1 day')")
+    for other in TIMES[:14]:
+        pair.run(f"SELECT timediff({value}, {other})")
+
+
+def test_date_functions_random_and_edge_cases(pair):
+    rng = random.Random(9)
+    for _ in range(500):
+        y, mo, d = rng.randint(-100, 9999), rng.randint(1, 12), rng.randint(1, 31)
+        t = (f"'{'-' if y < 0 else ''}{abs(y):04d}-{mo:02d}-{d:02d} {rng.randint(0, 23):02d}:"
+             f"{rng.randint(0, 59):02d}:{rng.randint(0, 59):02d}.{rng.randint(0, 999):03d}'")
+        mods = "".join(", " + rng.choice(MODIFIERS[:28]) for _ in range(rng.randint(0, 3)))
+        pair.run(f"SELECT datetime({t}{mods}), strftime('%j %W %V %G %s %f', {t}), timediff({t}, '2000-01-01')")
+    for sql in [
+        "SELECT strftime('%', '2024-01-01'), strftime('%Q', '2024-01-01'), strftime('', '2024-01-01')",
+        "SELECT strftime(NULL, 'now'), typeof(strftime('%Y')), typeof(date()), typeof(CURRENT_DATE)",
+        "SELECT length(CURRENT_TIMESTAMP), length(CURRENT_TIME), date('now') = date(), "
+        "julianday('now') = julianday('now'), datetime('now') = CURRENT_TIMESTAMP",
+    ]:
+        pair.run(sql)
+
+
+def test_replace_checks_arguments_in_sqlites_order(pair):
+    pair.run("SELECT replace('ab', '', NULL), replace('ab', 'a', NULL), replace(NULL, '', 'x'), replace(5, '', NULL)")

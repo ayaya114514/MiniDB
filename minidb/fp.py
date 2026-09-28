@@ -272,3 +272,77 @@ def atof(literal: str) -> float:
         d += max(min(e, 10000), -10000)
     value = 0.0 if s == 0 else fp10convert2(s, d)
     return -value if sign == "-" else value
+
+
+def sql_atof(text: str) -> tuple[float, int]:
+    """SQLite's sqlite3AtoF: (value, rc).  rc > 0 if the whole text (spaces
+    aside) is a number, < 0 if a number is followed by other text, 0 if it
+    does not start with a number (the value is 0.0 then)."""
+    data = text.encode("utf-8", "surrogateescape").split(b"\x00", 1)[0]
+    n = len(data)
+    i = 0
+    while i < n and data[i] in b" \t\n\v\f\r":
+        i += 1
+    negative = False
+    s = d = state = 0
+    if i < n and data[i] in b"+-":
+        negative = data[i] == 0x2D
+        if i + 1 < n and 0x30 <= data[i + 1] <= 0x39:
+            i += 1
+    if i < n and 0x30 <= data[i] <= 0x39:
+        state = 1
+        s = data[i] - 0x30
+        i += 1
+        while i < n and 0x30 <= data[i] <= 0x39:
+            s = s * 10 + data[i] - 0x30
+            i += 1
+            if s >= (U64 - 9) // 10:
+                state = 9
+                while i < n and 0x30 <= data[i] <= 0x39:
+                    i += 1
+                    d += 1
+                break
+    elif i < n and data[i] in b"+-":
+        i += 1  # a sign not followed by a digit: no number
+    if i < n and data[i] == 0x2E:
+        i += 1
+        if i < n and 0x30 <= data[i] <= 0x39:
+            state |= 1
+            while i < n and 0x30 <= data[i] <= 0x39:
+                if s < (U64 - 9) // 10:
+                    s = s * 10 + data[i] - 0x30
+                    d -= 1
+                else:
+                    state = 11
+                i += 1
+        elif state == 0:
+            return 0.0, 0
+        state |= 2
+    elif state == 0:
+        return 0.0, 0
+    if i < n and data[i] in b"eE":
+        j = i + 1
+        sign = 1
+        if j < n and data[j] == 0x2D:
+            sign = -1
+            j += 1
+        elif j < n and data[j] == 0x2B:
+            j += 1
+        if j < n and 0x30 <= data[j] <= 0x39:
+            exp = 0
+            while j < n and 0x30 <= data[j] <= 0x39:
+                exp = exp * 10 + data[j] - 0x30 if exp < 10000 else 10000
+                j += 1
+            state |= 2
+            d += sign * exp
+            i = j
+    if s == 0:
+        value = 0.0
+        state |= 4
+    else:
+        value = fp10convert2(s, d)
+    if negative:
+        value = -value
+    while i < n and data[i] in b" \t\n\v\f\r":
+        i += 1
+    return value, (state if i >= n else -1)

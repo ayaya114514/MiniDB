@@ -1042,6 +1042,8 @@ class Parser:
             self.advance()
             if self.accept_op("("):
                 return self.call(ascii_upper(token.value))
+            if ascii_upper(token.text) in ("CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"):
+                return Call(ascii_upper(token.text), ())
             if self.accept_op("."):
                 return Column(self.identifier("column name"), token.value)
             return Column(token.value)

@@ -32,8 +32,11 @@ FUNCTIONS = [
     "abs", "length", "lower", "upper", "coalesce", "ifnull", "nullif", "typeof", "min", "max",
     "substr", "replace", "trim", "ltrim", "rtrim", "instr", "round", "hex", "quote", "unicode",
     "sign", "octet_length", "char", "iif", "concat", "concat_ws", "printf", "glob", "ceil", "floor",
-    "trunc", "sqrt", "ln", "exp", "mod", "pow", "atan2",
+    "trunc", "sqrt", "ln", "exp", "mod", "pow", "atan2", "date", "datetime", "julianday", "strftime",
+    "unixepoch",
 ]
+DATE_MODIFIERS = ["'+1 day'", "'-3 months'", "'start of month'", "'weekday 2'", "'+1.5 hours'", "'unixepoch'",
+                  "'floor'", "'+1-01-01'", "'subsec'"]
 PRINTF_FORMATS = ["'%d'", "'%5.2f'", "'%s|%x'", "'%.3e'", "'%-6s|'", "'%q'", "'%c'", "'%,d'", "'%g'",
                   "'%!.17g'", "'%05.1f'", "'%X-%o'"]
 TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz"]
@@ -227,6 +230,12 @@ class Generator:
             args = [sub(), sub(), sub()]
         elif function == "char":
             args = [str(rng.choice([65, 97, 233, 0x10FFFF, 0, 48])) for _ in range(rng.randint(1, 3))]
+        elif function in ("date", "datetime", "julianday", "unixepoch"):
+            args = [rng.choice([sub(), "'2024-01-31 12:00'", str(rng.randint(0, 2000000000)), "2460000.5"])]
+            args += [rng.choice(DATE_MODIFIERS) for _ in range(rng.randint(0, 2))]
+        elif function == "strftime":
+            args = [rng.choice(["'%Y-%m-%d'", "'%j %W %V'", "'%s %f'", "'%H:%M %p'"]),
+                    rng.choice([sub(), "'2024-02-29 23:59:59.5'"])]
         elif function == "printf":
             args = [rng.choice(PRINTF_FORMATS)] + [sub() for _ in range(rng.randint(1, 2))]
         else:  # coalesce, min, max, concat, concat_ws
