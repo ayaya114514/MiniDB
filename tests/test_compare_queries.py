@@ -373,3 +373,142 @@ def test_views_are_stored(tmp_path):
     db = Database(path)
     assert db.catalog.views == {} and db.integrity_check() == []
     db.close()
+
+
+class StatePair(Pair):
+    """Also compares total_changes, the transaction state and last_insert_rowid."""
+
+    def run(self, sql, ordered=None, parameters=None):
+        super().run(sql, ordered, parameters)
+        assert self.mini.in_transaction == self.lite.in_transaction, sql
+        assert self.mini.total_changes == self.lite.total_changes, sql
+        assert self.mini.last_insert_rowid == self.lite.execute("SELECT last_insert_rowid()").fetchone()[0], sql
+
+
+def test_conflict_resolution():
+    pair = StatePair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, n INTEGER NOT NULL)",
+        "CREATE TABLE p (k TEXT PRIMARY KEY, a INTEGER, b INTEGER, UNIQ INTEGER UNIQUE)",
+        "CREATE UNIQUE INDEX pab ON p (a, b)",
+        "INSERT INTO t VALUES (1, 'a', 1), (2, 'b', 2)",
+        # FAIL keeps the rows before the error, even outside a transaction
+        "INSERT OR FAIL INTO t VALUES (3, 'c', 3), (4, 'a', 4), (5, 'e', 5)", "SELECT * FROM t",
+        "INSERT OR ABORT INTO t VALUES (6, 'f', 6), (7, 'a', 7)", "SELECT * FROM t",
+        "INSERT OR IGNORE INTO t VALUES (6, 'f', 6), (7, 'a', 7), (8, 'h', NULL), (1, 'z', 1), (9, 'i', 9)",
+        "INSERT OR REPLACE INTO t VALUES (10, 'a', 10), (2, 'c', 20)",  # deletes rows 1 and 3
+        "INSERT OR REPLACE INTO t VALUES (11, 'k', NULL)",  # NOT NULL without a default: an error
+        "REPLACE INTO t VALUES (12, 'f', 12)", "REPLACE INTO t (u, n) SELECT u || '2', n FROM t",
+        "SELECT * FROM t",
+        "BEGIN", "INSERT INTO t VALUES (13, 'm', 13)", "INSERT OR ROLLBACK INTO t VALUES (14, 'm', 14)",
+        "SELECT * FROM t", "COMMIT",
+        "BEGIN", "INSERT INTO t VALUES (13, 'm', 13)", "INSERT OR FAIL INTO t VALUES (15, 'o', 15), (16, 'm', 16)",
+        "INSERT OR ABORT INTO t VALUES (17, 'q', 17), (18, 'm', 18)", "COMMIT", "SELECT * FROM t",
+        "UPDATE OR IGNORE t SET u = 'a' WHERE id = 13", "UPDATE OR IGNORE t SET n = NULL WHERE id = 13",
+        "UPDATE OR REPLACE t SET u = 'a' WHERE id = 13", "UPDATE OR REPLACE t SET id = 15 WHERE id = 13",
+        "UPDATE OR FAIL t SET u = 'o' WHERE id = 12", "SELECT * FROM t",
+        "BEGIN", "UPDATE OR ROLLBACK t SET u = 'o' WHERE id = 12", "SELECT * FROM t",
+        "INSERT INTO p VALUES ('x', 1, 1, 1), ('y', 1, 2, 2), ('z', NULL, 1, NULL), ('w', NULL, 1, NULL)",
+        "INSERT OR IGNORE INTO p VALUES ('x', 9, 9, 9), ('v', 1, 1, 9), ('u', 5, 5, 1), ('t', 5, 5, 5)",
+        "INSERT OR REPLACE INTO p VALUES ('s', 1, 2, 1)",  # conflicts with two different rows
+        "SELECT * FROM p ORDER BY k",
+        "UPDATE OR REPLACE p SET a = 5, b = 5 WHERE k = 's'", "SELECT * FROM p ORDER BY k",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_upsert_and_returning():
+    pair = StatePair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE, n INTEGER NOT NULL)",
+        "CREATE TABLE c (word TEXT PRIMARY KEY, hits INTEGER)",
+        "INSERT INTO t VALUES (13, 'm', 13), (20, 'a', 1)",
+        "INSERT INTO t VALUES (13, 'x', 1) ON CONFLICT DO NOTHING",
+        "INSERT INTO t VALUES (13, 'x', 1) ON CONFLICT (id) DO UPDATE SET n = n + excluded.n, u = excluded.u || u",
+        "INSERT INTO t VALUES (21, 'a', 1) ON CONFLICT (u) DO UPDATE SET n = 99 WHERE excluded.n > 5",
+        "INSERT INTO t VALUES (20, 'a', 7) ON CONFLICT (u) DO UPDATE SET n = 99 WHERE excluded.n > 5",
+        "INSERT INTO t VALUES (20, 'a', 7) ON CONFLICT (n) DO NOTHING",
+        "INSERT INTO t VALUES (22, 'q', 7) ON CONFLICT (u) DO UPDATE SET n = NULL",
+        "INSERT INTO t VALUES (13, 'y', 1) ON CONFLICT (u) DO NOTHING",
+        "INSERT INTO t VALUES (13, 'x', 1) ON CONFLICT (u) DO NOTHING ON CONFLICT DO UPDATE SET n = -1 RETURNING *",
+        "INSERT INTO t VALUES (13, 'x', 1) ON CONFLICT (id) DO UPDATE SET id = 20",
+        "INSERT INTO t VALUES (13, 'a', 1) ON CONFLICT (id) DO UPDATE SET n = 5",
+        "INSERT OR REPLACE INTO t VALUES (13, 'a', 1) ON CONFLICT (id) DO NOTHING",
+        "INSERT INTO t VALUES (50, 'zz', 1) ON CONFLICT (u) DO UPDATE SET n = excluded.n RETURNING *",
+        "INSERT INTO t VALUES (51, 'zz', 5) ON CONFLICT (u) DO UPDATE SET n = t.n + excluded.n RETURNING rowid, *",
+        "INSERT INTO t VALUES (51, 'zz', 5) ON CONFLICT (u) DO UPDATE SET n = n + 1 WHERE t.id = 50",
+        "INSERT INTO t VALUES (52, 'zz', 5) ON CONFLICT (u) DO UPDATE SET zz = 1",
+        "INSERT INTO t VALUES (52, 'zz', 5) ON CONFLICT (u) DO UPDATE SET n = excluded.nope",
+        "INSERT INTO t SELECT 40, 'y', 1 WHERE 1 ON CONFLICT DO NOTHING",
+        "SELECT * FROM t",
+        "INSERT INTO c VALUES ('a', 1), ('b', 1), ('a', 1), ('a', 1) ON CONFLICT (word) DO UPDATE SET hits = hits + 1",
+        "SELECT * FROM c",
+        "INSERT INTO t VALUES (30, 'r', 1), (31, 's', 2) RETURNING id * 2 AS dbl, u, typeof(n)",
+        "INSERT INTO t (u, n) VALUES ('t', '3') RETURNING id, n, typeof(n)",
+        "UPDATE t SET n = n + 1 WHERE id >= 30 RETURNING *, rowid",
+        "UPDATE t SET n = n + 1 WHERE id = -5 RETURNING *",
+        "DELETE FROM t WHERE id >= 30 RETURNING id, n", "INSERT OR IGNORE INTO t VALUES (13, 'x', 1) RETURNING id",
+        "INSERT INTO t VALUES (60, 'aa', 1) RETURNING nope", "DELETE FROM t RETURNING upper(u), (SELECT count(*) FROM c)",
+        "SELECT * FROM t",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+STATEMENT_JOURNAL_TABLES = [
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "CREATE TABLE t (id INTEGER PRIMARY KEY, c UNIQUE)",
+    "CREATE TABLE t (id INTEGER PRIMARY KEY, c NOT NULL)", "CREATE TABLE t (c, d UNIQUE)",
+]
+STATEMENT_JOURNAL_INSERTS = [
+    "INSERT INTO t VALUES (7, 1), (5.25, 2)",
+    "INSERT INTO t VALUES (7, 1), (5.25, 2) ON CONFLICT (id) DO NOTHING",
+    "INSERT INTO t VALUES (7, 1), (5.25, 2) ON CONFLICT DO NOTHING",
+    "INSERT INTO t VALUES (7, 1), (5.25, 2) ON CONFLICT (id) DO UPDATE SET c = 9",
+    "INSERT INTO t VALUES (7, 1), (5.25, 2) ON CONFLICT (id) DO UPDATE SET c = 9 WHERE 0",
+    "INSERT OR IGNORE INTO t VALUES (7, 1), (5.25, 2)", "INSERT OR REPLACE INTO t VALUES (7, 1), (5.25, 2)",
+    "INSERT OR FAIL INTO t VALUES (7, 1), (5.25, 2)", "INSERT OR ROLLBACK INTO t VALUES (7, 1), (5.25, 2)",
+    "INSERT INTO t VALUES (7, 1), (5.25, 2) RETURNING rowid", "INSERT INTO t VALUES (7, 1), ('x', 2)",
+    "INSERT OR IGNORE INTO t SELECT 8, 3 UNION ALL SELECT 'y', 4", "INSERT OR IGNORE INTO t VALUES ('z', 5)",
+]
+
+
+@pytest.mark.parametrize("table", STATEMENT_JOURNAL_TABLES)
+def test_error_inside_transaction_keeps_rows_without_statement_journal(table):
+    """Inside a transaction SQLite undoes a statement that fails with a
+    non-constraint error (a datatype mismatch) only if a constraint could
+    have aborted it; OR IGNORE and upserts that handle every constraint
+    leave the rows written before the error."""
+    for sql in STATEMENT_JOURNAL_INSERTS:
+        if table.startswith("CREATE TABLE t (c, d"):
+            sql = sql.replace("(id)", "(d)")
+        pair = StatePair(check_messages=True)
+        for step in [table, "INSERT INTO t VALUES (1, 1)", "BEGIN", sql, "SELECT rowid, * FROM t",
+                     "COMMIT", "SELECT rowid, * FROM t"]:
+            pair.run(step)
+        pair.close()
+
+
+@pytest.mark.parametrize("table, sql", [
+    ("CREATE TABLE t (a, c)", "UPDATE t SET c = CASE a WHEN 1 THEN 10 ELSE abs(a * 0 - 9223372036854775807 - 1) END"),
+    ("CREATE TABLE t (a, c)", "UPDATE OR IGNORE t SET c = CASE a WHEN 1 THEN 10 ELSE abs(a * 0 - 9223372036854775807 - 1) END"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t VALUES (7, 1), (5.25, 2) RETURNING id"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t VALUES (7, length('x')), (5.25, 2)"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t VALUES (7, coalesce(1, 2)), (5.25, 2)"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t VALUES (7, 'a' LIKE 'b'), (5.25, 2)"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t VALUES (7, (SELECT max(1, 2))), (5.25, 2)"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t VALUES (7, (SELECT count(*) FROM t)), (5.25, 2)"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "INSERT OR IGNORE INTO t SELECT id + 10, c FROM t UNION ALL SELECT 2.5, 1"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "UPDATE OR IGNORE t SET id = CASE id WHEN 1 THEN 10 ELSE 2.5 END RETURNING id"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "UPDATE OR IGNORE t SET id = CASE id WHEN 1 THEN 10 ELSE 2.5 END RETURNING upper(c)"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "UPDATE OR IGNORE t SET id = CASE id WHEN 1 THEN 10 ELSE 2.5 END WHERE typeof(c) = 'integer'"),
+    ("CREATE TABLE t (id INTEGER PRIMARY KEY, c)", "UPDATE t SET c = c + 1, id = CASE id WHEN 1 THEN 10 ELSE 2.5 END"),
+])
+def test_function_calls_make_sqlite_keep_a_statement_journal(table, sql):
+    """A call of a (not inlined) function may raise an error, so SQLite keeps
+    a statement journal for it: the statement is undone after any error."""
+    pair = StatePair(check_messages=True)
+    for step in [table, "INSERT INTO t VALUES (1, 1), (3, 3)", "BEGIN", sql, "SELECT rowid, * FROM t",
+                 "COMMIT", "SELECT rowid, * FROM t"]:
+        pair.run(step)
+    pair.close()

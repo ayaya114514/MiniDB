@@ -1,9 +1,9 @@
 import pytest
 
 from minidb.parser import (
-    Between, Binary, Call, Column, ColumnDef, Compound, CreateTable, Delete, DropTable, DropView, InList, InSelect,
-    Insert, Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef, Unary, Update, parse,
-    parse_script,
+    Between, Binary, Call, Column, ColumnDef, Compound, CreateTable, Delete, DropTable, DropView,
+    InList, InSelect, Insert, Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef,
+    Unary, Update, Upsert, parse, parse_script,
 )
 from minidb.errors import NotSupportedError, OperationalError
 from minidb.tokenizer import SQLSyntaxError
@@ -402,3 +402,22 @@ def test_create_and_drop_view():
     assert parse("CREATE TABLE view (view TEXT)").columns[0].name == "view"  # not reserved
     with pytest.raises(OperationalError, match="parameters are not allowed in views"):
         parse("CREATE VIEW v AS SELECT ?")
+
+
+def test_conflict_clauses_upsert_and_returning():
+    assert parse("INSERT OR IGNORE INTO t VALUES (1)").conflict == "IGNORE"
+    assert parse("REPLACE INTO t VALUES (1)").conflict == "REPLACE"
+    assert parse("UPDATE OR ROLLBACK t SET a = 1").conflict == "ROLLBACK"
+    assert parse("INSERT INTO t VALUES (1)").conflict == "ABORT"
+    stmt = parse("INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE b > 1 "
+                 "ON CONFLICT DO NOTHING RETURNING *, a AS x")
+    assert stmt.upsert == [
+        Upsert(["a"], [("b", Column("b", "excluded"))], Binary(">", Column("b"), Literal(1))),
+        Upsert(None),
+    ]
+    assert [item.alias for item in stmt.returning] == [None, "x"]
+    assert parse("DELETE FROM t WHERE a RETURNING a").returning[0].expr == Column("a")
+    with pytest.raises(OperationalError, match="conflict target is required"):
+        parse("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING ON CONFLICT DO NOTHING")
+    with pytest.raises(SQLSyntaxError, match="expected ROLLBACK, ABORT, FAIL, IGNORE or REPLACE"):
+        parse("INSERT OR NOTHING INTO t VALUES (1)")

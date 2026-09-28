@@ -368,3 +368,52 @@ def test_cached_statement_survives_schema_changes():
     with pytest.raises(minidb.OperationalError):
         db.execute("INSERT INTO t VALUES (?)", (3,))
     assert db.execute("SELECT * FROM t") == [(None, 2)]
+
+
+def test_returning_matches_sqlite3():
+    def script(conn, note):
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        cursor = conn.execute("INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, v || '!' AS bang")
+        note(cursor_state(cursor))
+        note(cursor.fetchall())
+        note(cursor_state(cursor))
+        cursor = conn.execute("INSERT INTO t VALUES (1, 'z') ON CONFLICT (id) DO UPDATE SET v = excluded.v RETURNING *")
+        note(cursor.fetchall())
+        note(cursor_state(cursor))
+        cursor = conn.execute("INSERT OR IGNORE INTO t VALUES (5, 'z') RETURNING id")
+        note(cursor.fetchall())
+        note(cursor_state(cursor))
+        cursor = conn.execute("UPDATE t SET v = v || v WHERE id = 2 RETURNING v")
+        note(cursor.fetchone())
+        note(cursor_state(cursor))
+        cursor = conn.execute("DELETE FROM t WHERE id = 1 RETURNING *")
+        note(cursor.fetchall())
+        note(cursor_state(cursor))
+        note(conn.total_changes)
+
+    same_behaviour(script)
+
+
+def test_returning_rowcount_appears_after_the_last_row():
+    def script(conn, note):
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT UNIQUE)")
+        cursor = conn.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c') RETURNING id, v || '!' AS bang")
+        note(cursor_state(cursor))
+        for _ in range(4):
+            note(cursor.fetchone())
+            note(cursor_state(cursor))
+        cursor = conn.execute("UPDATE t SET v = v || v WHERE id < 3 RETURNING v")
+        note(cursor.rowcount)
+        note(cursor.fetchmany(1))
+        note(cursor.rowcount)
+        note(list(cursor))
+        note(cursor.rowcount)
+        cursor = conn.execute("DELETE FROM t WHERE id = 99 RETURNING id")
+        note(cursor_state(cursor))
+        cursor = conn.execute("DELETE FROM t RETURNING id")
+        note(cursor.rowcount)
+        cursor.close()
+        note(conn.total_changes)
+        note(conn.execute("SELECT count(*) FROM t").fetchall())
+
+    same_behaviour(script)
