@@ -543,3 +543,12 @@ FULL 后是 `coalesce(...)`，在行尾占一个计算 slot（`Merge`），在�
 SQLite 的比较 opcode 把比较亲和性施加到两个操作数上（TEXT 只在至少一侧是文本时才把数字转文本），而不是
 “只转换另一侧”。对普通列两者等价（列值已有该亲和性），但对值不一定符合亲和性的表达式（UNION 子查询的
 列、上面的 coalesce）不同。`value_comparator` 改为两侧都转换，用 `type(x) is str` 快速跳过，benchmark 无明显变化。
+
+## D86 结果列别名
+SQLite 允许 WHERE、ON、GROUP BY、HAVING、ORDER BY 的表达式里用结果列别名（非标准扩展）：名字先按 FROM 的列
+解析，找不到才看别名（别名优先于外层查询的列）；结果列表本身看不到别名。`CompiledSelect` 在编译完结果列
+之后把这些子句里的别名引用替换成被引用的表达式；子查询里引用外层别名时由 `Scope.resolve` 在逐层查找中识别
+（`AliasReference`），在外层 scope 编译该表达式、用外层当前行求值。
+
+已知差异：SQLite 的 WHERE 常量传播会把 `x = 常量` 代入其他 AND 项，使其变成语句开始时只算一次的常量，于是
+`abs()` 的整数溢出这类错误可能在没有任何行时也报出；MiniDB 按行求值。只影响报错时机（fuzzer 给 abs 加了 guard）。
