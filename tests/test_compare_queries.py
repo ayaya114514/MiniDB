@@ -597,3 +597,60 @@ def test_upsert_excluded_values_in_real_columns():
                  "x = typeof(excluded.r) || ' ' || quote(excluded.r) || ' ' || typeof(excluded.f)")
         pair.run("SELECT x FROM t")
     pair.close()
+
+
+def test_common_table_expressions_and_values():
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (a)")
+    pair.run("INSERT INTO t VALUES (1), (2)")
+    for sql in [
+ "WITH x AS (SELECT 1 AS v) SELECT * FROM x",
+ "WITH x(p, q) AS (SELECT 1, 2) SELECT * FROM x",
+ "WITH x(p) AS (SELECT 1, 2) SELECT * FROM x",
+ "WITH a AS (SELECT * FROM b), b AS (SELECT 5) SELECT * FROM a",
+ "WITH a AS (SELECT 5), b AS (SELECT * FROM a) SELECT * FROM b",
+ "WITH t AS (SELECT 99) SELECT * FROM t",
+ "WITH c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 5) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION SELECT n % 3 + 1 FROM c) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c LIMIT 4) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c LIMIT 3 OFFSET 2) SELECT * FROM c",
+ "WITH RECURSIVE c(n, d) AS (SELECT 1, 0 UNION ALL SELECT n*2, d+1 FROM c WHERE d < 3 UNION ALL SELECT n*2+1, d+1 FROM c WHERE d < 3 ORDER BY 2 DESC) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3 ORDER BY 1 DESC) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT count(*) FROM c) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c, c AS d WHERE n < 3) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT (SELECT n+1 FROM c) WHERE 0) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT n FROM c) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM t LEFT JOIN c ON 1 WHERE n < 3) SELECT * FROM c",
+ "WITH x AS (SELECT 1), x AS (SELECT 2) SELECT * FROM x",
+ "SELECT (WITH y AS (SELECT a * 10 AS b) SELECT b FROM y) FROM t",
+ "WITH x AS (SELECT a FROM t) INSERT INTO t SELECT a + 10 FROM x",
+ "SELECT * FROM t",
+ "WITH x AS (SELECT 3) UPDATE t SET a = a + (SELECT * FROM x) WHERE a < 5",
+ "WITH x AS (SELECT 11) DELETE FROM t WHERE a IN x",
+ "SELECT * FROM t",
+ "WITH x AS MATERIALIZED (SELECT 1 AS v), y AS NOT MATERIALIZED (SELECT 2) SELECT * FROM x, y",
+ "WITH x AS (SELECT 1 AS v UNION ALL SELECT 2) SELECT * FROM x WHERE v > 1",
+ "WITH x AS (SELECT a, a FROM t) SELECT * FROM x",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3), d(m) AS (SELECT n*10 FROM c) SELECT * FROM d",
+ "WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x<3) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3 LIMIT -1) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT DISTINCT n+1 FROM c WHERE n < 3) SELECT * FROM c",
+ "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM c WHERE n < 3 GROUP BY n) SELECT * FROM c",
+ "VALUES (1, 'a'), (2, 'b')", "VALUES (1), (3) UNION SELECT 2 ORDER BY 1 DESC LIMIT 2", "SELECT 1 UNION VALUES (1), (1)", "VALUES (1), (1) UNION SELECT 2",
+ "SELECT * FROM (VALUES (1, 2), (3, 4)) AS v WHERE column1 > 1", "SELECT 2 IN (VALUES (1), (2))", "VALUES (1, 2), (3)",
+ "SELECT a, (WITH q AS (SELECT a * 2 AS d) SELECT d FROM q) FROM t",
+ "WITH RECURSIVE fib(i, a, b) AS (SELECT 1, 0, 1 UNION ALL SELECT i + 1, b, a + b FROM fib WHERE i < 20) SELECT group_concat(a) FROM fib",
+ "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt LIMIT 10) SELECT sum(x), count(*) FROM cnt",
+ "CREATE VIEW v AS SELECT * FROM t", "WITH t AS (SELECT 'cte') SELECT * FROM v",
+ "WITH RECURSIVE tree(id, depth) AS (SELECT 1, 0 UNION ALL SELECT id * 2 + k.column1, depth + 1 FROM tree, (VALUES (0), (1)) AS k WHERE depth < 3) SELECT count(*), max(id) FROM tree",
+]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_values_syntax_errors():
+    pair = Pair()
+    for sql in ["VALUES (1), (2) ORDER BY 1", "SELECT 3 UNION VALUES (1) LIMIT 1", "WITH x AS (SELECT 1)",
+                "WITH x AS SELECT 1 SELECT 2"]:
+        pair.run(sql)
+    pair.close()

@@ -19,6 +19,7 @@ row of its outer query.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import heapq
 import itertools
@@ -33,9 +34,9 @@ from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo, ViewInfo
 from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
     Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
-    CreateView, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
+    CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
     InSelect, Insert, Join, Like, Literal, Parameter, Reindex, Select, SelectItem, Star, Subquery,
-    TableRef, Unary, Update, Upsert,
+    TableRef, Unary, Update, Upsert, Values,
 )
 from minidb.parser import Expr, Statement
 from minidb.values import SQLValue, ascii_lower
@@ -1146,7 +1147,8 @@ class Executor:
         self.last_insert_rowid = 0
         self.parameters = []  # values of ?-parameters; compiled plans read this list
         self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
-        self.expanding = []  # views being compiled (to detect a view that uses itself)
+        self.expanding = []  # views and CTEs being compiled (to detect one that uses itself)
+        self.cte_scopes = []  # the WITH clauses in effect: dicts of lower-case name -> CteInfo
         self.statement_journal = True  # see PreparedInsert.statement_journal
         self.changes = 0  # changes() and total_changes(), kept up to date by Database
         self.total_changes = 0
@@ -1157,7 +1159,7 @@ class Executor:
         self.parameters[:] = parameters
         self.statement_journal = True
         dates.statement_time[0] = None  # 'now' is fixed for the length of a statement
-        if isinstance(stmt, (Select, Compound, Insert, Update, Delete)):
+        if isinstance(stmt, (Select, Compound, Values, Insert, Update, Delete)):
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
                 cache.clear()
@@ -1196,14 +1198,16 @@ class Executor:
         if cached is not None and cached[0] == self.catalog.version:
             return cached[1]
         self.once_caches = []
-        if isinstance(stmt, (Select, Compound)):
+        if isinstance(stmt, (Select, Compound, Values)):
             plan = PreparedSelect(self.compile_query(stmt))
-        elif isinstance(stmt, Insert):
-            plan = PreparedInsert(self, stmt)
-        elif isinstance(stmt, Update):
-            plan = PreparedUpdate(self, stmt)
         else:
-            plan = PreparedDelete(self, stmt)
+            with self.cte_scope(stmt.ctes or []):
+                if isinstance(stmt, Insert):
+                    plan = PreparedInsert(self, stmt)
+                elif isinstance(stmt, Update):
+                    plan = PreparedUpdate(self, stmt)
+                else:
+                    plan = PreparedDelete(self, stmt)
         plan.once_caches = self.once_caches
         stmt._plan = (self.catalog.version, plan)
         return plan
@@ -1218,12 +1222,107 @@ class Executor:
         row.append(rowid)
         return row
 
-    def compile_query(self, stmt: Select | Compound, parent: Scope | None = None) -> CompiledQuery:
-        """Compile a SELECT or compound SELECT (``parent``: the enclosing
-        query's scope when this is a subquery)."""
+    def compile_query(self, stmt: Select | Compound | Values, parent: Scope | None = None) -> CompiledQuery:
+        """Compile a SELECT, VALUES or compound SELECT (``parent``: the
+        enclosing query's scope when this is a subquery), with its WITH clause."""
+        if stmt.ctes:
+            with self.cte_scope(stmt.ctes):
+                return self._compile_query(stmt, parent)
+        return self._compile_query(stmt, parent)
+
+    def _compile_query(self, stmt: Select | Compound | Values, parent: Scope | None) -> CompiledQuery:
         if isinstance(stmt, Compound):
             return CompiledCompound(self, stmt, parent)
+        if isinstance(stmt, Values):
+            return CompiledValues(self, stmt, parent)
         return CompiledSelect(self, stmt, parent)
+
+    # ---- common table expressions (WITH) -------------------------------------
+
+    @contextlib.contextmanager
+    def cte_scope(self, ctes: list[Cte]) -> Iterator[None]:
+        """Make the CTEs of a WITH clause visible (to each other too)."""
+        names = {}
+        for cte in ctes:
+            lowered = ascii_lower(cte.name)
+            if lowered in names:
+                raise OperationalError(f"duplicate WITH table name: {cte.name}")
+            names[lowered] = CteInfo(cte, len(self.cte_scopes))
+        self.cte_scopes.append(names)
+        try:
+            yield
+        finally:
+            self.cte_scopes.pop()
+
+    def find_cte(self, name: str) -> CteInfo | WorkingSource | None:
+        lowered = ascii_lower(name)
+        for names in reversed(self.cte_scopes):
+            if lowered in names:
+                return names[lowered]
+        return None
+
+    def cte_source(self, found: CteInfo | WorkingSource, scope: Scope) -> DerivedSource:
+        """A CTE used in FROM, compiled in the scope of its WITH clause."""
+        if isinstance(found, WorkingSource):  # a recursive CTE inside its recursive part
+            if scope.parent is not found.parent_scope:
+                raise OperationalError(f"circular reference: {found.name}")
+            if found.used:
+                raise OperationalError(f"multiple references to recursive table: {found.name}")
+            found.used = True
+            return found
+        if found in self.expanding:
+            raise OperationalError(f"circular reference: {found.cte.name}")
+        saved = self.cte_scopes
+        self.expanding.append(found)
+        self.cte_scopes = saved[:found.level + 1]
+        try:
+            return self.compile_cte(found.cte, scope.parent)
+        finally:
+            self.cte_scopes = saved
+            self.expanding.pop()
+
+    def compile_cte(self, cte: Cte, parent: Scope | None) -> DerivedSource:
+        body = cte.query
+        parts = body.selects if isinstance(body, Compound) else [body]
+        operators = body.operators if isinstance(body, Compound) else []
+        recursive = [self_reference_count(part, cte.name) for part in parts]
+        if not any(recursive):
+            compiled = self.compile_query(body, parent)
+            check_cte_columns(cte, compiled.names)
+            return DerivedSource(cte.name, compiled, cte.columns)
+        k = next(i for i, count in enumerate(recursive) if count)
+        if k == 0 or operators[k - 1] not in ("UNION", "UNION ALL"):
+            raise OperationalError(f"circular reference: {cte.name}")
+        initial_stmt = parts[0] if k == 1 else Compound(parts[:k], operators[:k - 1])
+        initial = self.compile_query(initial_stmt, parent)
+        check_cte_columns(cte, initial.names)
+        names = cte.columns or unique_names(initial.names)
+        working = WorkingSource(cte.name, names, initial.affinities, parent)
+        compiled_parts = []
+        for part in parts[k:]:
+            if isinstance(part, Select) and (part.group_by or any(
+                contains_aggregate(item.expr) for item in part.items if not isinstance(item.expr, Star)
+            )):
+                raise OperationalError("recursive aggregate queries not supported")
+            working.used = False
+            self.cte_scopes.append({ascii_lower(cte.name): working})
+            try:
+                compiled = self.compile_query(part, parent)
+            finally:
+                self.cte_scopes.pop()
+            if len(compiled.names) != len(names):
+                raise OperationalError(
+                    f"SELECTs to the left and right of {operators[k - 1]} "
+                    "do not have the same number of result columns"
+                )
+            compiled_parts.append(compiled)
+        order_terms, limit = [], None
+        if isinstance(body, Compound):
+            if body.order_by:
+                order_terms = self.compound_order_terms(body, [initial] + compiled_parts)
+            limit = self.compile_limit(body)
+        return RecursiveSource(cte.name, initial, names, working, compiled_parts,
+                               operators[k - 1] == "UNION", order_terms, limit)
 
     def view_source(self, view: ViewInfo) -> DerivedSource:
         """A view used in FROM: its SELECT, compiled as a subquery that sees
@@ -1231,6 +1330,7 @@ class Executor:
         if view in self.expanding:
             raise OperationalError(f"view {view.name} is circularly defined")
         self.expanding.append(view)
+        saved, self.cte_scopes = self.cte_scopes, []  # a view sees no CTE of the query using it
         try:
             compiled = self.compile_query(view.query)
         except OperationalError as exc:
@@ -1241,6 +1341,7 @@ class Executor:
             raise
         finally:
             self.expanding.pop()
+            self.cte_scopes = saved
         return DerivedSource(view.name, compiled, view.columns)
 
     def build_from(self, joins: list[Join], scope: Scope) -> tuple[list[Join], list[DerivedSource]]:
@@ -1261,6 +1362,13 @@ class Executor:
                 source = DerivedSource(ref.alias or "", compiled)
                 derived.append(source)
                 scope.add(source, ref.alias or "")
+            elif self.find_cte(ref.name) is not None:
+                source = self.cte_source(self.find_cte(ref.name), scope)
+                if not isinstance(source, WorkingSource):
+                    derived.append(source)
+                    if source.correlated:
+                        scope.uses_outer = True
+                scope.add(source, ref.alias)
             elif self.catalog.find_view(ref.name) is not None:
                 source = self.view_source(self.catalog.find_view(ref.name))
                 derived.append(source)
@@ -1998,7 +2106,7 @@ class CompiledCompound:
     """``SELECT ... UNION [ALL] | INTERSECT | EXCEPT SELECT ...`` compiled once."""
 
     def __init__(self, executor: Executor, stmt: Compound, parent: Scope | None = None) -> None:
-        self.parts = [CompiledSelect(executor, select, parent) for select in stmt.selects]
+        self.parts = [executor.compile_query(select, parent) for select in stmt.selects]
         count = len(self.parts[0].names)
         for operator, part in zip(stmt.operators, self.parts[1:]):
             if len(part.names) != count:
@@ -2008,6 +2116,7 @@ class CompiledCompound:
                 )
         self.operators = stmt.operators
         self.names = self.parts[0].names
+        self.exprs = self.parts[0].exprs
         # SQLite takes a compound's affinity from its last SELECT.
         self.affinities = self.parts[-1].affinities
         self.order_terms = executor.compound_order_terms(stmt, self.parts)
@@ -2024,6 +2133,27 @@ class CompiledCompound:
         start, end = self.limit() if self.limit is not None else (0, None)
         records = order_records([(row, ()) for row in rows], self.order_terms, start, end)
         return [row for row, _ in records]
+
+
+class CompiledValues:
+    """``VALUES (...), (...)``: rows of expressions; columns column1, column2, ..."""
+
+    def __init__(self, executor: Executor, stmt: Values, parent: Scope | None = None) -> None:
+        self.scope = Scope(parent)
+        compiler = Compiler(self.scope, executor=executor)
+        self.rows = [[compiler.compile(e) for e in row] for row in stmt.rows]
+        width = len(stmt.rows[0])
+        self.names = [f"column{i}" for i in range(1, width + 1)]
+        self.affinities = [None] * width
+        self.exprs = list(stmt.rows[0])
+
+    @property
+    def correlated(self) -> bool:
+        return self.scope.uses_outer
+
+    def run(self, max_rows: int | None = None) -> list[tuple]:
+        rows = self.rows if max_rows is None else self.rows[:max_rows]
+        return [tuple(f([]) for f in row) for row in rows]
 
 
 class PreparedSelect:
@@ -2382,8 +2512,122 @@ class DerivedSource:
     def column_index(self, name: str) -> int | None:
         return self.positions.get(ascii_lower(name))
 
+    @property
+    def correlated(self) -> bool:
+        return self.compiled.correlated
+
     def materialize(self) -> None:
         self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+
+
+class CteInfo:
+    """A CTE and the depth of its WITH clause in Executor.cte_scopes."""
+
+    __slots__ = ("cte", "level")
+
+    def __init__(self, cte: Cte, level: int) -> None:
+        self.cte = cte
+        self.level = level
+
+
+def check_cte_columns(cte: Cte, names: list[str]) -> None:
+    if cte.columns is not None and len(cte.columns) != len(names):
+        raise OperationalError(f"table {cte.name} has {len(names)} values for {len(cte.columns)} columns")
+
+
+def self_reference_count(query: object, name: str) -> int:
+    """How often a SELECT's own FROM clause names table ``name``."""
+    if not isinstance(query, Select):
+        return 0
+    lowered = ascii_lower(name)
+    return sum(1 for join in query.source
+               if isinstance(join.table, TableRef) and ascii_lower(join.table.name) == lowered)
+
+
+class WorkingSource(DerivedSource):
+    """A recursive CTE as its recursive part sees it: the one row being
+    processed (set by RecursiveSource before each run)."""
+
+    def __init__(self, name: str, names: list[str], affinities: list, parent_scope: Scope | None) -> None:
+        self.name = name
+        self.columns = [ColumnName(n) for n in names]
+        self.affinities = list(affinities)
+        self.positions = {}
+        for i, n in enumerate(names):
+            self.positions.setdefault(ascii_lower(n), i)
+        self.rows = []
+        self.parent_scope = parent_scope  # only the recursive part's own FROM may use it
+        self.used = False
+
+    @property
+    def correlated(self) -> bool:
+        return False
+
+    def materialize(self) -> None:
+        pass
+
+
+class RecursiveSource(DerivedSource):
+    """A recursive CTE: the initial rows go into a queue; each row taken out
+    is part of the result and is fed (as the working table) to the recursive
+    parts, whose rows join the queue.  UNION drops rows seen before; ORDER BY
+    makes the queue a priority queue (ties in arrival order); LIMIT and
+    OFFSET apply to the rows taken out, as in SQLite."""
+
+    def __init__(self, name: str, initial: CompiledQuery, names: list[str], working: WorkingSource,
+                 parts: list[CompiledQuery], distinct: bool, order_terms: list[OrderTerm],
+                 limit: Callable[[], tuple[int, int | None]] | None) -> None:
+        super().__init__(name, initial, names)
+        self.working = working
+        self.parts = parts
+        self.distinct = distinct
+        self.order_key = order_key(order_terms) if order_terms else None
+        self.limit = limit
+
+    @property
+    def correlated(self) -> bool:
+        return self.compiled.correlated or any(part.correlated for part in self.parts)
+
+    def materialize(self) -> None:
+        start, end = self.limit() if self.limit is not None else (0, None)
+        seen = set()
+        queue = []  # a heap of (key, arrival, row) with ORDER BY, else a FIFO
+        arrivals = itertools.count()
+        head = 0
+        sort_key, key = values.sort_key, self.order_key
+
+        def push(row: tuple) -> None:
+            if self.distinct:
+                identity = tuple(sort_key(v) for v in row)
+                if identity in seen:
+                    return
+                seen.add(identity)
+            if key is not None:
+                heapq.heappush(queue, (key((row, ())), next(arrivals), row))
+            else:
+                queue.append(row)
+
+        for row in self.compiled.run():
+            push(tuple(row))
+        out, taken = [], 0
+        while (len(queue) > head) if key is None else queue:
+            if end is not None and taken >= end:
+                break
+            if key is not None:
+                row = heapq.heappop(queue)[2]
+            else:
+                row = queue[head]
+                head += 1
+            if taken >= start:
+                out.append(row)
+            taken += 1
+            if end is not None and taken >= end:
+                break
+            self.working.rows = [list(row) + [1]]
+            for part in self.parts:
+                for new in part.run():
+                    push(tuple(new))
+        self.rows = [list(row) + [i] for i, row in enumerate(out, 1)]
 
 
 def unique_names(names: list[str]) -> list[str]:

@@ -208,6 +208,7 @@ class Insert:
     conflict: str = "ABORT"  # INSERT OR <conflict>: ABORT, FAIL, IGNORE, REPLACE or ROLLBACK
     upsert: list = field(default_factory=list)  # Upsert clauses, in order
     returning: list | None = None  # SelectItems of RETURNING
+    ctes: list | None = None  # WITH ...
 
 
 @dataclass
@@ -261,6 +262,7 @@ class Select:
     order_by: list = field(default_factory=list)
     limit: object = None
     offset: object = None
+    ctes: list | None = None  # WITH ...
 
 
 @dataclass
@@ -297,11 +299,29 @@ class Compound:
     """``select UNION [ALL] | INTERSECT | EXCEPT select ...`` evaluated left to
     right; ORDER BY and LIMIT apply to the whole result."""
 
-    selects: list
+    selects: list  # Select or Values
     operators: list  # "UNION", "UNION ALL", "INTERSECT" or "EXCEPT", one per join
     order_by: list = field(default_factory=list)
     limit: object = None
     offset: object = None
+    ctes: list | None = None  # WITH ...
+
+
+@dataclass
+class Values:
+    """``VALUES (...), (...)`` as a query: columns column1, column2, ..."""
+
+    rows: list  # lists of expressions
+    ctes: list | None = None
+
+
+@dataclass
+class Cte:
+    """``name [(columns)] AS (query)`` of a WITH clause."""
+
+    name: str
+    columns: list | None
+    query: object
 
 
 @dataclass
@@ -312,6 +332,7 @@ class Update:
     conflict: str = "ABORT"
     returning: list | None = None
     indexed_by: str | None = None
+    ctes: list | None = None
 
 
 @dataclass
@@ -320,6 +341,7 @@ class Delete:
     where: object = None
     returning: list | None = None
     indexed_by: str | None = None
+    ctes: list | None = None
 
 
 @dataclass
@@ -333,7 +355,7 @@ Expr = Union[
     Subquery, InSelect, Exists, Call,
 ]
 Statement = Union[
-    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Insert, Select, Compound, Update, Delete,
+    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Values, Insert, Select, Compound, Update, Delete,
     Begin, Commit, Rollback, Analyze, Explain,
 ]
 
@@ -463,10 +485,22 @@ class Parser:
             if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == "QUERY":
                 self.advance()
                 self.expect_word("PLAN")
-            if not self.at_keyword("SELECT", "UPDATE", "DELETE"):
+            if not (self.at_query() or self.at_keyword("UPDATE", "DELETE")):
                 raise self.error("SELECT, UPDATE or DELETE")
             return Explain(self.statement())
-        if self.at_keyword("SELECT"):
+        if self.at_word("WITH") and self._starts_query(self.i):
+            ctes = self.with_clause()
+            if self.at_keyword("INSERT") or self.at_word("REPLACE"):
+                stmt = self.insert()
+            elif self.at_keyword("UPDATE"):
+                stmt = self.update()
+            elif self.at_keyword("DELETE"):
+                stmt = self.delete()
+            else:
+                stmt = self.query(with_allowed=False)
+            stmt.ctes = ctes
+            return stmt
+        if self.at_query():
             return self.query()
         if self.at_keyword("INSERT") or self.at_word("REPLACE"):
             return self.insert()
@@ -652,7 +686,7 @@ class Parser:
             while self.accept_op(","):
                 columns.append(self.identifier("column name"))
             self.expect_op(")")
-        if self.at_keyword("SELECT"):
+        if self.at_query() and not self.at_keyword("VALUES"):
             stmt = Insert(table, columns, [], self.query(), conflict)
         else:
             self.expect_keyword("VALUES")
@@ -673,17 +707,72 @@ class Parser:
         self.expect_op(")")
         return values
 
-    def query(self) -> Select | Compound:
-        """A SELECT or a compound SELECT, with ORDER BY and LIMIT."""
-        selects = [self.select_core()]
+    def _starts_query(self, i: int) -> bool:
+        """Does a query (SELECT, VALUES or WITH name ...) start at token i?"""
+        token = self.tokens[i]
+        if token.kind == "KEYWORD":
+            return token.value in ("SELECT", "VALUES")
+        return (token.kind == "IDENT" and ascii_upper(token.text) == "WITH"
+                and self.tokens[i + 1].kind == "IDENT")
+
+    def at_query(self) -> bool:
+        return self._starts_query(self.i)
+
+    def with_clause(self) -> list[Cte]:
+        """``WITH [RECURSIVE] name [(columns)] AS [[NOT] MATERIALIZED] (query), ...``
+        (RECURSIVE is optional: a CTE that names itself is recursive)."""
+        self.advance()  # WITH
+        if self.at_word("RECURSIVE"):
+            self.advance()
+        ctes = []
+        while True:
+            name = self.identifier("table name")
+            columns = None
+            if self.accept_op("("):
+                columns = [self.identifier("column name")]
+                while self.accept_op(","):
+                    columns.append(self.identifier("column name"))
+                self.expect_op(")")
+            self.expect_keyword("AS")
+            if self.accept_keyword("NOT"):
+                self.expect_word("MATERIALIZED")
+            elif self.at_word("MATERIALIZED"):
+                self.advance()
+            self.expect_op("(")
+            ctes.append(Cte(name, columns, self.query()))
+            self.expect_op(")")
+            if not self.accept_op(","):
+                return ctes
+
+    def values_core(self) -> Values:
+        self.expect_keyword("VALUES")
+        rows = [self.value_row()]
+        while self.accept_op(","):
+            rows.append(self.value_row())
+        if any(len(row) != len(rows[0]) for row in rows):
+            raise OperationalError("all VALUES must have the same number of terms")
+        return Values(rows)
+
+    def query(self, with_allowed: bool = True) -> Select | Compound | Values:
+        """A SELECT, VALUES or a compound of them, with ORDER BY and LIMIT,
+        optionally after WITH."""
+        ctes = self.with_clause() if with_allowed and self.at_word("WITH") else None
+        stmt = self._compound()
+        stmt.ctes = ctes
+        return stmt
+
+    def _compound(self) -> Select | Compound | Values:
+        selects = [self.values_core() if self.at_keyword("VALUES") else self.select_core()]
         operators = []
         while self.at_keyword("UNION", "INTERSECT", "EXCEPT"):
             operator = self.advance().value
             if operator == "UNION" and self.accept_keyword("ALL"):
                 operator = "UNION ALL"
             operators.append(operator)
-            selects.append(self.select_core())
+            selects.append(self.values_core() if self.at_keyword("VALUES") else self.select_core())
         stmt = selects[0] if not operators else Compound(selects, operators)
+        if isinstance(selects[-1], Values):
+            return stmt  # in SQLite's grammar ORDER BY and LIMIT belong to a last SELECT, not VALUES
         if self.accept_keyword("ORDER"):
             self.expect_keyword("BY")
             stmt.order_by = [self.order_item()]
@@ -797,8 +886,7 @@ class Parser:
 
     def table_or_group(self) -> TableRef | DerivedTable | list[Join]:
         """A table, or a parenthesized join ``(a JOIN b ...)`` as a list of Joins."""
-        if self.at_op("(") and not (self.tokens[self.i + 1].kind == "KEYWORD"
-                                    and self.tokens[self.i + 1].value == "SELECT"):
+        if self.at_op("(") and not self._starts_query(self.i + 1):
             self.advance()
             group = self.from_clause()
             self.expect_op(")")
@@ -821,7 +909,7 @@ class Parser:
         return source
 
     def table_ref(self) -> TableRef | DerivedTable:
-        if self.at_op("(") and self.tokens[self.i + 1].kind == "KEYWORD" and self.tokens[self.i + 1].value == "SELECT":
+        if self.at_op("(") and self._starts_query(self.i + 1):
             self.advance()
             query = self.query()
             self.expect_op(")")
@@ -935,7 +1023,7 @@ class Parser:
                         left = InSelect(left, Select([SelectItem(Star())], [Join(table)]), negated)
                         continue
                     self.expect_op("(")
-                    if self.at_keyword("SELECT"):
+                    if self.at_query():
                         left = InSelect(left, self.query(), negated)
                     elif self.at_op(")"):
                         left = InList(left, (), negated)  # always false (true with NOT)
@@ -1014,7 +1102,7 @@ class Parser:
         if token.kind == "PARAM":
             return self.parameter()
         if self.accept_op("("):
-            if self.at_keyword("SELECT"):
+            if self.at_query():
                 expr = Subquery(self.query())
             else:
                 expr = self.expr()
