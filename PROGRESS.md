@@ -171,29 +171,34 @@
 - 测试：619 个，全部通过（新增 `test_sqllogictest.py` 21 个、`test_metamorphic.py` 14 个）。
 - 已知问题：sqllogictest 的 `label` 只解析不交叉核对（每条记录本身都有期望结果，不影响判定）。
 
-## 阶段 16：SQL 补齐（进行中，2026-09-29 暂停）
-已完成（每项都有与参考 SQLite 3.53.4 的对照测试，fuzzer 已覆盖）：
+## 阶段 16：SQL 补齐（完成）
+完成的功能（每项都有与参考 SQLite 3.53.4 的对照测试，fuzzer 已覆盖）：
 - `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`、`REPLACE`、UPSERT（`ON CONFLICT ... DO UPDATE/NOTHING`，含 excluded 的亲和性细节；DO UPDATE 只在有冲突检查能到达时才解析，D83）、`RETURNING`、语句日志（statement journal）语义；`INSERT INTO t (rowid, ...)`。
 - CTE：`WITH`、`WITH RECURSIVE`（UNION 去重、ORDER BY 优先队列、LIMIT/OFFSET），`VALUES` 作为查询。
 - `ALTER TABLE ADD COLUMN / RENAME TO / RENAME COLUMN / DROP COLUMN`（同步改写视图 SQL）、列 `DEFAULT`、`INSERT DEFAULT VALUES`、`TRUE/FALSE`。
 - `CREATE [TEMP] VIEW` / `DROP VIEW`、`REINDEX`、`INDEXED BY` / `NOT INDEXED`。
-- 标量函数：`substr`、`replace`、`trim`/`ltrim`/`rtrim`（按 trimFunc 逐字节，字符集遇 NUL 截断）、`instr`、`round`、`printf`/`format`（移植 3.53 源码）、`hex`/`unhex`、`quote`、`unicode`/`unistr`、`char`、`concat`/`concat_ws`、`glob`/`like`（ESCAPE）、`iif`/`if`、数学函数、日期时间函数（移植 date.c）；位运算 `& | ~ << >>`，BLOB 字面量、十六进制整数字面量。
+- 窗口函数（D88）：全部内置窗口函数、聚合作窗口函数、ROWS/RANGE/GROUPS frame、EXCLUDE、`WINDOW` 子句；聚合的 `FILTER (WHERE ...)`；`string_agg`。按 SQLite window.c 的执行顺序逐步复现，滑动求和的浮点舍入与行序都与 SQLite 一致。
+- 标量函数：`substr`、`replace`、`trim`/`ltrim`/`rtrim`（按 trimFunc 逐字节，字符集遇 NUL 截断）、`instr`、`round`、`printf`/`format`（移植 3.53 源码）、`hex`/`unhex`、`quote`、`unicode`/`unistr`、`char`、`concat`/`concat_ws`、`glob`/`like`（ESCAPE）、`iif`/`if`、数学函数、日期时间函数（移植 date.c）；位运算 `& | ~ << >>`，BLOB 字面量、十六进制整数字面量；后缀 `ISNULL` / `NOTNULL` / `NOT NULL`。
 - 列类型亲和性 INTEGER/REAL/NUMERIC/TEXT/BLOB（任意类型名）、BLOB 值、非法 UTF-8 文本、REAL↔TEXT 逐位对齐（D80）。
-- `RIGHT` / `FULL [OUTER] JOIN`（含 USING/NATURAL 的 SQLite 合并列语义、`ON clause references tables to its right` 检查，D84）；比较亲和性施加到两侧（D85）。
+- `RIGHT` / `FULL [OUTER] JOIN`（含 USING/NATURAL 的 SQLite 合并列语义、`ON clause references tables to its right` 检查，D84）；比较亲和性施加到两侧，索引查找的 key 转换同样按此规则（D85）。
 - 结果列别名可在 WHERE/ON/GROUP BY/HAVING/ORDER BY 表达式中使用（D86）。
 - 子查询中的外层聚合，以及 SQLite 判定聚合查询与 misuse 报错的规则（D87）。
 
-测试：823 个，全部通过（参考 SQLite 3.53.4，Python 3.12）。
-fuzz / 变形测试（本阶段后半段）：f25 600 种子 × 400：5 个失败种子，其中 4 个被随后的外层聚合、trim 修复消除（用当时的生成器回放确认），1 个促成了 ON 右侧引用检查；m10 300 种子 × 300 查询 0 失败；外层聚合提交后 200 种子 × 300 0 失败。暂停时启动的 f26/f27/m11 被中止，未计入。
-sqllogictest：阶段中途（2026-09-28）一次全量运行 5,939,820 / 5,939,879 条通过（615/622 个文件无失败）；之后又补了 REINDEX、INSERT OR、TEMP VIEW 等，尚未重跑，CI 的 `--min-passed` 仍是阶段 15 的基线。
+**sqllogictest**：5,939,852 / 5,939,879 条通过（619/622 个文件无失败；阶段 15 基线 3,743,727，即 63.03% → 99.9995%）。剩下的 27 条：23 条是 `CREATE TRIGGER`（不支持）；4 条在 `slt_lang_aggfunc.test`，语料的期望值来自 3.43 之前的 SQLite（sum 还没有补偿求和、溢出时不报错），MiniDB 的结果与参考 SQLite 3.53.4 相同。CI 的 `--min-passed` 提高到 5939852（CI 上未运行，本阶段未 push）。
+
+**测试**：871 个，全部通过（参考 SQLite 3.53.4，Python 3.12）。新增 `tests/test_window.py`（窗口函数探测集按顺序比较 + 40 个随机窗口种子）。独立的随机窗口对照（全部 frame 类型/边界、EXCLUDE、分区、ORDER BY 并列、NULL 与混合类型）另跑了 600 个种子，全部逐位一致。
+
+**fuzz / 变形测试**（阶段后半段，参考 SQLite 3.53.4）：
+- f25 600 种子 × 400：5 个失败种子，其中 4 个被随后的外层聚合、trim 修复消除（用当时的生成器回放确认），1 个促成了 ON 右侧引用检查。
+- 加入 RIGHT/FULL、三表连接、别名、外层聚合、窗口函数之后：f28 400 × 400、f29（文件模式）200 × 400、m12 200 × 300、m13（文件模式）150 × 300 均 0 失败；f30 600 × 500 发现 1 个（连接重排后误用“第一张表的顺序”免排序，已修复并加了会在修复前失败的回归测试）。
+- 其间修掉的其它 fuzz 发现：RIGHT JOIN 之前含子查询的 ON 被放到 RIGHT 级之后测试；INSERT OR REPLACE 用默认值填 NOT NULL 列后 upsert 的 excluded 没看到；USING 的 coalesce 值走索引查找时没做亲和性转换；`pow()` 溢出符号；DO UPDATE 的过早解析；`trim` 的 NUL 处理；RANGE 在 DESC 时 `<=` 的翻转（窗口）。
+- 阶段末一轮（全部修复之后）：f31 600 种子 × 500 语句、m14 300 种子 × 300 查询，均 0 失败。
+
+**性能**（`tests/benchmark.py`，10 万行，与阶段 15 相比）：插入 4.26 → 4.34 s、每条 SQL 都不同的 1 万次主键点查 0.71 → 0.78 s（解析 + 编译变多：新语法、别名替换、窗口收集器等），扫描/聚合/连接基本不变（比较改为两侧施加亲和性后用 `type(x) is str` 快速跳过，见 D85）。点查的解析/编译开销留给阶段 17。
 
 已知问题 / 差异（如实记录）：
-- 计划相关的报错时机：SQLite 的 WHERE 常量传播、恒真 OR 折叠会让某些错误（`abs()` 溢出、外层聚合 misuse）不出现或提前出现；子查询里 `sum()` 溢出同理。fuzzer 对这些做了 guard。
-- `max()`/`min()` 并列或无 min/max 的聚合查询里，裸列取哪一行依赖扫描顺序（SQLite 可能走覆盖索引）。
+- 计划相关的报错时机：SQLite 的 WHERE 常量传播、恒真 OR 折叠会让某些错误（`abs()` 溢出、外层聚合 misuse）不出现或提前出现；子查询里 `sum()` 溢出同理。fuzzer 对这些做了 guard（D86、D87）。
+- 聚合查询里的裸列取自哪一行依赖扫描顺序（`max()` 并列、无 min/max 时）；窗口 ORDER BY 有并列时的行序依赖读行顺序（单表全表扫描时已验证一致，走索引时不保证），fuzzer 的窗口 ORDER BY 以 rowid 收尾。
 - 聚合参数中含子查询时，一律视为当前层的聚合（SQLite 会看子查询里的列）。
-- 不支持：TRIGGER、CHECK、COLLATE、TEMP TABLE、聚合的 `FILTER` 子句；localtime 只在一个时区验证过。
-
-剩余（下次从这里继续）：
-1. 窗口函数：`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`PERCENT_RANK`/`CUME_DIST`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`，聚合 `OVER (PARTITION BY ... ORDER BY ... frame)`（ROWS/RANGE/GROUPS、EXCLUDE）、`WINDOW` 子句，以及聚合的 `FILTER (WHERE ...)`。正在读 SQLite window.c（`sqlite3WindowUpdate`、`windowCheckValue`、`windowCodeRangeTest`），尚未写代码。
-2. 重跑 sqllogictest，更新数字并提高 CI 的 `--min-passed`。
-3. 阶段末：全量测试 + 大规模 fuzz / 变形测试；README 更新（功能列表、去掉 D20 的限制）；勾选 CLAUDE.md 的阶段 16。
+- `isnull`/`notnull` 在 MiniDB 里仍可作标识符（SQLite 里是保留字）；语法错误的措辞与 SQLite 不同。
+- 不支持：TRIGGER、CHECK、COLLATE、TEMP TABLE、外键、表值函数；localtime 只在一个时区验证过；FROM 里外连接右侧的括号连接。
