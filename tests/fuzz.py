@@ -193,7 +193,9 @@ class Generator:
         where = f" WHERE {condition}" if rng.random() < 0.8 else ""
         kind = rng.random()
         if kind < 0.45:
-            function = rng.choice(["count", "max", "min", "sum", "total", "avg"])
+            # Not sum(): an integer overflow in a subquery surfaces only if
+            # SQLite's plan evaluates it (a known, plan-dependent difference).
+            function = rng.choice(["count", "max", "min", "total", "avg"])
             argument = self.expr(inner, depth + 2, text_safe)
             return f"(SELECT {function}({argument}) FROM {table.name} AS s{where})"
         if kind < 0.8:
