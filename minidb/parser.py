@@ -22,7 +22,7 @@ from typing import Union
 
 from minidb.errors import NotSupportedError, OperationalError
 from minidb.tokenizer import SQLSyntaxError, Token, tokenize
-from minidb.values import ascii_upper
+from minidb.values import ascii_lower, ascii_upper
 
 # ---- expressions -------------------------------------------------------
 
@@ -397,13 +397,21 @@ class Reindex:
     name: str | None = None  # an index, a table or a collation; None: every index
 
 
+@dataclass
+class Vacuum:
+    """``VACUUM [schema] [INTO <file name>]``."""
+
+    schema: str = "main"
+    into: object = None  # the expression naming the file to write a compacted copy to
+
+
 # Any expression node, and any statement.
 Expr = Union[
     Literal, Parameter, Column, Star, Unary, Binary, Between, InList, Like, Case, Cast,
     Subquery, InSelect, Exists, Call,
 ]
 Statement = Union[
-    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Values, AlterTable, Insert, Select, Compound, Update, Delete,
+    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Vacuum, Values, AlterTable, Insert, Select, Compound, Update, Delete,
     Begin, Commit, Rollback, Analyze, Explain,
 ]
 
@@ -576,6 +584,17 @@ class Parser:
             if self.accept_op("."):  # schema.name: only the main schema exists
                 name = self.identifier("index or table name")
             return Reindex(name)
+        if self.at_word("VACUUM"):
+            self.advance()
+            stmt = Vacuum()
+            if self.tok.kind == "IDENT":
+                schema = ascii_lower(self.advance().value)
+                if schema not in ("main", "temp"):
+                    raise OperationalError(f"unknown database {schema}")
+                stmt.schema = schema
+            if self.accept_keyword("INTO"):
+                stmt.into = self.expr()
+            return stmt
         raise self.error("a statement")
 
     def create(self) -> CreateTable | CreateIndex | CreateView:

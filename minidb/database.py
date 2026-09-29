@@ -13,7 +13,7 @@ from minidb.locking import LockTimeout
 from minidb.pager import Pager
 from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, CreateView, Delete, DropIndex, DropTable,
-    AlterTable, DropView, Insert, Reindex, Rollback, Update, parse_script,
+    AlterTable, DropView, Insert, Reindex, Rollback, Update, Vacuum, parse_script,
 )
 from minidb.values import INT_MAX, INT_MIN, SQLValue
 
@@ -138,6 +138,10 @@ class Database:
             pager.end_transaction()
             return Result()
         writes = isinstance(stmt, WRITE_STATEMENTS)
+        if isinstance(stmt, Vacuum):
+            if self.in_transaction:
+                raise OperationalError("cannot VACUUM from within a transaction")
+            writes = stmt.schema == "main" and stmt.into is None
         if not self.in_transaction:
             try:
                 if writes:
@@ -179,6 +183,8 @@ class Database:
                 pager.end_transaction()
             raise
         self._end_statement()
+        if isinstance(stmt, Vacuum) and writes and not self.broken:
+            pager.checkpoint()  # shrinks the file, unless another connection is reading
         if result.rowcount > 0:
             self.total_changes += result.rowcount
         if isinstance(stmt, (Insert, Update, Delete)):
