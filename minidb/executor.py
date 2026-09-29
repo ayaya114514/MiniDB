@@ -44,7 +44,7 @@ from minidb.parser import (
 from minidb.parser import ColumnDef, Expr, Statement, parse
 from minidb.tokenizer import tokenize
 from minidb.values import SQLValue, ascii_lower
-from minidb.record import decode_record, encode_record
+from minidb.record import decode_record, decode_row, encode_record
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")
 # Functions that read the connection's state: name -> Executor attribute.
@@ -418,6 +418,15 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
     return comparator
 
 
+def tuple_function(functions: list[RowFunction]) -> Callable[[Row], tuple]:
+    """A function row -> the tuple of the functions' values."""
+    if not functions:
+        return lambda row: ()
+    source = _Source()
+    parts = [f"{source.value(f)}(row)" for f in functions]
+    return source.function(f"({', '.join(parts)},)")
+
+
 _PYTHON_COMPARISONS = {"=": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">="}
 _NUMBER_TYPES = (int, float)
 _CODE_CACHE = {}  # source text -> code object: statements of the same shape compile once
@@ -496,6 +505,17 @@ class Compiler:
             text, affinity = self._source(expr, source, 0)
             return source.function(text), affinity
         return self._closure_with_affinity(expr)
+
+    def compile_tuple(self, exprs: list[Expr]) -> tuple[Callable[[Row], tuple], list[str | None]]:
+        """One function computing the tuple of ``exprs`` (result columns),
+        and their affinities."""
+        source = _Source()
+        parts, affinities = [], []
+        for expr in exprs:
+            text, affinity = self._source(expr, source, 0)
+            parts.append(text)
+            affinities.append(affinity)
+        return source.function(f"({', '.join(parts)}{',' if len(parts) == 1 else ''})"), affinities
 
     def _source(self, expr: Expr, source: _Source, depth: int) -> tuple[str, str | None]:
         """Python source computing ``expr`` from ``row``, and its affinity.
@@ -1800,7 +1820,7 @@ class Executor:
 
     @staticmethod
     def load_row(table: TableInfo, rowid: int, record: bytes) -> Row:
-        row = decode_record(record)[0]
+        row = decode_row(record)
         if len(row) < len(table.columns):  # written before ALTER TABLE ADD COLUMN
             row.extend(table.padding[len(row):])
         if table.rowid_column is not None:
@@ -2882,14 +2902,13 @@ class CompiledSelect:
         compiler = Compiler(scope, self.aggregates, misuse="misuse of aggregate: {name}()",
                             executor=executor, allow_aggregates=True, windows=self.windows)
         scope.phase = "outputs"
-        compiled = [compiler.compile_with_affinity(e) for e in self.exprs]
-        self.outputs = [function for function, _ in compiled]
-        self.affinities = [affinity for _, affinity in compiled]
+        self.output_row, self.affinities = compiler.compile_tuple(self.exprs)
         scope.aliases = aliases
         scope.phase = "order"
-        self.order_terms, self.order_functions = executor.order_terms(
+        self.order_terms, order_functions = executor.order_terms(
             stmt, self.exprs, self.names, compiler
         )
+        self.order_key = tuple_function(order_functions)
         scope.phase = "having"
         compiler.windows = None
         self.having = compiler.compile(stmt.having) if stmt.having is not None else None
@@ -2995,7 +3014,7 @@ class CompiledSelect:
             rows = self.executor.join_rows(self.scope, self.levels)
         else:
             rows = [[]]
-        outputs, order_functions = self.outputs, self.order_functions
+        output_row, order_key = self.output_row, self.order_key
         start, end = self.limit() if self.limit is not None else (0, None)
         if max_rows is not None and not self.order_terms and not self.distinct:
             end = max_rows if end is None else min(end, start + max_rows)
@@ -3010,8 +3029,7 @@ class CompiledSelect:
             )
         if self.windows is not None:
             rows = self.windows.apply(rows)
-        records = ((tuple(f(row) for f in outputs), tuple(f(row) for f in order_functions))
-                   for row in rows)
+        records = ((output_row(row), order_key(row)) for row in rows)
         if self.distinct:
             records = distinct_records(records)
         if self.presorted or not self.order_terms:

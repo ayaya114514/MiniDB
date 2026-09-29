@@ -160,6 +160,21 @@ def _compile(header: bytes) -> tuple[struct.Struct, Callable[[tuple], list[SQLVa
     return layout, assemble
 
 
+def decode_row(data: bytes) -> list[SQLValue]:
+    """The values of a record that makes up all of ``data`` (a table row):
+    decode_record without the end position, for speed."""
+    size = data[0]
+    if size != 0xFF:
+        decoder = _decoders.get(data[1:size + 1])
+        if decoder is not None:
+            layout, assemble = decoder
+            try:
+                return assemble(layout.unpack_from(data, size + 1))
+            except struct.error:
+                pass  # reported by decode_record
+    return decode_record(data)[0]
+
+
 def decode_record(data: bytes | bytearray | memoryview, pos: int = 0) -> tuple[list[SQLValue], int]:
     """Decode a record starting at ``pos``; returns (values, end position)."""
     size = data[pos]
