@@ -137,6 +137,7 @@ class Call:
     name: str  # upper case
     args: tuple
     distinct: bool = False
+    defer_affinity: bool = False  # has its first argument's affinity (SQLite's AFF_DEFER)
 
 
 # ---- statements --------------------------------------------------------
@@ -256,7 +257,7 @@ class Join:
     """One table of a FROM clause and how it joins to the tables before it."""
 
     table: object  # TableRef or DerivedTable
-    kind: str = "INNER"  # INNER (also for "," and CROSS JOIN) or LEFT
+    kind: str = "INNER"  # INNER (also for "," and CROSS JOIN), LEFT, RIGHT or FULL
     on: object = None
     using: list | None = None  # column names of USING (...)
     natural: bool = False
@@ -449,9 +450,9 @@ class Parser:
             raise self.error(f'"{op}"')
         return self.advance()
 
-    def at_word(self, word: str) -> bool:
+    def at_word(self, *words: str) -> bool:
         """At a non-reserved word such as VIEW (tokenized as an identifier)?"""
-        return self.tok.kind == "IDENT" and ascii_upper(self.tok.text) == word
+        return self.tok.kind == "IDENT" and ascii_upper(self.tok.text) in words
 
     def expect_word(self, word: str) -> Token:
         """Expect a non-reserved word such as KEY (tokenized as an identifier)."""
@@ -937,6 +938,9 @@ class Parser:
             if self.accept_keyword("LEFT"):
                 self.accept_keyword("OUTER")
                 kind = "LEFT"
+            elif self.at_word("RIGHT", "FULL"):
+                kind = ascii_upper(self.advance().text)
+                self.accept_keyword("OUTER")
             elif self.accept_keyword("INNER") or self.accept_keyword("CROSS"):
                 kind = "INNER"
             elif self.at_keyword("JOIN"):
@@ -987,7 +991,7 @@ class Parser:
         if not isinstance(source, list):
             return [Join(source, kind)]
         if kind != "INNER":
-            raise NotSupportedError("LEFT JOIN of a parenthesized join is not supported")
+            raise NotSupportedError(f"{kind} JOIN of a parenthesized join is not supported")
         return source
 
     def table_ref(self) -> TableRef | DerivedTable:
@@ -998,7 +1002,7 @@ class Parser:
             alias = None
             if self.accept_keyword("AS"):
                 alias = self.identifier("alias")
-            elif self.tok.kind == "IDENT":
+            elif self.tok.kind == "IDENT" and not self.at_word("RIGHT", "FULL"):
                 alias = self.advance().value
             return DerivedTable(query, alias)
         pos = self.tok.pos
@@ -1006,8 +1010,8 @@ class Parser:
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
-        elif self.tok.kind == "IDENT" and not self.at_word("INDEXED"):
-            alias = self.advance().value
+        elif self.tok.kind == "IDENT" and not self.at_word("INDEXED", "RIGHT", "FULL"):
+            alias = self.advance().value  # (RIGHT / FULL start a join, as LEFT does)
         return TableRef(name, alias, self.index_hint(), pos)
 
     def index_hint(self) -> str | None:

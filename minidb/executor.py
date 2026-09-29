@@ -92,13 +92,28 @@ class Result(list):
 class ScopeEntry:
     """One table (or derived table) of a FROM clause."""
 
-    __slots__ = ("name", "table", "offset", "hidden")
+    __slots__ = ("name", "table", "offset", "hidden", "using")
 
     def __init__(self, name: str, table: Source, offset: int) -> None:
         self.name = name  # alias or table name, lower case
         self.table = table
         self.offset = offset  # position of its first column in a row
-        self.hidden = set()  # USING / NATURAL columns only reachable when qualified
+        self.hidden = set()  # columns only reachable when qualified (see Executor.using_condition)
+        self.using = set()  # the columns of its own USING / NATURAL join (left out of *)
+
+
+class Merge:
+    """A USING column of a FULL JOIN: unqualified, it is the first non-NULL
+    of the joined tables' columns (with the first one's affinity, as SQLite
+    does), kept in a slot of its own."""
+
+    __slots__ = ("slot", "index", "parts", "affinity")
+
+    def __init__(self, slot: int, index: int, parts: list[int], affinity: str | None) -> None:
+        self.slot = slot
+        self.index = index  # the FULL JOIN's table, where the slot is set
+        self.parts = parts  # slots of the columns, in order
+        self.affinity = affinity
 
 
 class Scope:
@@ -111,11 +126,17 @@ class Scope:
         self.cell = [None]  # the row of this scope while one of its subqueries runs
         self.uses_outer = False  # some expression here refers to an enclosing query
         self.used = set()  # (table index, column position) pairs referenced so far
+        self.last_right = -1  # the index of the last RIGHT or FULL JOIN's table
+        self.merged = {}  # lower case name -> Merge
 
     def add(self, table: Source, alias: str | None = None) -> None:
         name = ascii_lower(alias if alias is not None else table.name)
         self.entries.append(ScopeEntry(name, table, self.width))
         self.width += len(table.columns) + 1
+
+    def add_merge(self, name: str, index: int, parts: list[int], affinity: str | None) -> None:
+        self.merged[ascii_lower(name)] = Merge(self.width, index, parts, affinity)
+        self.width += 1
 
     def rowid_slot(self, index: int) -> int:
         entry = self.entries[index]
@@ -124,6 +145,9 @@ class Scope:
     def _matches(self, column: Column) -> list[tuple[int, str | None, int]]:
         matches = []
         lowered = ascii_lower(column.name)
+        if column.table is None and lowered in self.merged:
+            merge = self.merged[lowered]
+            matches.append((merge.slot, merge.affinity, merge.index))
         for index, entry in enumerate(self.entries):
             if column.table is not None:
                 if ascii_lower(column.table) != entry.name:
@@ -150,7 +174,8 @@ class Scope:
                 for inner in passed:
                     inner.uses_outer = True
                 slot, _, index = matches[0]
-                scope.used.add((index, slot - scope.entries[index].offset))
+                if column.table is not None or ascii_lower(column.name) not in scope.merged:
+                    scope.used.add((index, slot - scope.entries[index].offset))
                 return (*matches[0], depth)
             passed.append(scope)
             scope, depth = scope.parent, depth + 1
@@ -163,20 +188,28 @@ class Scope:
             scope = scope.parent
         return scope
 
-    def star_columns(self, table_name: str | None = None) -> list[tuple[str, str]]:
-        """(table name, column name) pairs that ``*`` or ``table.*`` expands to."""
+    def star_columns(self, table_name: str | None = None) -> list[tuple[str | None, str]]:
+        """(table name, column name) pairs that ``*`` or ``table.*`` expands to.
+
+        As in SQLite, a column of a table left of a RIGHT or FULL JOIN that a
+        later USING joins on is taken by its unqualified name (table None),
+        which may mean another table's column or a Merge."""
         if not self.entries:
             raise OperationalError("no tables specified")
         result = []
         found = False
-        for entry in self.entries:
+        for i, entry in enumerate(self.entries):
             if table_name is not None and ascii_lower(table_name) != entry.name:
                 continue
             found = True
             for column in entry.table.columns:
-                if table_name is None and ascii_lower(column.name) in entry.hidden:
+                lowered = ascii_lower(column.name)
+                if table_name is None and lowered in entry.using:
                     continue
-                result.append((entry.name, column.name))
+                if i < self.last_right and any(lowered in e.using for e in self.entries[i + 1:]):
+                    result.append((None, column.name))
+                else:
+                    result.append((entry.name, column.name))
         if not found:
             raise OperationalError(f"no such table: {table_name}")
         return result
@@ -273,23 +306,36 @@ _FLIPPED = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
 
 def value_comparator(op: str, left_affinity: str | None, right_affinity: str | None) -> Callable[[SQLValue, SQLValue], int | None]:
-    """A function (a, b) -> 1, 0 or None comparing two values with SQLite's rules."""
-    convert_left, convert_right = (
-        _AFFINITY_FUNCTIONS.get(a)
-        for a in values.comparison_affinities(left_affinity, right_affinity)
-    )
+    """A function (a, b) -> 1, 0 or None comparing two values with SQLite's
+    rules: the comparison affinity applies to both operands, TEXT only when
+    one of them is text (as in SQLite's OP_Eq and friends)."""
+    affinity = values.comparison_affinity(left_affinity, right_affinity)
     compare = values.compare
+    if affinity in values.NUMERIC_AFFINITIES:
+        numeric = values.numeric_affinity
+
+        def order(a, b):
+            if type(a) is str:
+                a = numeric(a)
+            if type(b) is str:
+                b = numeric(b)
+            return compare(a, b)
+    elif affinity == values.TEXT:
+        text = values.text_affinity
+
+        def order(a, b):
+            if type(a) is str or type(b) is str:
+                return compare(text(a), text(b))
+            return compare(a, b)
+    else:
+        order = compare
     if op in ("IS", "IS NOT"):
         want = op == "IS"
 
         def is_test(a, b):
             if a is None or b is None:
                 return int((a is None and b is None) == want)
-            if convert_left:
-                a = convert_left(a)
-            if convert_right:
-                b = convert_right(b)
-            return int((compare(a, b) == 0) == want)
+            return int((order(a, b) == 0) == want)
 
         return is_test
     test = _TESTS[op]
@@ -297,11 +343,7 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
     def comparator(a, b):
         if a is None or b is None:
             return None
-        if convert_left:
-            a = convert_left(a)
-        if convert_right:
-            b = convert_right(b)
-        return int(test(compare(a, b)))
+        return int(test(order(a, b)))
 
     return comparator
 
@@ -369,6 +411,8 @@ class Compiler:
         if isinstance(expr, Like):
             return self._like(expr), None
         if isinstance(expr, Call):
+            if expr.defer_affinity:
+                return self.call(expr), self.compile_with_affinity(expr.args[0])[1]
             return self.call(expr), None
         if isinstance(expr, Star):
             raise OperationalError("* is only allowed in a select list or COUNT(*)")
@@ -1369,6 +1413,7 @@ class Executor:
         the derived tables (which must be materialized before each run)."""
         derived = []
         normalized = []
+        scope.last_right = max((i for i, j in enumerate(joins) if j.kind in ("RIGHT", "FULL")), default=-1)
         for index, join in enumerate(joins):
             ref = join.table
             if isinstance(ref, DerivedTable):
@@ -1403,32 +1448,62 @@ class Executor:
     @staticmethod
     def using_condition(scope: Scope, index: int, join: Join) -> Join:
         """``JOIN t USING (c, ...)`` / ``NATURAL JOIN t`` as an ON condition.
-        The right table's copies of the columns become reachable only by
-        qualified name, so ``c`` and ``*`` mean the left table's column."""
+
+        As in SQLite, an unqualified ``c`` afterwards means the left table's
+        column after an inner or LEFT JOIN (the right table's copy becomes
+        reachable only by qualified name), the right table's after a RIGHT
+        JOIN, and the first non-NULL of them (a Merge) after a FULL JOIN.
+        The left side of the condition is the left-most table with the
+        column; in a FROM clause with a RIGHT or FULL JOIN, the first
+        non-NULL of all the left tables with it (all but the first must have
+        joined on it with USING)."""
         right = scope.entries[index]
         left_entries = scope.entries[:index]
 
-        def left_with(name):
-            return next(
-                (e for e in left_entries
-                 if e.table.column_index(name) is not None and ascii_lower(name) not in e.hidden),
-                None,
-            )
+        def having(name):
+            return [e for e in left_entries if e.table.column_index(name) is not None]
 
         if join.natural:
-            names = [c.name for c in right.table.columns if left_with(c.name) is not None]
+            names = [c.name for c in right.table.columns if having(c.name)]
         else:
             names = join.using
         condition = None
         for name in names:
-            left = left_with(name)
-            if left is None or right.table.column_index(name) is None:
+            key = ascii_lower(name)
+            lefts = having(name)
+            if not lefts or right.table.column_index(name) is None:
                 raise OperationalError(
                     f"cannot join using column {name} - column not present in both tables"
                 )
-            equal = Binary("=", Column(name, left.name), Column(name, right.name))
+            if scope.last_right < 0 or len(lefts) == 1:
+                left = Column(name, lefts[0].name)
+            else:
+                if any(key not in e.using for e in lefts[1:]):
+                    raise OperationalError(f"ambiguous reference to {name} in USING()")
+                left = Call("COALESCE", tuple(Column(name, e.name) for e in lefts), defer_affinity=True)
+            equal = Binary("=", left, Column(name, right.name))
             condition = equal if condition is None else Binary("AND", condition, equal)
-            right.hidden.add(ascii_lower(name))
+            right.using.add(key)
+            if join.kind not in ("RIGHT", "FULL"):
+                right.hidden.add(key)
+                continue
+            # What the unqualified name meant so far, for FULL JOIN's Merge.
+            position = right.table.column_index(name)
+            affinity = right.table.affinities[position]
+            parts = []
+            if key in scope.merged:
+                merge = scope.merged.pop(key)
+                parts, affinity = merge.parts, merge.affinity
+            else:
+                visible = [e for e in lefts if key not in e.hidden]
+                if visible:
+                    first = visible[0].table.column_index(name)
+                    parts, affinity = [visible[0].offset + first], visible[0].table.affinities[first]
+            for entry in lefts:
+                entry.hidden.add(key)
+            if join.kind == "FULL":
+                right.hidden.add(key)
+                scope.add_merge(name, index, parts + [right.offset + position], affinity)
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
     def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False) -> tuple[list[JoinLevel], list[RowFunction]]:
@@ -1438,27 +1513,44 @@ class Executor:
         filters; each is checked at the first level where all the tables it
         uses are bound.  Conjuncts that use none of the tables (and no
         subquery) are the ``constants``: like SQLite, callers test them once
-        before the loop starts and skip it entirely when one is false.  A LEFT
-        JOIN's ON condition decides which rows match at its own level (and is
-        the only thing its access path may use).  Without LEFT JOINs the
-        tables are joined in the cheapest order.
+        before the loop starts and skip it entirely when one is false.  An
+        outer (LEFT, RIGHT, FULL) JOIN's ON condition decides which rows
+        match at its own level (and is the only thing its access path may
+        use).  A RIGHT or FULL JOIN adds its unmatched rows after the loop
+        (see join_rows), so a condition on the joined rows is never tested
+        before its level.  Without outer joins the tables are joined in the
+        cheapest order.
         """
         compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
         on_compiler = Compiler(scope, executor=self)
-        pool = split_conjuncts(fold_and(where))
-        for join in joins:
-            if join.kind != "LEFT":
-                pool += split_conjuncts(fold_and(join.on))
-        referenced = [(conjunct, tables_referenced(conjunct, scope)) for conjunct in pool]
-        constants = [compiler.compile(conjunct) for conjunct, tables in referenced if not tables]
-        referenced = [(conjunct, tables) for conjunct, tables in referenced if tables]
+        rights = [i for i, join in enumerate(joins) if join.kind in ("RIGHT", "FULL")]
+
+        def floor(j):
+            """The lowest level for a condition of join j (len(joins): WHERE)."""
+            return max((i for i in rights if i < j), default=0)
+
+        # (conjunct, lowest level, join whose ON it comes from or None)
+        pool = [(c, floor(len(joins)), None) for c in split_conjuncts(fold_and(where))]
+        for j, join in enumerate(joins):
+            if join.kind == "INNER":
+                pool += [(c, floor(j), j) for c in split_conjuncts(fold_and(join.on))]
+        referenced = []
+        constants = []
+        for conjunct, lowest, home in pool:
+            tables = tables_referenced(conjunct, scope)
+            if tables or (home is not None and any(i > home for i in rights)):
+                # (A constant ON condition before a RIGHT JOIN only filters
+                # the rows it joins to.)
+                referenced.append((conjunct, tables, lowest if tables else home))
+            else:
+                constants.append(compiler.compile(conjunct))
         order = list(range(len(joins)))
-        if len(joins) > 1 and all(join.kind != "LEFT" for join in joins):
-            order = self.join_order(scope, referenced, compiler)
+        if len(joins) > 1 and all(join.kind == "INNER" for join in joins):
+            order = self.join_order(scope, [(c, tables) for c, tables, _ in referenced], compiler)
         position = {table: i for i, table in enumerate(order)}
         placed = {}
-        for conjunct, tables in referenced:
-            level = max((position[t] for t in tables), default=0)
+        for conjunct, tables, lowest in referenced:
+            level = max([position[t] for t in tables] + [lowest])
             placed.setdefault(level, []).append(conjunct)
         # Compile all conditions first: the access paths may then check which
         # columns the query uses (covering indexes).
@@ -1466,21 +1558,28 @@ class Executor:
         for level, index in enumerate(order):
             join = joins[index]
             match = None
-            if join.kind == "LEFT" and join.on is not None:
+            if join.kind != "INNER" and join.on is not None:
                 match = on_compiler.compile(join.on)
             compiled.append((match, [compiler.compile(f) for f in placed.get(level, [])]))
         levels = []
         for level, (index, (match, filters)) in enumerate(zip(order, compiled)):
             join = joins[index]
             entry = scope.entries[index]
-            usable = split_conjuncts(join.on) if join.kind == "LEFT" else pool
-            hint = order_hint if level == 0 and index == 0 else None
+            if join.kind == "INNER":
+                usable = [c for c, lowest, _ in pool if lowest <= level]
+            else:
+                usable = split_conjuncts(join.on)
+            hint = order_hint if level == 0 and index == 0 and not rights else None
             access = plan_access(scope, index, self.catalog, usable, compiler, hint,
                                  bound=set(order[:level]))
             if covering and isinstance(access, IndexScan):
                 access.cover_if_possible(scope, index)
             levels.append(JoinLevel(entry.table, entry.offset, access,
-                                    join.kind == "LEFT", match, filters))
+                                    join.kind in ("LEFT", "FULL"), match, filters))
+            if join.kind in ("RIGHT", "FULL"):
+                scan = plan_access(scope, index, self.catalog, [], compiler)
+                levels[-1].unmatched = JoinLevel(entry.table, entry.offset, scan, False, None, [])
+            levels[-1].merges = [(m.slot, m.parts) for m in scope.merged.values() if m.index == index]
         return levels, constants
 
     def join_order(self, scope: Scope, referenced: list[tuple[Expr, set[int]]], compiler: Compiler) -> list[int]:
@@ -1538,6 +1637,13 @@ class Executor:
                     return False
             return True
 
+        # Row ids a RIGHT / FULL JOIN level matched, by level.
+        matched_ids = {i: set() for i, level in enumerate(levels) if level.unmatched is not None}
+
+        def merge(level):
+            for slot, parts in level.merges:
+                row[slot] = next((row[p] for p in parts if row[p] is not None), None)
+
         def visit(i):
             if i == depth:
                 yield row
@@ -1545,20 +1651,48 @@ class Executor:
             level = levels[i]
             start, stop = level.offset, level.offset + len(level.table.columns) + 1
             load = level.load
+            seen = matched_ids.get(i)
             matched = False
             for rowid, record in level.access.candidates(row):
                 row[start:stop] = load(rowid, record)
+                if level.merges:
+                    merge(level)
                 if level.match is not None and not truth(level.match(row)):
                     continue
                 matched = True
+                if seen is not None:
+                    seen.add(row[stop - 1])
                 if passes(level.filters):
                     yield from visit(i + 1)
             if level.outer and not matched:
                 row[start:stop] = [None] * (stop - start)
+                merge(level)
                 if passes(level.filters):
                     yield from visit(i + 1)
 
-        return visit(0)
+        def unmatched(i):
+            """The rows of a RIGHT / FULL JOIN's table that nothing before it
+            matched, with NULL for the tables before, joined to the rest."""
+            level = levels[i]
+            for before in levels[:i]:
+                row[before.offset:before.offset + len(before.table.columns) + 1] = \
+                    [None] * (len(before.table.columns) + 1)
+                for slot, _ in before.merges:
+                    row[slot] = None
+            start, stop = level.offset, level.offset + len(level.table.columns) + 1
+            scan, seen = level.unmatched, matched_ids[i]
+            for rowid, record in scan.access.candidates(row):
+                row[start:stop] = scan.load(rowid, record)
+                merge(level)
+                if row[stop - 1] not in seen and passes(level.filters):
+                    yield from visit(i + 1)
+
+        def run():
+            yield from visit(0)
+            for i in matched_ids:
+                yield from unmatched(i)
+
+        return run() if matched_ids else visit(0)
 
     def explain(self, stmt: Select | Compound | Update | Delete) -> Result:
         """One row (table, access path) per table the statement reads, in join order."""
@@ -2107,8 +2241,10 @@ class JoinLevel:
         self.table = table
         self.offset = offset  # position of the table's first slot in a row
         self.access = access
-        self.outer = outer  # LEFT JOIN: emit a NULL row when nothing matches
-        self.match = match  # LEFT JOIN ON condition
+        self.outer = outer  # LEFT / FULL JOIN: emit a NULL row when nothing matches
+        self.match = match  # an outer join's ON condition
+        self.unmatched = None  # RIGHT / FULL JOIN: a JoinLevel scanning the whole table
+        self.merges = []  # (slot, part slots) of the Merges to set once this table is bound
         self.filters = filters  # conditions checked once this table is bound
         if isinstance(table, DerivedSource) or getattr(access, "yields_rows", False):
             self.load = lambda rowid, row: row  # already a row
@@ -2158,6 +2294,7 @@ class CompiledSelect:
         # True when the first table's access path already yields ORDER BY order.
         self.presorted = bool(
             self.levels and order_columns and not self.is_aggregate
+            and all(level.unmatched is None for level in self.levels)
             and follows_order(order_columns, self.levels[0].access.order())
         )
 
