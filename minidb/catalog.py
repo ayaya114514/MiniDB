@@ -60,9 +60,7 @@ def index_key(key_values: Sequence[SQLValue], rowid: int) -> IndexKey:
 class IndexKeyCodec:
     """Serializes index keys (tuples of sort-key pairs) as records."""
 
-    @staticmethod
-    def _plain(pair: tuple) -> SQLValue:
-        return None if pair[0] == 0 else pair[1]
+    _plain = staticmethod(values.plain_value)
 
     @classmethod
     def encode(cls, key: IndexKey) -> bytes:

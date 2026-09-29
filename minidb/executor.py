@@ -878,12 +878,13 @@ class IndexScan:
         if self.covering:
             table = self.index.table
             width, positions, alias = len(table.columns), self.index.positions, table.rowid_column
+            plain_value = values.plain_value
             for key in keys:
                 rowid = key[-1][1]
                 built = [None] * width
-                for position, (rank, *value) in zip(positions, key):
-                    if rank:
-                        built[position] = value[0]
+                for position, pair in zip(positions, key):
+                    if pair[0]:
+                        built[position] = plain_value(pair)
                 if alias is not None:
                     built[alias] = rowid
                 built.append(rowid)
@@ -1689,7 +1690,9 @@ class Executor:
         As in SQLite: NOT NULL is checked first, then the upsert targets in
         clause order, then the row id and the other UNIQUE indexes (newest
         first).  REPLACE deletes each conflicting row and goes on."""
-        raw = list(row)  # the values before column affinities (see below)
+        # The values before column affinities (see below); SQLite has already
+        # made integers in REAL columns REALs (OP_RealAffinity).
+        raw = [float(v) if a == values.REAL and type(v) is int else v for v, a in zip(row, table.affinities)]
         rowid = self.prepare_row(table, row)
         violation = self.not_null_violation(table, row)
         if violation is not None:
