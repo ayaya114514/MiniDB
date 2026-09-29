@@ -424,8 +424,32 @@ class Generator:
                 sql += f" LIMIT {rng.randint(0, 4)} OFFSET {rng.randint(0, 2)}"
         return sql
 
+    def cte_select(self):
+        """A query over a CTE: a plain one over a table, or a recursive counter."""
+        rng = self.rng
+        if rng.random() < 0.5:
+            table = rng.choice([t for t in self.tables if not t.derived])
+            scope = [("q", table)]
+            where = f" WHERE {self.condition(scope)}" if rng.random() < 0.6 else ""
+            body = (f"SELECT {self.expr(scope, 1, True)} AS x, {self.expr(scope, 1, True)} AS y "
+                    f"FROM {table.name} AS q{where}")
+        else:
+            op = rng.choice(["UNION ALL", "UNION"])
+            limit = f" LIMIT {rng.randint(0, 8)}" if rng.random() < 0.3 else ""
+            order = f" ORDER BY {rng.choice(['1', '2', '1 DESC', '2 DESC'])}" if rng.random() < 0.3 else ""
+            body = (f"SELECT {self.literal()} AS x, 0 AS y {op} SELECT (x {rng.choice(['+', '*', '||'])} "
+                    f"{rng.randint(1, 3)}) % 50, y + 1 FROM c WHERE y < {rng.randint(0, 6)}{order}{limit}")
+        cte = Table("c", [("x", "", ""), ("y", "", "")], None)
+        cte.derived = True
+        scope = [("a", cte)]
+        where = f" WHERE {self.condition(scope)}" if rng.random() < 0.5 else ""
+        items = ", ".join(self.expr(scope, 1) for _ in range(rng.randint(1, 2)))
+        return f"WITH c AS ({body}) SELECT {items} FROM c AS a{where}"
+
     def select(self):
         rng = self.rng
+        if rng.random() < 0.05:
+            return self.cte_select()
         if rng.random() < 0.08:
             return self.compound_select()
         if rng.random() < 0.1 and self.views:
