@@ -15,6 +15,8 @@ Operator precedence, lowest first (as in SQLite):
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import Union
 
@@ -34,6 +36,10 @@ class Literal:
 class Column:
     name: str
     table: str | None = None
+    # Where the name and the table qualifier are in the SQL text (for ALTER
+    # TABLE's rewriting of views); not part of the node's value.
+    pos: int = field(default=-1, compare=False)
+    table_pos: int = field(default=-1, compare=False)
 
 
 @dataclass(frozen=True)
@@ -143,6 +149,17 @@ class ColumnDef:
     primary_key: bool = False
     not_null: bool = False
     unique: bool = False
+    default: object = None  # DEFAULT expression, or None
+    default_text: str | None = None  # its SQL text
+
+
+@dataclass
+class AlterTable:
+    table: str
+    action: str  # "rename", "rename column", "add" or "drop"
+    column: str | None = None  # the column renamed or dropped
+    new_name: str | None = None
+    definition: object = None  # ColumnDef of ADD COLUMN
 
 
 @dataclass
@@ -223,6 +240,7 @@ class TableRef:
     name: str
     alias: str | None = None
     indexed_by: str | None = None  # INDEXED BY <index>: must exist; only checked
+    pos: int = field(default=-1, compare=False)  # of the name in the SQL text
 
 
 @dataclass
@@ -355,7 +373,7 @@ Expr = Union[
     Subquery, InSelect, Exists, Call,
 ]
 Statement = Union[
-    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Values, Insert, Select, Compound, Update, Delete,
+    CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Values, AlterTable, Insert, Select, Compound, Update, Delete,
     Begin, Commit, Rollback, Analyze, Explain,
 ]
 
@@ -512,6 +530,8 @@ class Parser:
             return self.create()
         if self.at_keyword("DROP"):
             return self.drop()
+        if self.at_word("ALTER"):
+            return self.alter_table()
         if self.at_word("REINDEX"):
             self.advance()
             if self.tok.kind != "IDENT":
@@ -549,6 +569,31 @@ class Parser:
             self.expect_keyword("EXISTS")
             return True
         return False
+
+    def alter_table(self) -> AlterTable:
+        self.advance()  # ALTER
+        self.expect_keyword("TABLE")
+        table = self.identifier("table name")
+        if self.at_word("RENAME"):
+            self.advance()
+            if self.at_word("TO"):
+                self.advance()
+                return AlterTable(table, "rename", new_name=self.identifier("table name"))
+            if self.at_word("COLUMN"):
+                self.advance()
+            column = self.identifier("column name")
+            self.expect_word("TO")
+            return AlterTable(table, "rename column", column, self.identifier("column name"))
+        if self.at_word("ADD"):
+            self.advance()
+            if self.at_word("COLUMN"):
+                self.advance()
+            return AlterTable(table, "add", definition=self.column_def())
+        if self.accept_keyword("DROP"):
+            if self.at_word("COLUMN"):
+                self.advance()
+            return AlterTable(table, "drop", self.identifier("column name"))
+        raise self.error("RENAME, ADD or DROP")
 
     def create_view(self, start: int, temp: bool = False) -> CreateView:
         self.advance()  # VIEW
@@ -603,8 +648,42 @@ class Parser:
                 pass
             elif self.accept_keyword("UNIQUE"):
                 column.unique = True
+            elif self.at_word("DEFAULT"):
+                self.advance()
+                start = self.tok.pos
+                column.default = self.default_value(column.name)
+                last = self.tokens[self.i - 1]
+                column.default_text = self.text[start:last.pos + len(last.text)]
             else:
                 return column
+
+    def default_value(self, column: str) -> Expr:
+        """DEFAULT <literal>, <signed number>, <identifier> (as text),
+        TRUE/FALSE, CURRENT_TIME/DATE/TIMESTAMP, or (<constant expression>)."""
+        token = self.tok
+        if self.accept_op("("):
+            expr = self.expr()
+            self.expect_op(")")
+            if any(isinstance(e, (Column, Subquery, InSelect, Exists, Parameter)) for e in walk_expr(expr)):
+                raise OperationalError(f"default value of column [{column}] is not constant")
+            return expr
+        if self.at_op("+", "-"):
+            op = self.advance().value
+            return Unary(op, self.default_value(column))
+        if token.kind in ("INTEGER", "FLOAT", "STRING", "BLOB"):
+            self.advance()
+            return Literal(token.value)
+        if self.accept_keyword("NULL"):
+            return Literal(None)
+        if token.kind == "IDENT":
+            self.advance()
+            word = ascii_upper(token.text)
+            if word in ("CURRENT_TIME", "CURRENT_DATE", "CURRENT_TIMESTAMP"):
+                return Call(word, ())
+            if word in ("TRUE", "FALSE"):
+                return Literal(int(word == "TRUE"))
+            return Literal(token.value)  # a bare identifier is a string
+        raise self.error("default value")
 
     def drop(self) -> DropTable | DropIndex | DropView:
         self.expect_keyword("DROP")
@@ -686,7 +765,11 @@ class Parser:
             while self.accept_op(","):
                 columns.append(self.identifier("column name"))
             self.expect_op(")")
-        if self.at_query() and not self.at_keyword("VALUES"):
+        if self.at_word("DEFAULT"):
+            self.advance()
+            self.expect_keyword("VALUES")
+            stmt = Insert(table, [], [[]], None, conflict)
+        elif self.at_query() and not self.at_keyword("VALUES"):
             stmt = Insert(table, columns, [], self.query(), conflict)
         else:
             self.expect_keyword("VALUES")
@@ -919,13 +1002,14 @@ class Parser:
             elif self.tok.kind == "IDENT":
                 alias = self.advance().value
             return DerivedTable(query, alias)
+        pos = self.tok.pos
         name = self.identifier("table name")
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
         elif self.tok.kind == "IDENT" and not self.at_word("INDEXED"):
             alias = self.advance().value
-        return TableRef(name, alias, self.index_hint())
+        return TableRef(name, alias, self.index_hint(), pos)
 
     def index_hint(self) -> str | None:
         """``INDEXED BY <index>`` (returned) or ``NOT INDEXED`` (None).  They
@@ -1019,7 +1103,8 @@ class Parser:
                 keyword = self.advance().value
                 if keyword == "IN":
                     if self.tok.kind == "IDENT":  # x IN table: x IN (SELECT * FROM table)
-                        table = TableRef(self.advance().value)
+                        pos = self.tok.pos
+                        table = TableRef(self.advance().value, pos=pos)
                         left = InSelect(left, Select([SelectItem(Star())], [Join(table)]), negated)
                         continue
                     self.expect_op("(")
@@ -1133,8 +1218,9 @@ class Parser:
             if ascii_upper(token.text) in ("CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"):
                 return Call(ascii_upper(token.text), ())
             if self.accept_op("."):
-                return Column(self.identifier("column name"), token.value)
-            return Column(token.value)
+                pos = self.tok.pos
+                return Column(self.identifier("column name"), token.value, pos, token.pos)
+            return Column(token.value, None, token.pos)
         raise self.error("expression")
 
     def case(self) -> Case:
@@ -1210,3 +1296,24 @@ class Parser:
         args = tuple(self.expr_list())
         self.expect_op(")")
         return Call(name, args, distinct)
+
+
+def walk_expr(expr: object) -> Iterator[object]:
+    """Every node of an expression tree (not into subqueries' queries)."""
+    yield expr
+    if isinstance(expr, (Subquery, InSelect, Exists)):
+        if isinstance(expr, InSelect):
+            yield from walk_expr(expr.expr)
+        return
+    if dataclasses.is_dataclass(expr):
+        for f in dataclasses.fields(expr):
+            value = getattr(expr, f.name)
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    if isinstance(item, tuple):
+                        for part in item:
+                            yield from walk_expr(part)
+                    else:
+                        yield from walk_expr(item)
+            elif dataclasses.is_dataclass(value):
+                yield from walk_expr(value)

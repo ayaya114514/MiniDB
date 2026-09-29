@@ -28,7 +28,7 @@ from minidb import values
 from minidb.btree import BTree
 from minidb.errors import DatabaseError, OperationalError
 from minidb.pager import Pager
-from minidb.parser import ColumnDef, CreateIndex, CreateTable, CreateView, parse
+from minidb.parser import ColumnDef, CreateIndex, CreateTable, CreateView, Literal, Unary, parse
 from minidb.record import decode_record, encode_record, encoded_size
 from minidb.values import SQLValue, ascii_lower
 
@@ -96,6 +96,10 @@ class TableInfo:
             (i for i, c in enumerate(columns) if c.primary_key and c.type == "INTEGER"), None
         )  # only the type name INTEGER itself: "INT PRIMARY KEY" is an ordinary column
         self.affinities = [values.type_affinity(c.type) for c in columns]
+        # Values of columns missing from a record (added by ALTER TABLE ADD
+        # COLUMN after the row was written): their constant defaults.
+        self.padding = [values.apply_affinity(constant_default(c.default), a)
+                        for c, a in zip(columns, self.affinities)]
 
     def column_index(self, name: str) -> int | None:
         return self.positions.get(ascii_lower(name))
@@ -111,6 +115,8 @@ class TableInfo:
         parts = []
         for column in self.columns:
             text = f"{quote(column.name)} {column.type}".rstrip()
+            if column.default_text is not None:
+                text += f" DEFAULT {column.default_text}"
             if column.primary_key:
                 text += " PRIMARY KEY"
             if column.not_null:
@@ -119,6 +125,21 @@ class TableInfo:
                 text += " UNIQUE"
             parts.append(text)
         return f"CREATE TABLE {quote(self.name)} ({', '.join(parts)})"
+
+
+def constant_default(expr: object) -> SQLValue:
+    """The value of a constant DEFAULT (a literal, possibly signed), or None."""
+    if isinstance(expr, Literal):
+        return expr.value
+    if isinstance(expr, Unary) and expr.op in ("-", "+") and isinstance(expr.operand, (Literal, Unary)):
+        value = constant_default(expr.operand)
+        return values.subtract(0, value) if expr.op == "-" else value
+    return None
+
+
+def is_constant_default(expr: object) -> bool:
+    return expr is None or isinstance(expr, Literal) or (
+        isinstance(expr, Unary) and expr.op in ("-", "+") and is_constant_default(expr.operand))
 
 
 class IndexInfo:
@@ -383,6 +404,33 @@ class Catalog:
             self.schema.delete(index.stat_key)
         del self.indexes[ascii_lower(index.name)]
         index.table.indexes.remove(index)
+
+    # ---- ALTER TABLE ------------------------------------------------------------
+
+    def rewrite_table_entries(self, table: TableInfo) -> None:
+        """Store a table's (changed) definition, its indexes' and their
+        statistics again, under their old keys; then reload the schema."""
+        self.version += 1
+        self.schema.insert(table.schema_key, encode_record(
+            ["table", table.name, table.name, table.root, table.sql()]), replace=True)
+        for index in table.indexes:
+            self.schema.insert(index.schema_key, encode_record(
+                ["index", index.name, table.name, index.root, index.sql()]), replace=True)
+            if index.stat_key is not None:
+                text = " ".join(f"{n:g}" if isinstance(n, float) else str(n)
+                                for n in [table.stat_rows or 0] + index.stat_average)
+                self.schema.insert(index.stat_key, encode_record(
+                    ["stat", index.name, table.name, 0, text]), replace=True)
+        if table.stat_key is not None:
+            self.schema.insert(table.stat_key, encode_record(
+                ["stat", table.name, table.name, 0, str(table.stat_rows)]), replace=True)
+
+    def rewrite_view(self, view: ViewInfo, sql: str) -> None:
+        self.version += 1
+        if view.schema_key is None:  # a temporary view
+            self.temp_views[ascii_lower(view.name)] = ViewInfo(parse(sql))
+            return
+        self.schema.insert(view.schema_key, encode_record(["view", view.name, view.name, 0, sql]), replace=True)
 
     # ---- statistics ---------------------------------------------------------
 

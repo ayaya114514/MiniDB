@@ -45,11 +45,14 @@ TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", 
 def no_max_rowid(value):
     """An expression for an INTEGER PRIMARY KEY that is never a large number:
     once row id 2**63-1 exists (a row id near it, then a new row, does it),
-    SQLite picks later row ids at random.  (v) < '' holds exactly for numbers
-    (numbers sort before all text).  The value is written twice, so it must
-    not contain parameters; CASE calls no function (a function call would
-    change SQLite's statement journal decision)."""
-    return f"(CASE WHEN ({value}) > 1000000 AND ({value}) < '' THEN NULL ELSE ({value}) END)"
+    SQLite picks later row ids at random.  Text that looks like a number
+    counts too (the INTEGER PRIMARY KEY converts it), so the test is on
+    CAST(v AS NUMERIC); x < '' holds exactly for numbers (they sort before
+    all text).  The value is written several times, so it must not contain
+    parameters; CASE and CAST call no function (a function call would change
+    SQLite's statement journal decision)."""
+    number = f"CAST(({value}) AS NUMERIC)"
+    return f"(CASE WHEN {number} > 1000000 AND {number} < '' THEN NULL ELSE ({value}) END)"
 
 
 class Table:
@@ -57,9 +60,9 @@ class Table:
         self.name = name
         self.columns = columns  # [(name, type, constraints)]
         self.rowid_alias = rowid_alias  # column name or None
-        self.unique_columns = {c[0] for c in columns if c[2] == "UNIQUE"}
+        self.unique_columns = {c[0] for c in columns if "UNIQUE" in c[2]}
         # Column tuples of uniqueness constraints: valid ON CONFLICT targets.
-        self.unique_targets = [(c[0],) for c in columns if c[2] in ("UNIQUE", "PRIMARY KEY")]
+        self.unique_targets = [(c[0],) for c in columns if "UNIQUE" in c[2] or "PRIMARY KEY" in c[2]]
         self.derived = False  # a subquery in FROM (no rowid)
 
     def column_names(self):
@@ -92,6 +95,9 @@ class Generator:
             col_type = rng.choice(["INTEGER", "TEXT", "INTEGER", "TEXT", "REAL", "NUMERIC", "",
                                    "BLOB", "VARCHAR(5)", "INT", "FLOAT"])
             constraint = rng.choice(["", "", "", "NOT NULL", "UNIQUE"])
+            if rng.random() < 0.3:
+                constraint = (constraint + " DEFAULT " + rng.choice(
+                    ["0", "'x'", "-1.5", "NULL", "(2 * 3)", "x'61'", "'10'"])).strip()
             columns.append((f"c{i}", col_type, constraint))
         table = Table(name, columns, rowid_alias)
         self.tables.append(table)
@@ -111,6 +117,16 @@ class Generator:
             table.unique_targets.append(tuple(columns))
         self.index_info[name] = (table, tuple(columns), bool(unique))
         return f"CREATE {unique}INDEX {name} ON {table.name} ({', '.join(columns)})"
+
+    def add_column(self):
+        """ALTER TABLE ADD COLUMN (old rows read the constant default)."""
+        rng = self.rng
+        table = rng.choice([t for t in self.tables if not t.derived])
+        name = f"c{len(table.columns)}"
+        col_type = rng.choice(["INTEGER", "TEXT", "REAL", ""])
+        default = rng.choice(["", " DEFAULT 5", " DEFAULT 'y'", " DEFAULT -2.5", " NOT NULL DEFAULT 1"])
+        table.columns.append((name, col_type, default.strip()))
+        return f"ALTER TABLE {table.name} ADD COLUMN {name} {col_type}{default}"
 
     def drop_index(self):
         if not self.indexes:
@@ -536,6 +552,8 @@ class Generator:
             return "ANALYZE"  # statistics change later plans, never results
         if roll < 0.095:
             return self.create_view() if rng.random() < 0.7 else self.drop_view()
+        if roll < 0.098:
+            return self.add_column()
         if roll < 0.40:
             return self.insert()
         if roll < 0.50:
