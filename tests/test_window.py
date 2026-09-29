@@ -277,3 +277,42 @@ def test_parse_windows():
         parse("SELECT sum(a) OVER (ROWS UNBOUNDED FOLLOWING) FROM t")
     with pytest.raises(SQLSyntaxError):
         parse("SELECT sum(a) OVER () FILTER (WHERE 1) FROM t")
+
+
+def test_window_edge_cases_match_sqlite():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE e (id INTEGER PRIMARY KEY, a, s)",
+        "INSERT INTO e VALUES (1, 9223372036854775807, ','), (2, 1, '::'), (3, -9223372036854775808, NULL), "
+        "(4, 5, ''), (5, 'x', ';;;'), (6, 2.5, '-'), (7, -9223372036854775808, ','), (8, 3, ',')",
+    ]:
+        pair.run(sql)
+    for sql in [
+        # xInverse of sum() on integers that overflow, and of the smallest integer
+        "SELECT id, sum(a) OVER (ORDER BY id ROWS 1 PRECEDING) FROM e WHERE id < 3",
+        "SELECT id, total(a) OVER (ORDER BY id ROWS 1 PRECEDING), avg(a) OVER (ORDER BY id ROWS 2 PRECEDING) FROM e",
+        "SELECT id, sum(a) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM e WHERE id IN (3, 4, 8)",
+        "SELECT id, sum(a) OVER (ORDER BY id ROWS 1 PRECEDING) FROM e WHERE id > 5",
+        "SELECT sum(column1) OVER (ROWS 2 PRECEDING) FROM (VALUES (-2), (9223372036854775807), (1), (0))",
+        "SELECT total(column1) OVER (ROWS 2 PRECEDING) FROM (VALUES (-2), (9223372036854775807), (1), (0))",
+        # separators of different lengths, removed from the front
+        "SELECT id, group_concat(a, s) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM e",
+        "SELECT id, group_concat(a, s) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND 1 FOLLOWING) FROM e",
+        "SELECT id, string_agg(s, a) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND 2 FOLLOWING) FROM e",
+        # nth_value() when frames are scanned afresh (EXCLUDE)
+        "SELECT id, nth_value(a, 2.0) OVER (ORDER BY id ROWS 2 PRECEDING EXCLUDE CURRENT ROW) FROM e",
+        "SELECT id, nth_value(a, 2.5) OVER (ORDER BY id ROWS 2 PRECEDING EXCLUDE CURRENT ROW) FROM e",
+        "SELECT id, nth_value(a, 'x') OVER (ORDER BY id) FROM e",
+        # RANGE offsets
+        "SELECT id, count(*) OVER (ORDER BY id RANGE -1 PRECEDING) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY id RANGE BETWEEN 'abc' PRECEDING AND CURRENT ROW) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY id RANGE BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM e",
+        "SELECT id, count(*) OVER (ORDER BY id RANGE BETWEEN CURRENT ROW AND x'01' FOLLOWING) FROM e",
+        "SELECT id, sum(id) OVER (ORDER BY id RANGE BETWEEN 2 FOLLOWING AND 1 FOLLOWING) FROM e",
+        "SELECT id, sum(id) OVER (ORDER BY id RANGE BETWEEN 1 PRECEDING AND 2 PRECEDING) FROM e",
+        "SELECT id, sum(id) OVER (ORDER BY id / 3 RANGE BETWEEN 1 FOLLOWING AND 3 FOLLOWING) FROM e",
+        "SELECT id, sum(id) OVER (ORDER BY id / 3 DESC RANGE BETWEEN 3 PRECEDING AND 1 PRECEDING) FROM e",
+        "SELECT id, cume_dist() OVER (PARTITION BY id % 2), percent_rank() OVER (PARTITION BY id % 3) FROM e",
+    ]:
+        pair.run(sql, ordered=True)
+    pair.close()

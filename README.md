@@ -5,29 +5,40 @@
 用 Python 从零实现的小型关系数据库，行为以 SQLite 为标准答案：解析并执行 SQL，数据按 4 KB
 页存在单个文件里，表和索引都是 B+ 树，提交通过预写日志（WAL）保证原子性和崩溃恢复。
 
-只依赖 Python 标准库（3.11–3.14），测试用 pytest。约 5,400 行实现代码（不含空行和注释），
+只依赖 Python 标准库（3.11–3.14），测试用 pytest。约 9,300 行实现代码（不含空行和注释），
 全部带类型注解。
 
 ## 功能
 
 **SQL**
 
-- `CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`；列类型 `INTEGER`、`TEXT`；
-  约束 `PRIMARY KEY`、`NOT NULL`、`UNIQUE`。`INTEGER PRIMARY KEY` 是 rowid 的别名；
-  其他表有隐藏的 `rowid`（也可写 `oid`、`_rowid_`）。
-- `INSERT`（多行 `VALUES`、指定列）、`UPDATE`（可改主键）、`DELETE`。
-- `SELECT`：`*` / `t.*`、别名、`DISTINCT`、`WHERE`、`GROUP BY`、`HAVING`、
-  `ORDER BY`（多列、`ASC`/`DESC`、`NULLS FIRST/LAST`、列序号、别名）、`LIMIT`/`OFFSET`、
-  不带 `FROM` 的 `SELECT`。
-- 连接：`,`、`[INNER] JOIN`、`CROSS JOIN`、`LEFT [OUTER] JOIN ... ON / USING (...)`、
-  `NATURAL [LEFT] JOIN`，任意多张表；FROM 里可以用子查询（derived table）。
+- `CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`；任意类型名，按 SQLite 规则得到
+  INTEGER / REAL / NUMERIC / TEXT / BLOB 亲和性；约束 `PRIMARY KEY`、`NOT NULL`、`UNIQUE`、
+  `DEFAULT`。`INTEGER PRIMARY KEY` 是 rowid 的别名；其他表有隐藏的 `rowid`（也可写 `oid`、`_rowid_`）。
+- `ALTER TABLE ... RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN`（视图里的引用一并改写）；
+  `CREATE [TEMP] VIEW` / `DROP VIEW`；`REINDEX`。
+- `INSERT`（多行 `VALUES`、`DEFAULT VALUES`、`INSERT ... SELECT`、`(rowid, ...)` 列）、`UPDATE`、`DELETE`；
+  冲突处理 `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`、`REPLACE`、UPSERT
+  （`ON CONFLICT (...) DO UPDATE SET ... WHERE / DO NOTHING`，多个子句）、`RETURNING`。
+- `SELECT`：`*` / `t.*`、别名（也可在 WHERE/GROUP BY/HAVING/ORDER BY 的表达式里引用）、`DISTINCT`、
+  `WHERE`、`GROUP BY`、`HAVING`、`ORDER BY`（多列、`ASC`/`DESC`、`NULLS FIRST/LAST`、列序号）、
+  `LIMIT`/`OFFSET`、不带 `FROM` 的 `SELECT`、`VALUES (...), (...)`。
+- `WITH [RECURSIVE]`（CTE，递归 CTE 支持 `UNION` 去重、`ORDER BY` 队列和 `LIMIT`）。
+- 连接：`,`、`[INNER] JOIN`、`CROSS JOIN`、`LEFT` / `RIGHT` / `FULL [OUTER] JOIN ... ON / USING (...)`、
+  `NATURAL ... JOIN`、带括号的连接（外连接右侧的除外），任意多张表；FROM 里可以用子查询、视图和 CTE。
 - 子查询：标量子查询、`[NOT] IN (SELECT ...)`、`[NOT] EXISTS (...)`，可以嵌套、可以引用外层查询的
-  列（相关子查询），能出现在 SELECT/WHERE/HAVING/ORDER BY/LIMIT 和 INSERT/UPDATE/DELETE 里。
+  列和聚合（`(SELECT count(t.a) FROM u)` 属于外层查询），能出现在各子句和 INSERT/UPDATE/DELETE 里。
 - 复合查询：`UNION [ALL]`、`INTERSECT`、`EXCEPT`，带整体的 `ORDER BY` / `LIMIT`。
-- 表达式：比较、`AND`/`OR`/`NOT`（三值逻辑）、`+ - * / %`、`||`、`IS [NOT]`、
-  `[NOT] IN (...)`、`[NOT] BETWEEN`、`[NOT] LIKE`、`CASE`、`CAST(x AS type)`、参数 `?` / `:name`。
-- 函数：`abs`、`length`、`lower`、`upper`、`coalesce`、`ifnull`、`nullif`、`typeof`、多参数
-  `min`/`max`；聚合 `count`、`sum`、`avg`、`min`、`max`、`total`、`group_concat`（均支持 `DISTINCT`）。
+- 窗口函数：`row_number`、`rank`、`dense_rank`、`percent_rank`、`cume_dist`、`ntile`、`lag`、`lead`、
+  `first_value`、`last_value`、`nth_value`，以及全部聚合函数 `OVER (PARTITION BY ... ORDER BY ...
+  {ROWS | RANGE | GROUPS} BETWEEN ... [EXCLUDE ...])`、`WINDOW` 子句；聚合的 `FILTER (WHERE ...)`。
+- 表达式：比较、`AND`/`OR`/`NOT`（三值逻辑）、`+ - * / %`、`||`、位运算 `& | ~ << >>`、`IS [NOT]`、
+  `[NOT] IN (...)`、`[NOT] BETWEEN`、`[NOT] LIKE / GLOB ... [ESCAPE]`、`CASE`、`CAST(x AS type)`、
+  BLOB 字面量 `x'..'`、十六进制整数、参数 `?` / `?NNN` / `:name`。
+- 函数：SQLite 的核心标量函数（`substr`、`replace`、`trim`、`instr`、`printf`/`format`、`round`、
+  `hex`/`unhex`、`quote`、`char`/`unicode`、`concat`、`iif` ……）、数学函数、日期时间函数
+  （`date`、`time`、`datetime`、`julianday`、`unixepoch`、`strftime`、`timediff`，全部修饰符）；
+  聚合 `count`、`sum`、`avg`、`min`、`max`、`total`、`group_concat`、`string_agg`（支持 `DISTINCT`）。
 - 索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`，UNIQUE 列自动建索引；
   执行器对“索引列前缀等值 + 下一列范围”使用索引，也用于连接的内层表。
   `EXPLAIN [QUERY PLAN]` 显示每张表的访问路径。
@@ -127,7 +138,7 @@ SQL 文本
 
 ```sh
 eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启用参考 SQLite（见下）
-.venv/bin/python -m pytest                                        # 全部测试（610+ 个）
+.venv/bin/python -m pytest                                        # 全部测试（860+ 个）
 .venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
 .venv/bin/python tests/metamorphic.py --seeds 0-399 --queries 300 # 变形测试（不需要 sqlite3）
 .venv/bin/python tools/sqllogictest.py --fetch                    # 下载 SQLite 官方 sqllogictest 语料
@@ -186,13 +197,12 @@ sqllogictest 全量语料（通过数低于基线即失败）。
 
 ## 已知限制
 
-- 列类型只有 `INTEGER`、`TEXT`（以及运算或 `CAST` 产生的 REAL）；没有 BLOB、视图、触发器、
-  `ALTER TABLE`、`RIGHT/FULL JOIN`、窗口函数、CTE（`WITH`）；子查询里不能使用外层查询的聚合函数。
-- REAL 转文本时，少数没有短十进制表示的值与 SQLite 在最后几位数字上不同（SQLite 用自己的近似
-  转换算法），见 DECISIONS.md D20。
+- 不支持触发器、`CHECK` 约束、`COLLATE`（只有 BINARY 比较）、临时表、外键、虚表 / 表值函数、
+  `WITHOUT ROWID`、生成列；`localtime` 修饰符只在一个时区的机器上对照过。
 - 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
-  多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、常量表达式出错的求值时机），MiniDB 不保证选择相同。
+  多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、聚合查询里裸列取自哪一行、常量传播 / 常量折叠
+  决定的出错时机），MiniDB 不保证选择相同。
 - 一直有读者时 checkpoint 做不成，日志会持续变长；Windows 上没有 `fcntl`，不加锁。
 - 数据库文件不会收缩（空闲页只复用）；目录里会保留（可能为空的）`-wal` 与 `-lock` 文件。
 - 与 sqlite3 对照时，Python 3.11 的 sqlite3 没有 `autocommit` 参数，两组事务行为对照测试在
