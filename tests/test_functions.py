@@ -201,6 +201,14 @@ def test_replace_checks_arguments_in_sqlites_order(pair):
     pair.run("SELECT replace('ab', '', NULL), replace('ab', 'a', NULL), replace(NULL, '', 'x'), replace(5, '', NULL)")
 
 
+def test_trim_compares_bytes_and_stops_the_set_at_nul(pair):
+    # trimFunc: the set is a C string, split into characters as SQLITE_SKIP_UTF8.
+    pair.run("SELECT ltrim(10, char(0) || '-165'), trim('xxaxx', 'x' || char(0) || 'a'), trim('éaé', 'é'), "
+             "hex(rtrim('aé', x'a9')), hex(ltrim(x'c3a9c3', x'c3')), trim(x'ffff41ff', x'ff'), trim(12.5, '15'), "
+             "ltrim(x'c38080', x'c38080'), hex(trim(x'c3a9', x'c3')), hex(rtrim(x'41c3a9', x'a9')), "
+             "trim('abc', ''), trim(NULL, 'a'), trim('a', NULL), rtrim('xé', 'é' || 'x'), hex(ltrim('é', x'c3'))")
+
+
 @pytest.mark.parametrize("blob", ["x'ff'", "x'80'", "x'c3'", "x'c328'", "x'e282'", "x'e282ac'", "x'f09f9880'",
                                   "x'eda080'", "x'efbfbe'", "x'c0af'", "x'41ff42'", "x'fe'", "x'f8888080'",
                                   "x'00ff'", "x''", "x'e28241'"])

@@ -546,6 +546,15 @@ class Generator:
             function = rng.choice(["count", "sum", "avg", "min", "max", "total", "count"])
             argument = "*" if function == "count" and rng.random() < 0.3 else self.expr(scope, 2)
             distinct = "DISTINCT " if argument != "*" and rng.random() < 0.15 else ""
+            if rng.random() < 0.12:
+                # An aggregate of this query inside a subquery (its argument
+                # uses only this query's columns).
+                alias, table = rng.choice(scope)
+                argument = f"{alias}.{rng.choice(table.column_names())}"
+                other = rng.choice([t for t in self.tables if not t.derived])
+                condition = f" WHERE {self.condition([('s', other)], 2)}" if rng.random() < 0.6 else ""
+                aggregates.append(f"(SELECT {function}({distinct}{argument}) FROM {other.name} AS s{condition})")
+                continue
             aggregates.append(f"{function}({distinct}{argument})")
         sql = f"SELECT {', '.join(groups + aggregates)} FROM {from_sql}{where}"
         if groups:

@@ -552,3 +552,20 @@ SQLite 允许 WHERE、ON、GROUP BY、HAVING、ORDER BY 的表达式里用结果
 
 已知差异：SQLite 的 WHERE 常量传播会把 `x = 常量` 代入其他 AND 项，使其变成语句开始时只算一次的常量，于是
 `abs()` 的整数溢出这类错误可能在没有任何行时也报出；MiniDB 按行求值。只影响报错时机（fuzzer 给 abs 加了 guard）。
+
+## D87 外层查询的聚合、聚合查询的判定
+按 SQLite 的 resolve.c：聚合调用属于其参数用到的最内层查询（参数只用外层列时属于外层；不用任何列时属于
+当前层）。`Compiler.aggregate_depth` 解析参数里的列得出层数；属于外层的调用登记到那一层的
+AggregateCollector，在子查询里通过外层的 `cell`（当前分组行）读取结果，中间各层标为相关子查询。
+只有 GROUP BY 或结果列里（含子查询中）属于本层的聚合才使查询成为聚合查询——HAVING 和 ORDER BY 里的
+不算（与 SQLite 相同：`SELECT a FROM t ORDER BY count(*)` 报错）。结果列编译到一半才发现外层聚合时抛出
+`NeedsAggregate`，该层按聚合查询重新编译。报错位置和措辞随子句（`Scope.phase`）而定：WHERE/ON 里在非聚合
+查询中是 "misuse of aggregate function"，在聚合查询中是 "misuse of aggregate:"；GROUP BY 里是
+"aggregate functions are not allowed in the GROUP BY clause"；聚合参数里的子查询不能再引用同层聚合。
+参数里含子查询的聚合一律算作当前层（SQLite 会看子查询里的列，这是简化）。
+
+已知差异：SQLite 在 WHERE 里把 `x OR 5` 这类恒真表达式折叠掉后，不再为其中的子查询生成代码，因此不会
+报其中外层聚合的 misuse 错误；MiniDB 照常报错（fuzzer 只在聚合查询的结果列里生成外层聚合）。
+
+外连接的 ON（FROM 中有 RIGHT/FULL 时任何 ON）不能引用它右边的表，报 "ON clause references tables to its
+right"；含子查询的 ON 先试编译一次，收集解析到本层的表（`Scope.watch`）。
