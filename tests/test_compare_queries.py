@@ -914,6 +914,52 @@ def test_order_by_first_table_after_join_reordering():
     pair.close()
 
 
+def test_hash_joins_match_sqlite():
+    """Equality joins on columns without an index hash the inner table's rows
+    (HashLookup): affinity conversions, NULLs, mixed types in derived tables,
+    outer joins, and a rebuild for every run of a correlated subquery."""
+    pair = Pair(check_messages=True)
+    for sql in [
+        'CREATE TABLE ti (a INTEGER, b)',
+        'CREATE TABLE tt (a TEXT, b)',
+        'CREATE TABLE tn (a, b)',
+        'CREATE TABLE tr (a REAL, b)',
+        "INSERT INTO ti VALUES (1, 'i1'), (2, 'i2'), (NULL, 'in'), ('x', 'ix'), (2, 'i2b'), (1.5, 'i15')",
+        "INSERT INTO tt VALUES ('1', 't1'), ('2', 't2'), (NULL, 'tn'), ('x', 'tx'), ('1.0', 't10'), (' 2', 'tsp')",
+        "INSERT INTO tn VALUES (1, 'n1'), ('1', 'n1s'), (2.0, 'n2'), (NULL, 'nn'), (x'31', 'nb'), ('x', 'nx')",
+        "INSERT INTO tr VALUES (1, 'r1'), (2.5, 'r25'), ('abc', 'rt'), (NULL, 'rn')",
+        'SELECT x.b, y.b FROM ti AS x JOIN tt AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tt AS x JOIN ti AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM ti AS x JOIN tn AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tn AS x JOIN tn AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tt AS x JOIN tn AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tn AS x JOIN tt AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tr AS x JOIN ti AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM ti AS x JOIN tr AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tt AS x JOIN tr AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM ti AS x LEFT JOIN tt AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM ti AS x RIGHT JOIN tt AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM ti AS x FULL JOIN tn AS y ON y.a = x.a',
+        "SELECT x.b, y.v FROM ti AS x JOIN (SELECT a AS k, b AS v FROM tn UNION ALL SELECT '2', 'u2') AS y ON y.k = x.a",
+        'SELECT x.b, y.v FROM tt AS x JOIN (SELECT a + 0 AS k, b AS v FROM tn) AS y ON y.k = x.a',
+        'SELECT x.b, y.v FROM tn AS x JOIN (SELECT a AS k, b AS v FROM tt) AS y ON y.k = x.a',
+        'SELECT x.b, (SELECT group_concat(y.b) FROM tn AS y JOIN tt AS z ON z.a = y.a WHERE y.b >= x.b) FROM ti AS x',
+        'SELECT x.b, y.b, z.b FROM ti AS x JOIN tt AS y ON y.a = x.a JOIN tn AS z ON z.a = y.a',
+        'SELECT x.b, y.b FROM ti AS x JOIN tt AS y ON y.a = x.a + 0',
+        "SELECT x.b, y.b FROM ti AS x JOIN tt AS y ON y.a = x.a AND y.b > 't'",
+        'SELECT count(*) FROM ti AS x JOIN tt AS y ON y.a = x.a WHERE x.a IS NOT NULL',
+        'WITH c AS (SELECT a, b FROM tn) SELECT x.b, c.b FROM ti AS x JOIN c ON c.a = x.a',
+        'UPDATE ti SET b = (SELECT group_concat(y.b) FROM tn AS y JOIN ti AS z ON z.a = y.a WHERE z.b = ti.b) WHERE a IS NOT NULL',
+        'SELECT * FROM ti',
+        'SELECT x.b, y.b FROM tt AS x LEFT JOIN ti AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tt AS x RIGHT JOIN ti AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tt AS x FULL JOIN tr AS y ON y.a = x.a',
+        'SELECT x.b, y.b FROM tn AS x LEFT JOIN tn AS y ON y.a = x.a AND y.b != x.b',
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_common_table_expressions_and_values():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")

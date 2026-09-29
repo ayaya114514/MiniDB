@@ -125,6 +125,13 @@ def benchmark(engine, n, results):
           lambda: run("SELECT city, count(*), avg(age), max(name) FROM people GROUP BY city"))
     timed(results, "ORDER BY age, name LIMIT 10", engine,
           lambda: run("SELECT * FROM people ORDER BY age, name LIMIT 10"))
+    timed(results, "full scan with a compound WHERE", engine,
+          lambda: run("SELECT count(*) FROM people WHERE age * 2 + 1 > 100 AND city != 'rome' "
+                      "AND (name LIKE 'user1%' OR id % 7 = 3)"))
+    run("CREATE TABLE tags (name TEXT, tag TEXT)")
+    run("INSERT INTO tags VALUES " + ", ".join(f"('user{i * 97:06d}', 't{i}')" for i in range(1, 201)))
+    timed(results, f"join {n:,} people with 200 unindexed rows (equality)", engine,
+          lambda: run("SELECT count(*), max(t.tag) FROM people p JOIN tags t ON t.name = p.name"))
     timed(results, "CREATE INDEX on age", engine,
           lambda: run("CREATE INDEX people_age ON people (age)"))
 
