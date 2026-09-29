@@ -430,6 +430,10 @@ def parse_script(text: str) -> list[Statement]:
     return Parser(text).parse_script()
 
 
+_LIST_ENDS = frozenset((",", ")", ";"))
+_CURRENT_WORDS = frozenset(("CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"))
+
+
 class Parser:
     def __init__(self, text: str) -> None:
         self.text = text
@@ -1191,6 +1195,17 @@ class Parser:
         return exprs
 
     def expr(self) -> Expr:
+        # A lone literal or column (as in a VALUES row) needs no trip through
+        # every precedence level.
+        token = self.tok
+        following = self.tokens[self.i + 1] if token.kind != "EOF" else token
+        if following.kind == "EOF" or (following.kind == "OP" and following.value in _LIST_ENDS):
+            if token.kind in ("INTEGER", "FLOAT", "STRING", "BLOB"):
+                self.advance()
+                return Literal(token.value)
+            if token.kind == "IDENT" and ascii_upper(token.text) not in _CURRENT_WORDS:
+                self.advance()
+                return Column(token.value, None, token.pos)
         return self.or_expr()
 
     def or_expr(self) -> Expr:
