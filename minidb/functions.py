@@ -89,16 +89,52 @@ def replace(value: SQLValue, pattern: SQLValue, replacement: SQLValue) -> SQLVal
     return to_text(value).replace(pattern_text, to_text(replacement))
 
 
+def _utf8_chunks(data: bytes) -> list[bytes]:
+    """The characters of a C string as SQLite steps over them
+    (SQLITE_SKIP_UTF8): a lead byte and its continuation bytes, up to a NUL."""
+    chunks, i = [], 0
+    while i < len(data) and data[i]:
+        j = i + 1
+        if data[i] >= 0xC0:
+            while j < len(data) and data[j] & 0xC0 == 0x80:
+                j += 1
+        chunks.append(data[i:j])
+        i = j
+    return chunks
+
+
 def _trim(value: SQLValue, characters: SQLValue, left: bool, right: bool) -> SQLValue:
+    """SQLite's trimFunc: the set of characters is a C string (it ends at a
+    NUL); they are removed by comparing bytes."""
     if value is None or characters is None:
         return None
     text = to_text(value)
     chars = to_text(characters)
+    if text.isascii() and chars.isascii():
+        chars = values._c_string(chars)
+        if not chars:
+            return text
+        if left:
+            text = text.lstrip(chars)
+        if right:
+            text = text.rstrip(chars)
+        return text
+    data = text.encode("utf-8", "surrogateescape")
+    chunks = _utf8_chunks(chars.encode("utf-8", "surrogateescape"))
+    start, end = 0, len(data)
     if left:
-        text = text.lstrip(chars) if chars else text
+        while start < end:
+            chunk = next((c for c in chunks if data.startswith(c, start, end)), None)
+            if chunk is None:
+                break
+            start += len(chunk)
     if right:
-        text = text.rstrip(chars) if chars else text
-    return text
+        while start < end:
+            chunk = next((c for c in chunks if data.endswith(c, start, end)), None)
+            if chunk is None:
+                break
+            end -= len(chunk)
+    return data[start:end].decode("utf-8", "surrogateescape")
 
 
 def trim(value: SQLValue, characters: SQLValue = " ") -> SQLValue:

@@ -100,6 +100,16 @@ class AliasReference(OperationalError):
         self.depth = depth
 
 
+class NeedsAggregate(Exception):
+    """A subquery in the result columns of the query owning ``scope`` has an
+    aggregate of that query: CompiledSelect compiles it again as an
+    aggregate query."""
+
+    def __init__(self, scope: Scope) -> None:
+        super().__init__()
+        self.scope = scope
+
+
 class ScopeEntry:
     """One table (or derived table) of a FROM clause."""
 
@@ -140,6 +150,10 @@ class Scope:
         self.last_right = -1  # the index of the last RIGHT or FULL JOIN's table
         self.merged = {}  # lower case name -> Merge
         self.aliases = {}  # lower case alias -> SelectItem, once the result columns are compiled
+        self.aggregates = None  # the AggregateCollector of an aggregate query
+        self.phase = None  # the clause of the query being compiled: "outputs", "where", "group", ...
+        self.in_aggregate = False  # compiling the arguments of one of its aggregate calls
+        self.watch = None  # a set to collect the indexes of the tables references resolve to
 
     def add(self, table: Source, alias: str | None = None) -> None:
         name = ascii_lower(alias if alias is not None else table.name)
@@ -192,6 +206,8 @@ class Scope:
                 slot, _, index = matches[0]
                 if column.table is not None or ascii_lower(column.name) not in scope.merged:
                     scope.used.add((index, slot - scope.entries[index].offset))
+                if scope.watch is not None:
+                    scope.watch.add(index)
                 return (*matches[0], depth)
             passed.append(scope)
             scope, depth = scope.parent, depth + 1
@@ -398,13 +414,19 @@ class Compiler:
     calls: each becomes a lookup of the aggregate's result, which the executor
     appends to the group's representative row.  Without one, an aggregate
     call is an error reported with ``misuse`` (formatted with the name).
+
+    An aggregate whose arguments use only columns of an enclosing query
+    belongs to that query (as in SQLite): it is collected there, and read
+    from that query's current group row.  ``allow_aggregates`` says whether
+    such a call may appear here at all (SQLite's NC_AllowAgg).
     """
 
-    def __init__(self, scope: Scope, aggregates: AggregateCollector | None = None, misuse: str = "misuse of aggregate function {name}()", executor: Executor | None = None) -> None:
+    def __init__(self, scope: Scope, aggregates: AggregateCollector | None = None, misuse: str = "misuse of aggregate function {name}()", executor: Executor | None = None, allow_aggregates: bool | None = None) -> None:
         self.scope = scope
         self.aggregates = aggregates
         self.misuse = misuse
         self.executor = executor  # needed to compile subqueries
+        self.allow_aggregates = aggregates is not None if allow_aggregates is None else allow_aggregates
 
     def compile(self, expr: Expr) -> RowFunction:
         return self.compile_with_affinity(expr)[0]
@@ -467,7 +489,9 @@ class Compiler:
         """An enclosing query's result column by its alias: its expression,
         evaluated with that query's current row."""
         outer = self.scope.ancestor(reference.depth)
-        compiler = Compiler(outer, misuse="misuse of aggregate: {name}()", executor=self.executor)
+        # (An aliased aggregate works where the query's own aggregates do.)
+        aggregates = outer.aggregates if outer.phase in ("having", "order") and not outer.in_aggregate else None
+        compiler = Compiler(outer, aggregates, misuse="misuse of aggregate: {name}()", executor=self.executor)
         function, affinity = compiler.compile_with_affinity(reference.item.expr)
         cell = outer.cell
         return (lambda row: function(cell[0])), affinity
@@ -715,8 +739,50 @@ class Compiler:
             return lambda row: function(arg(row))
         return lambda row: function(*[arg(row) for arg in args])
 
+    def aggregate_depth(self, expr: Call) -> int:
+        """How many queries up the aggregate call ``expr`` belongs: to the
+        innermost one whose columns its arguments use (0 when they use none).
+        (Arguments with a subquery are taken to belong here.)"""
+        depths = []
+        for arg in expr.args:
+            for e in walk(arg):
+                if isinstance(e, (Subquery, InSelect, Exists)):
+                    return 0
+                if isinstance(e, Column):
+                    try:
+                        depths.append(self.scope.resolve(e)[3])
+                    except AliasReference as reference:
+                        depths.append(reference.depth)
+                    except OperationalError:
+                        return 0  # reported when compiled
+        return min(depths, default=0)
+
+    def _outer_aggregate(self, expr: Call, depth: int) -> RowFunction:
+        name = ascii_lower(expr.name)
+        if not self.allow_aggregates:
+            raise OperationalError(f"misuse of aggregate function {name}()")
+        owner = self.scope.ancestor(depth)
+        if owner.phase == "group":
+            raise OperationalError("aggregate functions are not allowed in the GROUP BY clause")
+        if owner.aggregates is None:
+            if owner.phase == "outputs":
+                raise NeedsAggregate(owner)
+            raise OperationalError(f"misuse of aggregate: {name}()")
+        if owner.phase == "where" or owner.in_aggregate:
+            raise OperationalError(f"misuse of aggregate: {name}()")
+        scope = self.scope
+        for _ in range(depth):  # the queries in between depend on the owner's row
+            scope.uses_outer = True
+            scope = scope.parent
+        function = Compiler(owner, owner.aggregates, executor=self.executor)._aggregate(expr)
+        cell = owner.cell
+        return lambda row: function(cell[0])
+
     def _aggregate(self, expr: Call) -> RowFunction:
         name = expr.name
+        depth = self.aggregate_depth(expr)
+        if depth:
+            return self._outer_aggregate(expr, depth)
         if self.aggregates is None:
             raise OperationalError(self.misuse.format(name=ascii_lower(name)))
         _, min_args, max_args = values.AGGREGATE_FUNCTIONS[name]
@@ -729,7 +795,11 @@ class Compiler:
             args = []  # COUNT(*) and COUNT()
         else:
             inner = Compiler(self.scope, executor=self.executor)  # aggregates may not be nested
-            args = [inner.compile(arg) for arg in expr.args]
+            self.scope.in_aggregate = True
+            try:
+                args = [inner.compile(arg) for arg in expr.args]
+            finally:
+                self.scope.in_aggregate = False
         return itemgetter(self.aggregates.add(name, args, expr.distinct))
 
 
@@ -746,6 +816,17 @@ def in_select_affinity(left: str | None, right: str | None) -> str | None:
 def contains_aggregate(expr: Expr) -> bool:
     return any(
         isinstance(e, Call) and values.is_aggregate_call(e.name, len(e.args)) for e in walk(expr)
+    )
+
+
+def owns_aggregate(expr: Expr, scope: Scope) -> bool:
+    """Whether ``expr`` (outside its subqueries) has an aggregate call that
+    belongs to the query of ``scope`` rather than to an enclosing one."""
+    compiler = Compiler(scope)
+    return any(
+        isinstance(e, Call) and values.is_aggregate_call(e.name, len(e.args))
+        and compiler.aggregate_depth(e) == 0
+        for e in walk(expr)
     )
 
 
@@ -1563,7 +1644,14 @@ class Executor:
                 scope.add_merge(name, index, parts + [right.offset + position], affinity)
         return dataclasses.replace(join, on=condition, using=None, natural=False)
 
-    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False) -> tuple[list[JoinLevel], list[RowFunction]]:
+    def where_compiler(self, scope: Scope, aggregate: bool) -> Compiler:
+        """The compiler for WHERE and ON.  As in SQLite, an aggregate there is
+        an error either way, reported differently in an aggregate query."""
+        if aggregate:
+            return Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self, allow_aggregates=True)
+        return Compiler(scope, executor=self)
+
+    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False, aggregate: bool = False) -> tuple[list[JoinLevel], list[RowFunction]]:
         """Plan a nested loop over ``joins``; returns (levels, constants).
 
         WHERE conjuncts and the ON conditions of inner joins form one pool of
@@ -1578,8 +1666,21 @@ class Executor:
         before its level.  Without outer joins the tables are joined in the
         cheapest order.
         """
-        compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
+        compiler = self.where_compiler(scope, aggregate)
         rights = [i for i, join in enumerate(joins) if join.kind in ("RIGHT", "FULL")]
+        for j, join in enumerate(joins):
+            # As in SQLite, an outer join's ON may not use a table to its right
+            # (nor any ON, with a RIGHT or FULL JOIN in the FROM clause).
+            if join.on is not None and (join.kind != "INNER" or rights):
+                scope.watch = set()
+                try:
+                    Compiler(scope, executor=self, allow_aggregates=True).compile(join.on)
+                except OperationalError:
+                    pass  # reported below, when compiled for real
+                finally:
+                    used, scope.watch = scope.watch, None
+                if any(index > j for index in used):
+                    raise OperationalError("ON clause references tables to its right")
 
         def floor(j):
             """The lowest level for a condition of join j (len(joins): WHERE)."""
@@ -2314,6 +2415,17 @@ class CompiledSelect:
 
     def __init__(self, executor: Executor, stmt: Select, parent: Scope | None = None) -> None:
         self.executor = executor
+        try:
+            self.compile(stmt, parent)
+        except NeedsAggregate as signal:
+            if signal.scope is not self.scope:
+                raise
+            self.compile(stmt, parent, aggregate=True)
+
+    def compile(self, stmt: Select, parent: Scope | None, aggregate: bool = False) -> None:
+        """``aggregate``: an aggregate query even without aggregates of its
+        own outside subqueries (see NeedsAggregate)."""
+        executor = self.executor
         self.scope = scope = Scope(parent)
         joins, self.derived = executor.build_from(stmt.source, scope)
         self.exprs, self.names = executor.expand_items(stmt, scope)
@@ -2325,35 +2437,39 @@ class CompiledSelect:
                 aliases.setdefault(ascii_lower(item.alias), item)
         if aliases:
             stmt, joins = self.substitute_aliases(stmt, joins, aliases)
-        self.is_aggregate = bool(stmt.group_by) or any(
-            contains_aggregate(e)
-            for e in self.exprs + [stmt.having] + [item.expr for item in stmt.order_by]
-            if e is not None
-        )
+        # As in SQLite, GROUP BY or an aggregate in the result columns makes
+        # an aggregate query (not one in HAVING or ORDER BY).
+        self.is_aggregate = aggregate or bool(stmt.group_by) or any(owns_aggregate(e, scope) for e in self.exprs)
         if stmt.having is not None and not self.is_aggregate:
             raise OperationalError("HAVING clause on a non-aggregate query")
-        self.aggregates = AggregateCollector(scope.width) if self.is_aggregate else None
-        compiler = Compiler(scope, self.aggregates, executor=executor)
+        self.aggregates = scope.aggregates = AggregateCollector(scope.width) if self.is_aggregate else None
+        compiler = Compiler(scope, self.aggregates, misuse="misuse of aggregate: {name}()",
+                            executor=executor, allow_aggregates=True)
+        scope.phase = "outputs"
         compiled = [compiler.compile_with_affinity(e) for e in self.exprs]
         self.outputs = [function for function, _ in compiled]
         self.affinities = [affinity for _, affinity in compiled]
         scope.aliases = aliases
+        scope.phase = "order"
         self.order_terms, self.order_functions = executor.order_terms(
             stmt, self.exprs, self.names, compiler
         )
+        scope.phase = "having"
         self.having = compiler.compile(stmt.having) if stmt.having is not None else None
+        scope.phase = "group"
         self.group_functions = executor.group_functions(stmt, self.exprs, self.names, scope)
+        scope.phase = "where"
         self.levels = None
         self.constants = []  # conditions tested once, before the loop
         order_columns = self.order_columns(stmt)
         if stmt.source:
             hint = order_columns[0] if order_columns and stmt.limit is not None else None
             self.levels, self.constants = executor.plan_joins(
-                scope, joins, stmt.where, hint, covering=True
+                scope, joins, stmt.where, hint, covering=True, aggregate=self.is_aggregate
             )
         elif stmt.where is not None:
-            where = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=executor)
-            self.constants = [where.compile(stmt.where)]
+            self.constants = [executor.where_compiler(scope, self.is_aggregate).compile(stmt.where)]
+        scope.phase = None
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
         # True when the first table's access path already yields ORDER BY order.

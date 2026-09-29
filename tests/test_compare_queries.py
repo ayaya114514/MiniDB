@@ -714,6 +714,12 @@ def test_right_and_full_joins():
         "SELECT * FROM a RIGHT JOIN b USING (x) FULL JOIN c USING (x)",
         "SELECT * FROM a FULL JOIN b USING (x) WHERE a.x IS NULL",
         "SELECT * FROM a left JOIN b ON 1 RIGHT JOIN c ON 0 WHERE 0",
+        # An outer join's ON (any ON, with a RIGHT or FULL JOIN) may not use a table to its right.
+        "SELECT * FROM a LEFT JOIN b ON b.z = d.x, d", "SELECT * FROM a JOIN b ON b.z = d.x, d",
+        "SELECT * FROM a JOIN b ON b.z = d.x RIGHT JOIN c ON 1", "SELECT * FROM a FULL JOIN b ON b.z = d.x JOIN d",
+        "SELECT * FROM a LEFT JOIN b ON b.x = (SELECT d.x) JOIN d",
+        "SELECT * FROM a LEFT JOIN b ON EXISTS (SELECT 1 FROM a AS e WHERE e.x = d.x), d",
+        "SELECT * FROM a LEFT JOIN b ON b.x IN (SELECT x FROM d AS f) JOIN d",
         # The coalesce() of USING columns has its first argument's affinity.
         "SELECT * FROM b RIGHT JOIN a USING (x) FULL JOIN c USING (x) WHERE x = '3'",
         "SELECT * FROM a RIGHT JOIN b USING (x) FULL JOIN (SELECT CAST(x AS TEXT) AS x FROM c) AS t USING (x)",
@@ -785,6 +791,72 @@ def test_result_column_aliases_in_other_clauses():
         "SELECT max(a) AS m FROM t ORDER BY m",
         "SELECT count(*) AS n FROM t WHERE (SELECT n) > 0",
         "SELECT count(*) AS n FROM t AS x LEFT JOIN t AS y ON n > 0",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_aggregates_of_an_enclosing_query():
+    # An aggregate whose arguments use only an enclosing query's columns
+    # belongs to that query (which then is an aggregate query).
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (a, b)", "INSERT INTO t VALUES (1, 2), (3, 4), (5, 6), (3, 9)",
+        "CREATE TABLE u (a, k)", "INSERT INTO u VALUES (1, 10), (3, 30), (3, 31)", "CREATE TABLE e (a, b)",
+        "SELECT (SELECT count(t.a) FROM u) FROM t",
+        "SELECT (SELECT count(t.a)) FROM t",
+        "SELECT a, (SELECT sum(t.b) FROM u WHERE u.a = t.a) FROM t GROUP BY a",
+        "SELECT a FROM t WHERE (SELECT count(t.a)) > 0",
+        "SELECT a FROM t GROUP BY a HAVING (SELECT count(t.b)) > 1",
+        "SELECT (SELECT count(t.a) + count(*) FROM u) FROM t",
+        "SELECT (SELECT count(u.k + t.a) FROM u) FROM t",
+        "SELECT a FROM t ORDER BY (SELECT count(t.a))",
+        "SELECT (SELECT max(t.a) FROM u WHERE u.k > 10) FROM t",
+        "SELECT (SELECT max(t.a) FROM u WHERE u.k > 100) FROM t",
+        "SELECT (SELECT 1 FROM u WHERE count(t.a) > 0) FROM t",
+        "SELECT (SELECT count(t.a) FROM u GROUP BY u.a) FROM t",
+        "SELECT (SELECT (SELECT count(t.a))) FROM t",
+        "SELECT (SELECT count(t.a) FROM u) FROM t WHERE 0",
+        "SELECT (SELECT count(t.a) FROM u) FROM e",
+        "SELECT b, (SELECT group_concat(t.a || u.a) FROM u) FROM t",
+        "SELECT (SELECT count(*) FROM u HAVING count(t.a) > 1) FROM t",
+        "SELECT (SELECT u.a FROM u ORDER BY count(t.a)) FROM t",
+        "SELECT count(*), (SELECT sum(t.a) FROM u) FROM t",
+        "SELECT a IN (SELECT count(t.b) FROM u) FROM t",
+        "SELECT EXISTS (SELECT max(t.a)) FROM t",
+        "SELECT (SELECT count(x.a) FROM t AS x WHERE x.a = t.a) FROM t",
+        "SELECT (SELECT sum(t.a + x.a) FROM t AS x) FROM t",
+        "SELECT (SELECT count(t.a) FROM u AS t) FROM t",
+        "SELECT (SELECT total(t.a) FROM u) + 1 FROM t GROUP BY b",
+        "SELECT * FROM (SELECT (SELECT count(t.a)) AS n FROM t)",
+        "SELECT (SELECT count(a)) FROM t",
+        "SELECT (SELECT count(k) FROM u) FROM t",
+        "SELECT (SELECT count(b) FROM u) FROM t",
+        "SELECT a FROM t ORDER BY count(*)",
+        "SELECT a FROM t HAVING count(*) > 0",
+        "SELECT a FROM t GROUP BY count(*)",
+        "SELECT a FROM t GROUP BY (SELECT count(t.b))",
+        "SELECT a FROM t WHERE count(*) > 1",
+        "SELECT count(*) FROM t WHERE count(*) > 1",
+        "SELECT count(*) FROM t AS x JOIN t AS y ON count(*) > 1",
+        "SELECT sum(a) FROM t WHERE (SELECT count(t.b))",
+        "SELECT a FROM t GROUP BY a HAVING a > 0 ORDER BY count(*)",
+        "SELECT a, count(*) AS n FROM t GROUP BY a HAVING (SELECT n) > 1",
+        "SELECT a AS k FROM t WHERE (SELECT count(k)) > 0",
+        "SELECT (SELECT count(*) FROM u WHERE u.k > count(t.a) * 7) FROM t",
+        "SELECT a, (SELECT min(t.b) + max(u.k) FROM u) FROM t GROUP BY a",
+        "SELECT (SELECT count(DISTINCT t.a)) FROM t",
+        "SELECT max((SELECT count(t.a))) FROM t",
+        "SELECT sum((SELECT count(t.a) FROM u)) FROM t", "SELECT max((SELECT count(t.a) + t.b)) FROM t",
+        "SELECT count(*) AS n, max((SELECT n)) FROM t", "SELECT a, count(*) AS n FROM t GROUP BY a ORDER BY (SELECT n)",
+        "SELECT sum(a) AS n FROM t WHERE (SELECT n) > 1",
+        "SELECT (SELECT count(t.a) FROM u) FROM t GROUP BY a ORDER BY 1",
+        "SELECT a, (SELECT count(t.b)) AS c FROM t GROUP BY a ORDER BY c DESC, a",
+        "SELECT (SELECT count(t.a) FROM u) FROM t UNION ALL SELECT (SELECT sum(u.k)) FROM u",
+        "WITH w AS (SELECT (SELECT count(t.a)) AS n FROM t) SELECT * FROM w",
+        "SELECT DISTINCT (SELECT count(t.a)) FROM t",
+        "SELECT (SELECT count(t.a) FROM u LIMIT 1) FROM t LIMIT 5",
+        "SELECT (SELECT u.a FROM u WHERE u.a = (SELECT max(t.a)) ) FROM t",
     ]:
         pair.run(sql)
     pair.close()
