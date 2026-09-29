@@ -1106,6 +1106,7 @@ class AggregateCollector:
     def __init__(self, base_width: int) -> None:
         self.base_width = base_width  # aggregate results follow the row's slots
         self.calls = []  # (name, argument functions, distinct, FILTER function or None)
+        self.loop = None  # the generated grouping loop
 
     def add(self, name: str, args: list[RowFunction], distinct: bool, filter_: RowFunction | None = None) -> int:
         self.calls.append((name, args, distinct, filter_))
@@ -1126,27 +1127,58 @@ class AggregateCollector:
             state.append((aggregate, set() if distinct else None))
         return state
 
-    def step(self, state: list[tuple[Any, set | None]], row: Row) -> bool:
-        """Feed one row to every aggregate; True if a lone MIN/MAX changed."""
-        changed = False
-        for (aggregate, seen), (_, args, _, filter_) in zip(state, self.calls):
-            if filter_ is not None and not values.truth(filter_(row)):
-                continue
-            if not args:
-                aggregate.step()
-                continue
-            arguments = [arg(row) for arg in args]
-            if seen is not None:
-                key = values.sort_key(arguments[0])
-                if arguments[0] is None or key in seen:
-                    continue
-                seen.add(key)
-            changed = aggregate.step(*arguments) or changed
-        return changed
-
     @staticmethod
     def results(state: list[tuple[Any, set | None]]) -> list[SQLValue]:
         return [aggregate.result() for aggregate, _ in state]
+
+    def grouping_loop(self, group_functions: list[RowFunction]) -> Callable[[Iterable[Row], dict, Callable], None]:
+        """A generated function (rows, groups, new_state) that puts each row in
+        its group (key -> [representative row, state]) and steps the
+        group's aggregates, as ``step`` does, in straight-line code."""
+        if self.loop is not None:
+            return self.loop
+        env = {"_sort_key": values.sort_key, "_truth": values.truth}
+        key = ", ".join(f"_sort_key(_group{i}(row))" for i in range(len(group_functions)))
+        lines = ["def loop(rows, groups, new_state):",
+                 "    for row in rows:",
+                 f"        key = ({key}{',' if len(group_functions) == 1 else ''})",
+                 "        group = groups.get(key)",
+                 "        if group is None:",
+                 "            group = groups[key] = [list(row), new_state()]",
+                 "        state = group[1]"]
+        for i, function in enumerate(group_functions):
+            env[f"_group{i}"] = function
+        tracks = self.tracks_extreme
+        for i, (_, args, distinct, filter_) in enumerate(self.calls):
+            indent = "        "
+            if filter_ is not None:
+                env[f"_filter{i}"] = filter_
+                lines.append(f"{indent}_v = _filter{i}(row)")
+                lines.append(f"{indent}if _v is not None and ((_v != 0) if type(_v) is int else _truth(_v)):")
+                indent += "    "
+            for j, arg in enumerate(args):
+                env[f"_arg{i}_{j}"] = arg
+            arguments = ", ".join(f"_arg{i}_{j}(row)" for j in range(len(args)))
+            call = f"state[{i}][0].step({arguments})"
+            if distinct:
+                lines.append(f"{indent}_a = _arg{i}_0(row)")
+                lines.append(f"{indent}_seen = state[{i}][1]")
+                lines.append(f"{indent}if _a is not None and (_key := _sort_key(_a)) not in _seen:")
+                lines.append(f"{indent}    _seen.add(_key)")
+                indent += "    "
+                call = f"state[{i}][0].step(_a)"
+            if tracks:
+                lines.append(f"{indent}if {call}:")
+                lines.append(f"{indent}    group[0] = list(row)")
+            else:
+                lines.append(f"{indent}{call}")
+        text = "\n".join(lines)
+        code = _CODE_CACHE.get(text)
+        if code is None:
+            code = _CODE_CACHE[text] = compile(text, "<grouping loop>", "exec")
+        exec(code, env)
+        self.loop = env["loop"]
+        return self.loop
 
 
 # ---- access paths --------------------------------------------------------------
@@ -2344,15 +2376,7 @@ class Executor:
         """Aggregate ``rows`` into groups; yield each group's representative row
         followed by its aggregate results, ordered by group key."""
         groups = {}
-        sort_key = values.sort_key
-        tracks_extreme = aggregates.tracks_extreme
-        for row in rows:
-            key = tuple(sort_key(f(row)) for f in group_functions)
-            group = groups.get(key)
-            if group is None:
-                group = groups[key] = [list(row), aggregates.new_state()]
-            if aggregates.step(group[1], row) and tracks_extreme:
-                group[0] = list(row)
+        aggregates.grouping_loop(group_functions)(rows, groups, aggregates.new_state)
         if not groups and not group_functions:
             groups[()] = [[None] * scope.width, aggregates.new_state()]
         for key in sorted(groups):
