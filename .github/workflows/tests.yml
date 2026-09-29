@@ -73,4 +73,4 @@ jobs:
       - name: Fetch SQLite's sqllogictest corpus (pinned, hash-checked)
         run: test -d .sqllogictest/test || python tools/sqllogictest.py --fetch
       - name: Run the corpus; fail if fewer records pass than the recorded baseline
-        run: python tools/sqllogictest.py --jobs 4 --min-passed 3743727
+        run: python tools/sqllogictest.py --jobs 4 --min-passed 5939852

@@ -1220,6 +1220,15 @@ class Parser:
             elif self.accept_keyword("IS"):
                 op = "IS NOT" if self.accept_keyword("NOT") else "IS"
                 left = Binary(op, left, self.comparison())
+            elif self.at_word("ISNULL", "NOTNULL") or (
+                self.at_keyword("NOT") and self.tokens[self.i + 1].kind == "KEYWORD"
+                and self.tokens[self.i + 1].value == "NULL"
+            ):
+                # The postfix forms x ISNULL, x NOTNULL and x NOT NULL.
+                op = "IS" if ascii_upper(self.advance().text) == "ISNULL" else "IS NOT"
+                if op == "IS NOT" and self.at_keyword("NULL"):
+                    self.advance()
+                left = Binary(op, left, Literal(None))
             elif self.at_word("GLOB") or (
                 self.at_keyword("NOT") and self.tokens[self.i + 1].kind == "IDENT"
                 and ascii_upper(self.tokens[self.i + 1].text) == "GLOB"

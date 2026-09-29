@@ -2649,6 +2649,7 @@ class CompiledSelect:
         self.presorted = bool(
             self.levels and order_columns and not self.is_aggregate and self.windows is None
             and all(level.unmatched is None for level in self.levels)
+            and self.levels[0].offset == scope.entries[0].offset  # (the join order may put another table first)
             and follows_order(order_columns, self.levels[0].access.order())
         )
 
