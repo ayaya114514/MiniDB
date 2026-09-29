@@ -120,6 +120,17 @@ def apply_affinity(value: SQLValue, affinity: str | None) -> SQLValue:
     return value
 
 
+def comparison_affinity(left: str | None, right: str | None) -> str | None:
+    """The affinity SQLite applies to both operands of a comparison: with
+    two columns (any affinity), NUMERIC if either is numeric, else none;
+    otherwise the column's.  (Applied to both, it changes a column's own
+    value only where the value does not have the column's affinity, as a
+    coalesce() of USING columns may not.)"""
+    if left is not None and right is not None:
+        return NUMERIC if left in NUMERIC_AFFINITIES or right in NUMERIC_AFFINITIES else None
+    return left if left is not None else right
+
+
 def comparison_affinities(left: str | None, right: str | None) -> tuple[str | None, str | None]:
     """Which affinity to apply to each operand of a comparison (SQLite rules):
     NUMERIC to the other operand of a numeric column, TEXT to an operand

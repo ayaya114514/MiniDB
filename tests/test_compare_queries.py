@@ -648,6 +648,100 @@ def test_insert_row_id_by_name():
     pair.close()
 
 
+def test_right_and_full_joins():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE a (x, y)", "CREATE TABLE b (x, z)", "CREATE TABLE c (x INTEGER PRIMARY KEY, w)", "CREATE TABLE d (x)",
+        "INSERT INTO a VALUES (1, 'a1'), (2, 'a2'), (3, 'a3'), (NULL, 'an')",
+        "INSERT INTO b VALUES (2, 'b2'), (3, 'b3'), (4, 'b4'), (NULL, 'bn'), (4, 'b4b')",
+        "INSERT INTO c VALUES (3, 'c3'), (4, 'c4'), (5, 'c5'), (1, 'c1')", "INSERT INTO d VALUES (9)",
+    ]:
+        pair.run(sql)
+    for sql in [
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x",
+        "SELECT * FROM a FULL JOIN b ON a.x = b.x",
+        "SELECT * FROM a FULL OUTER JOIN b ON a.x = b.x WHERE a.y IS NULL",
+        "SELECT * FROM a RIGHT OUTER JOIN b ON a.x = b.x WHERE a.x = 2",
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x WHERE a.x IS NULL OR a.x > 2",
+        "SELECT * FROM a JOIN b ON a.x = b.x RIGHT JOIN c ON c.x = b.x",
+        "SELECT * FROM a JOIN b ON 0 RIGHT JOIN c ON 1",
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x RIGHT JOIN c ON c.x = b.x",
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x FULL JOIN c ON c.x = a.x",
+        "SELECT * FROM a FULL JOIN b ON a.x = b.x LEFT JOIN c ON c.x = b.x",
+        "SELECT * FROM a LEFT JOIN b ON a.x = b.x FULL JOIN c ON c.x = b.x",
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x JOIN c ON c.x = coalesce(a.x, b.x)",
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x JOIN c ON a.x = 3",
+        "SELECT count(*), sum(b.x), group_concat(a.y) FROM a FULL JOIN b ON a.x = b.x",
+        "SELECT * FROM a FULL JOIN b ON a.x = b.x ORDER BY a.x, b.z",
+        "SELECT * FROM a FULL JOIN c ON a.x = c.x ORDER BY a.x LIMIT 3",
+        "SELECT * FROM c FULL JOIN a ON a.x = c.x ORDER BY c.x LIMIT 4",
+        "SELECT * FROM (SELECT x FROM a) AS s RIGHT JOIN (SELECT x FROM b) AS t ON s.x = t.x",
+        "SELECT * FROM a RIGHT JOIN b",
+        "SELECT * FROM a RIGHT JOIN b ON 0",
+        "SELECT * FROM a FULL JOIN b ON 0 WHERE 1",
+        "SELECT * FROM a, b FULL JOIN c ON c.x = a.x AND c.x = b.x",
+        "SELECT (SELECT count(*) FROM a RIGHT JOIN b ON a.x = b.x AND b.x = c.x) FROM c",
+        "SELECT * FROM c WHERE EXISTS (SELECT 1 FROM a FULL JOIN b ON a.x = c.x WHERE b.x = c.x)",
+        "SELECT * FROM a RIGHT JOIN b ON a.x = b.x WHERE b.x = 4",
+        "SELECT * FROM c RIGHT JOIN b ON c.x = b.x WHERE c.x = 4",
+        "SELECT * FROM c RIGHT JOIN b ON c.x = b.x AND c.w = 'c4'",
+        "SELECT * FROM a RIGHT JOIN b USING (x)",
+        "SELECT x, a.x, b.x FROM a FULL JOIN b USING (x)",
+        "SELECT * FROM a NATURAL FULL JOIN b",
+        "SELECT * FROM a NATURAL RIGHT JOIN b",
+        "SELECT * FROM a FULL JOIN b USING (x) FULL JOIN c USING (x)",
+        "SELECT x FROM a FULL JOIN b USING (x) FULL JOIN c USING (x)",
+        "SELECT * FROM a RIGHT JOIN b USING (x) JOIN c USING (x)",
+        "SELECT * FROM a JOIN b USING (x) FULL JOIN c USING (x)",
+        "SELECT x FROM a FULL JOIN b USING (x) JOIN d ON 1",
+        "SELECT * FROM a FULL JOIN b USING (x) JOIN d ON 1",
+        "SELECT a.* FROM a FULL JOIN b USING (x)",
+        "SELECT b.* FROM a FULL JOIN b USING (x)",
+        "SELECT * FROM a JOIN d ON 1 FULL JOIN b USING (x)",
+        "SELECT * FROM a FULL JOIN b USING (x) WHERE x > 1",
+        "SELECT typeof(x), x FROM a FULL JOIN b USING (x) WHERE x = '2'",
+        "SELECT (SELECT x) FROM a FULL JOIN b USING (x)",
+        "SELECT (SELECT x FROM d AS a) FROM a FULL JOIN b USING (x)",
+        "SELECT * FROM a LEFT JOIN b USING (x) RIGHT JOIN c ON 1",
+        "SELECT x FROM a LEFT JOIN b USING (x) RIGHT JOIN c USING (x)",
+        "SELECT x, count(*) FROM a FULL JOIN b USING (x) GROUP BY x ORDER BY x",
+        "SELECT * FROM a FULL JOIN b USING (x) ORDER BY x DESC",
+        "SELECT * FROM a FULL JOIN b USING (x) FULL JOIN c ON c.x = x",
+        "SELECT * FROM a JOIN b USING (x) JOIN c USING (x) RIGHT JOIN d ON 1",
+        "SELECT * FROM a JOIN b ON 1 JOIN c USING (x)",
+        "SELECT * FROM a RIGHT JOIN b USING (x) RIGHT JOIN c USING (x)",
+        "SELECT * FROM a FULL JOIN b USING (x) RIGHT JOIN c USING (x)",
+        "SELECT * FROM a RIGHT JOIN b USING (x) FULL JOIN c USING (x)",
+        "SELECT * FROM a FULL JOIN b USING (x) WHERE a.x IS NULL",
+        "SELECT * FROM a left JOIN b ON 1 RIGHT JOIN c ON 0 WHERE 0",
+        # The coalesce() of USING columns has its first argument's affinity.
+        "SELECT * FROM b RIGHT JOIN a USING (x) FULL JOIN c USING (x) WHERE x = '3'",
+        "SELECT * FROM a RIGHT JOIN b USING (x) FULL JOIN (SELECT CAST(x AS TEXT) AS x FROM c) AS t USING (x)",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_comparison_affinity_applies_to_both_operands():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (i INTEGER, r REAL, x TEXT, b BLOB, n)",
+        "INSERT INTO t VALUES (5, 5.0, '5', x'35', 5), (NULL, NULL, 'a', '5', '5')",
+        "CREATE TABLE p (c0 REAL)", "CREATE TABLE q (c0 TEXT)", "INSERT INTO q VALUES ('0')",
+        "SELECT v, v = 5, v = '5', v < 10 FROM (SELECT i AS v FROM t UNION ALL SELECT '5' UNION ALL SELECT ' 5')",
+        "SELECT v, v = 5, v = '5' FROM (SELECT x AS v FROM t UNION ALL SELECT 5 UNION ALL SELECT 5.0)",
+        "SELECT v IN (5, '5'), v BETWEEN 4 AND '6', CASE v WHEN 5 THEN 'five' END "
+        "FROM (SELECT i AS v FROM t UNION ALL SELECT '5')",
+        "SELECT a.x = b.i, a.b = b.x, a.n = b.x, a.x = b.r FROM t AS a, t AS b",
+        "SELECT v = 5 FROM (SELECT r AS v FROM t UNION ALL SELECT '5.0' UNION ALL SELECT 'abc')",
+        "SELECT v IS 5, v IS NOT '5' FROM (SELECT i AS v FROM t UNION ALL SELECT '5')",
+        # coalesce(p.c0, q.c0) has REAL affinity, which the text '0' then gets.
+        "SELECT * FROM p RIGHT JOIN q USING (c0) JOIN q AS r USING (c0)",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_common_table_expressions_and_values():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")

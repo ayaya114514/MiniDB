@@ -519,3 +519,27 @@ D20 记录的“REAL→TEXT 末位与 SQLite 不同”已解决：直接读参�
 ## D82 一元负号即 0 - X
 SQLite 把非数字字面量的 `-X` 编译为 `0 - X`，所以 `-(c)` 永远得不到 -0.0（`atan2(0, -c)` 对 c = 0.0 是 0.0）。
 只有紧跟数字字面量的负号生成负常量（`-0.0` 仍是 -0.0）。
+
+## D83 UPSERT 的 DO UPDATE 只在可达时解析
+SQLite 在生成冲突检查代码时才解析 ON CONFLICT 的 SET/WHERE：rowid 冲突只在 INSERT 显式给出 rowid
+（INTEGER PRIMARY KEY 列或 `rowid`/`oid`/`_rowid_`）时检查，每个 UNIQUE 索引各检查一次，由第一个目标匹配
+（或无目标）的子句处理。一个子句若没有任何检查能到达，其中写错的列名不报错。`PreparedUpsert.resolve()`
+按同样的可达性延迟编译。无目标的子句必须是最后一个，否则是语法错误（与 SQLite 的文法一致）。
+
+## D84 RIGHT / FULL JOIN
+嵌套循环不变，RIGHT/FULL 级记录匹配过的行号；主循环结束后，按级别从左到右对每个 RIGHT/FULL 表扫一遍，
+没匹配过的行配上前面各表的 NULL，再接着跑后面的级别（后面 RIGHT 级的匹配也在这一轮里记录）。
+语义上 WHERE 条件和 RIGHT JOIN 之后的内连接 ON 不能下推到 RIGHT 级之前（否则会改变“哪些行没匹配”）：
+每个条件有一个最低级别；RIGHT 级之前的常量 ON 条件只过滤它所在的连接，不再作为整个查询的常量。
+有外连接时不重排表；有 RIGHT/FULL 时不用索引顺序免排序（未匹配行最后才出）。
+
+USING 列按 SQLite 的 lookupName：内连接/LEFT 后未限定名指最左表；RIGHT 后指右表（左表的同名列被遮蔽）；
+FULL 后是 `coalesce(...)`，在行尾占一个计算 slot（`Merge`），在该级加载后算出。`*` 对 RIGHT JOIN 左边、且
+名字出现在后面某个 USING 里的列用未限定名展开（`a.*` 也是）。查询里有 RIGHT/FULL 时，USING 条件的左侧是
+所有左表同名列的 coalesce（除第一个外都必须来自 USING，否则 "ambiguous reference"）。这些 coalesce 取第一个
+参数的亲和性（SQLite 的 `SQLITE_AFF_DEFER`）。
+
+## D85 比较亲和性作用于两侧
+SQLite 的比较 opcode 把比较亲和性施加到两个操作数上（TEXT 只在至少一侧是文本时才把数字转文本），而不是
+“只转换另一侧”。对普通列两者等价（列值已有该亲和性），但对值不一定符合亲和性的表达式（UNION 子查询的
+列、上面的 coalesce）不同。`value_comparator` 改为两侧都转换，用 `type(x) is str` 快速跳过，benchmark 无明显变化。

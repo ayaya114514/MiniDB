@@ -486,22 +486,9 @@ class Generator:
             scope = [("a", rng.choice(self.tables))]
             from_sql = f"{scope[0][1].name} AS a"
         if rng.random() < 0.3 and len(self.tables) > 1:
-            other = rng.choice(self.tables)
-            scope.append(("b", other))
-            join = rng.choice(["JOIN", "LEFT JOIN", ",", "USING", "NATURAL"])
-            if join == "USING" and scope[0][1].derived:
-                join = "JOIN"
-            if join == "USING":
-                from_sql += f" {rng.choice(['', 'LEFT '])}JOIN {other.name} AS b USING (c0)"
-            elif join == "NATURAL":
-                from_sql += f" NATURAL {rng.choice(['', 'LEFT '])}JOIN {other.name} AS b"
-            else:
-                on = ""
-                if join != ",":
-                    left, right = self.column(scope[:1]), self.column(scope[1:])
-                    on = f" ON b.{right} = {left}" if rng.random() < 0.7 else f" ON {self.expr(scope, 1)}"
-                    on = on.replace("b.b.", "b.")
-                from_sql += f" {join} {other.name} AS b{on}"
+            from_sql += self.join(scope, "b")
+            if rng.random() < 0.25:
+                from_sql += self.join(scope, "c")
         where = f" WHERE {self.condition(scope)}" if rng.random() < 0.7 else ""
         if rng.random() < 0.3:
             return self.aggregate_select(scope, from_sql, where)
@@ -518,6 +505,28 @@ class Generator:
             if rng.random() < 0.5:
                 sql += f" LIMIT {rng.randint(0, 5)} OFFSET {rng.randint(0, 3)}"
         return sql
+
+    def join(self, scope, alias):
+        """A join of one more table (as ``alias``) to the tables in ``scope``."""
+        rng = self.rng
+        other = rng.choice(self.tables)
+        kind = rng.choice(["", "LEFT ", "RIGHT ", "FULL "])
+        join = rng.choice(["JOIN", "JOIN", ",", "USING", "NATURAL"])
+        if join == "USING" and scope[0][1].derived:
+            join = "JOIN"
+        scope.append((alias, other))
+        if join == "USING":
+            return f" {kind}JOIN {other.name} AS {alias} USING (c0)"
+        if join == "NATURAL":
+            return f" NATURAL {kind}JOIN {other.name} AS {alias}"
+        if join == ",":
+            return f", {other.name} AS {alias}"
+        if rng.random() < 0.7:
+            left, right = self.column(scope[:-1]), self.column(scope[-1:])
+            on = f"{alias}.{right} = {left}".replace(f"{alias}.{alias}.", f"{alias}.")
+        else:
+            on = self.expr(scope, 1)
+        return f" {kind}JOIN {other.name} AS {alias} ON {on}"
 
     def aggregate_select(self, scope, from_sql, where):
         rng = self.rng

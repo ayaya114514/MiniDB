@@ -115,6 +115,16 @@ def test_joins():
         Join(TableRef("f"), "LEFT"),
         Join(TableRef("g")),
     ]
+    stmt = parse("SELECT * FROM a right JOIN b ON 1 FULL OUTER JOIN c USING (k) NATURAL RIGHT OUTER JOIN d")
+    assert stmt.source == [
+        Join(TableRef("a")),
+        Join(TableRef("b"), "RIGHT", lit(1)),
+        Join(TableRef("c"), "FULL", using=["k"]),
+        Join(TableRef("d"), "RIGHT", natural=True),
+    ]
+    assert parse("SELECT * FROM a AS right").source[0].table == TableRef("a", "right")
+    with pytest.raises(SQLSyntaxError, match="expected JOIN"):
+        parse("SELECT * FROM a full")  # as in SQLite, not an alias
 
 
 def test_select_item_text():

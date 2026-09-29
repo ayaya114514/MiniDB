@@ -115,7 +115,7 @@ class Checker:
         if rng.random() < 0.35:
             other = rng.choice(tables)
             scope.append(("b", other))
-            join = rng.choice(["JOIN", "LEFT JOIN", ","])
+            join = rng.choice(["JOIN", "LEFT JOIN", "RIGHT JOIN", "FULL JOIN", ","])
             if join == ",":
                 sql += f", {other.name} AS b"
             else:
