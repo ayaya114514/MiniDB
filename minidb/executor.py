@@ -1274,6 +1274,61 @@ class IndexScan:
         return f"SEARCH USING {covering}INDEX {self.index.name} ({' AND '.join(parts)})"
 
 
+class HashLookup:
+    """The rows whose column equals a key, for an equality join on a column
+    without an index: like SQLite's automatic index, the table's rows are
+    hashed by that column (with the key's affinity conversion) the first
+    time a run of the join looks for one, then found by the key."""
+
+    yields_rows = True
+
+    def __init__(self, table: Source, tree: BTree | None, position: int, key: RowFunction, convert: Callable[[SQLValue], SQLValue] | None, scan: AccessPath) -> None:
+        self.table = table
+        self.tree = tree  # None for a derived table
+        self.position = position
+        self.key = key
+        self.convert = convert
+        self.scan = scan  # the full scan it replaces (for its estimate)
+        self.hashed = None
+
+    def reset(self) -> None:
+        self.hashed = None  # the table may have changed since the last run
+
+    def build(self) -> dict:
+        if self.tree is None:
+            rows = self.table.rows
+        else:
+            load_row, table = Executor.load_row, self.table
+            rows = (load_row(table, rowid, record) for rowid, record in self.tree.scan())
+        hashed = {}
+        position, convert, sort_key = self.position, self.convert, values.sort_key
+        for row in rows:
+            value = row[position]
+            if value is not None and convert is not None:
+                value = convert(value)
+            if value is not None:
+                hashed.setdefault(sort_key(value), []).append(row)
+        self.hashed = hashed
+        return hashed
+
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
+        hashed = self.hashed if self.hashed is not None else self.build()
+        key = self.key(row)
+        if key is None:
+            return iter(())
+        return ((found[-1], found) for found in hashed.get(values.sort_key(key), ()))
+
+    def order(self) -> tuple[list[int], set[int]] | None:
+        return None
+
+    def estimate(self) -> tuple[float, float]:
+        rows = min(self.scan.estimate()[0], DEFAULT_EQUAL_ROWS)
+        return rows, 1 + rows
+
+    def describe(self) -> str:
+        return f"SEARCH USING AUTOMATIC INDEX ({self.table.columns[self.position].name}=?)"
+
+
 class MultiScan:
     """The union of several row id / index lookups: ``col IN (...)`` on an
     index, or the terms of an OR.  Rows come in row id order."""
@@ -1317,10 +1372,12 @@ ROWID = -1  # column position standing for the row id in constraints
 class Constraint:
     """A WHERE/ON conjunct of the form ``column op key`` usable by an access path."""
 
-    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction]) -> None:
+    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction], convert: Callable[[SQLValue], SQLValue] | None = None, joined: bool = False) -> None:
         self.position = position  # column position in the table, or ROWID
         self.op = op  # "=", "<", "<=", ">", ">=" or "IN"
         self.key = key  # key function(s) evaluated on the outer row
+        self.convert = convert  # the affinity conversion the key gets
+        self.joined = joined  # the key uses a table joined before this one
 
 
 def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int]) -> list[Constraint]:
@@ -1348,6 +1405,8 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             return ROWID
         return slot - offset
 
+    conversions = {}  # key function -> the conversion it applies
+
     def key_function(position, expr, key_affinity=None):
         if tables_referenced(expr, scope) - bound:
             return None
@@ -1368,7 +1427,9 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             convert = _AFFINITY_FUNCTIONS.get(shared)
         if convert is None:
             return function
-        return lambda row: convert(function(row))
+        converted = lambda row: convert(function(row))  # noqa: E731
+        conversions[converted] = convert
+        return converted
 
     for conjunct in conjuncts:
         if isinstance(conjunct, InList) and not conjunct.negated:
@@ -1388,7 +1449,8 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             continue
         key = key_function(position, right)
         if key is not None:
-            constraints.append(Constraint(position, op, key))
+            joined = bool(tables_referenced(right, scope) & bound)
+            constraints.append(Constraint(position, op, key, conversions.get(key), joined))
     return constraints
 
 
@@ -1452,6 +1514,16 @@ def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: lis
     return candidates
 
 
+def hash_lookup(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int], scan: AccessPath) -> HashLookup | None:
+    """A HashLookup for an equality with a table joined before, if any."""
+    for c in find_constraints(scope, index, conjuncts, compiler, bound):
+        if c.op == "=" and c.position != ROWID and c.joined:
+            table = scope.entries[index].table
+            tree = None if isinstance(table, DerivedSource) else catalog.table_tree(table)
+            return HashLookup(table, tree, c.position, c.key, c.convert, scan)
+    return None
+
+
 def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, order_hint: int | None = None, bound: set[int] | frozenset[int] | None = None) -> AccessPath:
     """Choose the cheapest way to read table ``index`` of ``scope``.
 
@@ -1460,10 +1532,13 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
     whose every term can use a row id or index lookup becomes a union of
     those lookups."""
     table = scope.entries[index].table
-    if isinstance(table, DerivedSource):
-        return DerivedScan(table)
     if bound is None:
         bound = set(range(index))
+    if isinstance(table, DerivedSource):
+        scan = DerivedScan(table)
+        if type(table) is DerivedSource:  # (not a CTE's working table, which changes)
+            return hash_lookup(scope, index, catalog, conjuncts, compiler, bound, scan) or scan
+        return scan
     rows = table_rows(catalog, table)
     candidates = access_candidates(scope, index, catalog, conjuncts, compiler, bound, rows)
     for conjunct in conjuncts:
@@ -1481,6 +1556,10 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
         else:
             candidates.append(MultiScan(parts, catalog.table_tree(table), "OR"))
     best = min(candidates, key=lambda a: a.estimate()[1])  # the first of equals wins
+    if isinstance(best, FullScan):
+        lookup = hash_lookup(scope, index, catalog, conjuncts, compiler, bound, best)
+        if lookup is not None:
+            return lookup
     if isinstance(best, FullScan) and order_hint is not None and order_hint != ROWID:
         # Nothing narrows the scan, but ORDER BY ... LIMIT wants this column
         # first: walk an index on it in order and stop early.
@@ -1950,6 +2029,9 @@ class Executor:
         row = [None] * scope.width
         truth = values.truth
         depth = len(levels)
+        for level in levels:
+            if isinstance(level.access, HashLookup):
+                level.access.reset()
 
         def passes(conditions):
             for condition in conditions:

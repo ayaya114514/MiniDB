@@ -56,9 +56,9 @@ def test_text_column_compared_with_integer_column_cannot_use_index():
     db.execute("CREATE TABLE n (y INTEGER)")
     db.execute("CREATE INDEX s_x ON s (x)")
     # x = y converts x to a number, so the index on x (ordered as text) is
-    # unusable in either join order ...
+    # unusable in either join order (n's rows are hashed by y instead) ...
     for sql in ["SELECT * FROM n JOIN s ON s.x = n.y", "SELECT * FROM s JOIN n ON s.x = n.y"]:
-        assert [p for _, p in db.execute("EXPLAIN " + sql)] == ["SCAN", "SCAN"]
+        assert db.execute("EXPLAIN " + sql) == [("s", "SCAN"), ("n", "SEARCH USING AUTOMATIC INDEX (y=?)")]
     # ... but an index on y is fine: the text side is converted instead.
     db.execute("CREATE INDEX n_y ON n (y)")
     for sql in ["SELECT * FROM n JOIN s ON s.x = n.y", "SELECT * FROM s JOIN n ON s.x = n.y"]:
@@ -277,3 +277,16 @@ def test_order_by_follows_index_or_rowid_order():
     pair.run("SELECT DISTINCT a FROM o ORDER BY a LIMIT 3")
     assert presorted > 50  # most of these really skip the sort
     pair.close()
+
+
+def test_equality_join_without_index_hashes_the_inner_table():
+    db = Database()
+    db.execute("CREATE TABLE big (k INTEGER, v)")
+    db.execute("CREATE TABLE small (k INTEGER, w)")
+    db.execute("INSERT INTO big VALUES (1, 'a'), (2, 'b'), (2, 'c'), (NULL, 'd')")
+    db.execute("INSERT INTO small VALUES (2, 'x'), (NULL, 'y')")
+    plan = db.execute("EXPLAIN SELECT * FROM small JOIN big ON big.k = small.k")
+    assert plan[-1][1] == "SEARCH USING AUTOMATIC INDEX (k=?)"
+    assert sorted(db.execute("SELECT v, w FROM small JOIN big ON big.k = small.k")) == [("b", "x"), ("c", "x")]
+    # A constant key is no join: the table is scanned.
+    assert db.execute("EXPLAIN SELECT * FROM big WHERE k = 2") == [("big", "SCAN")]
