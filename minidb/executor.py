@@ -2620,24 +2620,31 @@ class Executor:
         else:
             raise OperationalError("unable to identify the object to be reindexed")
         for index in indexes:
-            tree = catalog.index_tree(index)
-            tree.clear()
-            for rowid, record in catalog.table_tree(index.table).scan():
-                tree.insert(index.key(self.load_row(index.table, rowid, record), rowid), b"")
+            catalog.index_tree(index).clear()
+            self.build_index(index)
         return Result()
 
     def create_index(self, stmt: CreateIndex) -> Result:
         index = self.catalog.create_index(stmt)
         if index is None:
             return Result()
-        table = index.table
-        index_tree = self.catalog.index_tree(index)
-        for rowid, record in self.catalog.table_tree(table).scan():
-            row = self.load_row(table, rowid, record)
-            if index.unique:
-                self.check_unique(table, row, rowid)
-            index_tree.insert(index.key(row, rowid), b"")
+        self.build_index(index)
         return Result()
+
+    def build_index(self, index: IndexInfo) -> None:
+        """Fill the (empty) tree of ``index`` from its table: the keys are
+        sorted, checked for duplicates and loaded bottom up."""
+        table = index.table
+        load_row, key = self.load_row, index.key
+        keys = sorted(key(load_row(table, rowid, record), rowid)
+                      for rowid, record in self.catalog.table_tree(table).scan())
+        if index.unique:
+            width = len(index.positions)
+            for a, b in zip(keys, keys[1:]):
+                # NULLs never conflict (their sort keys start with 0).
+                if a[:width] == b[:width] and all(part[0] != 0 for part in a[:width]):
+                    raise IntegrityError(self.unique_error(table, index))
+        self.catalog.index_tree(index).bulk_load((k, b"") for k in keys)
 
 
 class JoinLevel:

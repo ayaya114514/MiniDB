@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import struct
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any, Protocol, Self
 
 from minidb.errors import Error
@@ -524,6 +524,75 @@ class BTree:
         del node.keys[m:], node.children[m + 1:], node.key_refs[m:]
         node.recompute_size()
         return separator, separator_ref, right
+
+    # ---- bulk loading --------------------------------------------------
+
+    def _pack(self, sizes: list[int], free_first: bool = False) -> list[tuple[int, int]]:
+        """Split cells of ``sizes`` into consecutive nodes, each as full as it
+        can be; the last two are balanced so that no node is under
+        ``min_fill``.  With ``free_first`` a node's first cell costs nothing
+        (an internal node's first child pointer is in its header)."""
+        groups = []
+        start, size = 0, HEADER_SIZE
+        for i, cell in enumerate(sizes):
+            cost = 0 if free_first and i == start else cell
+            if size + cost > self.capacity and i > start:
+                groups.append((start, i))
+                start, size = i, HEADER_SIZE
+                cost = 0 if free_first else cell
+            size += cost
+        groups.append((start, len(sizes)))
+
+        def total(begin, end):
+            first = begin + 1 if free_first else begin
+            return HEADER_SIZE + sum(sizes[first:end])
+
+        while len(groups) > 1 and total(*groups[-1]) < self.min_fill:
+            (a, b), (_, d) = groups[-2], groups[-1]
+            if b - a < 2:
+                break
+            groups[-2:] = [(a, b - 1), (b - 1, d)]
+        return groups
+
+    def bulk_load(self, items: Iterable[tuple[Any, bytes]]) -> None:
+        """Fill this empty tree from ``items`` (key, value) sorted by key with
+        no duplicates, bottom up: much faster than inserting one by one, and
+        the nodes end up full."""
+        keys, refs, stored, sizes = [], [], [], []
+        for key, value in items:
+            ref = self._store_key(key)
+            key_cell = self._key_cell(key, ref)
+            data = self._store_value(value, key_cell)
+            keys.append(key)
+            refs.append(ref)
+            stored.append(data)
+            sizes.append(key_cell + value_cell_size(data))
+        if not keys:
+            return
+        groups = self._pack(sizes)
+        if len(groups) == 1:
+            self.pager.write(Leaf(self.root, self.codec, keys, stored, 0, refs))
+            return
+        leaves = [self.pager.allocate(Leaf, self.codec, keys[a:b], stored[a:b], 0, refs[a:b]) for a, b in groups]
+        for leaf, following in zip(leaves, leaves[1:]):
+            leaf.next_leaf = following.pgno
+        # (child page, separator key, its ref): a leaf's separator is a copy of
+        # its first key; an internal node's moves up to the level above.
+        level = [(leaf.pgno, leaf.keys[0], self._copy_key(leaf.keys[0], leaf.key_refs[0]) if i else None)
+                 for i, leaf in enumerate(leaves)]
+        while True:
+            sizes = [4 + self._key_cell(key, ref) for _, key, ref in level]
+            groups = self._pack(sizes, free_first=True)
+            nodes = []
+            for a, b in groups:
+                children = level[a:b]
+                args = ([key for _, key, _ in children[1:]], [pgno for pgno, _, _ in children],
+                        [ref for _, _, ref in children[1:]])
+                if len(groups) == 1:
+                    self.pager.write(Internal(self.root, self.codec, *args))
+                    return
+                nodes.append((self.pager.allocate(Internal, self.codec, *args).pgno, children[0][1], children[0][2]))
+            level = nodes
 
     # ---- deletion ------------------------------------------------------
 
