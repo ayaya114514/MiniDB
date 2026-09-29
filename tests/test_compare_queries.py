@@ -1066,3 +1066,16 @@ def test_alter_table_survives_reopening(tmp_path):
     assert db.execute("SELECT * FROM t2 ORDER BY x") == [(1, "a", 1), (2, None, 2), (3, "d", 3)]
     assert db.integrity_check() == []
     db.close()
+
+
+def test_join_of_many_tables():
+    # More tables than Python allows nested blocks in one generated loop.
+    pair = Pair(check_messages=True)
+    names = [f"t{i}" for i in range(22)]
+    for i, name in enumerate(names):
+        pair.run(f"CREATE TABLE {name} (a{i}, b{i})")
+        pair.run(f"INSERT INTO {name} VALUES ({i}, {i + 1}), ({i + 1}, {i + 2})")
+    where = " AND ".join(f"b{i} = a{i + 1}" for i in range(21))
+    pair.run(f"SELECT a0, b21 FROM {', '.join(names)} WHERE {where}")
+    pair.run(f"SELECT count(*) FROM {', '.join(names)} WHERE a0 = 0 AND {where}")
+    pair.close()

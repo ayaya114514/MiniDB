@@ -2201,7 +2201,8 @@ class Executor:
         for level in levels:
             if isinstance(level.access, HashLookup):
                 level.access.reset()
-        if levels and all(level.plain for level in levels):
+        # (Python allows at most 20 nested blocks: many tables use visit.)
+        if levels and len(levels) <= MAX_GENERATED_LEVELS and all(level.plain for level in levels):
             loop = levels[0].loop
             if loop is None:
                 loop = levels[0].loop = inner_join_loop(levels)
@@ -2811,6 +2812,9 @@ class Executor:
                 if a[:width] == b[:width] and all(part[0] != 0 for part in a[:width]):
                     raise IntegrityError(self.unique_error(table, index))
         self.catalog.index_tree(index).bulk_load((k, b"") for k in keys)
+
+
+MAX_GENERATED_LEVELS = 16
 
 
 def inner_join_loop(levels: list[JoinLevel]) -> Callable[[Row], Iterator[Row]]:
