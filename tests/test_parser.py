@@ -417,7 +417,7 @@ def test_conflict_clauses_upsert_and_returning():
     ]
     assert [item.alias for item in stmt.returning] == [None, "x"]
     assert parse("DELETE FROM t WHERE a RETURNING a").returning[0].expr == Column("a")
-    with pytest.raises(OperationalError, match="conflict target is required"):
+    with pytest.raises(SQLSyntaxError, match='syntax error near "ON"'):
         parse("INSERT INTO t VALUES (1) ON CONFLICT DO NOTHING ON CONFLICT DO NOTHING")
     with pytest.raises(SQLSyntaxError, match="expected ROLLBACK, ABORT, FAIL, IGNORE or REPLACE"):
         parse("INSERT OR NOTHING INTO t VALUES (1)")

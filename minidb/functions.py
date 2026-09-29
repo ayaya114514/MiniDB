@@ -494,12 +494,15 @@ def _log(*args: SQLValue) -> float | None:
 
 
 def _power(x: float, y: float) -> float:
+    """C's pow(): an overflow (or a zero to a negative power) is an infinity
+    that keeps the sign of x when y is an odd integer."""
     try:
         return math.pow(x, y)
-    except OverflowError:
-        return math.inf
-    except ValueError:
-        return math.nan if x < 0 else math.inf
+    except (OverflowError, ValueError):
+        if x < 0 and y != int(y):
+            return math.nan
+        odd = abs(y) < 2 ** 53 and int(y) % 2 == 1
+        return math.copysign(math.inf, x) if odd else math.inf
 
 
 MATH_FUNCTIONS = {

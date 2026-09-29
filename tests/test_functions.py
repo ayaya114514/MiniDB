@@ -66,6 +66,8 @@ def test_function_edge_cases(pair):
         "SELECT pi(), log(100), log(2, 8), ln(exp(2)), pow(2, 10), power(-8, 1.0/3), mod(-7, 3), mod(7.5, 2)",
         "SELECT ceil(-1.5), floor(-1.5), trunc(-1.5), ceil('1.5'), floor('abc'), ceil(9223372036854775807)",
         "SELECT sqrt(-1), ln(0), log(-1), acos(2), exp(1000), pow(0, -1), atanh(1), atanh(-1)",
+        "SELECT pow(-13, 1e15 + 1), pow(-13, 1e15), pow(-0.0, -3), pow(-0.0, -2), pow(-2, 0.5), "
+        "pow(-1e200, 3), pow(-1e200, -3), pow(-2, 1e20), pow(-13, 9007199254740993)",
         "SELECT sign('5'), sign('-5.5'), sign('abc'), sign(x'35'), sign(0.0), sign(-0.0)",
         "SELECT round(2.675, 2), round(-1.005, 2), round(0.5), round(-0.5), round(1234.5678, -2), "
         "round(1e300, 5), round('abc'), round(x'35')",

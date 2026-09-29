@@ -326,6 +326,8 @@ class Generator:
         verb = "REPLACE " if rng.random() < 0.05 else f"INSERT {self.conflict()}"
         if rng.random() < 0.5:
             columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
+            if table.rowid_alias not in columns and rng.random() < 0.15:
+                columns.insert(rng.randint(0, len(columns)), "rowid")  # the row id by name
             prefix = f"{verb}INTO {table.name} ({', '.join(columns)}) VALUES "
         else:
             columns = table.column_names()
@@ -333,7 +335,7 @@ class Generator:
         for _ in range(rng.randint(1, 4)):
             values = []
             for column in columns:
-                if column == table.rowid_alias:
+                if column in (table.rowid_alias, "rowid"):
                     self.no_parameters = True
                     value = no_max_rowid(self.expr([], 2, True))
                     self.no_parameters = False
