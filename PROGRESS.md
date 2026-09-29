@@ -170,3 +170,30 @@
 - CI：fuzz 作业增加变形测试（固定 200 种子 + 每次换 100 个新种子的文件模式）；新增 sqllogictest 作业（语料按清单哈希缓存，`--min-passed 3743727`）。CI 上的这两项尚未实际运行（本阶段未 push）。
 - 测试：619 个，全部通过（新增 `test_sqllogictest.py` 21 个、`test_metamorphic.py` 14 个）。
 - 已知问题：sqllogictest 的 `label` 只解析不交叉核对（每条记录本身都有期望结果，不影响判定）。
+
+## 阶段 16：SQL 补齐（进行中，2026-09-29 暂停）
+已完成（每项都有与参考 SQLite 3.53.4 的对照测试，fuzzer 已覆盖）：
+- `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`、`REPLACE`、UPSERT（`ON CONFLICT ... DO UPDATE/NOTHING`，含 excluded 的亲和性细节；DO UPDATE 只在有冲突检查能到达时才解析，D83）、`RETURNING`、语句日志（statement journal）语义；`INSERT INTO t (rowid, ...)`。
+- CTE：`WITH`、`WITH RECURSIVE`（UNION 去重、ORDER BY 优先队列、LIMIT/OFFSET），`VALUES` 作为查询。
+- `ALTER TABLE ADD COLUMN / RENAME TO / RENAME COLUMN / DROP COLUMN`（同步改写视图 SQL）、列 `DEFAULT`、`INSERT DEFAULT VALUES`、`TRUE/FALSE`。
+- `CREATE [TEMP] VIEW` / `DROP VIEW`、`REINDEX`、`INDEXED BY` / `NOT INDEXED`。
+- 标量函数：`substr`、`replace`、`trim`/`ltrim`/`rtrim`（按 trimFunc 逐字节，字符集遇 NUL 截断）、`instr`、`round`、`printf`/`format`（移植 3.53 源码）、`hex`/`unhex`、`quote`、`unicode`/`unistr`、`char`、`concat`/`concat_ws`、`glob`/`like`（ESCAPE）、`iif`/`if`、数学函数、日期时间函数（移植 date.c）；位运算 `& | ~ << >>`，BLOB 字面量、十六进制整数字面量。
+- 列类型亲和性 INTEGER/REAL/NUMERIC/TEXT/BLOB（任意类型名）、BLOB 值、非法 UTF-8 文本、REAL↔TEXT 逐位对齐（D80）。
+- `RIGHT` / `FULL [OUTER] JOIN`（含 USING/NATURAL 的 SQLite 合并列语义、`ON clause references tables to its right` 检查，D84）；比较亲和性施加到两侧（D85）。
+- 结果列别名可在 WHERE/ON/GROUP BY/HAVING/ORDER BY 表达式中使用（D86）。
+- 子查询中的外层聚合，以及 SQLite 判定聚合查询与 misuse 报错的规则（D87）。
+
+测试：823 个，全部通过（参考 SQLite 3.53.4，Python 3.12）。
+fuzz / 变形测试（本阶段后半段）：f25 600 种子 × 400：5 个失败种子，其中 4 个被随后的外层聚合、trim 修复消除（用当时的生成器回放确认），1 个促成了 ON 右侧引用检查；m10 300 种子 × 300 查询 0 失败；外层聚合提交后 200 种子 × 300 0 失败。暂停时启动的 f26/f27/m11 被中止，未计入。
+sqllogictest：阶段中途（2026-09-28）一次全量运行 5,939,820 / 5,939,879 条通过（615/622 个文件无失败）；之后又补了 REINDEX、INSERT OR、TEMP VIEW 等，尚未重跑，CI 的 `--min-passed` 仍是阶段 15 的基线。
+
+已知问题 / 差异（如实记录）：
+- 计划相关的报错时机：SQLite 的 WHERE 常量传播、恒真 OR 折叠会让某些错误（`abs()` 溢出、外层聚合 misuse）不出现或提前出现；子查询里 `sum()` 溢出同理。fuzzer 对这些做了 guard。
+- `max()`/`min()` 并列或无 min/max 的聚合查询里，裸列取哪一行依赖扫描顺序（SQLite 可能走覆盖索引）。
+- 聚合参数中含子查询时，一律视为当前层的聚合（SQLite 会看子查询里的列）。
+- 不支持：TRIGGER、CHECK、COLLATE、TEMP TABLE、聚合的 `FILTER` 子句；localtime 只在一个时区验证过。
+
+剩余（下次从这里继续）：
+1. 窗口函数：`ROW_NUMBER`/`RANK`/`DENSE_RANK`/`PERCENT_RANK`/`CUME_DIST`/`NTILE`/`LAG`/`LEAD`/`FIRST_VALUE`/`LAST_VALUE`/`NTH_VALUE`，聚合 `OVER (PARTITION BY ... ORDER BY ... frame)`（ROWS/RANGE/GROUPS、EXCLUDE）、`WINDOW` 子句，以及聚合的 `FILTER (WHERE ...)`。正在读 SQLite window.c（`sqlite3WindowUpdate`、`windowCheckValue`、`windowCodeRangeTest`），尚未写代码。
+2. 重跑 sqllogictest，更新数字并提高 CI 的 `--min-passed`。
+3. 阶段末：全量测试 + 大规模 fuzz / 变形测试；README 更新（功能列表、去掉 D20 的限制）；勾选 CLAUDE.md 的阶段 16。
