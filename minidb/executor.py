@@ -30,15 +30,19 @@ from typing import Any, Protocol, Union
 
 from minidb import dates, functions, values
 from minidb.btree import BTree
-from minidb.catalog import HIGH, Catalog, IndexInfo, TableInfo, ViewInfo
+from minidb.catalog import (
+    AUTO_INDEX_PREFIX, HIGH, RESERVED_PREFIX, Catalog, IndexInfo, TableInfo, ViewInfo, constant_default,
+    is_constant_default, quote,
+)
 from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
-    Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
+    AlterTable, Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
     CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
     InSelect, Insert, Join, Like, Literal, Parameter, Reindex, Select, SelectItem, Star, Subquery,
     TableRef, Unary, Update, Upsert, Values,
 )
-from minidb.parser import Expr, Statement
+from minidb.parser import ColumnDef, Expr, Statement, parse
+from minidb.tokenizer import tokenize
 from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, encode_record
 
@@ -330,7 +334,16 @@ class Compiler:
             parameters, i = self.executor.parameters, expr.index - 1
             return (lambda row: parameters[i]), None
         if isinstance(expr, Column):
-            slot, affinity, _, depth = self.scope.resolve(expr)
+            try:
+                slot, affinity, index, depth = self.scope.resolve(expr)
+            except OperationalError:
+                if expr.table is None and ascii_lower(expr.name) in ("true", "false"):
+                    value = int(ascii_lower(expr.name) == "true")  # TRUE and FALSE, unless a column
+                    return (lambda row: value), None
+                raise
+            hook = self.executor.column_hook if self.executor is not None else None
+            if hook is not None:
+                hook(expr, self.scope.ancestor(depth).entries[index].table)
             if depth == 0:
                 return itemgetter(slot), affinity
             cell = self.scope.ancestor(depth).cell  # the enclosing query's current row
@@ -1149,6 +1162,7 @@ class Executor:
         self.once_caches = []  # caches of uncorrelated subqueries of the plan being compiled
         self.expanding = []  # views and CTEs being compiled (to detect one that uses itself)
         self.cte_scopes = []  # the WITH clauses in effect: dicts of lower-case name -> CteInfo
+        self.column_hook = None  # called with (Column, table) for each column reference compiled
         self.statement_journal = True  # see PreparedInsert.statement_journal
         self.changes = 0  # changes() and total_changes(), kept up to date by Database
         self.total_changes = 0
@@ -1181,6 +1195,8 @@ class Executor:
             return Result()
         if isinstance(stmt, Reindex):
             return self.reindex(stmt.name)
+        if isinstance(stmt, AlterTable):
+            return self.alter_table(stmt)
         if isinstance(stmt, DropView):
             self.catalog.drop_view(stmt.name, stmt.if_exists)
             return Result()
@@ -1217,6 +1233,8 @@ class Executor:
     @staticmethod
     def load_row(table: TableInfo, rowid: int, record: bytes) -> Row:
         row = decode_record(record)[0]
+        if len(row) < len(table.columns):  # written before ALTER TABLE ADD COLUMN
+            row.extend(table.padding[len(row):])
         if table.rowid_column is not None:
             row[table.rowid_column] = rowid
         row.append(rowid)
@@ -1717,10 +1735,16 @@ class Executor:
             raise IntegrityError("datatype mismatch")
         return rowid
 
-    @staticmethod
-    def not_null_violation(table: TableInfo, row: Row) -> str | None:
+    def not_null_violation(self, table: TableInfo, row: Row, conflict: str = "ABORT") -> str | None:
+        """The NOT NULL constraint ``row`` violates, if any.  Under REPLACE a
+        NULL becomes the column's default first, if that is not NULL."""
         for i, column in enumerate(table.columns):
             if column.not_null and row[i] is None:
+                if conflict == "REPLACE" and column.default is not None:
+                    value = Compiler(Scope(), executor=self).compile(column.default)([])
+                    row[i] = values.apply_affinity(value, table.affinities[i])
+                    if row[i] is not None:
+                        continue
                 return f"NOT NULL constraint failed: {table.name}.{column.name}"
         return None
 
@@ -1802,7 +1826,7 @@ class Executor:
         # made integers in REAL columns REALs (OP_RealAffinity).
         raw = [float(v) if a == values.REAL and type(v) is int else v for v, a in zip(row, table.affinities)]
         rowid = self.prepare_row(table, row)
-        violation = self.not_null_violation(table, row)
+        violation = self.not_null_violation(table, row, conflict)
         if violation is not None:
             if conflict == "IGNORE":
                 return None
@@ -1854,7 +1878,7 @@ class Executor:
             new_rowid = self.prepare_row(table, row)
             if new_rowid is None:
                 raise IntegrityError("datatype mismatch")
-        violation = self.not_null_violation(table, row)
+        violation = self.not_null_violation(table, row, conflict)
         if violation is not None:
             if conflict == "IGNORE":
                 return None
@@ -1914,6 +1938,126 @@ class Executor:
         return IntegrityError(f"UNIQUE constraint failed: {table.name}.{name}")
 
     # ---- indexes -------------------------------------------------------------
+
+    # ---- ALTER TABLE ------------------------------------------------------------
+
+    def alter_table(self, stmt: AlterTable) -> Result:
+        catalog = self.catalog
+        table = catalog.get_table(stmt.table)
+        if stmt.action == "rename":
+            self.rename_table(table, stmt.new_name)
+        elif stmt.action == "rename column":
+            self.rename_column(table, stmt.column, stmt.new_name)
+        elif stmt.action == "add":
+            self.add_column(table, stmt.definition)
+        else:
+            self.drop_column(table, stmt.column)
+        catalog.load()
+        return Result()
+
+    def _views(self) -> list[ViewInfo]:
+        return [*self.catalog.views.values(), *self.catalog.temp_views.values()]
+
+    def _view_references(self, view: ViewInfo, table: TableInfo) -> list[Column] | None:
+        """The column references of a view that resolve to ``table`` (None if
+        the view does not compile)."""
+        found = []
+        saved = self.cte_scopes
+        self.cte_scopes = []
+        self.column_hook = lambda expr, source: found.append(expr) if source is table else None
+        try:
+            self.compile_query(view.query)
+        except Error:
+            return None
+        finally:
+            self.column_hook = None
+            self.cte_scopes = saved
+        return found
+
+    def rename_table(self, table: TableInfo, new: str) -> None:
+        catalog = self.catalog
+        lowered = ascii_lower(new)
+        if lowered in catalog.tables or lowered in catalog.views or lowered in catalog.indexes:
+            raise OperationalError(f"there is already another table or index with this name: {new}")
+        if lowered.startswith(RESERVED_PREFIX):
+            raise OperationalError(f"object name reserved for internal use: {new}")
+        old = table.name
+        for view in self._views():
+            stmt = parse(view.sql)
+            edits = [(node.pos, quote(new)) for node in walk_nodes(stmt.query)
+                     if isinstance(node, TableRef) and ascii_lower(node.name) == ascii_lower(old)]
+            edits += [(node.table_pos, quote(new)) for node in walk_nodes(stmt.query)
+                      if isinstance(node, Column) and node.table is not None
+                      and ascii_lower(node.table) == ascii_lower(old) and node.table_pos >= 0]
+            if edits:
+                catalog.rewrite_view(view, apply_edits(view.sql, edits))
+        table.name = new
+        for index in table.indexes:
+            if index.is_auto:
+                index.name = AUTO_INDEX_PREFIX + new + index.name[len(AUTO_INDEX_PREFIX) + len(old):]
+        catalog.rewrite_table_entries(table)
+
+    def rename_column(self, table: TableInfo, old: str, new: str) -> None:
+        position = table.column_index(old)
+        if position is None:
+            raise OperationalError(f'no such column: "{old}"')
+        if any(ascii_lower(c.name) == ascii_lower(new) for i, c in enumerate(table.columns) if i != position):
+            raise OperationalError(f"error in table {table.name} after rename: duplicate column name: {new}")
+        for view in self._views():
+            references = self._view_references(view, table)
+            edits = [(node.pos, plain_identifier(new)) for node in references or ()
+                     if node.pos >= 0 and ascii_lower(node.name) == ascii_lower(table.columns[position].name)]
+            if edits:
+                self.catalog.rewrite_view(view, apply_edits(view.sql, edits))
+        table.columns[position].name = new
+        for index in table.indexes:
+            index.column_names = [table.columns[p].name for p in index.positions]
+        self.catalog.rewrite_table_entries(table)
+
+    def add_column(self, table: TableInfo, column: ColumnDef) -> None:
+        if table.column_index(column.name) is not None:
+            raise OperationalError(f"duplicate column name: {column.name}")
+        if column.primary_key:
+            raise OperationalError("Cannot add a PRIMARY KEY column")
+        if column.unique:
+            raise OperationalError("Cannot add a UNIQUE column")
+        if not is_constant_default(column.default):
+            raise OperationalError("Cannot add a column with non-constant default")
+        if column.not_null and constant_default(column.default) is None:
+            raise OperationalError("Cannot add a NOT NULL column with default value NULL")
+        table.columns.append(column)
+        self.catalog.rewrite_table_entries(table)
+
+    def drop_column(self, table: TableInfo, name: str) -> None:
+        position = table.column_index(name)
+        if position is None:
+            raise OperationalError(f'no such column: "{name}"')
+        column = table.columns[position]
+        if column.primary_key:
+            raise OperationalError(f'cannot drop PRIMARY KEY column: "{column.name}"')
+        if column.unique:
+            raise OperationalError(f'cannot drop UNIQUE column: "{column.name}"')
+        if len(table.columns) == 1:
+            raise OperationalError(f'cannot drop column "{column.name}": no other columns exist')
+        for index in table.indexes:
+            if position in index.positions:
+                raise OperationalError(
+                    f"error in index {index.name} after drop column: no such column: {column.name}")
+        for view in self._views():
+            references = self._view_references(view, table)
+            if any(ascii_lower(node.name) == ascii_lower(column.name) for node in references or ()):
+                raise OperationalError(
+                    f"error in view {view.name} after drop column: no such column: {column.name}")
+        tree = self.catalog.table_tree(table)
+        rows = [(rowid, self.load_row(table, rowid, record)) for rowid, record in tree.scan()]
+        table.columns.pop(position)
+        alias = next((i for i, c in enumerate(table.columns) if c.primary_key and c.type == "INTEGER"), None)
+        for rowid, row in rows:
+            stored = row[:position] + row[position + 1:-1]
+            if alias is not None:
+                stored[alias] = None  # kept in the key
+            tree.insert(rowid, encode_record(stored), replace=True)
+        self.catalog.rewrite_table_entries(table)
 
     def reindex(self, name: str | None) -> Result:
         """Rebuild the indexes of ``name`` (an index, a table, or the default
@@ -2179,6 +2323,8 @@ class PreparedInsert:
                     raise OperationalError(f"table {table.name} has no column named {name}")
                 self.positions.append(position)
         compiler = Compiler(Scope(), executor=executor)
+        self.defaults = [(p, compiler.compile(c.default)) for p, c in enumerate(table.columns)
+                         if p not in self.positions and c.default is not None]
         self.conflict = stmt.conflict
         self.upserts = [PreparedUpsert(executor, table, clause) for clause in stmt.upsert]
         scope = Scope()
@@ -2244,6 +2390,8 @@ class PreparedInsert:
             row = [None] * width
             for position, value in zip(self.positions, source):
                 row[position] = value
+            for position, default in self.defaults:
+                row[position] = default([])
             rows.append(row)
         changed = []  # rows inserted or updated by an upsert, with their row ids
         try:
@@ -2528,6 +2676,34 @@ class CteInfo:
     def __init__(self, cte: Cte, level: int) -> None:
         self.cte = cte
         self.level = level
+
+
+def walk_nodes(node: object) -> Iterator[object]:
+    """Every syntax tree node under ``node``, subqueries included."""
+    yield node
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            yield from walk_nodes(item)
+    elif dataclasses.is_dataclass(node):
+        for f in dataclasses.fields(node):
+            if f.compare:
+                yield from walk_nodes(getattr(node, f.name))
+
+
+def apply_edits(text: str, edits: list[tuple[int, str]]) -> str:
+    """Replace the SQL token starting at each position with new text."""
+    lengths = {token.pos: len(token.text) for token in tokenize(text)}
+    for pos, replacement in sorted(set(edits), reverse=True):
+        text = text[:pos] + replacement + text[pos + lengths[pos]:]
+    return text
+
+
+def plain_identifier(name: str) -> str:
+    """A name as written in SQL: bare if that reads back the same, else quoted."""
+    tokens = tokenize(name)
+    if len(tokens) == 2 and tokens[0].kind == "IDENT" and tokens[0].text == name:
+        return name
+    return quote(name)
 
 
 def check_cte_columns(cte: Cte, names: list[str]) -> None:

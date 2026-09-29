@@ -654,3 +654,54 @@ def test_values_syntax_errors():
                 "WITH x AS SELECT 1 SELECT 2"]:
         pair.run(sql)
     pair.close()
+
+
+def test_defaults_and_alter_table():
+    pair = Pair(check_messages=True)
+    for sql in [
+ "CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT DEFAULT 'x', c DEFAULT (1 + 2), d REAL DEFAULT -5, e DEFAULT CURRENT_DATE, f NOT NULL DEFAULT 7, g DEFAULT NULL, h INT DEFAULT +3, i DEFAULT TRUE, j DEFAULT 0x10, k DEFAULT b, l TEXT DEFAULT 5, m DEFAULT (abs(-4)), n DEFAULT x'41', o DEFAULT -0x10, p DEFAULT 'a''b')",
+ "INSERT INTO t (a) VALUES (1)", "SELECT a, b, c, d, typeof(d), length(e), f, g, h, i, j, k, l, typeof(l), m, n, o, p FROM t",
+ "INSERT INTO t (a, f) VALUES (2, NULL)", "INSERT OR REPLACE INTO t (a, f) VALUES (3, NULL)", "SELECT a, f FROM t",
+ "INSERT INTO t DEFAULT VALUES", "SELECT a, b FROM t WHERE a > 3", "UPDATE OR REPLACE t SET f = NULL WHERE a = 1", "SELECT a, f FROM t",
+ "CREATE TABLE d2(x DEFAULT (random()))", "CREATE TABLE d3(x DEFAULT -'a')", "CREATE TABLE bad4(a DEFAULT (b))", "INSERT INTO d3 DEFAULT VALUES", "SELECT x, typeof(x) FROM d3",
+ "SELECT true, false, true + 1, typeof(false)", "CREATE TABLE tf(true, x)", "INSERT INTO tf VALUES (5, 1)", "SELECT true, false FROM tf",
+ "CREATE TABLE u(x INTEGER UNIQUE, y)", "INSERT INTO u VALUES (1, 'one'), (2, 'two')", "CREATE INDEX uy ON u(y)",
+ "CREATE VIEW vu AS SELECT u.x, y FROM u WHERE x > 0", "CREATE VIEW vu2 AS SELECT q.y FROM u AS q",
+ "ALTER TABLE u ADD COLUMN z INTEGER DEFAULT 42", "SELECT * FROM u", "ALTER TABLE u ADD w", "ALTER TABLE u ADD COLUMN v NOT NULL",
+ "ALTER TABLE u ADD COLUMN v NOT NULL DEFAULT 'q'", "ALTER TABLE u ADD COLUMN k UNIQUE", "ALTER TABLE u ADD COLUMN k PRIMARY KEY",
+ "ALTER TABLE u ADD COLUMN k DEFAULT CURRENT_TIME", "ALTER TABLE u ADD COLUMN y", "ALTER TABLE u ADD COLUMN k DEFAULT (1+1)", "ALTER TABLE u ADD COLUMN r REAL DEFAULT '7'",
+ "SELECT *, typeof(r) FROM u", "INSERT INTO u (x) VALUES (3)", "SELECT * FROM u", "UPDATE u SET z = z + 1", "SELECT * FROM u WHERE z > 42",
+ "ALTER TABLE u RENAME COLUMN y TO yy", "SELECT * FROM vu", "SELECT * FROM vu2", "SELECT yy FROM u WHERE yy = 'one'",
+ "ALTER TABLE u RENAME TO uu", "SELECT * FROM vu", "SELECT * FROM vu2", "SELECT * FROM uu", "SELECT * FROM u",
+ "ALTER TABLE uu RENAME COLUMN nope TO x2", "ALTER TABLE uu RENAME COLUMN x TO yy", "ALTER TABLE nope RENAME TO z", "ALTER TABLE uu RENAME TO t", "ALTER TABLE uu RENAME TO vu",
+ "ALTER TABLE uu DROP COLUMN x", "ALTER TABLE uu DROP COLUMN yy", "DROP VIEW vu", "DROP VIEW vu2", "ALTER TABLE uu DROP COLUMN yy", "DROP INDEX uy", "ALTER TABLE uu DROP COLUMN yy",
+ "SELECT * FROM uu", "ALTER TABLE uu DROP COLUMN nope", "CREATE TABLE one(a)", "ALTER TABLE one DROP COLUMN a",
+ "CREATE TABLE pk(a TEXT PRIMARY KEY, b, c)", "INSERT INTO pk VALUES ('k', 1, 2)", "ALTER TABLE pk DROP COLUMN a", "ALTER TABLE pk DROP COLUMN b", "SELECT * FROM pk",
+ "CREATE TABLE ip(id INTEGER PRIMARY KEY, b, c)", "INSERT INTO ip VALUES (5, 'b', 'c')", "ALTER TABLE ip DROP COLUMN b", "SELECT *, rowid FROM ip", "ALTER TABLE ip DROP COLUMN id",
+ "ALTER TABLE ip RENAME COLUMN id TO ident", "SELECT ident, rowid FROM ip", "INSERT INTO ip (c) VALUES ('d')", "SELECT * FROM ip",
+ "CREATE VIEW vv AS SELECT v.a FROM (SELECT 1 AS a) AS v", "ALTER TABLE ip RENAME TO v", "SELECT * FROM vv",
+]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_alter_table_survives_reopening(tmp_path):
+    path = str(tmp_path / "alter.db")
+    db = Database(path)
+    db.execute("CREATE TABLE u (x INTEGER UNIQUE, y TEXT DEFAULT 'd', z INTEGER PRIMARY KEY);"
+               "INSERT INTO u (x, y) VALUES (1, 'a'), (2, NULL); CREATE INDEX uy ON u (y);"
+               "CREATE VIEW v AS SELECT u.y, x FROM u WHERE y IS NOT NULL; ANALYZE;"
+               "ALTER TABLE u ADD COLUMN w REAL DEFAULT -1.5; ALTER TABLE u RENAME COLUMN y TO yy;"
+               "ALTER TABLE u RENAME TO t2; INSERT INTO t2 (x) VALUES (3)")
+    db.close()
+    db = Database(path)
+    assert db.execute("SELECT * FROM t2 ORDER BY x") == [(1, "a", 1, -1.5), (2, None, 2, -1.5), (3, "d", 3, -1.5)]
+    assert db.execute("SELECT * FROM v") == [("a", 1), ("d", 3)]
+    assert db.catalog.views["v"].sql == 'CREATE VIEW v AS SELECT "t2".yy, x FROM "t2" WHERE yy IS NOT NULL'
+    assert sorted(i.name for i in db.catalog.tables["t2"].indexes) == ["minidb_autoindex_t2_1", "uy"]
+    db.execute("ALTER TABLE t2 DROP COLUMN w")
+    db.close()
+    db = Database(path)
+    assert db.execute("SELECT * FROM t2 ORDER BY x") == [(1, "a", 1), (2, None, 2), (3, "d", 3)]
+    assert db.integrity_check() == []
+    db.close()
