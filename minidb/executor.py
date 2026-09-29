@@ -23,15 +23,17 @@ import contextlib
 import dataclasses
 import heapq
 import itertools
+import os
 import random
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
 
 from minidb import dates, functions, values, window
-from minidb.btree import BTree
+from minidb.btree import BTree, IntKey
 from minidb.catalog import (
-    AUTO_INDEX_PREFIX, HIGH, RESERVED_PREFIX, Catalog, IndexInfo, TableInfo, ViewInfo, constant_default,
+    AUTO_INDEX_PREFIX, HIGH, RESERVED_PREFIX, Catalog, IndexInfo, IndexKeyCodec, TableInfo, ViewInfo,
+    constant_default,
     is_constant_default, quote,
 )
 from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
@@ -39,12 +41,13 @@ from minidb.parser import (
     AlterTable, Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
     CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
     InSelect, Insert, Join, Like, Literal, Parameter, Reindex, Select, SelectItem, Star, Subquery,
-    TableRef, Unary, Update, Upsert, Values, Frame, WindowDef,
+    TableRef, Unary, Update, Upsert, Vacuum, Values, Frame, WindowDef,
 )
 from minidb.parser import ColumnDef, Expr, Statement, parse
 from minidb.tokenizer import tokenize
 from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, decode_row, encode_record
+from minidb.pager import Pager
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")
 # Functions that read the connection's state: name -> Executor attribute.
@@ -1783,6 +1786,8 @@ class Executor:
             return Result()
         if isinstance(stmt, Reindex):
             return self.reindex(stmt.name)
+        if isinstance(stmt, Vacuum):
+            return self.vacuum(stmt)
         if isinstance(stmt, AlterTable):
             return self.alter_table(stmt)
         if isinstance(stmt, DropView):
@@ -2790,6 +2795,58 @@ class Executor:
             catalog.index_tree(index).clear()
             self.build_index(index)
         return Result()
+
+    def vacuum(self, stmt: Vacuum) -> Result:
+        """Rebuild the database compactly: every table and index is copied, in
+        schema order, into a new in-memory database with bulk_load, whose
+        pages then replace the database's own (the page count shrinks and the
+        free list is gone; a checkpoint shrinks the file).  ``VACUUM INTO``
+        writes the copy to a new file instead."""
+        if stmt.schema == "temp":
+            return Result()  # temporary views live in memory only
+        if stmt.into is not None:
+            path = Compiler(Scope(), executor=self).compile(stmt.into)([])
+            if not isinstance(path, str):
+                raise OperationalError("non-text filename")
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                raise OperationalError("output file already exists")
+            target = Pager(path)
+            try:
+                self.copy_database(target)
+                target.commit()
+                target.end_transaction()
+                target.checkpoint()
+            finally:
+                target.close_files()
+            return Result()
+        pager = self.catalog.pager
+        copy = Pager()
+        self.copy_database(copy)
+        count = copy.page_count
+        for pgno in range(1, count):
+            pager.write(copy.cache[pgno])
+        pager.write(pager.header)
+        pager.header.page_count = count
+        pager.header.freelist_head = 0
+        for pgno in [p for p in pager.cache if p >= count]:
+            del pager.cache[pgno]
+            pager.dirty.discard(pgno)
+        self.catalog.load()
+        return Result()
+
+    def copy_database(self, target: Pager) -> None:
+        """Copy the schema, tables and indexes into the empty database ``target``
+        (the schema table keeps its keys, objects get new root pages)."""
+        catalog = Catalog(target)
+        source = self.catalog
+        for key, value in list(source.schema.scan()):
+            kind, name, table_name, root, sql = decode_record(value)[0]
+            if kind in ("table", "index"):
+                codec = IntKey if kind == "table" else IndexKeyCodec
+                tree = BTree.create(target, codec)
+                tree.bulk_load(BTree(source.pager, root, codec).scan())
+                root = tree.root
+            catalog.schema.insert(key, encode_record([kind, name, table_name, root, sql]))
 
     def create_index(self, stmt: CreateIndex) -> Result:
         index = self.catalog.create_index(stmt)

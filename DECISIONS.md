@@ -604,3 +604,11 @@ benchmark：10 万行与 200 行无索引表的等值连接 17.2 s → 0.15 s。
 按源码文本缓存 code 对象——同形的语句（例如只差一个常量的点查）只编译一次。
 只有内连接的计划生成扁平的嵌套 for 循环（每张表一层，过滤条件内联真值判断），代替递归生成器；外连接、
 RIGHT/FULL、合并列仍用原来的通用循环。
+
+## D91 VACUUM
+在写事务里把整个数据库按 schema 表的键顺序复制进一个新的内存 pager：表按 rowid、索引按键用 `bulk_load`
+自底向上装满，schema 表保留原来的键、只换根页号；然后把新 pager 的页对象按相同页号写回（`page_count`
+缩小、空闲链表清空），提交后立即尝试 checkpoint。checkpoint 在持有 EXCLUSIVE（没有读者）时把文件截断到
+`page_count` 页——有读者时不截断，以后的 checkpoint 再截断。rowid 保持不变（与现代 SQLite 相同）。
+`VACUUM INTO 'file'` 把同样的副本写进一个新文件（已存在且非空时报 "output file already exists"）。
+VACUUM 不能在事务中执行。崩溃安全沿用 WAL：提交前崩溃是旧库，提交后崩溃是新库，截断发生在 WAL 清空之前。

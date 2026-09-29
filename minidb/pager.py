@@ -531,6 +531,7 @@ class Pager:
             for pgno, image in pages:
                 self.file.seek(pgno * PAGE_SIZE)
                 self.file.write(image)
+            self.file.truncate(self.header.page_count * PAGE_SIZE)
         else:
             self._append_frames(pages, commit=True)
             self._crash_point("wal_sync")
@@ -587,10 +588,15 @@ class Pager:
                 return False
             self._scan_wal(apply=True)  # we might have been behind
             images = {pgno: self._read_image(pgno) for pgno in self.frames}
+            page_count = Header.from_bytes(0, verify_page(0, images[0])).page_count if 0 in images else None
             for i, (pgno, image) in enumerate(sorted(images.items())):
+                if page_count is not None and pgno >= page_count:
+                    continue  # beyond the end: the file shrank (VACUUM)
                 self._crash_point("checkpoint_page", i)
                 self.file.seek(pgno * PAGE_SIZE)
                 self.file.write(image)
+            if page_count is not None:
+                self.file.truncate(page_count * PAGE_SIZE)  # no one reads: we hold EXCLUSIVE
             self._crash_point("checkpoint_sync")
             os.fsync(self.file.fileno())
             self._crash_point("wal_reset")
