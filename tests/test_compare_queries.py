@@ -886,6 +886,34 @@ def test_upsert_sees_defaults_that_replace_put_in_not_null_columns():
     pair.close()
 
 
+def test_postfix_null_tests():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (a NOT NULL DEFAULT 5 NOT NULL, b)", "INSERT INTO t (b) VALUES (NULL), (1)",
+        "SELECT 1 NOT NULL, NULL NOT NULL, 1 ISNULL, NULL NOTNULL, 1 = 1 NOT NULL, NOT 1 NOT NULL, "
+        "1 + 1 NOTNULL, 2 NOT NULL = 1, 5 NOT NULL IS 1",
+        "SELECT 1 NOT NULL NOT NULL, NULL ISNULL ISNULL, 1 < 2 ISNULL, 1 NOT NULL BETWEEN 0 AND 1, 1 NOT NULL AND 0",
+        "SELECT a, b FROM t WHERE b NOT NULL", "SELECT b ISNULL, b NOTNULL FROM t",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_order_by_first_table_after_join_reordering():
+    # The planner puts the smaller t2 first: rows then come in t2's order,
+    # not in the order of t0's row ids, so ORDER BY a.id must sort.
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t0 (id INTEGER PRIMARY KEY, c0)", "CREATE TABLE t2 (id INTEGER PRIMARY KEY, c0 TEXT)",
+        "INSERT INTO t0 VALUES (1, 10), (2, NULL), (3, 0), (4, 5), (5, NULL)",
+        "INSERT INTO t2 VALUES (1, 'a'), (2, 'b')",
+        "INSERT INTO t0 SELECT id + 5, c0 FROM t0", "INSERT INTO t0 SELECT id + 10, c0 FROM t0", "ANALYZE",
+        "SELECT a.c0 FROM t0 AS a, t2 AS b ORDER BY a.id ASC, a.c0 ASC, 1 LIMIT 3 OFFSET 3",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_common_table_expressions_and_values():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")
