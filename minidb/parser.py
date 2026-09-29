@@ -748,6 +748,8 @@ class Parser:
                 if self.accept_keyword("WHERE"):
                     clause.where = self.expr()
             clauses.append(clause)
+            if clause.columns is None:
+                break  # only the last clause may omit the target
         return clauses
 
     def insert(self) -> Insert:
@@ -778,9 +780,6 @@ class Parser:
                 rows.append(self.value_row())
             stmt = Insert(table, columns, rows, None, conflict)
         stmt.upsert = self.upsert_clauses()
-        for clause in stmt.upsert[:-1]:
-            if clause.columns is None:
-                raise OperationalError("a conflict target is required on all but the last ON CONFLICT clause")
         stmt.returning = self.returning()
         return stmt
 

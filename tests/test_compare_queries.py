@@ -599,6 +599,55 @@ def test_upsert_excluded_values_in_real_columns():
     pair.close()
 
 
+def test_upsert_clauses_resolved_only_when_reachable():
+    # SQLite compiles DO UPDATE only for a conflict check that can reach it:
+    # the row id is checked only when the INSERT gives it.
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t1 (c0, c1)",
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, c0)",
+        "CREATE TABLE t3 (id INTEGER PRIMARY KEY, c0 UNIQUE, c1 UNIQUE)",
+        "INSERT INTO t1 (c0) VALUES (1) ON CONFLICT DO UPDATE SET c2 = 1",
+        "INSERT INTO t2 (c0) VALUES (1) ON CONFLICT DO UPDATE SET c2 = 1",
+        "INSERT INTO t2 (id, c0) VALUES (1, 1) ON CONFLICT DO UPDATE SET c2 = 1",
+        "INSERT INTO t2 VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET c2 = 1",
+        "INSERT INTO t2 (c0) VALUES (1) ON CONFLICT (id) DO UPDATE SET c2 = 1",
+        "INSERT INTO t3 (c0) VALUES (1) ON CONFLICT (id) DO UPDATE SET c2 = 1",
+        "INSERT INTO t3 (c0) VALUES (1) ON CONFLICT (c0) DO UPDATE SET c2 = 1",
+        "INSERT INTO t3 (c0) VALUES (1) ON CONFLICT (c0) DO UPDATE SET c1 = 1 ON CONFLICT (c1) DO UPDATE SET c1 = x",
+        "INSERT INTO t3 (c0) VALUES (1) ON CONFLICT (c0) DO UPDATE SET c1 = 1 "
+        "ON CONFLICT (c1) DO UPDATE SET c1 = 1 ON CONFLICT DO UPDATE SET c1 = x",
+        "INSERT INTO t3 (id) VALUES (1) ON CONFLICT (c0) DO UPDATE SET c1 = 1 "
+        "ON CONFLICT (c1) DO UPDATE SET c1 = 1 ON CONFLICT DO UPDATE SET c1 = x",
+        "INSERT INTO t3 (id, c0) VALUES (1, 2) ON CONFLICT (id) DO UPDATE SET c1 = 3 WHERE y",
+        "INSERT INTO t1 (c0) VALUES (1) ON CONFLICT DO UPDATE SET c1 = 1 RETURNING nosuch",
+        "SELECT rowid, * FROM t1", "SELECT rowid, * FROM t2", "SELECT rowid, * FROM t3",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_insert_row_id_by_name():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t1 (c0, c1 UNIQUE)",
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, c0)",
+        "INSERT INTO t1 (rowid, c0) VALUES (5, 1), ('7', 2), (8.0, 3), (NULL, 4)",
+        "INSERT INTO t1 (rowid, c0) VALUES ('x', 1)",
+        "INSERT INTO t1 (rowid, c0) VALUES (8.5, 1)",
+        "INSERT INTO t1 (oid, c0) VALUES (5, 9)",
+        "INSERT OR REPLACE INTO t1 (_rowid_, c0) VALUES (5, 9)",
+        "INSERT INTO t1 (rowid, c0) VALUES (5, 10) ON CONFLICT DO UPDATE SET c0 = excluded.c0 + 100 RETURNING rowid, *",
+        "INSERT INTO t1 (rowid, c0) VALUES (6, 1) ON CONFLICT DO UPDATE SET c2 = 1",
+        "INSERT INTO t2 (rowid, c0) VALUES (3, 3), (NULL, 4)",
+        "INSERT INTO t2 (rowid, c0) VALUES (3, 5) ON CONFLICT (id) DO UPDATE SET c0 = -1",
+        "INSERT INTO t1 (nosuch, c0) VALUES (1, 1)",
+        "SELECT rowid, * FROM t1", "SELECT rowid, * FROM t2",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_common_table_expressions_and_values():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")

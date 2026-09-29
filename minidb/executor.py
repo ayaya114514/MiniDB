@@ -1813,7 +1813,7 @@ class Executor:
             stored[table.rowid_column] = None  # kept in the key, not the record
         return encode_record(stored)
 
-    def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str = "ABORT", upserts: Sequence[PreparedUpsert] = ()) -> tuple[str, Row] | None:
+    def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str = "ABORT", upserts: Sequence[PreparedUpsert] = (), rowid: SQLValue = None) -> tuple[str, Row] | None:
         """Insert ``row`` under a conflict resolution (INSERT OR ...) and the
         statement's ON CONFLICT clauses.  Returns ("insert", row + [rowid]),
         ("update", row + [rowid]) when an upsert updated an existing row, or
@@ -1821,11 +1821,16 @@ class Executor:
 
         As in SQLite: NOT NULL is checked first, then the upsert targets in
         clause order, then the row id and the other UNIQUE indexes (newest
-        first).  REPLACE deletes each conflicting row and goes on."""
+        first).  REPLACE deletes each conflicting row and goes on.  ``rowid``
+        is a row id given by name for a table without an INTEGER PRIMARY KEY."""
         # The values before column affinities (see below); SQLite has already
         # made integers in REAL columns REALs (OP_RealAffinity).
         raw = [float(v) if a == values.REAL and type(v) is int else v for v, a in zip(row, table.affinities)]
-        rowid = self.prepare_row(table, row)
+        given, rowid = rowid, self.prepare_row(table, row)
+        if given is not None:
+            rowid = values.apply_affinity(given, values.INTEGER)
+            if not isinstance(rowid, int):
+                raise IntegrityError("datatype mismatch")
         violation = self.not_null_violation(table, row, conflict)
         if violation is not None:
             if conflict == "IGNORE":
@@ -2320,13 +2325,24 @@ class PreparedInsert:
             for name in stmt.columns:
                 position = table.column_index(name)
                 if position is None:
-                    raise OperationalError(f"table {table.name} has no column named {name}")
+                    if ascii_lower(name) not in ROWID_NAMES:
+                        raise OperationalError(f"table {table.name} has no column named {name}")
+                    # The row id by name; "width" when it is not a column.
+                    position = width if table.rowid_column is None else table.rowid_column
                 self.positions.append(position)
+        self.rowid_given = (width if table.rowid_column is None else table.rowid_column) in self.positions
         compiler = Compiler(Scope(), executor=executor)
         self.defaults = [(p, compiler.compile(c.default)) for p, c in enumerate(table.columns)
                          if p not in self.positions and c.default is not None]
         self.conflict = stmt.conflict
         self.upserts = [PreparedUpsert(executor, table, clause) for clause in stmt.upsert]
+        # SQLite checks the row id for a conflict only when the INSERT gives it.
+        checks = ["rowid"] if self.rowid_given else []
+        checks += [index for index in table.indexes if index.unique]
+        for upsert in self.upserts:
+            if any(next((u for u in self.upserts if u.constraint in (check, None)), None) is upsert
+                   for check in checks):
+                upsert.resolve()
         scope = Scope()
         scope.add(table)
         self.returning = executor.compile_returning(stmt.returning, scope)
@@ -2359,7 +2375,7 @@ class PreparedInsert:
         def handled(constraint):
             return conflict != "ABORT" or any(u.constraint in (constraint, None) for u in self.upserts)
 
-        if table.rowid_column is not None and table.rowid_column in self.positions and not handled("rowid"):
+        if self.rowid_given and not handled("rowid"):
             return True
         if any(index.unique and not handled(index) for index in table.indexes):
             return True
@@ -2387,7 +2403,7 @@ class PreparedInsert:
             [function([]) for function in functions] for functions in self.rows
         )
         for source in sources:
-            row = [None] * width
+            row = [None] * (width + 1)  # the last: a row id given by name
             for position, value in zip(self.positions, source):
                 row[position] = value
             for position, default in self.defaults:
@@ -2396,7 +2412,8 @@ class PreparedInsert:
         changed = []  # rows inserted or updated by an upsert, with their row ids
         try:
             for row in rows:
-                outcome = executor.insert_row(table, self.tree, row, self.conflict, self.upserts)
+                rowid = row.pop()
+                outcome = executor.insert_row(table, self.tree, row, self.conflict, self.upserts, rowid)
                 if outcome is not None:
                     kind, stored = outcome
                     if kind == "insert":
@@ -2501,26 +2518,37 @@ class PreparedUpsert:
     def __init__(self, executor: Executor, table: TableInfo, clause: Upsert) -> None:
         self.executor = executor
         self.table = table
+        self.clause = clause
         self.constraint = self.find_constraint(table, clause)  # None: any uniqueness constraint
-        self.assignments = None  # None: DO NOTHING
-        if clause.assignments is not None:
-            # SET and WHERE see the existing row (by the table's name) and "excluded".
-            self.scope = Scope()
-            self.scope.add(table)
-            self.scope.add(ExcludedSource(table))
-            # An unqualified name is the existing row's column; excluded.x must be qualified.
-            self.scope.entries[1].hidden.update(ascii_lower(c.name) for c in table.columns)
-            compiler = Compiler(self.scope, executor=executor)
-            width = len(table.columns)
-            self.assignments = []
-            for name, expr in clause.assignments:
-                position = table.column_index(name)
-                if position is None:
-                    if ascii_lower(name) not in ROWID_NAMES:
-                        raise OperationalError(f"no such column: {name}")
-                    position = width if table.rowid_column is None else table.rowid_column
-                self.assignments.append((position, compiler.compile(expr)))
-            self.where = compiler.compile(clause.where) if clause.where is not None else None
+        self.do_update = clause.assignments is not None
+        self.assignments = []
+        self.where = None
+
+    def resolve(self) -> None:
+        """Compile DO UPDATE's SET and WHERE.  Like SQLite, PreparedInsert
+        does this only for a clause that some conflict check can reach: a
+        name error in any other clause goes unreported."""
+        if not self.do_update or self.assignments:
+            return
+        table, clause = self.table, self.clause
+        # SET and WHERE see the existing row (by the table's name) and "excluded".
+        self.scope = Scope()
+        self.scope.add(table)
+        self.scope.add(ExcludedSource(table))
+        # An unqualified name is the existing row's column; excluded.x must be qualified.
+        self.scope.entries[1].hidden.update(ascii_lower(c.name) for c in table.columns)
+        compiler = Compiler(self.scope, executor=self.executor)
+        width = len(table.columns)
+        assignments = []
+        for name, expr in clause.assignments:
+            position = table.column_index(name)
+            if position is None:
+                if ascii_lower(name) not in ROWID_NAMES:
+                    raise OperationalError(f"no such column: {name}")
+                position = width if table.rowid_column is None else table.rowid_column
+            assignments.append((position, compiler.compile(expr)))
+        self.where = compiler.compile(clause.where) if clause.where is not None else None
+        self.assignments = assignments
 
     @staticmethod
     def find_constraint(table: TableInfo, clause: Upsert) -> IndexInfo | str | None:
@@ -2546,7 +2574,7 @@ class PreparedUpsert:
     def apply(self, tree: BTree, rowid: int, excluded: Row) -> tuple[str, Row] | None:
         """Handle a conflict with existing row ``rowid``; ``excluded`` is the
         row that could not be inserted (with its row id)."""
-        if self.assignments is None:
+        if not self.do_update:
             return None
         executor, table = self.executor, self.table
         old = executor.load_row(table, rowid, tree.get(rowid))
