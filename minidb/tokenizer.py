@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from minidb.errors import OperationalError
@@ -41,7 +42,7 @@ class SQLSyntaxError(OperationalError):
         return line + "\n" + " " * (self.column - 1) + "^"
 
 
-@dataclass
+@dataclass(slots=True)
 class Token:
     kind: str     # KEYWORD, IDENT, INTEGER, FLOAT, STRING, BLOB, OP, PARAM or EOF
     value: object  # keyword in upper case, identifier name, number, string,
@@ -50,11 +51,52 @@ class Token:
     text: str     # the exact source text of the token
 
 
+# The common tokens, matched by one regular expression; anything else
+# (REAL and hex numbers, strings with doubled quotes, comments, parameters,
+# quoted identifiers, BLOBs, errors) goes through the code below it.
+_FAST = re.compile(
+    r"(\s+)"  # 1: white space
+    r"|((?![xX]')[^\W\d][\w$]*)"  # 2: a word (not the x of x'...')
+    r"|([0-9]+)(?![\w$.])"  # 3: an integer
+    r"|'([^']*)'(?!')"  # 4: a string without doubled quotes
+    r"|(<<|>>|<>|<=|>=|==|!=|\|\||(?!--)-|(?!/\*)/|\.(?![0-9])|[<>=+*%&|~(),;])"  # 5: an operator
+)
+_KEYWORDS = {word: word for word in KEYWORDS}
+
+
 def tokenize(text: str) -> list[Token]:
     tokens = []
+    append = tokens.append
+    fast = _FAST.match
+    keywords = _KEYWORDS
     i = 0
     n = len(text)
     while i < n:
+        m = fast(text, i)
+        if m is not None:
+            group = m.lastindex
+            end = m.end()
+            if group == 2:
+                word = m.group(2)
+                upper = keywords.get(word.upper() if word.isascii() else ascii_upper(word))
+                if upper is not None:
+                    append(Token("KEYWORD", upper, i, word))
+                else:
+                    append(Token("IDENT", word, i, word))
+            elif group == 3:
+                literal = m.group(3)
+                value = int(literal)
+                if value >= 2**63:  # too large for 64 bits: a REAL, as SQLite
+                    append(Token("FLOAT", atof(literal), i, literal))
+                else:
+                    append(Token("INTEGER", value, i, literal))
+            elif group == 4:
+                append(Token("STRING", m.group(4), i, text[i:end]))
+            elif group == 5:
+                op = m.group(5)
+                append(Token("OP", op, i, op))
+            i = end
+            continue
         ch = text[i]
         if ch.isspace():
             i += 1
