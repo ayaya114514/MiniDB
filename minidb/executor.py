@@ -418,6 +418,49 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
     return comparator
 
 
+_PYTHON_COMPARISONS = {"=": "==", "!=": "!=", "<": "<", "<=": "<=", ">": ">", ">=": ">="}
+_NUMBER_TYPES = (int, float)
+_CODE_CACHE = {}  # source text -> code object: statements of the same shape compile once
+
+
+class _Source:
+    """The values that generated source refers to (by name) and fresh
+    names for its temporaries."""
+
+    def __init__(self) -> None:
+        self.env = {}
+        self.names = 0
+
+    def value(self, value: object) -> str:
+        """A name for ``value``.  (Constants, too, are not written into the
+        source, which then depends only on the shape of the expression.)"""
+        if value is None:
+            return "None"
+        name = f"_k{len(self.env)}"
+        self.env[name] = value
+        return name
+
+    def name(self) -> str:
+        self.names += 1
+        return f"_v{self.names}"
+
+    def truth(self, operand: str) -> str:
+        """values.truth(operand): None, or whether the number is not 0."""
+        t = self.name()
+        return (f"(None if ({t} := {operand}) is None else ({t} != 0 if type({t}) is int "
+                f"else {self.value(values.truth)}({t})))")
+
+    def function(self, text: str) -> RowFunction:
+        if text.startswith("_k") and text.endswith("(row)") and text[2:-5].isdigit():
+            return self.env[text[:-5]]  # a single closure: no need to wrap it
+        code = _CODE_CACHE.get(text)
+        if code is None:
+            if len(_CODE_CACHE) > 4096:
+                _CODE_CACHE.clear()
+            code = _CODE_CACHE[text] = compile("lambda row: " + text, "<expression>", "eval")
+        return eval(code, self.env)
+
+
 class Compiler:
     """Compiles expression trees into closures ``fn(row) -> value``.
 
@@ -444,7 +487,81 @@ class Compiler:
         return self.compile_with_affinity(expr)[0]
 
     def compile_with_affinity(self, expr: Expr) -> tuple[RowFunction, str | None]:
-        """Return (function, affinity); only column references have an affinity."""
+        """Return (function, affinity); only column references have an affinity.
+
+        Operators are turned into Python source (see _Source) and compiled
+        into one function; other expressions are closures."""
+        if isinstance(expr, (Binary, Unary)):
+            source = _Source()
+            text, affinity = self._source(expr, source, 0)
+            return source.function(text), affinity
+        return self._closure_with_affinity(expr)
+
+    def _source(self, expr: Expr, source: _Source, depth: int) -> tuple[str, str | None]:
+        """Python source computing ``expr`` from ``row``, and its affinity.
+        The operators have fast paths for integers and numbers; anything
+        else calls the same functions as the closures do."""
+        if depth > 12 or not isinstance(expr, (Binary, Unary, Literal, Column)):
+            function, affinity = self._closure_with_affinity(expr)
+            return f"{source.value(function)}(row)", affinity
+        if isinstance(expr, Literal):
+            return source.value(expr.value), None
+        if isinstance(expr, Column):
+            try:
+                slot, affinity, index, column_depth = self.scope.resolve(expr)
+            except OperationalError:
+                column_depth = None  # an alias, TRUE / FALSE, or an error: see the closure
+            if column_depth != 0:
+                function, affinity = self._closure_with_affinity(expr)
+                return f"{source.value(function)}(row)", affinity
+            hook = self.executor.column_hook if self.executor is not None else None
+            if hook is not None:
+                hook(expr, self.scope.entries[index].table)
+            return f"row[{slot}]", affinity
+        depth += 1
+        if isinstance(expr, Unary):
+            if expr.op == "-" and isinstance(expr.operand, Literal) and type(expr.operand.value) in (int, float):
+                return source.value(values.negate(expr.operand.value)), None  # (-0.0 stays -0.0)
+            operand, _ = self._source(expr.operand, source, depth)
+            if expr.op == "+":
+                return operand, None
+            a = source.name()
+            if expr.op == "-":  # 0 - X, as SQLite (never -0.0)
+                return (f"(-{a} if type({a} := {operand}) is int and {a} != {values.INT_MIN} "
+                        f"else {source.value(values.subtract)}(0, {a}))"), None
+            if expr.op == "~":
+                return f"{source.value(values.bit_not)}({operand})", None
+            t = source.name()
+            return f"(None if ({t} := {source.truth(operand)}) is None else (0 if {t} else 1))", None
+        op = expr.op
+        if op == "AND" and folded_literal(expr) == Literal(0):
+            return "0", None  # see _binary
+        left, left_affinity = self._source(expr.left, source, depth)
+        right, right_affinity = self._source(expr.right, source, depth)
+        x, y = source.name(), source.name()
+        if op == "AND":
+            return (f"(0 if ({x} := {source.truth(left)}) is False else "
+                    f"(0 if ({y} := {source.truth(right)}) is False else "
+                    f"(None if {x} is None or {y} is None else 1)))"), None
+        if op == "OR":
+            return (f"(1 if ({x} := {source.truth(left)}) else (1 if ({y} := {source.truth(right)}) else "
+                    f"(None if {x} is None or {y} is None else 0)))"), None
+        both = f"(({x} := {left}), ({y} := {right}))"
+        if op in ("+", "-", "*"):
+            s_ = source.name()
+            function = source.value(_ARITHMETIC[op])
+            return (f"({s_} if {both} and type({x}) is int and type({y}) is int and "
+                    f"{values.INT_MIN} <= ({s_} := {x} {op} {y}) <= {values.INT_MAX} else {function}({x}, {y}))"), None
+        if op in _ARITHMETIC:
+            return f"{source.value(_ARITHMETIC[op])}({left}, {right})", None
+        comparator = source.value(value_comparator(op, left_affinity, right_affinity))
+        if op in _PYTHON_COMPARISONS:
+            numbers = source.value(_NUMBER_TYPES)
+            return (f"((1 if {x} {_PYTHON_COMPARISONS[op]} {y} else 0) if {both} and type({x}) in {numbers} "
+                    f"and type({y}) in {numbers} else {comparator}({x}, {y}))"), None
+        return f"{comparator}({left}, {right})", None
+
+    def _closure_with_affinity(self, expr: Expr) -> tuple[RowFunction, str | None]:
         if isinstance(expr, Literal):
             value = expr.value
             return (lambda row: value), None
@@ -2032,6 +2149,11 @@ class Executor:
         for level in levels:
             if isinstance(level.access, HashLookup):
                 level.access.reset()
+        if levels and all(level.plain for level in levels):
+            loop = levels[0].loop
+            if loop is None:
+                loop = levels[0].loop = inner_join_loop(levels)
+            return loop(row)
 
         def passes(conditions):
             for condition in conditions:
@@ -2647,8 +2769,40 @@ class Executor:
         self.catalog.index_tree(index).bulk_load((k, b"") for k in keys)
 
 
+def inner_join_loop(levels: list[JoinLevel]) -> Callable[[Row], Iterator[Row]]:
+    """A generated generator function for a nested loop over inner joins:
+    one ``for`` statement per table, its conditions tested inline."""
+    env = {"_truth": values.truth}
+    lines = ["def loop(row):"]
+    indent = "    "
+    for i, level in enumerate(levels):
+        env[f"_candidates{i}"] = level.access.candidates
+        env[f"_load{i}"] = level.load
+        start, stop = level.offset, level.offset + len(level.table.columns) + 1
+        lines.append(f"{indent}for _rowid, _record in _candidates{i}(row):")
+        indent += "    "
+        lines.append(f"{indent}row[{start}:{stop}] = _load{i}(_rowid, _record)")
+        for j, condition in enumerate(level.filters):
+            env[f"_filter{i}_{j}"] = condition
+            lines.append(f"{indent}_v = _filter{i}_{j}(row)")
+            lines.append(f"{indent}if (not _v) if type(_v) is int else not _truth(_v):")
+            lines.append(f"{indent}    continue")
+    lines.append(f"{indent}yield row")
+    text = "\n".join(lines)
+    code = _CODE_CACHE.get(text)
+    if code is None:
+        code = _CODE_CACHE[text] = compile(text, "<join loop>", "exec")
+    exec(code, env)
+    return env["loop"]
+
+
 class JoinLevel:
     """One table of a nested loop join."""
+
+    @property
+    def plain(self) -> bool:
+        """An inner join level (inner_join_loop handles it)."""
+        return not self.outer and self.unmatched is None and not self.merges and self.match is None
 
     def __init__(self, table: Source, offset: int, access: AccessPath, outer: bool, match: RowFunction | None, filters: list[RowFunction]) -> None:
         self.table = table
@@ -2659,6 +2813,7 @@ class JoinLevel:
         self.unmatched = None  # RIGHT / FULL JOIN: a JoinLevel scanning the whole table
         self.merges = []  # (slot, part slots) of the Merges to set once this table is bound
         self.filters = filters  # conditions checked once this table is bound
+        self.loop = None  # of the first level: the generated loop (inner_join_loop)
         if isinstance(table, DerivedSource) or getattr(access, "yields_rows", False):
             self.load = lambda rowid, row: row  # already a row
         else:
