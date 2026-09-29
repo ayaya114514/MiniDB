@@ -347,3 +347,36 @@ def test_statement_commit_keeps_changes():
     tree.insert(1, b"a")
     pager.end_statement()
     assert tree.get(1) == b"a"
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 50, 300, 5000])
+@pytest.mark.parametrize("capacity", [256, 4096])
+def test_bulk_load(count, capacity):
+    """Bottom-up loading gives a valid tree with the same contents, which
+    then takes inserts and deletes like any other."""
+    rng = random.Random(count * 7 + capacity)
+    _, tree = make_tree(capacity)
+    keys = sorted(rng.sample(range(-10**6, 10**6), count))
+    items = [(k, value_for(k, rng.choice([0, 0, 30, capacity // 3, capacity]))) for k in keys]
+    tree.bulk_load(items)
+    assert tree.check() == count
+    assert list(tree.scan()) == items
+    extra = rng.sample(range(10**6, 2 * 10**6), 200)
+    for key in extra:
+        tree.insert(key, value_for(key))
+    for key, _ in rng.sample(items, count // 2):
+        assert tree.delete(key)
+    assert tree.check() == count - count // 2 + 200
+
+
+def test_bulk_load_index_keys_with_overflow():
+    from minidb.catalog import IndexKeyCodec, index_key
+
+    pager = Pager()
+    tree = BTree.create(pager, IndexKeyCodec, capacity=512)
+    rng = random.Random(3)
+    texts = ["k" * rng.choice([1, 10, 100, 700]) + str(i) for i in range(400)]
+    keys = sorted(index_key([t], i) for i, t in enumerate(texts))
+    tree.bulk_load((k, b"") for k in keys)
+    assert tree.check() == len(keys)
+    assert [k for k, _ in tree.scan()] == keys
