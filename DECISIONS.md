@@ -89,6 +89,7 @@ NULL 三值逻辑、整数溢出转 REAL、整数除法向零截断、除零得 
 `abs('1')` 返回 REAL、LIKE 大小写不敏感（本机 sqlite3 对非 ASCII 也不敏感，用 `re.IGNORECASE` 对齐）。
 
 ## D20 REAL 转文本
+（已被 D80 取代：现在与 SQLite 逐位一致。以下为当时的记录。）
 sqlite 3.53 的浮点转文本用自己的近似十进制算法，无法低成本逐位复刻。采用“15 位有效数字能往返
 就用 15 位，否则 17 位”，排版规则与 SQLite 相同（总带 `.0`，<1e-4 或 ≥1e17 用指数形式）。
 实测与 sqlite 一致率约 91%，差异只在最后几位数字，列为已知限制；对照测试避开这类转换。
@@ -473,3 +474,48 @@ sqllogictest 是 SQLite 自己的、与引擎无关的测试集（约 600 万条
   使用时缺表报 `no such table: main.x`；自引用报 `view v is circularly defined`；
   视图不能增删改、不能建索引、不能带参数；DROP TABLE / DROP VIEW 用错对象时给出 SQLite 的提示。
 - 子查询和视图的重复列名照 SQLite 加 `:1`、`:2` 后缀（SQLite 在第 4 个以后改用随机数，不模仿）。
+
+## D77 冲突处理、UPSERT、RETURNING
+- 冲突策略按语句生效（`INSERT/UPDATE OR ...`；列级 `ON CONFLICT` 子句不支持）。检查顺序同 SQLite：
+  NOT NULL → UPSERT 目标（按子句顺序）→ rowid → 其余 UNIQUE 索引（新建的在前）。REPLACE 删除冲突行后继续
+  检查；因为没有 DEFAULT，NOT NULL 遇 REPLACE 仍报错。FAIL 保留本语句已做的修改（自动提交时也提交），
+  ROLLBACK 结束事务；异常对象带 `resolution` / `changes`，由 `Database` 处理。
+- UPSERT 目标必须对应 rowid 或某个 UNIQUE 索引的列集合。SQLite 的怪癖：包含 INTEGER PRIMARY KEY 的
+  UNIQUE 索引永远匹配不上（解析后目标里的 id 是 rowid，索引里的 id 是普通列号），照做。
+- `excluded` 行：列没有亲和性；值是否已按列亲和性转换，取决于 SQLite 发现冲突时是否已经检查过某个索引
+  （它在检查第一个索引时就地转换寄存器）——rowid 冲突通常先检查，所以看到原值，但 REAL 列的整数已被
+  `OP_RealAffinity` 转成 REAL；`excluded.<INTEGER PRIMARY KEY>` 是最终 rowid。这些都由 fuzz 发现，逐条
+  对照 SQLite 确认。
+- RETURNING 在修改每行时求值，全部修改完成后返回。DB-API 的 `rowcount` 模仿 sqlite3：取完最后一行才出现。
+
+## D78 语句日志：事务内出错时哪些修改保留
+SQLite 只在“语句可能写多行（多行 VALUES 或 SELECT）且可能中止”时开语句日志（statement journal）；
+“可能中止”= 有按 ABORT 处理的约束检查，或调用了非内联函数（`sqlite3VdbeAddFunctionCall` 会调用
+`sqlite3MayAbort`；coalesce/ifnull/iif 等内联函数与聚合不算）。没有语句日志时，事务内非约束错误
+（如 datatype mismatch）留下已写入的行，且不计入 total_changes / changes()。MiniDB 在编译计划时按同样
+规则算出 `statement_journal`，`Database` 据此决定回滚语句还是保留。自动提交模式下整个事务回滚，不受影响。
+
+## D79 BLOB 与非 UTF-8 文本
+BLOB 用 `bytes`，记录格式新增类型码 9（旧文件不受影响），排序 NULL < 数 < 文本 < BLOB。BLOB 转文本按 UTF-8
+解读，非法字节用 surrogateescape 保留为孤立代理字符，转回 BLOB 得到原字节；这类文本比较、排序、索引按
+UTF-8 字节序（`values._text_key`：非 ASCII 文本转成“每字节一个字符”的串，索引键读回时用
+`plain_value` 还原），与 SQLite 的 memcmp 一致。DB-API 遇到这类文本像 sqlite3 一样报解码错误；对照测试
+给 sqlite3 设 surrogateescape 的 text_factory，在引擎层面比较。SQLite 的 C 字符串行为也照搬：LIKE、
+length()、printf 的 %s 等在 NUL 处截断；数值转换遇到含 NUL 的文本得到 REAL；列亲和性只看 NUL 之前部分。
+
+## D80 浮点与文本转换逐位对齐 SQLite 3.53（取代 D20）
+D20 记录的“REAL→TEXT 末位与 SQLite 不同”已解决：直接读参考 SQLite 3.53.4 的源码，把 `sqlite3FpDecode`、
+`sqlite3Fp2Convert10`、`sqlite3Fp10Convert2`（改编自 rsc/fpfmt，64/128 位整数运算）和 `sqlite3AtoF` 移植到
+`minidb/fp.py`。REAL→TEXT 是 `printf('%!.17g')`，在一串 9 或 0 能缩短且可精确转回时缩短；TEXT→REAL 只用前
+约 19 位有效数字。10 万个随机 double 与 5 万个最长 30 位的字面量逐位一致。printf（`minidb/printf.py`）同样
+按 `sqlite3_str_vappendf` 源码移植。先前凭记忆写的版本（双倍精度 dekker 乘法）与 3.53 不符，是读源码才发现的
+——教训：对照对象有源码时，直接读源码而不是凭记忆。
+
+## D81 日期时间函数
+`minidb/dates.py` 逐段移植 date.c：C 的整数除法/取余向零截断用 `_div`/`_rem`，修饰符上限按 C float 取值，
+格式化走 printf 移植。'now' 在一条语句内固定（执行器在每条语句开始时清空缓存）。localtime/utc 用 Python 的
+`time.localtime`，与 SQLite 在同一时区下结果一致（未在其他时区的机器上验证）。
+
+## D82 一元负号即 0 - X
+SQLite 把非数字字面量的 `-X` 编译为 `0 - X`，所以 `-(c)` 永远得不到 -0.0（`atan2(0, -c)` 对 c = 0.0 是 0.0）。
+只有紧跟数字字面量的负号生成负常量（`-0.0` 仍是 -0.0）。
