@@ -439,17 +439,15 @@ class Parser:
         self.text = text
         self.tokens = tokenize(text)
         self.i = 0
+        self.tok = self.tokens[0]  # the current token (only advance() moves on)
 
     # ---- token helpers ------------------------------------------------
 
-    @property
-    def tok(self) -> Token:
-        return self.tokens[self.i]
-
     def advance(self) -> Token:
-        token = self.tokens[self.i]
+        token = self.tok
         if token.kind != "EOF":
             self.i += 1
+            self.tok = self.tokens[self.i]
         return token
 
     def error(self, expected: str, token: Token | None = None) -> SQLSyntaxError:
@@ -458,18 +456,22 @@ class Parser:
         return SQLSyntaxError(f"syntax error {where}: expected {expected}", self.text, token.pos)
 
     def at_keyword(self, *words: str) -> bool:
-        return self.tok.kind == "KEYWORD" and self.tok.value in words
+        tok = self.tok
+        return tok.kind == "KEYWORD" and tok.value in words
 
     def at_op(self, *ops: str) -> bool:
-        return self.tok.kind == "OP" and self.tok.value in ops
+        tok = self.tok
+        return tok.kind == "OP" and tok.value in ops
 
     def accept_keyword(self, word: str) -> Token | None:
-        if self.at_keyword(word):
+        tok = self.tok
+        if tok.kind == "KEYWORD" and tok.value == word:
             return self.advance()
         return None
 
     def accept_op(self, op: str) -> Token | None:
-        if self.at_op(op):
+        tok = self.tok
+        if tok.kind == "OP" and tok.value == op:
             return self.advance()
         return None
 
