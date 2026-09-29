@@ -43,11 +43,13 @@ TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", 
 
 
 def no_max_rowid(value):
-    """An expression for an INTEGER PRIMARY KEY that is never 2**63-1: once
-    that row id exists, SQLite picks later ones at random.  The value is
-    written twice, so it must not contain parameters; CASE calls no function
-    (a function call would change SQLite's statement journal decision)."""
-    return f"(CASE ({value}) WHEN 9223372036854775807 THEN NULL ELSE ({value}) END)"
+    """An expression for an INTEGER PRIMARY KEY that is never a large number:
+    once row id 2**63-1 exists (a row id near it, then a new row, does it),
+    SQLite picks later row ids at random.  (v) < '' holds exactly for numbers
+    (numbers sort before all text).  The value is written twice, so it must
+    not contain parameters; CASE calls no function (a function call would
+    change SQLite's statement journal decision)."""
+    return f"(CASE WHEN ({value}) > 1000000 AND ({value}) < '' THEN NULL ELSE ({value}) END)"
 
 
 class Table:

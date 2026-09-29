@@ -546,9 +546,26 @@ def numeric_type_value(value: SQLValue) -> SQLValue:
     """SQLite's sqlite3_value_numeric_type() conversion: numeric-looking TEXT
     becomes INTEGER or REAL (without turning '5.0' into 5); other values stay."""
     if isinstance(value, str):
+        if "\x00" in value:
+            return _numeric_type_before_nul(value)
         match = _WHOLE_NUMBER.match(value)
         return _parse_number(match.group(1)) if match else value
     return value
+
+
+def _numeric_type_before_nul(text: str) -> SQLValue:
+    """sqlite3_value_numeric_type() of text with a NUL: SQLite reads the
+    number before the NUL as a double; an integer literal becomes an INTEGER
+    only if that double is one below 2**51 (sqlite3RealSameAsInt), since the
+    whole text, NUL included, is no integer; otherwise a REAL."""
+    match = _WHOLE_NUMBER.match(text.split("\x00", 1)[0])
+    if not match:
+        return text
+    literal = match.group(1)
+    real = atof(literal)
+    if _INTEGER_LITERAL.match(literal) and real == int(real) and -(2**51) <= int(real) < 2**51:
+        return int(real)
+    return real
 
 
 _KBN_LIMIT = 4503599627370496  # 2**52

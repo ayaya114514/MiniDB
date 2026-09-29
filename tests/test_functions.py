@@ -197,3 +197,24 @@ def test_date_functions_random_and_edge_cases(pair):
 
 def test_replace_checks_arguments_in_sqlites_order(pair):
     pair.run("SELECT replace('ab', '', NULL), replace('ab', 'a', NULL), replace(NULL, '', 'x'), replace(5, '', NULL)")
+
+
+@pytest.mark.parametrize("blob", ["x'ff'", "x'80'", "x'c3'", "x'c328'", "x'e282'", "x'e282ac'", "x'f09f9880'",
+                                  "x'eda080'", "x'efbfbe'", "x'c0af'", "x'41ff42'", "x'fe'", "x'f8888080'",
+                                  "x'00ff'", "x''", "x'e28241'"])
+def test_text_that_is_not_utf8(pair, blob):
+    """unicode() decodes as sqlite3Utf8Read (U+FFFD for invalid sequences);
+    substr() and length() step through characters as SQLite does."""
+    t = f"CAST({blob} AS TEXT)"
+    pair.run(f"SELECT unicode({t}), length({t}), hex(substr({t}, 1, 1)), hex(substr({t}, 2)), "
+             f"hex(substr({t}, -1)), hex(substr({t}, -2, 1)), instr({t}, 'B'), hex(replace({t}, x'00', 'z'))")
+
+
+@pytest.mark.parametrize("value", ["'5'", "'5.0'", "'9007199254740993'", "'2251799813685248'", "'2251799813685247'",
+                                   "'-2251799813685248'", "'1e2'", "' 5 '", "'abc'", "''", "'99999999999999999999'"])
+def test_numbers_in_text_with_nul(pair, value):
+    t = f"{value} || x'00'"
+    for template in ["sum({t})", "typeof(sum({t}))", "ln({t})", "sqrt({t})", "sign({t})", "ceil({t})",
+                     "typeof(ceil({t}))", "avg({t})", "total({t})", "mod({t}, 3)", "pow({t}, 2)"]:
+        pair.run("SELECT " + template.format(t=t))
+    pair.run("SELECT replace('ab', x'0061', 'z'), replace('a' || x'00', x'00', 'z')")

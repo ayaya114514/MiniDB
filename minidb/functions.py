@@ -46,15 +46,20 @@ def substr(value: SQLValue, start: SQLValue, length: SQLValue = LENGTH_LIMIT) ->
     if value is None or start is None or length is None:
         return None
     p1, p2 = to_int64(start), to_int64(length)
-    blob = isinstance(value, bytes)
     if value == b"":
         return None  # SQLite gets no pointer for an empty BLOB
-    data = value if blob else _text(value)
+    if isinstance(value, bytes):
+        units = value
+    else:
+        text = _text(value)
+        # Characters as SQLite steps through them; Python's differ only for
+        # bytes that are not UTF-8 (lone surrogates, see values.to_text).
+        units = _characters(text) if any(0xDC80 <= ord(c) <= 0xDCFF for c in text) else text
     negative = p2 < 0
     if negative:
         p2 = -p2
     if p1 < 0:
-        p1 += len(data)
+        p1 += len(units)
         if p1 < 0:
             p2 = 0 if p2 < 0 else p2 + p1
             p1 = 0
@@ -67,7 +72,8 @@ def substr(value: SQLValue, start: SQLValue, length: SQLValue = LENGTH_LIMIT) ->
         if p1 < 0:
             p2 += p1
             p1 = 0
-    return data[p1:p1 + max(p2, 0)]
+    piece = units[p1:p1 + max(p2, 0)]
+    return piece if isinstance(piece, (str, bytes)) else "".join(piece)
 
 
 def replace(value: SQLValue, pattern: SQLValue, replacement: SQLValue) -> SQLValue:
@@ -76,7 +82,7 @@ def replace(value: SQLValue, pattern: SQLValue, replacement: SQLValue) -> SQLVal
     if value is None or pattern is None:
         return None
     pattern_text = to_text(pattern)
-    if pattern_text == "":
+    if pattern_text == "" or pattern_text[0] == "\x00":  # SQLite tests zPattern[0]==0
         return to_text(value)
     if replacement is None:
         return None
@@ -188,16 +194,47 @@ def unistr(value: SQLValue) -> str | None:
     return _from_utf8(bytes(out))
 
 
+# SQLite's sqlite3Utf8Trans1: the value bits of a UTF-8 lead byte from 0xC0 up.
+_UTF8_TRANS1 = bytes(list(range(32)) + list(range(16)) + list(range(8)) + [0, 1, 2, 3, 0, 1, 0, 0])
+
+
+def _utf8_read(data: bytes, i: int) -> tuple[int, int]:
+    """SQLite's sqlite3Utf8Read: (code point, index after it).  Invalid
+    sequences give U+FFFD; a stray continuation byte gives its own value."""
+    c = data[i]
+    i += 1
+    if c >= 0xC0:
+        c = _UTF8_TRANS1[c - 0xC0]
+        while i < len(data) and data[i] & 0xC0 == 0x80:
+            c = ((c << 6) + (data[i] & 0x3F)) & 0xFFFFFFFF
+            i += 1
+        if c < 0x80 or (c & 0xFFFFF800) == 0xD800 or (c & 0xFFFFFFFE) == 0xFFFE:
+            c = 0xFFFD
+    return c, i
+
+
+def _characters(text: str) -> list[str]:
+    """The text split into characters as SQLite's SQLITE_SKIP_UTF8 steps
+    through it (differs from Python only for bytes that are not UTF-8)."""
+    data = text.encode("utf-8", "surrogateescape")
+    out, i = [], 0
+    while i < len(data):
+        start = i
+        i += 1
+        if data[start] >= 0xC0:
+            while i < len(data) and data[i] & 0xC0 == 0x80:
+                i += 1
+        out.append(data[start:i].decode("utf-8", "surrogateescape"))
+    return out
+
+
 def unicode(value: SQLValue) -> int | None:
     if value is None:
         return None
-    text = _text(value)
-    if not text:
+    data = _text(value).encode("utf-8", "surrogateescape")
+    if not data:
         return None
-    code = ord(text[0])
-    if 0xDC80 <= code <= 0xDCFF:  # a byte that is not UTF-8 (see values.to_text)
-        return code - 0xDC00
-    return code
+    return _utf8_read(data, 0)[0]
 
 
 def octet_length(value: SQLValue) -> int | None:
