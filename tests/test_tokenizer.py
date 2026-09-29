@@ -80,3 +80,8 @@ def test_caret():
     with pytest.raises(SQLSyntaxError) as info:
         tokenize("SELECT 1,\n  2 # 3")
     assert info.value.caret() == "  2 # 3\n    ^"
+
+
+def test_non_ascii_digits_are_identifier_characters():
+    # As in SQLite, only ASCII digits make numbers ("²" used to crash int()).
+    assert [(t.kind, t.value) for t in tokenize("² x² 2")][:3] == [("IDENT", "²"), ("IDENT", "x²"), ("INTEGER", 2)]
