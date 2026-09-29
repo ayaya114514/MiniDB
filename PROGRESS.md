@@ -202,3 +202,41 @@
 - 聚合参数中含子查询时，一律视为当前层的聚合（SQLite 会看子查询里的列）。
 - `isnull`/`notnull` 在 MiniDB 里仍可作标识符（SQLite 里是保留字）；语法错误的措辞与 SQLite 不同。
 - 不支持：TRIGGER、CHECK、COLLATE、TEMP TABLE、外键、表值函数；localtime 只在一个时区验证过；FROM 里外连接右侧的括号连接。
+
+
+## 阶段 17：执行性能（完成）
+每项改动都在改动前后跑了 `tests/benchmark.py`（新增两项：复合 WHERE 全表扫描、10 万行与 200 行无索引表的等值连接），并用差分测试或对照测试确认语义不变。
+
+- **无索引等值连接用哈希**（D89）：内层表只能全扫、且有“本表列 = 已连接表的表达式”时，每次运行连接首次探测前把该表按列哈希（SQLite 的 automatic index），派生表也适用；有索引时仍走索引。17.2 s → 0.12 s。
+- **tokenizer 用单个正则**：词、整数、普通字符串、运算符、空白走一个编译好的正则，其余情况沿用原逻辑。与旧 tokenizer 对 40 万个随机片段做差分，除非 ASCII 数字（如 `²`，旧实现直接崩溃，现在与 SQLite 一样当作标识符字符）外完全一致。
+- **CREATE INDEX / REINDEX 批量构建**：键排序后 `BTree.bulk_load` 自底向上装满节点（每层末尾两节点平衡以满足最小填充），UNIQUE 在排好序的键上检查；新增 bulk_load 的不变量测试。文件因索引页装满变小（15.7 → 14.8 MB）。
+- **生成 Python 源码**（D90）：运算符表达式、结果列元组、ORDER BY 键、只有内连接的嵌套循环、分组聚合循环都生成源码再 `compile()`；常量放在环境里、按源码文本缓存 code 对象，同形语句只编译一次。
+- **解析器**：单个字面量/列（VALUES 行里）跳过各优先级层；当前 token 由属性改为普通字段。与旧解析器对 5.5 万条 fuzz 语句做差分，语法树与报错完全一致。
+- 其它：`decode_row` 快路径。
+
+| 操作（10 万行） | 阶段 16 末 | 阶段 17 末 | sqlite3 |
+|---|---:|---:|---:|
+| insert 100,000 rows, one INSERT each, one transaction | 4.358 s | 2.670 s | 0.191 s |
+| insert 100,000 rows, one INSERT each with ? parameters | 1.061 s | 0.983 s | 0.067 s |
+| insert 100,000 rows, 1,000 per INSERT, one transaction | 3.049 s | 1.770 s | 0.064 s |
+| insert 1,000 rows, autocommit (a commit + fsync each) | 0.136 s | 0.137 s | 0.379 s |
+| 10,000 primary key lookups | 0.798 s | 0.729 s | 0.055 s |
+| 10,000 primary key lookups with ? parameter | 0.153 s | 0.106 s | 0.039 s |
+| 100 primary key range scans (1,000 rows each) | 0.199 s | 0.081 s | 0.021 s |
+| full scan: count(*) WHERE age > 50 | 0.124 s | 0.059 s | 0.002 s |
+| full scan: SELECT * (all rows) | 0.123 s | 0.066 s | 0.036 s |
+| GROUP BY city with 3 aggregates | 0.174 s | 0.093 s | 0.030 s |
+| ORDER BY age, name LIMIT 10 | 0.142 s | 0.080 s | 0.003 s |
+| full scan with a compound WHERE | 0.237 s | 0.121 s | 0.006 s |
+| join 100,000 people with 200 unindexed rows (equality) | 17.156 s | 0.118 s | 0.010 s |
+| CREATE INDEX on age | 0.697 s | 0.387 s | 0.017 s |
+| 73 indexed lookups (age = ?, ~1,400 rows each) | 0.146 s | 0.074 s | 0.002 s |
+| join 100,000 people with cities (index lookup per row) | 0.281 s | 0.152 s | 0.006 s |
+| reopen and run one lookup | 0.001 s | 0.001 s | 0.000 s |
+| database file size (MB) | 15.7 | 14.8 | 9.3 |
+
+扫描、聚合、连接、排序大约快了一倍，字面量插入快约 40%；最慢的一项（无索引连接）从 1500 倍降到 12 倍于 SQLite。
+
+**验证**：测试 888 个全部通过；fuzz 600 种子 × 500 语句、文件模式 200 × 400、变形测试 300 × 300，均 0 失败；sqllogictest 全量第一次跑出 528 条回归——21 张表的连接生成了 21 层嵌套 `for`，超出 Python 的 20 层静态嵌套限制——改为超过 16 张表时用通用循环，select5.test 恢复 1436/1436，总数回到 5,939,852 / 5,939,879。
+
+**已知问题**：每条语句都不同的点查（解析 + 编译为主）只快了约 9%，解析与规划本身仍是纯 Python 的开销；参数化插入受 B+ 树与记录编码限制，只快了约 7%。生成代码的调试信息是 `<expression>` / `<join loop>` 这类伪文件名。
