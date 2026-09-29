@@ -133,11 +133,39 @@ class Exists:
 
 
 @dataclass(frozen=True)
+class Frame:
+    """``{ROWS | RANGE | GROUPS} BETWEEN <start> AND <end> [EXCLUDE ...]``.
+    A bound is UNBOUNDED, PRECEDING, CURRENT or FOLLOWING (with an offset
+    expression for PRECEDING and FOLLOWING)."""
+
+    unit: str
+    start: str
+    start_offset: object = None
+    end: str = "CURRENT"
+    end_offset: object = None
+    exclude: str | None = None  # NO OTHERS, CURRENT ROW, GROUP or TIES
+
+
+@dataclass(frozen=True)
+class WindowDef:
+    """``OVER (...)`` or ``WINDOW name AS (...)``: an optional base window
+    name, PARTITION BY expressions, ORDER BY (expr, descending, nulls_first)
+    triples and a frame (None: the default one)."""
+
+    base: str | None = None
+    partition: tuple = ()
+    order_by: tuple = ()
+    frame: Frame | None = None
+
+
+@dataclass(frozen=True)
 class Call:
     name: str  # upper case
     args: tuple
     distinct: bool = False
     defer_affinity: bool = False  # has its first argument's affinity (SQLite's AFF_DEFER)
+    filter: object = None  # FILTER (WHERE <expr>)
+    over: object = None  # OVER (<WindowDef>) or OVER <window name>
 
 
 # ---- statements --------------------------------------------------------
@@ -282,6 +310,7 @@ class Select:
     limit: object = None
     offset: object = None
     ctes: list | None = None  # WITH ...
+    windows: list = field(default_factory=list)  # WINDOW name AS (...): (name, WindowDef) pairs
 
 
 @dataclass
@@ -888,7 +917,108 @@ class Parser:
             stmt.group_by = self.expr_list()
         if self.accept_keyword("HAVING"):
             stmt.having = self.expr()
+        if self.at_word("WINDOW"):
+            self.advance()
+            while True:
+                name = self.identifier("window name")
+                self.expect_keyword("AS")
+                self.expect_op("(")
+                stmt.windows.append((name, self.window_def()))
+                self.expect_op(")")
+                if not self.accept_op(","):
+                    break
         return stmt
+
+    def window_def(self) -> WindowDef:
+        """The inside of ``OVER (...)`` or ``WINDOW name AS (...)``."""
+        base = None
+        if self.tok.kind == "IDENT" and not self.at_word("PARTITION", "RANGE", "ROWS", "GROUPS"):
+            base = self.advance().value
+        partition = ()
+        if self.at_word("PARTITION"):
+            self.advance()
+            self.expect_keyword("BY")
+            partition = tuple(self.expr_list())
+        order_by = ()
+        if self.accept_keyword("ORDER"):
+            self.expect_keyword("BY")
+            items = [self.order_item()]
+            while self.accept_op(","):
+                items.append(self.order_item())
+            order_by = tuple((item.expr, item.descending, item.nulls_first) for item in items)
+        frame = None
+        if self.at_word("RANGE", "ROWS", "GROUPS"):
+            unit = ascii_upper(self.advance().text)
+            if self.accept_keyword("BETWEEN"):
+                start, start_offset = self.frame_bound(True)
+                self.expect_keyword("AND")
+                end, end_offset = self.frame_bound(False)
+            else:
+                (start, start_offset), (end, end_offset) = self.frame_bound(True), ("CURRENT", None)
+            exclude = None
+            if self.at_word("EXCLUDE"):
+                self.advance()
+                if self.at_word("NO"):
+                    self.advance()
+                    self.expect_word("OTHERS")
+                    exclude = "NO OTHERS"
+                elif self.at_word("CURRENT"):
+                    self.advance()
+                    self.expect_word("ROW")
+                    exclude = "CURRENT ROW"
+                elif self.accept_keyword("GROUP"):
+                    exclude = "GROUP"
+                elif self.at_word("TIES"):
+                    self.advance()
+                    exclude = "TIES"
+                else:
+                    raise self.error("NO, CURRENT, GROUP or TIES")
+            # As SQLite: the start may not come after the end in
+            # UNBOUNDED PRECEDING, <n> PRECEDING, CURRENT ROW, <n> FOLLOWING.
+            if (start == "CURRENT" and end == "PRECEDING") or (
+                    start == "FOLLOWING" and end in ("PRECEDING", "CURRENT")):
+                raise OperationalError("unsupported frame specification")
+            frame = Frame(unit, start, start_offset, end, end_offset, exclude)
+        return WindowDef(base, partition, order_by, frame)
+
+    def frame_bound(self, starting: bool) -> tuple[str, object]:
+        """A frame boundary: (UNBOUNDED | PRECEDING | CURRENT | FOLLOWING, offset)."""
+        if self.at_word("UNBOUNDED"):
+            self.advance()
+            self.expect_word("PRECEDING" if starting else "FOLLOWING")
+            return "UNBOUNDED", None
+        if self.at_word("CURRENT") and self.tokens[self.i + 1].kind == "IDENT" \
+                and ascii_upper(self.tokens[self.i + 1].text) == "ROW":
+            self.advance()
+            self.advance()
+            return "CURRENT", None
+        offset = self.expr()
+        if self.at_word("PRECEDING", "FOLLOWING"):
+            return ascii_upper(self.advance().text), offset
+        raise self.error("PRECEDING or FOLLOWING")
+
+    def window_suffix(self, call: Call) -> Call:
+        """``FILTER (WHERE <expr>)`` and ``OVER (...)`` / ``OVER <name>`` after a call."""
+        filter_ = None
+        if self.at_word("FILTER") and self.tokens[self.i + 1].text == "(":
+            self.advance()
+            self.advance()
+            self.expect_keyword("WHERE")
+            filter_ = self.expr()
+            self.expect_op(")")
+        over = None
+        if self.at_word("OVER") and (self.tokens[self.i + 1].text == "(" or self.tokens[self.i + 1].kind == "IDENT"):
+            self.advance()
+            if self.accept_op("("):
+                over = self.window_def()
+                self.expect_op(")")
+            else:
+                over = self.identifier("window name")
+            if self.at_word("FILTER") and self.tokens[self.i + 1].text == "(":
+                raise self.error("an operator")  # FILTER goes before OVER
+        if filter_ is None and over is None:
+            return call
+        return dataclasses.replace(call, filter=filter_, over=over)
 
     def order_item(self) -> OrderItem:
         item = OrderItem(self.expr())
@@ -1002,7 +1132,7 @@ class Parser:
             alias = None
             if self.accept_keyword("AS"):
                 alias = self.identifier("alias")
-            elif self.tok.kind == "IDENT" and not self.at_word("RIGHT", "FULL"):
+            elif self.tok.kind == "IDENT" and not self.at_word("RIGHT", "FULL", "WINDOW"):
                 alias = self.advance().value
             return DerivedTable(query, alias)
         pos = self.tok.pos
@@ -1010,8 +1140,8 @@ class Parser:
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
-        elif self.tok.kind == "IDENT" and not self.at_word("INDEXED", "RIGHT", "FULL"):
-            alias = self.advance().value  # (RIGHT / FULL start a join, as LEFT does)
+        elif self.tok.kind == "IDENT" and not self.at_word("INDEXED", "RIGHT", "FULL", "WINDOW"):
+            alias = self.advance().value  # (RIGHT / FULL start a join, as LEFT does; WINDOW a clause)
         return TableRef(name, alias, self.index_hint(), pos)
 
     def index_hint(self) -> str | None:
@@ -1290,15 +1420,15 @@ class Parser:
     def call(self, name: str) -> Call:
         if self.accept_op("*"):
             self.expect_op(")")
-            return Call(name, (Star(),))
+            return self.window_suffix(Call(name, (Star(),)))
         if self.accept_op(")"):
-            return Call(name, ())
+            return self.window_suffix(Call(name, ()))
         distinct = bool(self.accept_keyword("DISTINCT"))
         if not distinct:
             self.accept_keyword("ALL")  # the default: count(ALL x) is count(x)
         args = tuple(self.expr_list())
         self.expect_op(")")
-        return Call(name, args, distinct)
+        return self.window_suffix(Call(name, args, distinct))
 
 
 def walk_expr(expr: object) -> Iterator[object]:

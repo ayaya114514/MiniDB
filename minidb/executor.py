@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
 
-from minidb import dates, functions, values
+from minidb import dates, functions, values, window
 from minidb.btree import BTree
 from minidb.catalog import (
     AUTO_INDEX_PREFIX, HIGH, RESERVED_PREFIX, Catalog, IndexInfo, TableInfo, ViewInfo, constant_default,
@@ -39,7 +39,7 @@ from minidb.parser import (
     AlterTable, Analyze, Between, Binary, Call, Case, Cast, Column, Compound, CreateIndex, CreateTable,
     CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
     InSelect, Insert, Join, Like, Literal, Parameter, Reindex, Select, SelectItem, Star, Subquery,
-    TableRef, Unary, Update, Upsert, Values,
+    TableRef, Unary, Update, Upsert, Values, Frame, WindowDef,
 )
 from minidb.parser import ColumnDef, Expr, Statement, parse
 from minidb.tokenizer import tokenize
@@ -270,6 +270,17 @@ def walk(expr: Expr) -> Iterator[Expr]:
     elif isinstance(expr, Call):
         for arg in expr.args:
             yield from walk(arg)
+        if expr.filter is not None:
+            yield from walk(expr.filter)
+        if isinstance(expr.over, WindowDef):
+            for part in expr.over.partition:
+                yield from walk(part)
+            for item, _, _ in expr.over.order_by:
+                yield from walk(item)
+            frame = expr.over.frame
+            for offset in (frame.start_offset, frame.end_offset) if frame is not None else ():
+                if offset is not None:
+                    yield from walk(offset)
     elif isinstance(expr, Cast):
         yield from walk(expr.expr)
     elif isinstance(expr, Case):
@@ -421,12 +432,13 @@ class Compiler:
     such a call may appear here at all (SQLite's NC_AllowAgg).
     """
 
-    def __init__(self, scope: Scope, aggregates: AggregateCollector | None = None, misuse: str = "misuse of aggregate function {name}()", executor: Executor | None = None, allow_aggregates: bool | None = None) -> None:
+    def __init__(self, scope: Scope, aggregates: AggregateCollector | None = None, misuse: str = "misuse of aggregate function {name}()", executor: Executor | None = None, allow_aggregates: bool | None = None, windows: WindowCollector | None = None) -> None:
         self.scope = scope
         self.aggregates = aggregates
         self.misuse = misuse
         self.executor = executor  # needed to compile subqueries
         self.allow_aggregates = aggregates is not None if allow_aggregates is None else allow_aggregates
+        self.windows = windows  # where window functions may appear (result columns, ORDER BY)
 
     def compile(self, expr: Expr) -> RowFunction:
         return self.compile_with_affinity(expr)[0]
@@ -488,6 +500,8 @@ class Compiler:
     def _outer_alias(self, reference: AliasReference) -> tuple[RowFunction, str | None]:
         """An enclosing query's result column by its alias: its expression,
         evaluated with that query's current row."""
+        if contains_window(reference.item.expr):
+            raise OperationalError(f"misuse of aliased window function {reference.item.alias}")
         outer = self.scope.ancestor(reference.depth)
         # (An aliased aggregate works where the query's own aggregates do.)
         aggregates = outer.aggregates if outer.phase in ("having", "order") and not outer.in_aggregate else None
@@ -718,6 +732,10 @@ class Compiler:
 
     def call(self, expr: Call) -> RowFunction:
         name = expr.name
+        if expr.over is not None:
+            return self._window(expr)
+        if name in window.WINDOW_FUNCTIONS:
+            raise OperationalError(f"misuse of window function {ascii_lower(name)}()")
         if values.is_aggregate_call(name, len(expr.args)):
             return self._aggregate(expr)
         if name in CONNECTION_FUNCTIONS:
@@ -731,6 +749,8 @@ class Compiler:
         # DISTINCT means nothing to a scalar function; SQLite ignores it.
         if len(expr.args) < min_args or (max_args is not None and len(expr.args) > max_args):
             raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
+        if expr.filter is not None:
+            raise OperationalError(f"FILTER may not be used with non-aggregate {ascii_lower(name)}()")
         args = [self.compile(arg) for arg in expr.args]
         if not args:
             return lambda row: function()
@@ -800,7 +820,54 @@ class Compiler:
                 args = [inner.compile(arg) for arg in expr.args]
             finally:
                 self.scope.in_aggregate = False
-        return itemgetter(self.aggregates.add(name, args, expr.distinct))
+        filter_ = None
+        if expr.filter is not None:
+            filter_ = Compiler(self.scope, executor=self.executor).compile(expr.filter)
+        return itemgetter(self.aggregates.add(name, args, expr.distinct, filter_))
+
+    def _window(self, expr: Call) -> RowFunction:
+        """A window function call: its result is read from the row, where
+        CompiledSelect puts it (WindowCollector)."""
+        name, lowered = expr.name, ascii_lower(expr.name)
+        if expr.distinct:
+            raise OperationalError("DISTINCT is not supported for window functions")
+        builtin = name in window.WINDOW_FUNCTIONS
+        if not builtin and not values.is_aggregate_call(name, len(expr.args)):
+            if name in functions.SCALAR_FUNCTIONS or name in CONNECTION_FUNCTIONS or name in ("MIN", "MAX"):
+                raise OperationalError(f"{lowered}() may not be used as a window function")
+            raise OperationalError(f"no such function: {lowered}")
+        if self.windows is None:
+            raise OperationalError(f"misuse of window function {lowered}()")
+        min_args, max_args = window.WINDOW_FUNCTIONS[name] if builtin else values.AGGREGATE_FUNCTIONS[name][1:]
+        star = expr.args == (Star(),)
+        if star and name != "COUNT" or not star and not min_args <= len(expr.args) <= max_args:
+            raise OperationalError(f"wrong number of arguments to function {lowered}()")
+        definition = self.windows.resolve(expr.over)
+        frame = definition.frame or Frame("RANGE", "UNBOUNDED", None, "CURRENT", None, None)
+        if frame.unit == "RANGE" and (frame.start_offset is not None or frame.end_offset is not None) \
+                and len(definition.order_by) != 1:
+            raise OperationalError("RANGE with offset PRECEDING/FOLLOWING requires one ORDER BY expression")
+        if builtin and expr.filter is not None:
+            raise OperationalError("FILTER clause may only be used with aggregate window functions")
+        if name in window.BUILTIN_FRAMES:
+            unit, start, start_offset, end = window.BUILTIN_FRAMES[name]
+            frame = Frame(unit, start, None if start_offset is None else Literal(start_offset), end, None, None)
+        # As SQLite: an offset that is not a constant is NULL (an error once
+        # there is a row).
+        frame = dataclasses.replace(
+            frame,
+            start_offset=frame.start_offset if frame.start_offset is None or is_parse_constant(frame.start_offset)
+            else Literal(None),
+            end_offset=frame.end_offset if frame.end_offset is None or is_parse_constant(frame.end_offset)
+            else Literal(None),
+        )
+        inner = Compiler(self.scope, self.aggregates, misuse=self.misuse, executor=self.executor,
+                         allow_aggregates=self.allow_aggregates)  # no window functions inside
+        args = [] if star else [inner.compile(arg) for arg in expr.args]
+        filter_ = inner.compile(expr.filter) if expr.filter is not None else None
+        number = self.windows.add(definition, frame, name, args, filter_, inner)
+        windows = self.windows
+        return lambda row: row[windows.base + number]
 
 
 def in_select_affinity(left: str | None, right: str | None) -> str | None:
@@ -813,21 +880,107 @@ def in_select_affinity(left: str | None, right: str | None) -> str | None:
     return left if left is not None else right
 
 
+def is_aggregate(e: object) -> bool:
+    """An aggregate function call (not a window function)."""
+    return isinstance(e, Call) and e.over is None and values.is_aggregate_call(e.name, len(e.args))
+
+
 def contains_aggregate(expr: Expr) -> bool:
-    return any(
-        isinstance(e, Call) and values.is_aggregate_call(e.name, len(e.args)) for e in walk(expr)
-    )
+    return any(is_aggregate(e) for e in walk(expr))
+
+
+def contains_window(expr: Expr) -> bool:
+    return any(isinstance(e, Call) and e.over is not None for e in walk(expr))
 
 
 def owns_aggregate(expr: Expr, scope: Scope) -> bool:
     """Whether ``expr`` (outside its subqueries) has an aggregate call that
     belongs to the query of ``scope`` rather than to an enclosing one."""
     compiler = Compiler(scope)
-    return any(
-        isinstance(e, Call) and values.is_aggregate_call(e.name, len(e.args))
-        and compiler.aggregate_depth(e) == 0
-        for e in walk(expr)
-    )
+    return any(is_aggregate(e) and compiler.aggregate_depth(e) == 0 for e in walk(expr))
+
+
+def is_parse_constant(expr: Expr) -> bool:
+    """Whether SQLite's parser sees ``expr`` as a constant (sqlite3ExprIsConstant
+    before names are resolved): no columns, function calls or subqueries."""
+    for e in walk(expr):
+        if isinstance(e, Column):
+            if e.table is not None or ascii_lower(e.name) not in ("true", "false"):
+                return False
+        elif isinstance(e, (Call, Subquery, InSelect, Exists)):
+            return False
+    return True
+
+
+class WindowCollector:
+    """The window function calls of a query, grouped by window definition,
+    and the named windows of its WINDOW clause."""
+
+    def __init__(self, definitions: list[tuple[str, WindowDef]]) -> None:
+        # As SQLite's parser: each definition but the first is based on the
+        # ones before it; the first keeps its base name, which is ignored.
+        # The last definition of a name wins.
+        self.named = {}
+        for i, (name, definition) in enumerate(definitions):
+            self.named[ascii_lower(name)] = self.chain(definition) if i else definition
+        self.groups = []  # [((partition, ORDER BY, frame), window.WindowGroup)]
+        self.count = 0
+        self.base = 0
+
+    def find(self, name: str) -> WindowDef:
+        definition = self.named.get(ascii_lower(name))
+        if definition is None:
+            raise OperationalError(f"no such window: {name}")
+        return definition
+
+    def chain(self, definition: WindowDef) -> WindowDef:
+        """A definition based on a named window (sqlite3WindowChain)."""
+        if definition.base is None:
+            return definition
+        base = self.find(definition.base)
+        base = dataclasses.replace(base, base=None)
+        if definition.partition:
+            clause = "PARTITION clause"
+        elif base.order_by and definition.order_by:
+            clause = "ORDER BY clause"
+        elif base.frame is not None:
+            clause = "frame specification"
+        else:
+            return WindowDef(None, base.partition, definition.order_by or base.order_by, definition.frame)
+        raise OperationalError(f"cannot override {clause} of window: {definition.base}")
+
+    def resolve(self, over: WindowDef | str) -> WindowDef:
+        return self.find(over) if isinstance(over, str) else self.chain(over)
+
+    def add(self, definition: WindowDef, frame: Frame, name: str, args: list[RowFunction], filter_: RowFunction | None, compiler: Compiler) -> int:
+        """Register a call; returns its number."""
+        key = (definition.partition, definition.order_by, frame)
+        group = next((g for k, g in self.groups if k == key), None)  # (the key may not be hashable)
+        if group is None:
+            group = window.WindowGroup(
+                [compiler.compile(e) for e in definition.partition],
+                [(compiler.compile(e), descending, nulls_first) for e, descending, nulls_first in definition.order_by],
+                frame.unit, frame.start,
+                None if frame.start_offset is None else compiler.compile(frame.start_offset),
+                frame.end,
+                None if frame.end_offset is None else compiler.compile(frame.end_offset),
+                frame.exclude,
+            )
+            self.groups.append((key, group))
+        number = self.count
+        self.count += 1
+        group.functions.append(window.WindowFunction(name, args, filter_, number))
+        return number
+
+    def apply(self, rows: Iterable[Row]) -> list[Row]:
+        """The rows with the window functions' results appended, in the order
+        SQLite returns them: the window seen first is computed last (SQLite
+        nests the others in subqueries)."""
+        padding = [None] * self.count
+        rows = [list(row) + padding for row in rows]
+        for _, group in reversed(self.groups):
+            rows = group.run(rows, self.base)
+        return rows
 
 
 class AggregateCollector:
@@ -835,10 +988,10 @@ class AggregateCollector:
 
     def __init__(self, base_width: int) -> None:
         self.base_width = base_width  # aggregate results follow the row's slots
-        self.calls = []  # (name, argument functions, distinct)
+        self.calls = []  # (name, argument functions, distinct, FILTER function or None)
 
-    def add(self, name: str, args: list[RowFunction], distinct: bool) -> int:
-        self.calls.append((name, args, distinct))
+    def add(self, name: str, args: list[RowFunction], distinct: bool, filter_: RowFunction | None = None) -> int:
+        self.calls.append((name, args, distinct, filter_))
         return self.base_width + len(self.calls) - 1
 
     @property
@@ -848,7 +1001,7 @@ class AggregateCollector:
 
     def new_state(self) -> list[tuple[Any, set | None]]:
         state = []
-        for name, args, distinct in self.calls:
+        for name, args, distinct, _ in self.calls:
             if name == "COUNT" and not args:
                 aggregate = values.CountStarAggregate()
             else:
@@ -859,7 +1012,9 @@ class AggregateCollector:
     def step(self, state: list[tuple[Any, set | None]], row: Row) -> bool:
         """Feed one row to every aggregate; True if a lone MIN/MAX changed."""
         changed = False
-        for (aggregate, seen), (_, args, _) in zip(state, self.calls):
+        for (aggregate, seen), (_, args, _, filter_) in zip(state, self.calls):
+            if filter_ is not None and not values.truth(filter_(row)):
+                continue
             if not args:
                 aggregate.step()
                 continue
@@ -1199,15 +1354,18 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
         function, affinity = compiler.compile_with_affinity(expr)
         if position == ROWID:
             return function  # row id lookups apply numeric affinity themselves
+        column_affinity = table.affinities[position]
         if key_affinity is not None:  # IN: the column's affinity applies to the items
-            convert = _AFFINITY_FUNCTIONS.get(table.affinities[position])
+            convert = _AFFINITY_FUNCTIONS.get(column_affinity)
         else:
-            column_conversion, key_conversion = values.comparison_affinities(
-                table.affinities[position], affinity
-            )
-            if column_conversion is not None:
+            # The comparison affinity applies to both sides; the index can be
+            # used when that leaves the column's values as they are.
+            shared = values.comparison_affinity(column_affinity, affinity)
+            if shared in values.NUMERIC_AFFINITIES and column_affinity not in values.NUMERIC_AFFINITIES:
                 return None
-            convert = _AFFINITY_FUNCTIONS.get(key_conversion)
+            if shared == values.TEXT and column_affinity != values.TEXT:
+                return None
+            convert = _AFFINITY_FUNCTIONS.get(shared)
         if convert is None:
             return function
         return lambda row: convert(function(row))
@@ -1698,16 +1856,21 @@ class Executor:
             if tables or (home is not None and any(i > home for i in rights)):
                 # (A constant ON condition before a RIGHT JOIN only filters
                 # the rows it joins to.)
-                referenced.append((conjunct, tables, lowest if tables else home))
+                referenced.append((conjunct, tables, lowest if tables else home, home))
             else:
                 constants.append(compiler.compile(conjunct))
         order = list(range(len(joins)))
         if len(joins) > 1 and all(join.kind == "INNER" for join in joins):
-            order = self.join_order(scope, [(c, tables) for c, tables, _ in referenced], compiler)
+            order = self.join_order(scope, [(c, tables) for c, tables, _, _ in referenced], compiler)
         position = {table: i for i, table in enumerate(order)}
         placed = {}
-        for conjunct, tables, lowest in referenced:
+        for conjunct, tables, lowest, home in referenced:
             level = max([position[t] for t in tables] + [lowest])
+            if home is not None and any(i > home for i in rights):
+                # An ON condition before a RIGHT JOIN uses no table after its
+                # join (checked above); one with a subquery counts as using
+                # every table, yet must be tested at its join.
+                level = min(level, home)
             placed.setdefault(level, []).append(conjunct)
         # Compile all conditions first: the access paths may then check which
         # columns the query uses (covering indexes).
@@ -2026,14 +2189,18 @@ class Executor:
             raise IntegrityError("datatype mismatch")
         return rowid
 
-    def not_null_violation(self, table: TableInfo, row: Row, conflict: str = "ABORT") -> str | None:
+    def not_null_violation(self, table: TableInfo, row: Row, conflict: str = "ABORT", raw: Row | None = None) -> str | None:
         """The NOT NULL constraint ``row`` violates, if any.  Under REPLACE a
-        NULL becomes the column's default first, if that is not NULL."""
+        NULL becomes the column's default first, if that is not NULL (also
+        in ``raw``, the values before affinities, which upserts may see)."""
         for i, column in enumerate(table.columns):
             if column.not_null and row[i] is None:
                 if conflict == "REPLACE" and column.default is not None:
                     value = Compiler(Scope(), executor=self).compile(column.default)([])
                     row[i] = values.apply_affinity(value, table.affinities[i])
+                    if raw is not None:
+                        real = table.affinities[i] == values.REAL and type(value) is int
+                        raw[i] = float(value) if real else value
                     if row[i] is not None:
                         continue
                 return f"NOT NULL constraint failed: {table.name}.{column.name}"
@@ -2122,7 +2289,7 @@ class Executor:
             rowid = values.apply_affinity(given, values.INTEGER)
             if not isinstance(rowid, int):
                 raise IntegrityError("datatype mismatch")
-        violation = self.not_null_violation(table, row, conflict)
+        violation = self.not_null_violation(table, row, conflict, raw)
         if violation is not None:
             if conflict == "IGNORE":
                 return None
@@ -2443,8 +2610,9 @@ class CompiledSelect:
         if stmt.having is not None and not self.is_aggregate:
             raise OperationalError("HAVING clause on a non-aggregate query")
         self.aggregates = scope.aggregates = AggregateCollector(scope.width) if self.is_aggregate else None
+        self.windows = WindowCollector(stmt.windows)
         compiler = Compiler(scope, self.aggregates, misuse="misuse of aggregate: {name}()",
-                            executor=executor, allow_aggregates=True)
+                            executor=executor, allow_aggregates=True, windows=self.windows)
         scope.phase = "outputs"
         compiled = [compiler.compile_with_affinity(e) for e in self.exprs]
         self.outputs = [function for function, _ in compiled]
@@ -2455,6 +2623,7 @@ class CompiledSelect:
             stmt, self.exprs, self.names, compiler
         )
         scope.phase = "having"
+        compiler.windows = None
         self.having = compiler.compile(stmt.having) if stmt.having is not None else None
         scope.phase = "group"
         self.group_functions = executor.group_functions(stmt, self.exprs, self.names, scope)
@@ -2470,11 +2639,15 @@ class CompiledSelect:
         elif stmt.where is not None:
             self.constants = [executor.where_compiler(scope, self.is_aggregate).compile(stmt.where)]
         scope.phase = None
+        # Window results follow the row's values (and aggregate results).
+        self.windows.base = scope.width + (len(self.aggregates.calls) if self.aggregates is not None else 0)
+        if not self.windows.groups:
+            self.windows = None
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
         # True when the first table's access path already yields ORDER BY order.
         self.presorted = bool(
-            self.levels and order_columns and not self.is_aggregate
+            self.levels and order_columns and not self.is_aggregate and self.windows is None
             and all(level.unmatched is None for level in self.levels)
             and follows_order(order_columns, self.levels[0].access.order())
         )
@@ -2486,23 +2659,30 @@ class CompiledSelect:
         ORDER BY term that is an alias is left to group_term/order_terms.)"""
         scope = self.scope
 
-        def replace(column):
-            key = ascii_lower(column.name)
-            if column.table is not None or key not in aliases or scope._matches(column):
-                return None
-            return aliases[key].expr
+        def replacer(windows_allowed):
+            def replace(column):
+                key = ascii_lower(column.name)
+                if column.table is not None or key not in aliases or scope._matches(column):
+                    return None
+                item = aliases[key]
+                if not windows_allowed and contains_window(item.expr):
+                    raise OperationalError(f"misuse of aliased window function {item.alias}")
+                return item.expr
+            return replace
 
-        def term(expr):
+        restricted, ordering = replacer(False), replacer(True)
+
+        def term(expr, replace):
             return expr if isinstance(expr, Column) else substitute_columns(expr, replace)
 
         stmt = dataclasses.replace(
             stmt,
-            where=substitute_columns(stmt.where, replace),
-            having=substitute_columns(stmt.having, replace),
-            group_by=[term(e) for e in stmt.group_by],
-            order_by=[dataclasses.replace(item, expr=term(item.expr)) for item in stmt.order_by],
+            where=substitute_columns(stmt.where, restricted),
+            having=substitute_columns(stmt.having, restricted),
+            group_by=[term(e, restricted) for e in stmt.group_by],
+            order_by=[dataclasses.replace(item, expr=term(item.expr, ordering)) for item in stmt.order_by],
         )
-        joins = [dataclasses.replace(join, on=substitute_columns(join.on, replace)) for join in joins]
+        joins = [dataclasses.replace(join, on=substitute_columns(join.on, restricted)) for join in joins]
         return stmt, joins
 
     def order_columns(self, stmt: Select) -> list[int] | None:
@@ -2559,6 +2739,8 @@ class CompiledSelect:
                 )
                 if having is None or truth(having(group_row))
             )
+        if self.windows is not None:
+            rows = self.windows.apply(rows)
         records = ((tuple(f(row) for f in outputs), tuple(f(row) for f in order_functions))
                    for row in rows)
         if self.distinct:

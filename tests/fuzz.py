@@ -498,6 +498,8 @@ class Generator:
         if rng.random() < 0.3:
             return self.aggregate_select(scope, from_sql, where)
         items = [self.expr(scope, 1) for _ in range(rng.randint(1, 3))]
+        if len(scope) == 1 and not scope[0][1].derived and rng.random() < 0.15:
+            items.insert(rng.randint(0, len(items)), self.window_item(scope))
         distinct = "DISTINCT " if rng.random() < 0.1 else ""
         if rng.random() < 0.1:
             # Result column aliases, which WHERE (and ORDER BY) may use.
@@ -515,6 +517,37 @@ class Generator:
             if rng.random() < 0.5:
                 sql += f" LIMIT {rng.randint(0, 5)} OFFSET {rng.randint(0, 3)}"
         return sql
+
+    def window_item(self, scope):
+        """A window function over the rows of one table.  Its ORDER BY ends
+        with the row id, so that ties do not depend on the order the rows
+        are read in (RANGE with an offset orders by the row id alone)."""
+        rng = self.rng
+        function = rng.choice([
+            "sum({e})", "total({e})", "avg({e})", "count(*)", "count({e})", "min({e})", "max({e})",
+            "group_concat({e})", "group_concat({e}, '-')", "row_number()", "rank()", "dense_rank()",
+            "percent_rank()", "cume_dist()", "ntile(3)", "first_value({e})", "last_value({e})",
+            "nth_value({e}, 2)", "lead({e})", "lag({e}, 2, 0)", "sum({e}) FILTER (WHERE {e})",
+        ]).replace("{e}", self.expr(scope, 2))
+        parts = []
+        if rng.random() < 0.4:
+            parts.append(f"PARTITION BY {self.expr(scope, 2)}")
+        unit = rng.choice(["", "ROWS", "RANGE", "GROUPS"])
+        bounds = ["UNBOUNDED PRECEDING", "1 PRECEDING", "CURRENT ROW", "2 FOLLOWING", "UNBOUNDED FOLLOWING"]
+        i = rng.randrange(len(bounds) - 1)
+        start, end = bounds[i], bounds[rng.randrange(max(i, 1), len(bounds))]
+        if unit == "RANGE" and ("1 " in start or "2 " in end):
+            parts.append(f"ORDER BY rowid{rng.choice(['', ' DESC'])}")
+        elif rng.random() < 0.85:
+            parts.append(f"ORDER BY {self.expr(scope, 2)}{rng.choice(['', ' DESC'])}, rowid")
+        else:
+            parts.append("ORDER BY rowid")
+        if unit:
+            frame = f"{unit} BETWEEN {start} AND {end}"
+            if rng.random() < 0.2:
+                frame += " EXCLUDE " + rng.choice(["CURRENT ROW", "GROUP", "TIES", "NO OTHERS"])
+            parts.append(frame)
+        return f"{function} OVER ({' '.join(parts)})"
 
     def join(self, scope, alias):
         """A join of one more table (as ``alias``) to the tables in ``scope``."""
