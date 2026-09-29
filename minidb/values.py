@@ -131,22 +131,6 @@ def comparison_affinity(left: str | None, right: str | None) -> str | None:
     return left if left is not None else right
 
 
-def comparison_affinities(left: str | None, right: str | None) -> tuple[str | None, str | None]:
-    """Which affinity to apply to each operand of a comparison (SQLite rules):
-    NUMERIC to the other operand of a numeric column, TEXT to an operand
-    without affinity compared with a TEXT column."""
-    left_numeric, right_numeric = left in NUMERIC_AFFINITIES, right in NUMERIC_AFFINITIES
-    if left_numeric and not right_numeric:
-        return None, NUMERIC
-    if right_numeric and not left_numeric:
-        return NUMERIC, None
-    if left == TEXT and right is None:
-        return None, TEXT
-    if right == TEXT and left is None:
-        return TEXT, None
-    return None, None
-
-
 # ---- conversions -----------------------------------------------------------
 
 
@@ -738,6 +722,7 @@ AGGREGATE_FUNCTIONS = {
     "GROUP_CONCAT": (GroupConcatAggregate, 1, 2),
     "MAX": (lambda: MinMaxAggregate(1), 1, 1),
     "MIN": (lambda: MinMaxAggregate(-1), 1, 1),
+    "STRING_AGG": (GroupConcatAggregate, 2, 2),
     "SUM": (SumAggregate, 1, 1),
     "TOTAL": (TotalAggregate, 1, 1),
 }

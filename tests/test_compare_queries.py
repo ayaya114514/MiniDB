@@ -714,6 +714,10 @@ def test_right_and_full_joins():
         "SELECT * FROM a RIGHT JOIN b USING (x) FULL JOIN c USING (x)",
         "SELECT * FROM a FULL JOIN b USING (x) WHERE a.x IS NULL",
         "SELECT * FROM a left JOIN b ON 1 RIGHT JOIN c ON 0 WHERE 0",
+        # An ON condition with a subquery before a RIGHT JOIN filters only its own join.
+        "SELECT * FROM a JOIN b ON (NOT EXISTS (SELECT 1 FROM a AS s)) RIGHT JOIN c ON c.x = b.x",
+        "SELECT * FROM a JOIN b ON (SELECT a.x) = b.x RIGHT JOIN c ON c.x = b.x",
+        "SELECT * FROM a LEFT JOIN b ON (SELECT a.x + 1) = b.x FULL JOIN c ON c.x = b.x",
         # An outer join's ON (any ON, with a RIGHT or FULL JOIN) may not use a table to its right.
         "SELECT * FROM a LEFT JOIN b ON b.z = d.x, d", "SELECT * FROM a JOIN b ON b.z = d.x, d",
         "SELECT * FROM a JOIN b ON b.z = d.x RIGHT JOIN c ON 1", "SELECT * FROM a FULL JOIN b ON b.z = d.x JOIN d",
@@ -743,6 +747,9 @@ def test_comparison_affinity_applies_to_both_operands():
         "SELECT v IS 5, v IS NOT '5' FROM (SELECT i AS v FROM t UNION ALL SELECT '5')",
         # coalesce(p.c0, q.c0) has REAL affinity, which the text '0' then gets.
         "SELECT * FROM p RIGHT JOIN q USING (c0) JOIN q AS r USING (c0)",
+        # ... also when an index on the other side is used to find it.
+        "CREATE TABLE r (c0 REAL UNIQUE)", "INSERT INTO r VALUES (0), (1)",
+        "SELECT * FROM p RIGHT JOIN q USING (c0) JOIN r USING (c0)",
     ]:
         pair.run(sql)
     pair.close()
@@ -857,6 +864,23 @@ def test_aggregates_of_an_enclosing_query():
         "SELECT DISTINCT (SELECT count(t.a)) FROM t",
         "SELECT (SELECT count(t.a) FROM u LIMIT 1) FROM t LIMIT 5",
         "SELECT (SELECT u.a FROM u WHERE u.a = (SELECT max(t.a)) ) FROM t",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_upsert_sees_defaults_that_replace_put_in_not_null_columns():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c0 INTEGER NOT NULL DEFAULT '10', c1 REAL NOT NULL DEFAULT 7, "
+        "c2 TEXT NOT NULL DEFAULT 5)",
+        "INSERT INTO t VALUES (1, 1, 1, 1)",
+        "INSERT OR REPLACE INTO t VALUES (1, NULL, NULL, NULL) ON CONFLICT (id) DO UPDATE "
+        "SET c0 = typeof(excluded.c0) || excluded.c0, c1 = typeof(excluded.c1), c2 = typeof(excluded.c2)",
+        "CREATE UNIQUE INDEX u ON t (c2)",
+        "INSERT OR REPLACE INTO t VALUES (2, NULL, NULL, 'real') ON CONFLICT (c2) DO UPDATE "
+        "SET c0 = typeof(excluded.c0) || excluded.c0, c1 = typeof(excluded.c1) || excluded.c1",
+        "SELECT * FROM t",
     ]:
         pair.run(sql)
     pair.close()

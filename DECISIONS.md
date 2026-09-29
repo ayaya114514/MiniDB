@@ -569,3 +569,20 @@ AggregateCollector，在子查询里通过外层的 `cell`（当前分组行）�
 
 外连接的 ON（FROM 中有 RIGHT/FULL 时任何 ON）不能引用它右边的表，报 "ON clause references tables to its
 right"；含子查询的 ON 先试编译一次，收集解析到本层的表（`Scope.watch`）。
+
+## D88 窗口函数：照搬 SQLite 的执行顺序
+SQLite 按窗口的 PARTITION BY + ORDER BY 排序后，用 start / current / end 三个游标在分区缓冲上推进：end 处调用
+xStep、start 处调用 xInverse、current 处返回行，何时移动哪个游标由 frame 决定（`sqlite3WindowCodeStep` /
+`windowCodeOp`）。滑动 frame 下 sum/avg/total 的浮点结果取决于 xStep 与 xInverse 的交错顺序（KBN 求和），
+所以 `minidb/window.py` 不按“每行重算 frame”实现，而是逐步复现这段代码：同样的主循环、flush、peer 判断、
+RANGE 的 `windowCodeRangeTest`（含 DESC 时的比较翻转、NULLS 顺序、对非数值不做加减）、IfPos 倒计时。
+内置函数也照搬：row_number/rank/dense_rank/percent_rank/cume_dist/ntile 是带固定 frame 的聚合
+（`sqlite3WindowUpdate`），first_value/nth_value/lead/lag 直接读缓冲中的行（lag 的负偏移只能看到已读入的行），
+滑动 frame 的 min/max 用 (值, 序号) 的“索引”，EXCLUDE 时每行全量重扫并 finalize，group_concat 的 xInverse
+按字节删除（包括 SQLite 在剩余值全为空串时返回一个 NUL 字符的怪癖）。不同定义的窗口依出现顺序倒序计算
+（SQLite 把后出现的嵌进子查询），最终行序与 SQLite 相同。
+
+语义细节：窗口只能出现在结果列和 ORDER BY；非常量的 frame 偏移按 SQLite 的解析期规则变成 NULL（有行时才报错）；
+WINDOW 子句里只有非首个定义在解析时基于前面的定义链接；聚合的 `FILTER (WHERE ...)` 同时支持普通聚合与窗口。
+验证：随机窗口对照（全部 frame 类型、EXCLUDE、分区、带并列的 ORDER BY、NULL、混合类型）数百个种子全部逐位
+一致（含无 ORDER BY 时的行序）；fuzzer 在单表查询里生成窗口函数（ORDER BY 以 rowid 收尾，避免依赖读行顺序）。
