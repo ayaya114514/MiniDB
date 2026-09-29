@@ -742,6 +742,54 @@ def test_comparison_affinity_applies_to_both_operands():
     pair.close()
 
 
+def test_result_column_aliases_in_other_clauses():
+    # SQLite resolves a name that is no column of the FROM clause as a result
+    # column alias in WHERE, ON, GROUP BY, HAVING and ORDER BY (subqueries too).
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (a, b)", "INSERT INTO t VALUES (1, 2), (3, 4), (5, 6), (3, 9)",
+        "CREATE TABLE u (a, k)", "INSERT INTO u VALUES (1, 10), (3, 30)",
+        "SELECT a + 1 AS k FROM t WHERE k > 2",
+        "SELECT a + 1 AS k, count(*) FROM t GROUP BY k",
+        "SELECT a + 1 AS k, count(*) AS n FROM t GROUP BY k HAVING n > 0 AND k > 2",
+        "SELECT a AS b FROM t WHERE b > 2",
+        "SELECT a + 1 AS k FROM t WHERE (SELECT k) > 2",
+        "SELECT count(*) AS n FROM t WHERE n > 0",
+        "SELECT a AS k, k + 1 AS m FROM t",
+        "SELECT a AS k FROM t ORDER BY k + 1 DESC",
+        "SELECT a * 2 AS k FROM t ORDER BY -k",
+        "SELECT a AS k FROM t AS s JOIN u ON k = u.a",
+        "SELECT s.a AS z FROM t AS s JOIN u ON z = u.a",
+        "SELECT s.a AS z FROM t AS s LEFT JOIN u ON z = u.a AND u.k > 10",
+        "SELECT a AS k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.a = k)",
+        "SELECT a AS k FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.k = k * 10)",
+        "SELECT b AS q FROM t WHERE a IN (SELECT a FROM u WHERE k > q)",
+        "SELECT a + b AS k FROM t WHERE k IN (SELECT k FROM u)",
+        "SELECT count(*) AS n FROM t GROUP BY n",
+        "SELECT count(*) AS n FROM t GROUP BY a HAVING n > 1",
+        "SELECT a AS x, count(*) AS n FROM t GROUP BY x ORDER BY n * -1, x",
+        "SELECT a AS k FROM t WHERE (SELECT u.a AS k FROM u WHERE k = 3) = k",
+        "SELECT a AS k FROM t WHERE k = (SELECT k FROM u WHERE u.a = 1)",
+        "SELECT a AS k FROM t WHERE (SELECT k + 1 AS j FROM u AS w WHERE j > 20 LIMIT 1) > k",
+        "SELECT DISTINCT a % 2 AS m FROM t WHERE m = 1",
+        "SELECT a AS K FROM t WHERE k > 1",
+        "SELECT a AS k FROM t WHERE t.k > 1",
+        "SELECT a AS k, b AS k FROM t WHERE k = 4",
+        "SELECT a AS rowid FROM t WHERE rowid = 3",
+        "SELECT a AS k FROM t UNION SELECT a AS j FROM u WHERE j = 3",
+        "SELECT a AS k FROM t WHERE k BETWEEN 2 AND 4 AND k LIKE '3' AND k IN (3, 5) AND CASE k WHEN 3 THEN 1 END",
+        "SELECT a AS k FROM t WHERE coalesce(k, 0) > 1 ORDER BY 1",
+        "SELECT sum(a) AS s FROM t HAVING s > 1",
+        "SELECT a AS k FROM t WHERE (SELECT max(k) FROM u) > 1",
+        "SELECT a AS k FROM t GROUP BY k + 0",
+        "SELECT max(a) AS m FROM t ORDER BY m",
+        "SELECT count(*) AS n FROM t WHERE (SELECT n) > 0",
+        "SELECT count(*) AS n FROM t AS x LEFT JOIN t AS y ON n > 0",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_common_table_expressions_and_values():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")

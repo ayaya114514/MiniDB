@@ -245,8 +245,13 @@ class Generator:
             return self.subquery(scope, depth, text_safe)
         function = rng.choice(FUNCTIONS)
         small = lambda: str(rng.randint(-4, 6))  # noqa: E731
-        if function in ("abs", "typeof", "hex", "quote", "unicode", "sign", "octet_length", "ceil",
-                        "floor", "trunc", "sqrt", "ln", "exp", "length", "lower", "upper"):
+        if function == "abs":
+            # abs(-2**63) raises an error; when SQLite evaluates it depends on
+            # its plan (a WHERE term "x = constant" puts the constant into the
+            # other terms, which then run once, before any row is read).
+            args = [f"nullif({sub()}, -9223372036854775807 - 1)"]
+        elif function in ("typeof", "hex", "quote", "unicode", "sign", "octet_length", "ceil",
+                          "floor", "trunc", "sqrt", "ln", "exp", "length", "lower", "upper"):
             args = [sub()]
         elif function in ("ifnull", "nullif", "instr", "glob", "mod", "pow", "atan2"):
             args = [sub(), sub()]
@@ -494,6 +499,11 @@ class Generator:
             return self.aggregate_select(scope, from_sql, where)
         items = [self.expr(scope, 1) for _ in range(rng.randint(1, 3))]
         distinct = "DISTINCT " if rng.random() < 0.1 else ""
+        if rng.random() < 0.1:
+            # Result column aliases, which WHERE (and ORDER BY) may use.
+            items = [f"{item} AS k{i}" for i, item in enumerate(items)]
+            test = f"k{rng.randrange(len(items))} {rng.choice(['=', '<', '>=', 'IS NOT'])} {self.literal()}"
+            where = f" WHERE ({where[7:]}) {rng.choice(['AND', 'OR'])} {test}" if where else f" WHERE {test}"
         sql = f"SELECT {distinct}{', '.join(items)} FROM {from_sql}{where}"
         if rng.random() < 0.4:
             terms = [f"{self.expr(scope, 2)} {rng.choice(['ASC', 'DESC'])}" for _ in range(rng.randint(1, 2))]

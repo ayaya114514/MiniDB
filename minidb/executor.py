@@ -89,6 +89,17 @@ class Result(list):
 # ---- name resolution --------------------------------------------------------
 
 
+class AliasReference(OperationalError):
+    """Scope.resolve found a column name to be the alias of a result column of
+    an enclosing query (SQLite resolves those in WHERE, ON, GROUP BY, HAVING
+    and ORDER BY, subqueries there included)."""
+
+    def __init__(self, item: SelectItem, depth: int) -> None:
+        super().__init__(f"no such column: {item.alias}")
+        self.item = item
+        self.depth = depth
+
+
 class ScopeEntry:
     """One table (or derived table) of a FROM clause."""
 
@@ -128,6 +139,7 @@ class Scope:
         self.used = set()  # (table index, column position) pairs referenced so far
         self.last_right = -1  # the index of the last RIGHT or FULL JOIN's table
         self.merged = {}  # lower case name -> Merge
+        self.aliases = {}  # lower case alias -> SelectItem, once the result columns are compiled
 
     def add(self, table: Source, alias: str | None = None) -> None:
         name = ascii_lower(alias if alias is not None else table.name)
@@ -170,6 +182,10 @@ class Scope:
             matches = scope._matches(column)
             if len(matches) > 1:
                 raise OperationalError(f"ambiguous column name: {column.name}")
+            if not matches and depth and column.table is None and ascii_lower(column.name) in scope.aliases:
+                for inner in passed:
+                    inner.uses_outer = True
+                raise AliasReference(scope.aliases[ascii_lower(column.name)], depth)
             if matches:
                 for inner in passed:
                     inner.uses_outer = True
@@ -256,12 +272,39 @@ def tables_referenced(expr: Expr, scope: Scope) -> set[int]:
     tables = set()
     for e in walk(expr):
         if isinstance(e, Column):
-            _, _, index, depth = scope.resolve(e)
+            try:
+                _, _, index, depth = scope.resolve(e)
+            except AliasReference:
+                continue  # an enclosing query's result column
             if depth == 0:
                 tables.add(index)
         elif isinstance(e, (Subquery, InSelect, Exists)):
             return set(range(len(scope.entries)))
     return tables
+
+
+_COMPOUND_EXPRESSIONS = (Unary, Binary, Between, InList, InSelect, Like, Call, Cast, Case)
+
+
+def substitute_columns(expr: object, replace: Callable[[Column], Expr | None]) -> object:
+    """``expr`` with each Column for which ``replace`` returns an expression
+    replaced by it (not inside subqueries); unchanged parts are shared."""
+    if isinstance(expr, Column):
+        new = replace(expr)
+        return expr if new is None else new
+    if isinstance(expr, tuple):
+        new = tuple(substitute_columns(e, replace) for e in expr)
+        return expr if all(a is b for a, b in zip(new, expr)) else new
+    if isinstance(expr, _COMPOUND_EXPRESSIONS):
+        changes = {}
+        for f in dataclasses.fields(expr):
+            if f.name != "query":
+                value = getattr(expr, f.name)
+                new = substitute_columns(value, replace)
+                if new is not value:
+                    changes[f.name] = new
+        return dataclasses.replace(expr, **changes) if changes else expr
+    return expr
 
 
 def split_conjuncts(expr: Expr | None) -> list[Expr]:
@@ -378,6 +421,8 @@ class Compiler:
         if isinstance(expr, Column):
             try:
                 slot, affinity, index, depth = self.scope.resolve(expr)
+            except AliasReference as reference:
+                return self._outer_alias(reference)
             except OperationalError:
                 if expr.table is None and ascii_lower(expr.name) in ("true", "false"):
                     value = int(ascii_lower(expr.name) == "true")  # TRUE and FALSE, unless a column
@@ -417,6 +462,15 @@ class Compiler:
         if isinstance(expr, Star):
             raise OperationalError("* is only allowed in a select list or COUNT(*)")
         raise OperationalError(f"cannot evaluate {expr!r}")
+
+    def _outer_alias(self, reference: AliasReference) -> tuple[RowFunction, str | None]:
+        """An enclosing query's result column by its alias: its expression,
+        evaluated with that query's current row."""
+        outer = self.scope.ancestor(reference.depth)
+        compiler = Compiler(outer, misuse="misuse of aggregate: {name}()", executor=self.executor)
+        function, affinity = compiler.compile_with_affinity(reference.item.expr)
+        cell = outer.cell
+        return (lambda row: function(cell[0])), affinity
 
     def _unary(self, expr: Unary) -> RowFunction:
         operand = self.compile(expr.operand)
@@ -1048,7 +1102,10 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
     def column_position(expr):
         if not isinstance(expr, Column):
             return None
-        slot, _, table_index, depth = scope.resolve(expr)
+        try:
+            slot, _, table_index, depth = scope.resolve(expr)
+        except AliasReference:
+            return None
         if depth or table_index != index:
             return None
         if slot == rowid_slot or slot - offset == table.rowid_column:
@@ -1522,7 +1579,6 @@ class Executor:
         cheapest order.
         """
         compiler = Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self)
-        on_compiler = Compiler(scope, executor=self)
         rights = [i for i, join in enumerate(joins) if join.kind in ("RIGHT", "FULL")]
 
         def floor(j):
@@ -1559,7 +1615,7 @@ class Executor:
             join = joins[index]
             match = None
             if join.kind != "INNER" and join.on is not None:
-                match = on_compiler.compile(join.on)
+                match = compiler.compile(join.on)
             compiled.append((match, [compiler.compile(f) for f in placed.get(level, [])]))
         levels = []
         for level, (index, (match, filters)) in enumerate(zip(order, compiled)):
@@ -2261,6 +2317,14 @@ class CompiledSelect:
         self.scope = scope = Scope(parent)
         joins, self.derived = executor.build_from(stmt.source, scope)
         self.exprs, self.names = executor.expand_items(stmt, scope)
+        # Compile the result columns first: only the other clauses see aliases.
+        # (Their subqueries find them through scope.aliases.)
+        aliases = {}
+        for item in stmt.items:
+            if item.alias is not None and not isinstance(item.expr, Star):
+                aliases.setdefault(ascii_lower(item.alias), item)
+        if aliases:
+            stmt, joins = self.substitute_aliases(stmt, joins, aliases)
         self.is_aggregate = bool(stmt.group_by) or any(
             contains_aggregate(e)
             for e in self.exprs + [stmt.having] + [item.expr for item in stmt.order_by]
@@ -2273,6 +2337,7 @@ class CompiledSelect:
         compiled = [compiler.compile_with_affinity(e) for e in self.exprs]
         self.outputs = [function for function, _ in compiled]
         self.affinities = [affinity for _, affinity in compiled]
+        scope.aliases = aliases
         self.order_terms, self.order_functions = executor.order_terms(
             stmt, self.exprs, self.names, compiler
         )
@@ -2298,6 +2363,32 @@ class CompiledSelect:
             and follows_order(order_columns, self.levels[0].access.order())
         )
 
+    def substitute_aliases(self, stmt: Select, joins: list[Join], aliases: dict[str, SelectItem]) -> tuple[Select, list[Join]]:
+        """Replace references to result column aliases in WHERE, ON, GROUP BY,
+        HAVING and ORDER BY with the aliased expressions, as SQLite does for
+        a name that is no column of the FROM clause.  (A whole GROUP BY or
+        ORDER BY term that is an alias is left to group_term/order_terms.)"""
+        scope = self.scope
+
+        def replace(column):
+            key = ascii_lower(column.name)
+            if column.table is not None or key not in aliases or scope._matches(column):
+                return None
+            return aliases[key].expr
+
+        def term(expr):
+            return expr if isinstance(expr, Column) else substitute_columns(expr, replace)
+
+        stmt = dataclasses.replace(
+            stmt,
+            where=substitute_columns(stmt.where, replace),
+            having=substitute_columns(stmt.having, replace),
+            group_by=[term(e) for e in stmt.group_by],
+            order_by=[dataclasses.replace(item, expr=term(item.expr)) for item in stmt.order_by],
+        )
+        joins = [dataclasses.replace(join, on=substitute_columns(join.on, replace)) for join in joins]
+        return stmt, joins
+
     def order_columns(self, stmt: Select) -> list[int] | None:
         """ORDER BY as positions of the first table's columns (ROWID for the row
         id), or None unless every term is an ascending, NULLS FIRST plain
@@ -2312,7 +2403,10 @@ class CompiledSelect:
             expr = self.exprs[index] if source == "output" else item.expr
             if descending or not nulls_first or not isinstance(expr, Column):
                 return None
-            slot, _, table_index, depth = self.scope.resolve(expr)
+            try:
+                slot, _, table_index, depth = self.scope.resolve(expr)
+            except AliasReference:
+                return None
             if depth or table_index != 0:
                 return None
             position = slot - entry.offset
