@@ -240,3 +240,17 @@
 **验证**：测试 888 个全部通过；fuzz 600 种子 × 500 语句、文件模式 200 × 400、变形测试 300 × 300，均 0 失败；sqllogictest 全量第一次跑出 528 条回归——21 张表的连接生成了 21 层嵌套 `for`，超出 Python 的 20 层静态嵌套限制——改为超过 16 张表时用通用循环，select5.test 恢复 1436/1436，总数回到 5,939,852 / 5,939,879。
 
 **已知问题**：每条语句都不同的点查（解析 + 编译为主）只快了约 9%，解析与规划本身仍是纯 Python 的开销；参数化插入受 B+ 树与记录编码限制，只快了约 7%。生成代码的调试信息是 `<expression>` / `<join loop>` 这类伪文件名。
+
+## 阶段 18：存储层（进行中，2026-09-30 暂停）
+已完成：
+- **VACUUM / VACUUM INTO**（D91，已提交）：在内存 pager 里用 bulk_load 重建紧凑副本，按相同页号写回并缩小 `page_count`、清空空闲链表；没有读者时的 checkpoint 截断文件。测试覆盖内容与索引/统计/overflow 值保持、并发读者、提交和 checkpoint 每一步的崩溃（`tests/test_vacuum.py`，11 个）。示例：删掉 2/3 数据后 3.16 MB → 0.65 MB。
+
+进行中（未提交）：**读者标记 + 部分 checkpoint**。半成品存放在 `git stash` 里（`stash@{0}`，说明 "stage18-read-marks-wip"），恢复用 `git stash pop`：
+- 已写：`locking.py` 的读槽锁（`<db>-read0..8`，槽 1..8 独占并记录快照，槽 0 共享）；`pager.py` 的 `<db>-shm`（generation、已回填帧数、各槽的快照标记）读写，以及 `begin_read` 登记读槽（登记后若发现更新的提交就重来；WAL 已全部回填时共享槽 0、只读数据库文件）。
+- 未写：`checkpoint()` 改为按 min(各占用槽的标记) 部分回填、全部回填且无读者时才清空并截断；写者在 WAL 全部回填且无其他读者占槽时从头重启 WAL；`end_transaction` 释放槽；并发与崩溃测试。设计要点见 stash 中 `_take_read_slot` 的注释。
+
+剩余：
+1. 完成上面的读者标记与部分 checkpoint，并加“持续有读者时 WAL 不再无限增长”的测试。
+2. Windows 锁（`msvcrt.locking` 只有排他锁：读者锁区间内一个随机字节、排他者锁整个区间来模拟共享锁），CI 增加 `windows-latest`。本机无法运行 Windows，需如实标注“未运行”。
+3. 更强的崩溃模型测试：半页写（torn write）、fsync 之前的写入丢失。
+4. 阶段末：全量测试 + sqllogictest + 大规模 fuzz；更新 README 已知限制（文件会收缩了）；勾选 CLAUDE.md 的阶段 18。
