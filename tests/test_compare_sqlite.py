@@ -386,3 +386,21 @@ def test_blobs_and_text_with_nul(pair):
     pair.run("INSERT INTO t VALUES (x'3132', x'3132', x'3132'), ('12', '12', '12'), (12, 12, 12)")
     pair.run("SELECT typeof(b), typeof(s), typeof(n), b = s, s = 12, n = 12, b = '12' FROM t")
     pair.run("SELECT count(DISTINCT b), count(DISTINCT s), max(b), min(s) FROM t")
+
+
+def test_text_compares_by_utf8_bytes(pair):
+    """Text made from BLOBs may hold bytes that are not UTF-8; SQLite compares
+    text byte by byte, which for valid UTF-8 is code point order."""
+    texts = ["CAST(x'ff' AS TEXT)", "char(1114111)", "'é'", "CAST(x'c3' AS TEXT)", "CAST(x'80' AS TEXT)",
+             "char(57344)", "char(55295)", "'z'", "''", "'日本'", "CAST(x'e282' AS TEXT)"]
+    pair.run("CREATE TABLE t (a TEXT)")
+    pair.run("CREATE INDEX ta ON t (a)")
+    for text in texts:
+        pair.run(f"INSERT INTO t VALUES ({text})")
+    for a, b in itertools.product(texts, repeat=2):
+        pair.run(f"SELECT {a} < {b}, {a} = {b}, hex(max({a}, {b})), hex(min({a}, {b}))")
+    for sql in ["SELECT hex(a) FROM t ORDER BY a", "SELECT hex(max(a)), hex(min(a)) FROM t",
+                "SELECT hex(a) FROM t WHERE a > 'z' ORDER BY a",
+                "SELECT hex(a) FROM t INDEXED BY ta WHERE a >= char(57344) ORDER BY a DESC",
+                "SELECT DISTINCT hex(a) FROM t ORDER BY 1"]:
+        pair.run(sql)

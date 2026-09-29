@@ -42,6 +42,14 @@ PRINTF_FORMATS = ["'%d'", "'%5.2f'", "'%s|%x'", "'%.3e'", "'%-6s|'", "'%q'", "'%
 TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz"]
 
 
+def no_max_rowid(value):
+    """An expression for an INTEGER PRIMARY KEY that is never 2**63-1: once
+    that row id exists, SQLite picks later ones at random.  The value is
+    written twice, so it must not contain parameters; CASE calls no function
+    (a function call would change SQLite's statement journal decision)."""
+    return f"(CASE ({value}) WHEN 9223372036854775807 THEN NULL ELSE ({value}) END)"
+
+
 class Table:
     def __init__(self, name, columns, rowid_alias):
         self.name = name
@@ -305,14 +313,12 @@ class Generator:
         for _ in range(rng.randint(1, 4)):
             values = []
             for column in columns:
-                first_parameter = len(self.parameters)
-                value = self.expr([], 2, True)
                 if column == table.rowid_alias:
-                    # A row id of 2**63-1 makes SQLite pick later row ids at random.
-                    value = value.replace("9223372036854775807", "7")
-                    self.parameters[first_parameter:] = [
-                        7 if p == 9223372036854775807 else p for p in self.parameters[first_parameter:]
-                    ]
+                    self.no_parameters = True
+                    value = no_max_rowid(self.expr([], 2, True))
+                    self.no_parameters = False
+                else:
+                    value = self.expr([], 2, True)
                 values.append(value)
             rows.append("(" + ", ".join(values) + ")")
         return prefix + ", ".join(rows) + self.upsert(table) + self.returning(table)
@@ -326,7 +332,14 @@ class Generator:
         source = rng.choice([t for t in self.tables if not t.derived])
         scope = [("s", source)]
         columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
-        items = [self.expr(scope, 2, True) for _ in columns]
+        items = []
+        for column in columns:
+            if column == table.rowid_alias:
+                self.no_parameters = True
+                items.append(no_max_rowid(self.expr(scope, 2, True)))
+                self.no_parameters = False
+            else:
+                items.append(self.expr(scope, 2, True))
         where = f" WHERE {self.condition(scope)}" if rng.random() < 0.6 else ""
         order = ", ".join([str(i + 1) for i in range(len(items))] + ["s.rowid"])
         return (f"INSERT {self.conflict()}INTO {table.name} ({', '.join(columns)}) SELECT {', '.join(items)} "

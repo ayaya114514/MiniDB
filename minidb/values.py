@@ -235,22 +235,45 @@ def type_name(value: SQLValue) -> str:
 # ---- comparison ------------------------------------------------------------
 
 
+def _text_key(text: str) -> str:
+    """Text as a string whose order is SQLite's: its UTF-8 bytes compared
+    one by one.  For valid UTF-8 that is the order of code points, but text
+    made from a BLOB may hold bytes that are not UTF-8 (lone surrogates, see
+    to_text), and those must sort by their byte values; so non-ASCII text
+    becomes its UTF-8 bytes, one character per byte."""
+    if text.isascii():
+        return text
+    return text.encode("utf-8", "surrogateescape").decode("latin-1")
+
+
 def sort_key(value: SQLValue) -> tuple:
     """Key ordering values like SQLite: NULL < numbers < text < BLOBs."""
     if value is None:
         return (0, 0)
     if isinstance(value, str):
-        return (2, value)
+        return (2, _text_key(value))
     if isinstance(value, bytes):
         return (3, value)
     return (1, value)
 
 
+def plain_value(pair: tuple) -> SQLValue:
+    """The value of a sort key (the inverse of sort_key)."""
+    rank = pair[0]
+    if rank == 0:
+        return None
+    if rank == 2 and not pair[1].isascii():
+        return pair[1].encode("latin-1").decode("utf-8", "surrogateescape")
+    return pair[1]
+
+
 def compare(a: int | float | str | bytes, b: int | float | str | bytes) -> int:
     """Three-way comparison of two non-NULL values (-1, 0 or 1):
-    numbers < text < BLOBs, BLOBs byte by byte."""
+    numbers < text < BLOBs; text and BLOBs byte by byte."""
     a_text, b_text = type(a) is str, type(b) is str
     if a_text and b_text:
+        if not (a.isascii() and b.isascii()):
+            a, b = _text_key(a), _text_key(b)
         return (a > b) - (a < b)
     a_blob, b_blob = type(a) is bytes, type(b) is bytes
     if a_text == b_text and a_blob == b_blob:

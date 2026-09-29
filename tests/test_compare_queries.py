@@ -586,3 +586,14 @@ def test_upsert_excluded_values(table, target):
         pair.run(f"INSERT INTO t (s, i) VALUES (0, '5') ON CONFLICT {target} DO UPDATE SET r = ({expr})")
         pair.run("SELECT r FROM t ORDER BY rowid")
     pair.close()
+
+
+def test_upsert_excluded_values_in_real_columns():
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (id INTEGER PRIMARY KEY, r REAL, f FLOAT, x)")
+    pair.run("INSERT INTO t VALUES (1, 1, 1, 1)")
+    for value in ["0", "'5'", "'5.5'", "'abc'", "2.5", "x'35'", "NULL", "9223372036854775807"]:
+        pair.run(f"INSERT INTO t VALUES (1, {value}, {value}, 9) ON CONFLICT (id) DO UPDATE SET "
+                 "x = typeof(excluded.r) || ' ' || quote(excluded.r) || ' ' || typeof(excluded.f)")
+        pair.run("SELECT x FROM t")
+    pair.close()
