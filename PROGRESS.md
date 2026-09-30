@@ -241,16 +241,25 @@
 
 **已知问题**：每条语句都不同的点查（解析 + 编译为主）只快了约 9%，解析与规划本身仍是纯 Python 的开销；参数化插入受 B+ 树与记录编码限制，只快了约 7%。生成代码的调试信息是 `<expression>` / `<join loop>` 这类伪文件名。
 
-## 阶段 18：存储层（进行中，2026-09-30 暂停）
-已完成：
-- **VACUUM / VACUUM INTO**（D91，已提交）：在内存 pager 里用 bulk_load 重建紧凑副本，按相同页号写回并缩小 `page_count`、清空空闲链表；没有读者时的 checkpoint 截断文件。测试覆盖内容与索引/统计/overflow 值保持、并发读者、提交和 checkpoint 每一步的崩溃（`tests/test_vacuum.py`，11 个）。示例：删掉 2/3 数据后 3.16 MB → 0.65 MB。
+## 阶段 18：存储层（完成）
+完成的功能：
+- **VACUUM / VACUUM INTO**（D91）：在内存 pager 里用 bulk_load 重建紧凑副本，按相同页号写回并缩小 `page_count`、清空空闲链表，checkpoint 时截断文件。例：删掉 2/3 数据后 3.16 MB → 0.65 MB。rowid 规则照 SQLite：有 INTEGER PRIMARY KEY 或有索引的表保留 rowid，其余重新编号；`VACUUM INTO` 全部保留（最初写成“一律保留”，fuzz 加入 VACUUM 后发现，10/600 个种子）。
+- **读者标记 + 部分 checkpoint + 日志重启**（D92）：`<db>-shm` 里记录已回填帧数和 8 个读槽的快照标记；checkpoint 只拷到最老的在用标记，并按那个状态的页数截断文件；已回填的帧从数据库文件读，所以全部回填后写者可以在有读者时从头重用日志（新 generation）；读者总是跨越提交时写者最多等 0.1 秒。实测 4 个读进程（每个读事务 ≥2ms）+ 1 个写者约 4700 提交/秒：不等待时日志涨到 48224 帧，现在最长 1007 帧，吞吐降约 5%。
+- **锁改为 `-shm` 上的字节锁**（D93）：fcntl 记录锁 + 每进程一个描述符、进程内登记表仲裁；旁路文件只剩 `-wal`、`-shm`（`-lock` 没了）；数据库文件上的 SHARED 锁取消（每个读事务都持有读槽）。
+- **Windows 锁**（D95）：`msvcrt.locking` 只有排他锁，按 SQLite 的做法用 64 字节区间模拟共享锁；锁层拆成 `PosixLocks` / `WindowsLocks` 两个后端。CI 增加 `windows-latest` 任务（存储/并发/崩溃测试）。
+- **更强的崩溃模型**（D94）：`tests/test_crash_model.py` 模拟断电——未 fsync 的写入丢失、乱序、按 512 字节扇区撕裂，截断也可能丢失。发现并修正：checkpoint 扩展文件的写入被撕裂后文件大小不是页大小的整数倍，被误报为损坏。800 次随机崩溃（3075 个未同步操作被丢弃/撕裂）：633 次恢复到已确认提交、167 次恢复到进行中的提交、0 次错误。
+- fuzzer：生成 VACUUM；文件模式下另有一个连接持有读快照，主连接 `checkpoint_frames = 8` 且随机 checkpoint，快照必须始终不变（20 个种子里 604 次新 generation、69 次部分回填）。
+- 其间修掉的 fuzz 发现：UPSERT 的 `excluded` 要看到被同一语句中前面的行原地转换过的默认值（D96，SQLite 的寄存器复用行为）。
 
-进行中（未提交）：**读者标记 + 部分 checkpoint**。半成品存放在 `git stash` 里（`stash@{0}`，说明 "stage18-read-marks-wip"），恢复用 `git stash pop`：
-- 已写：`locking.py` 的读槽锁（`<db>-read0..8`，槽 1..8 独占并记录快照，槽 0 共享）；`pager.py` 的 `<db>-shm`（generation、已回填帧数、各槽的快照标记）读写，以及 `begin_read` 登记读槽（登记后若发现更新的提交就重来；WAL 已全部回填时共享槽 0、只读数据库文件）。
-- 未写：`checkpoint()` 改为按 min(各占用槽的标记) 部分回填、全部回填且无读者时才清空并截断；写者在 WAL 全部回填且无其他读者占槽时从头重启 WAL；`end_transaction` 释放槽；并发与崩溃测试。设计要点见 stash 中 `_take_read_slot` 的注释。
+**验证**：测试 932 个全部通过（新增 test_read_marks 9、test_crash_model 6、test_locking 15、test_vacuum 13 等）；fuzz 内存模式 600 种子 × 500 语句 0 失败，文件模式 200 × 400 有 2 个失败种子——9791 是上面的 UPSERT 问题（已修），9661 见已知问题；变形测试文件模式 300 × 300 0 失败；sqllogictest 全量 5,939,852 / 5,939,879，与阶段 17 相同。
 
-剩余：
-1. 完成上面的读者标记与部分 checkpoint，并加“持续有读者时 WAL 不再无限增长”的测试。
-2. Windows 锁（`msvcrt.locking` 只有排他锁：读者锁区间内一个随机字节、排他者锁整个区间来模拟共享锁），CI 增加 `windows-latest`。本机无法运行 Windows，需如实标注“未运行”。
-3. 更强的崩溃模型测试：半页写（torn write）、fsync 之前的写入丢失。
-4. 阶段末：全量测试 + sqllogictest + 大规模 fuzz；更新 README 已知限制（文件会收缩了）；勾选 CLAUDE.md 的阶段 18。
+**benchmark**（阶段 17 末 → 阶段 18 末，同一台机器，10 万行）：autocommit 的 `?` 点查 0.116 → 0.145 s（每个读事务多约 3 µs：拿/放读槽和 WAL_READ 共 4 次 lockf，外加读 `-shm`）；逐条 autocommit 插入 0.126 → 0.140 s；其余在噪声范围内（单条 INSERT 2.97 → 2.85 s，批量 1.93 → 1.86 s，范围扫描、全表扫描、GROUP BY、连接基本不变）。CREATE INDEX 在 benchmark 里 0.42 → 0.475 s，但单独测量和 cProfile 显示两个版本调用完全相同（1.316 vs 1.333 s），差异是 benchmark 进程内的噪声。
+
+**已知问题 / 做得不扎实的地方**：
+- **Windows 从未真正运行过**：只在按 `msvcrt.locking` 语义写的假模块上测试；CI 的 `windows-latest` 任务未运行（没有 push）。Windows 上最多 64 个进程同时共享一把锁；降级不是原子的（丢锁时放弃该槽重试）。
+- 一个始终不结束的读事务仍会让日志变长：写者等 0.1 秒后放弃，之后日志每增长 4000 帧才再等一次。
+- `-shm` 的读写依赖小 pread/pwrite 的原子性，没有 SQLite 那样的双份头 + 校验和防撕裂读。
+- 连接不能跨 `fork()` 使用；删除正在使用的 `-shm` 会让新旧连接各锁各的（与 SQLite 相同）。
+- 崩溃模型不模拟目录项丢失和 `-shm` 内容（重开时清零），扇区固定 512 字节。
+- fuzz 种子 9661（文件模式）：`sum(DISTINCT ...)` 的整数溢出取决于累加顺序，SQLite 用覆盖索引 `i12` 做全表扫描（按 c1 顺序），MiniDB 扫表（按 rowid），属于已记录的“依赖查询计划”一类，未修。
+- 每个 autocommit 读语句多约 3 µs 的锁开销（见上）。
