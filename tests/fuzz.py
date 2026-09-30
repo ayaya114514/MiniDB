@@ -619,6 +619,8 @@ class Generator:
             return self.create_view() if rng.random() < 0.7 else self.drop_view()
         if roll < 0.098:
             return self.add_column()
+        if roll < 0.1:
+            return "VACUUM"
         if roll < 0.40:
             return self.insert()
         if roll < 0.50:

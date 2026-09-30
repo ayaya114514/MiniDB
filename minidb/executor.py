@@ -2812,7 +2812,7 @@ class Executor:
                 raise OperationalError("output file already exists")
             target = Pager(path)
             try:
-                self.copy_database(target)
+                self.copy_database(target, keep_rowids=True)
                 target.commit()
                 target.end_transaction()
                 target.checkpoint()
@@ -2821,7 +2821,7 @@ class Executor:
             return Result()
         pager = self.catalog.pager
         copy = Pager()
-        self.copy_database(copy)
+        self.copy_database(copy, keep_rowids=False)
         count = copy.page_count
         for pgno in range(1, count):
             pager.write(copy.cache[pgno])
@@ -2834,9 +2834,14 @@ class Executor:
         self.catalog.load()
         return Result()
 
-    def copy_database(self, target: Pager) -> None:
+    def copy_database(self, target: Pager, keep_rowids: bool) -> None:
         """Copy the schema, tables and indexes into the empty database ``target``
-        (the schema table keeps its keys, objects get new root pages)."""
+        (the schema table keeps its keys, objects get new root pages).
+
+        Without ``keep_rowids`` (VACUUM, but not VACUUM INTO) a table with
+        neither an INTEGER PRIMARY KEY nor an index gets new rowids 1, 2, 3...
+        in rowid order, as SQLite's VACUUM gives them (its transfer
+        optimization keeps rowids only where they may be referenced)."""
         catalog = Catalog(target)
         source = self.catalog
         for key, value in list(source.schema.scan()):
@@ -2844,7 +2849,12 @@ class Executor:
             if kind in ("table", "index"):
                 codec = IntKey if kind == "table" else IndexKeyCodec
                 tree = BTree.create(target, codec)
-                tree.bulk_load(BTree(source.pager, root, codec).scan())
+                entries = BTree(source.pager, root, codec).scan()
+                if kind == "table" and not keep_rowids:
+                    table = source.tables[ascii_lower(name)]
+                    if table.rowid_column is None and not table.indexes:
+                        entries = ((rowid, record) for rowid, (_, record) in enumerate(entries, 1))
+                tree.bulk_load(entries)
                 root = tree.root
             catalog.schema.insert(key, encode_record([kind, name, table_name, root, sql]))
 
