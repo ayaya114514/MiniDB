@@ -886,6 +886,29 @@ def test_upsert_sees_defaults_that_replace_put_in_not_null_columns():
     pair.close()
 
 
+def test_upsert_sees_defaults_converted_by_an_earlier_row():
+    """SQLite computes a DEFAULT once per statement and converts it in place
+    when a row is checked against an index or stored: later rows'
+    "excluded" values show the converted default."""
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c1 VARCHAR(5) DEFAULT -1.5, c2 INT DEFAULT '7', c3)",
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, c1 VARCHAR(5) DEFAULT -1.5, c3 UNIQUE)",
+        "INSERT INTO t (id) VALUES (1)", "INSERT INTO u (id, c3) VALUES (1, 1)",
+        "INSERT INTO t (id) VALUES (5), (1) ON CONFLICT (id) DO UPDATE "
+        "SET c3 = excluded.c1 || typeof(excluded.c1) || typeof(excluded.c2) RETURNING *",
+        "INSERT INTO t (id) VALUES (1), (6) ON CONFLICT (id) DO UPDATE SET c3 = typeof(excluded.c1) RETURNING *",
+        "INSERT INTO t (id) SELECT 7 UNION ALL SELECT 1 ON CONFLICT DO UPDATE SET c3 = typeof(excluded.c2) RETURNING *",
+        "INSERT INTO u (id, c3) VALUES (1, 9), (2, 1) ON CONFLICT DO UPDATE SET c1 = typeof(excluded.c1) RETURNING *",
+        "INSERT OR IGNORE INTO u (id, c3) VALUES (3, 1), (1, 8) ON CONFLICT (id) DO UPDATE "
+        "SET c1 = typeof(excluded.c1) RETURNING *",
+        "INSERT INTO u (id, c1, c3) VALUES (4, 2.5, 4), (1, 2.5, 5) ON CONFLICT (id) DO UPDATE "
+        "SET c3 = typeof(excluded.c1) RETURNING *",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_postfix_null_tests():
     pair = Pair(check_messages=True)
     for sql in [

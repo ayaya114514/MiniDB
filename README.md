@@ -152,7 +152,7 @@ eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启
 
 GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
 固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）；另外跑变形测试和
-sqllogictest 全量语料（通过数低于基线即失败）。
+sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest` 上跑存储、并发与崩溃测试（尚未运行过）。
 
 - **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
   且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
@@ -161,7 +161,8 @@ sqllogictest 全量语料（通过数低于基线即失败）。
   `tools/reference_sqlite.py` 下载源码（校验 SHA3-256）、编译，并输出让 `sqlite3` 模块加载它的
   环境变量；链接的 SQLite 带 ICU 时对照测试直接报错。需要 C 编译器。
 - **模糊测试**（`tests/fuzz.py`）：随机 schema（约束、单列/多列/唯一索引）+ 随机增删改查、
-  嵌套表达式、聚合、连接、事务、建删索引，每个种子结束时做 `integrity_check`。
+  嵌套表达式、聚合、连接、事务、建删索引、VACUUM，每个种子结束时做 `integrity_check`；文件模式下
+  另有一个连接持有读快照，主连接频繁 checkpoint、重启日志，快照必须始终不变。
 - **sqllogictest**（`tools/sqllogictest.py`）：SQLite 官方的引擎无关测试集，约 594 万条记录。
   语料按固定版本下载、逐文件校验 SHA3-256，不入库；报告按每个文件的第一个失败归类根因（缺功能时
   后面的记录会连锁失败），错误结果和崩溃单独列出。当前通过率见 PROGRESS.md。
@@ -175,7 +176,8 @@ sqllogictest 全量语料（通过数低于基线即失败）。
   没覆盖的主要是防御性分支（Windows 无 `fcntl`、不可能的内部状态）。
 - **崩溃恢复**：在提交的每一步（写 WAL 帧、写提交帧、fsync 日志）和 checkpoint 的每一步
   （拷页、fsync、截断日志）模拟崩溃，包括子进程里真实的 `os._exit`，以及截断/损坏的 WAL，
-  重开后数据必须是事务前或事务后的完整状态。
+  重开后数据必须是事务前或事务后的完整状态。`tests/test_crash_model.py` 模拟断电：未 fsync 的写入
+  可能丢失、乱序或按 512 字节扇区撕裂，截断也可能丢失，重开后必须完整且是已确认的提交或进行中的那个。
 
 ## 性能
 
@@ -210,7 +212,8 @@ Python 源码编译执行，见 DECISIONS.md D90）。
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、聚合查询里裸列取自哪一行、常量传播 / 常量折叠
   决定的出错时机），MiniDB 不保证选择相同。
 - 一个始终不结束的读事务仍会让日志变长（写者等 0.1 秒后放弃，之后日志每增长 4000 帧才再等一次）。
-  Windows 上没有 `fcntl`，不加锁。
+- Windows 上用 `msvcrt.locking` 加锁（最多 64 个进程同时共享一把锁），只在模拟的 `msvcrt` 上测试过；
+  CI 的 `windows-latest` 任务已写好但尚未运行。
 - 删除空闲页不会自动收缩文件，需要 `VACUUM`；目录里会保留（可能为空的）`-wal` 与 `-shm` 文件。
   连接不能跨 `fork()` 使用。
 - 与 sqlite3 对照时，Python 3.11 的 sqlite3 没有 `autocommit` 参数，两组事务行为对照测试在
