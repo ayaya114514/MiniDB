@@ -23,7 +23,6 @@ Parameters = Sequence[object] | Mapping[str, object]
 STATEMENT_CACHE_SIZE = 256
 SPILL_PAGES = 1000  # dirty pages a transaction may hold before they go to the log
 CACHE_PAGES_AFTER_SPILL = 2000
-CHECKPOINT_FRAMES = 1000  # try to checkpoint once the log holds this many committed frames
 WRITE_STATEMENTS = (
     Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex, CreateView, DropView,
     Analyze, Reindex, AlterTable,
@@ -49,7 +48,7 @@ class Database:
         self.pager = Pager(path, timeout)  # starts inside a read transaction
         try:
             if self.pager.is_new:
-                # Creating the file: become the writer first (RESERVED before SHARED).
+                # Creating the file: become the writer first (RESERVED before the snapshot).
                 self.pager.end_transaction()
                 self.pager.begin_write()
                 self.pager.begin_read()
@@ -101,12 +100,13 @@ class Database:
     def execute_statement(self, stmt: Any, parameters: Sequence[SQLValue] = ()) -> Result:
         """Run one parsed statement.
 
-        Locking: a statement or explicit transaction reads under SHARED.  A
-        writing statement outside a transaction takes RESERVED first (waiting
-        for another writer), then SHARED.  Inside a transaction, which already
-        holds SHARED, RESERVED is not waited for: that writer may itself be
-        waiting for our SHARED to go away, so we fail with "database is
-        locked" at once, as SQLite does.
+        Locking: a statement or explicit transaction reads a snapshot (see
+        ``Pager.begin_read``).  A writing statement outside a transaction
+        takes RESERVED first (waiting for another writer), then its snapshot,
+        which is therefore the newest.  Inside a transaction RESERVED is not
+        waited for: once that writer commits, our snapshot is outdated and
+        could not write anyway, so we fail with "database is locked" at
+        once, as SQLite does.
         """
         if self.broken:
             raise DatabaseError("a commit failed: reopen the database to recover")
@@ -217,7 +217,7 @@ class Database:
     def _commit(self) -> None:
         try:
             self.pager.commit()
-            if self.pager.committed >= CHECKPOINT_FRAMES:
+            if self.pager.committed >= self.pager.checkpoint_frames:
                 self.pager.checkpoint()  # keeps the log short; skipped while others read
         except LockTimeout:
             raise  # nothing was written; the transaction is intact

@@ -107,7 +107,7 @@ def test_vacuum_while_another_connection_reads(tmp_path):
     assert contents(reader) == before  # and then sees the rebuilt database
     assert reader.integrity_check() == []
     reader.close()
-    assert db.pager.checkpoint()
+    db.pager.checkpoint()  # (the reader's close may already have done it)
     assert os.path.getsize(path) == db.pager.page_count * PAGE_SIZE
     db.close()
 
@@ -140,3 +140,4 @@ def test_vacuum_matches_sqlite():
     ]:
         pair.run(sql)
     pair.close()
+
