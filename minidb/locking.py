@@ -16,7 +16,8 @@ descriptor of the file would drop all of the process's locks on it.  So, as
 in SQLite, a process opens ``<db>-shm`` once (``_LockFile``, found by device
 and inode, shared by its connections and closed with the last one) and
 arbitrates between its own connections itself: the process holds the lock
-on a byte while any of its connections does.  A lock that is busy is retried
+on a byte while any of its connections does.  On Windows the process-level
+locks are ``msvcrt.locking`` ranges (``WindowsLocks``).  A lock that is busy is retried
 until ``timeout`` seconds have passed, then ``OperationalError("database is
 locked")`` is raised, like SQLite's busy timeout.
 """
@@ -32,8 +33,12 @@ from minidb.errors import OperationalError
 
 try:
     import fcntl
-except ImportError:  # pragma: no cover - Windows: no locking
+except ImportError:  # pragma: no cover - Windows
     fcntl = None
+try:
+    import msvcrt
+except ImportError:
+    msvcrt = None
 
 READ_SLOTS = 8  # slots with a read mark (slot 0 has none)
 
@@ -46,17 +51,88 @@ class LockTimeout(OperationalError):
     """A lock stayed busy for the whole timeout ("database is locked")."""
 
 
-def _lockf(fd: int, byte: int, operation: int) -> bool:
-    """Change the process's lock on ``byte`` without waiting."""
-    try:
-        if operation != fcntl.LOCK_UN:
-            operation |= fcntl.LOCK_NB
-        fcntl.lockf(fd, operation, 1, LOCK_OFFSET + byte, os.SEEK_SET)
-        return True
-    except OSError as exc:
-        if exc.errno in (errno.EACCES, errno.EAGAIN):
+class PosixLocks:
+    """Process-level locks on bytes of a file: POSIX record locks (fcntl)."""
+
+    def lock(self, fd: int, byte: int, exclusive: bool) -> bool:
+        return self._lockf(fd, byte, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+
+    def downgrade(self, fd: int, byte: int) -> bool:
+        return self._lockf(fd, byte, fcntl.LOCK_SH)  # atomic for record locks
+
+    def unlock(self, fd: int, byte: int) -> None:
+        self._lockf(fd, byte, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _lockf(fd: int, byte: int, operation: int) -> bool:
+        """Change the process's lock on ``byte`` without waiting."""
+        try:
+            if operation != fcntl.LOCK_UN:
+                operation |= fcntl.LOCK_NB
+            fcntl.lockf(fd, operation, 1, LOCK_OFFSET + byte, os.SEEK_SET)
+            return True
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                return False
+            raise
+
+
+class WindowsLocks:
+    """Process-level locks on bytes of a file with ``msvcrt.locking``, which
+    has exclusive locks only (per handle, and mandatory: they also block
+    reads and writes of the locked bytes, so they lie past the data).
+
+    As SQLite does on Windows without LockFileEx: every lock is a range of
+    ``WIDTH`` bytes; a shared holder locks one byte of it (any free one), an
+    exclusive holder all of them.  So up to ``WIDTH`` processes can share a
+    lock, and an exclusive lock needs all the others gone.  Converting a
+    lock is not atomic: an upgrade just fails while we share, and a
+    downgrade may lose the lock to another process (callers check)."""
+
+    WIDTH = 64
+
+    def __init__(self, module: object = None) -> None:
+        self.msvcrt = module if module is not None else msvcrt
+        self.shared = {}  # (fd, byte) -> the offset of the byte we lock
+
+    def _locking(self, fd: int, mode: int, offset: int, size: int) -> bool:
+        os.lseek(fd, offset, os.SEEK_SET)  # (callers hold _LockFile._mutex)
+        try:
+            self.msvcrt.locking(fd, mode, size)
+            return True
+        except OSError:
             return False
-        raise
+
+    def lock(self, fd: int, byte: int, exclusive: bool) -> bool:
+        base = LOCK_OFFSET + byte * self.WIDTH
+        if exclusive:
+            return self._locking(fd, self.msvcrt.LK_NBLCK, base, self.WIDTH)
+        start = int.from_bytes(os.urandom(2), "big") % self.WIDTH
+        for i in range(self.WIDTH):
+            offset = base + (start + i) % self.WIDTH
+            if self._locking(fd, self.msvcrt.LK_NBLCK, offset, 1):
+                self.shared[fd, byte] = offset
+                return True
+        return False
+
+    def downgrade(self, fd: int, byte: int) -> bool:
+        self._locking(fd, self.msvcrt.LK_UNLCK, LOCK_OFFSET + byte * self.WIDTH, self.WIDTH)
+        return self.lock(fd, byte, False)
+
+    def unlock(self, fd: int, byte: int) -> None:
+        offset = self.shared.pop((fd, byte), None)
+        if offset is not None:
+            self._locking(fd, self.msvcrt.LK_UNLCK, offset, 1)
+        else:
+            self._locking(fd, self.msvcrt.LK_UNLCK, LOCK_OFFSET + byte * self.WIDTH, self.WIDTH)
+
+
+if fcntl is not None:
+    BACKEND = PosixLocks()
+elif msvcrt is not None:  # pragma: no cover
+    BACKEND = WindowsLocks()
+else:  # pragma: no cover - no locking at all
+    BACKEND = None
 
 
 class _LockFile:
@@ -66,9 +142,10 @@ class _LockFile:
     _open = {}  # (device, inode) -> _LockFile
     _mutex = threading.Lock()  # guards everything below, in every instance
 
-    def __init__(self, fd: int, key: tuple[int, int]) -> None:
+    def __init__(self, fd: int, key: tuple[int, int], backend: object = None) -> None:
         self.fd = fd
         self.key = key
+        self.backend = backend if backend is not None else BACKEND
         self.users = 0
         self.exclusive = {}  # byte -> owner
         self.shared = {}  # byte -> set of owners
@@ -83,7 +160,7 @@ class _LockFile:
                 lock_file = None
             if lock_file is None:
                 # Never opened (and so never closed) twice: see the module docstring.
-                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+                fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
                 st = os.fstat(fd)
                 lock_file = cls(fd, (st.st_dev, st.st_ino))
                 cls._open[lock_file.key] = lock_file
@@ -113,7 +190,11 @@ class _LockFile:
             os.write(self.fd, data)
 
     def try_lock(self, owner: object, byte: int, exclusive: bool) -> bool:
-        if fcntl is None:
+        """Take (or convert to) a shared or exclusive lock on ``byte``
+        without waiting; returns whether ``owner`` now holds it so.  A
+        failed downgrade leaves ``owner`` without the lock."""
+        backend = self.backend
+        if backend is None:
             return True
         with self._mutex:
             holder = self.exclusive.get(byte)
@@ -123,17 +204,18 @@ class _LockFile:
                     return True
                 if holder is not None or sharers - {owner}:
                     return False
-                if not _lockf(self.fd, byte, fcntl.LOCK_EX):
+                if not backend.lock(self.fd, byte, True):
                     return False
                 sharers.discard(owner)
                 self.exclusive[byte] = owner
                 return True
             if owner in sharers:
                 return True
-            if holder is owner:  # downgrade (atomic for record locks)
-                _lockf(self.fd, byte, fcntl.LOCK_SH)
+            if holder is owner:
                 del self.exclusive[byte]
-            elif holder is not None or (not sharers and not _lockf(self.fd, byte, fcntl.LOCK_SH)):
+                if not backend.downgrade(self.fd, byte):
+                    return False
+            elif holder is not None or (not sharers and not backend.lock(self.fd, byte, False)):
                 return False
             sharers.add(owner)
             return True
@@ -149,31 +231,31 @@ class _LockFile:
             delay = min(delay * 2, 0.02)
 
     def unlock(self, owner: object, byte: int) -> None:
-        if fcntl is None:
+        if self.backend is None:
             return
         with self._mutex:
             if self.exclusive.get(byte) is owner:
                 del self.exclusive[byte]
-                _lockf(self.fd, byte, fcntl.LOCK_UN)
+                self.backend.unlock(self.fd, byte)
                 return
             sharers = self.shared.get(byte, set())
             if owner in sharers:
                 sharers.discard(owner)
                 if not sharers:
-                    _lockf(self.fd, byte, fcntl.LOCK_UN)
+                    self.backend.unlock(self.fd, byte)
 
     def held_by_others(self, owner: object, byte: int) -> bool:
         """Whether a connection other than ``owner`` holds ``byte`` (which
         ``owner`` must not hold itself)."""
-        if fcntl is None:
+        if self.backend is None:
             return False
         with self._mutex:
             holder = self.exclusive.get(byte)
             if (holder is not None and holder is not owner) or self.shared.get(byte, set()) - {owner}:
                 return True
-            if not _lockf(self.fd, byte, fcntl.LOCK_EX):
+            if not self.backend.lock(self.fd, byte, True):
                 return True  # another process
-            _lockf(self.fd, byte, fcntl.LOCK_UN)
+            self.backend.unlock(self.fd, byte)
             return False
 
 
@@ -235,9 +317,13 @@ class FileLocks:
             return True
         return False
 
-    def downgrade_slot(self) -> None:
-        """Exclusive -> shared on our slot."""
-        self.file.try_lock(self, SLOT_BYTE + self.slot, False)
+    def downgrade_slot(self) -> bool:
+        """Exclusive -> shared on our slot.  Returns False if the slot was
+        lost meanwhile (only possible on Windows): we then hold none."""
+        if self.file.try_lock(self, SLOT_BYTE + self.slot, False):
+            return True
+        self.slot = None
+        return False
 
     def share_slot_zero(self) -> None:
         """Share slot 0 (waits while a checkpoint copies pages)."""
