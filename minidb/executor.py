@@ -2525,7 +2525,7 @@ class Executor:
             stored[table.rowid_column] = None  # kept in the key, not the record
         return encode_record(stored)
 
-    def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str = "ABORT", upserts: Sequence[PreparedUpsert] = (), rowid: SQLValue = None) -> tuple[str, Row] | None:
+    def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str = "ABORT", upserts: Sequence[PreparedUpsert] = (), rowid: SQLValue = None, defaults: DefaultRegisters | None = None) -> tuple[str, Row] | None:
         """Insert ``row`` under a conflict resolution (INSERT OR ...) and the
         statement's ON CONFLICT clauses.  Returns ("insert", row + [rowid]),
         ("update", row + [rowid]) when an upsert updated an existing row, or
@@ -2534,11 +2534,15 @@ class Executor:
         As in SQLite: NOT NULL is checked first, then the upsert targets in
         clause order, then the row id and the other UNIQUE indexes (newest
         first).  REPLACE deletes each conflicting row and goes on.  ``rowid``
-        is a row id given by name for a table without an INTEGER PRIMARY KEY."""
+        is a row id given by name for a table without an INTEGER PRIMARY KEY;
+        ``defaults``: the statement's columns filled with their defaults."""
         # The values before column affinities (see below); SQLite has already
         # made integers in REAL columns REALs (OP_RealAffinity).
         raw = [float(v) if a == values.REAL and type(v) is int else v for v, a in zip(row, table.affinities)]
         given, rowid = rowid, self.prepare_row(table, row)
+        if defaults is not None and defaults.converted:
+            for position in defaults.positions:
+                raw[position] = row[position]
         if given is not None:
             rowid = values.apply_affinity(given, values.INTEGER)
             if not isinstance(rowid, int):
@@ -2563,6 +2567,8 @@ class Executor:
                 other = rowid if rowid in tree else None
             else:
                 converted = True
+                if defaults is not None:
+                    defaults.converted = True
                 other = self.find_conflict(constraint, row, None)
             if other is None:
                 continue
@@ -2576,6 +2582,8 @@ class Executor:
                 continue
             message = self.rowid_conflict(table).args[0] if constraint == "rowid" else self.unique_error(table, constraint)
             raise self.constraint_error(message, conflict)
+        if defaults is not None:
+            defaults.converted = True  # (OP_MakeRecord converts in place too)
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
         return "insert", row + [rowid]
@@ -3297,10 +3305,11 @@ class PreparedInsert:
                 row[position] = default([])
             rows.append(row)
         changed = []  # rows inserted or updated by an upsert, with their row ids
+        defaults = DefaultRegisters([position for position, _ in self.defaults])
         try:
             for row in rows:
                 rowid = row.pop()
-                outcome = executor.insert_row(table, self.tree, row, self.conflict, self.upserts, rowid)
+                outcome = executor.insert_row(table, self.tree, row, self.conflict, self.upserts, rowid, defaults)
                 if outcome is not None:
                     kind, stored = outcome
                     if kind == "insert":
@@ -3310,6 +3319,18 @@ class PreparedInsert:
             exc.changes = len(changed)  # the rows that FAIL (or no statement journal) keeps
             raise
         return returning_result(self.returning, changed)
+
+
+class DefaultRegisters:
+    """SQLite computes a column's (constant) DEFAULT once per INSERT, into
+    the register the rows are built in, and applies the column affinities
+    to those registers in place - at the first index check, or when the
+    record is made.  So once a row got that far, the "excluded" row of a
+    later upsert shows the default converted (a SQLite quirk kept here)."""
+
+    def __init__(self, positions: list[int]) -> None:
+        self.positions = positions
+        self.converted = False
 
 
 class PreparedSingleTable:

@@ -676,3 +676,10 @@ SQLite 在没有 LockFileEx 时的方案：每把逻辑锁是 64 字节的区间
 按 `msvcrt.locking` 语义实现的假模块（按句柄、重叠即失败、解锁必须匹配）测试 Windows 后端的共享/排他/降级，并在
 这个后端上跑读者标记和并发测试。CI 增加了 `windows-latest` 任务，只跑不依赖参考 SQLite 版本的存储/并发/崩溃测试
 （Windows 上编译参考 SQLite 需要 C 工具链）——该任务尚未运行（未 push）。
+
+## D96 UPSERT 的 excluded 看到被前一行转换过的默认值
+SQLite 把列的（常量）DEFAULT 在每条 INSERT 里只计算一次，直接放进构造行的寄存器（`sqlite3ExprCodeRunJustOnce`）；
+而列亲和性是原地作用于这些寄存器的——第一次查索引时（OP_Affinity）或生成记录时（OP_MakeRecord）。所以一旦
+语句中某一行走到了这一步，之后各行 upsert 的 `excluded` 里的默认值就是转换过的（`VARCHAR DEFAULT -1.5` 变成
+文本 `'-1.5'`），而第一行冲突时看到的是原值。显式给出的值每行重新计算，不受影响。MiniDB 用 `DefaultRegisters`
+记录“是否已转换”照做（D83 的 raw excluded 之上）。文件模式 fuzz 种子 9791 发现。
