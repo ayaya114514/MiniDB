@@ -141,3 +141,45 @@ def test_vacuum_matches_sqlite():
         pair.run(sql)
     pair.close()
 
+
+def test_vacuum_renumbers_rowids_like_sqlite():
+    """SQLite's VACUUM keeps rowids only of tables with an INTEGER PRIMARY
+    KEY or an index; others are numbered 1, 2, 3... again."""
+    pair = Pair()
+    for sql in [
+        "CREATE TABLE plain (a)", "CREATE TABLE ipk (id INTEGER PRIMARY KEY, a)",
+        "CREATE TABLE indexed (a, b)", "CREATE INDEX indexed_b ON indexed (b)",
+        "CREATE TABLE uniq (a UNIQUE)", "CREATE TABLE intpk (id INT PRIMARY KEY, a)",
+    ]:
+        pair.run(sql)
+    for table in ("plain", "ipk", "indexed", "uniq", "intpk"):
+        columns = "(a)" if table in ("plain", "uniq") else "(id, a)" if table in ("ipk", "intpk") else "(a, b)"
+        values = ", ".join(f"({i})" if columns == "(a)" else f"({i * 3}, {i})" for i in range(1, 9))
+        pair.run(f"INSERT INTO {table} {columns} VALUES {values}")
+        pair.run(f"DELETE FROM {table} WHERE a % 3 = 0 OR rowid = 1")
+    pair.run("VACUUM")
+    for table in ("plain", "ipk", "indexed", "uniq", "intpk"):
+        pair.run(f"SELECT rowid, * FROM {table}")
+        pair.run(f"INSERT INTO {table} (a) VALUES (100)")
+        pair.run(f"SELECT rowid, * FROM {table}")
+    pair.close()
+
+
+def test_vacuum_into_keeps_rowids(tmp_path):
+    import sqlite3
+
+    for engine in ("minidb", "sqlite"):
+        db = Database() if engine == "minidb" else sqlite3.connect(":memory:", isolation_level=None)
+        db.execute("CREATE TABLE plain (a)")
+        db.execute("INSERT INTO plain VALUES (1), (2), (3)")
+        db.execute("DELETE FROM plain WHERE a = 2")
+        target = str(tmp_path / f"{engine}.db")
+        db.execute("VACUUM INTO ?", [target])
+        if engine == "minidb":
+            with Database(target) as copy:
+                assert copy.execute("SELECT rowid, a FROM plain") == [(1, 1), (3, 3)]
+        else:
+            copy = sqlite3.connect(target)
+            assert copy.execute("SELECT rowid, a FROM plain").fetchall() == [(1, 1), (3, 3)]
+            copy.close()
+        db.close()

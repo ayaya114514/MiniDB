@@ -612,7 +612,9 @@ RIGHT/FULL、合并列仍用原来的通用循环。
 自底向上装满，schema 表保留原来的键、只换根页号；然后把新 pager 的页对象按相同页号写回（`page_count`
 缩小、空闲链表清空），提交后立即尝试 checkpoint。checkpoint 在持有 EXCLUSIVE（没有读者）时把文件截断到
 `page_count` 页——有读者时不截断，以后的 checkpoint 再截断（D92 之后：拷贝到哪个提交就按那个提交的
-页数截断，不再需要 EXCLUSIVE）。rowid 保持不变（与现代 SQLite 相同）。
+页数截断，不再需要 EXCLUSIVE）。rowid：有 INTEGER PRIMARY KEY 或有任何索引的表保持不变，其余的表按 rowid 顺序重新编号为 1, 2, 3…
+（与 SQLite 相同：它的 VACUUM 走 xfer 优化，只在 rowid 可能被引用时保留；`VACUUM INTO` 一律保留）。
+最初写成“一律保持不变”，是 fuzz 在阶段 18 发现的（旧对照测试恰好只用了带 UNIQUE 的表）。
 `VACUUM INTO 'file'` 把同样的副本写进一个新文件（已存在且非空时报 "output file already exists"）。
 VACUUM 不能在事务中执行。崩溃安全沿用 WAL：提交前崩溃是旧库，提交后崩溃是新库，截断发生在 WAL 清空之前。
 
