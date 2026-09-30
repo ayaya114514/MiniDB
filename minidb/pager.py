@@ -648,8 +648,7 @@ class Pager:
         for i in range(1, READ_SLOTS + 1):
             if locks.try_slot(i, exclusive=True):
                 self._write_mark(i, committed)
-                locks.downgrade_slot()
-                if self._read_mark(i) == (generation, committed):
+                if locks.downgrade_slot() and self._read_mark(i) == (generation, committed):
                     return True
                 locks.release_slot()
                 break
