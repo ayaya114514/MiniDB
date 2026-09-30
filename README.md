@@ -16,7 +16,7 @@
   INTEGER / REAL / NUMERIC / TEXT / BLOB 亲和性；约束 `PRIMARY KEY`、`NOT NULL`、`UNIQUE`、
   `DEFAULT`。`INTEGER PRIMARY KEY` 是 rowid 的别名；其他表有隐藏的 `rowid`（也可写 `oid`、`_rowid_`）。
 - `ALTER TABLE ... RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN`（视图里的引用一并改写）；
-  `CREATE [TEMP] VIEW` / `DROP VIEW`；`REINDEX`。
+  `CREATE [TEMP] VIEW` / `DROP VIEW`；`REINDEX`；`VACUUM`（重写紧凑文件、收缩文件）与 `VACUUM INTO 'file'`。
 - `INSERT`（多行 `VALUES`、`DEFAULT VALUES`、`INSERT ... SELECT`、`(rowid, ...)` 列）、`UPDATE`、`DELETE`；
   冲突处理 `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`、`REPLACE`、UPSERT
   （`ON CONFLICT (...) DO UPDATE SET ... WHERE / DO NOTHING`，多个子句）、`RETURNING`。
@@ -45,7 +45,8 @@
 - 事务：`BEGIN [DEFERRED|IMMEDIATE|EXCLUSIVE]`、`COMMIT`/`END`、`ROLLBACK`；不在事务中时每条语句
   自动提交；每条语句都是原子的（多行 `INSERT` 中途违反约束，整条语句不生效）。
 - 并发（WAL 模式）：多个连接、多个进程可以同时打开同一个文件；读者按快照读，不阻塞写者，写者也
-  不等读者；同一时刻一个写者，拿不到写锁时忙等到超时报 `database is locked`。
+  不等读者；同一时刻一个写者，拿不到写锁时忙等到超时报 `database is locked`。读者标记让 checkpoint
+  在有读者时也能拷贝到最老快照为止，拷完后写者从头重用日志，持续有读者时日志也不会无限增长。
 - 可靠性：每页带 CRC32 校验和，WAL 帧带链式校验和；损坏报 `DatabaseError` 而不是返回错误数据；
   任何时刻崩溃，重开后都是某次提交之后的完整状态。大事务的脏页会溢出到日志，内存有界。
 - 优化器：`ANALYZE` 收集统计；按代价选择访问路径（rowid、索引、覆盖索引、`IN`/`OR` 多路索引）；
@@ -114,9 +115,9 @@ SQL 文本
   │  btree.py       B+ 树：按字节大小分裂/合并/借位，叶子兄弟链，范围扫描，overflow 页
   ▼
   │  pager.py       4 KB 页（带 CRC32）的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
-  │  locking.py     跨进程文件锁（flock）与忙等超时
+  │  locking.py     跨进程字节锁（fcntl，进程内共享一个文件描述符）与忙等超时
   ▼
-数据库文件 app.db + 预写日志 app.db-wal + 锁文件 app.db-lock
+数据库文件 app.db + 预写日志 app.db-wal + 读者标记与锁 app.db-shm
 ```
 
 - **dbapi.py** 是 PEP 249 接口；**database.py** 的 `Database.execute()` 负责参数绑定、语句缓存、语句原子性、自动提交和事务状态。
@@ -131,8 +132,10 @@ SQL 文本
 - **执行**：语句编译成闭包组成的计划并缓存复用；覆盖索引、索引顺序免排序、LIMIT 时 top-k。
 - **记录格式**：每列一个类型码的紧凑编码，按头部缓存 `struct` 解码器。
 - **索引 key**：索引列值的 SQLite 排序键元组 + rowid，保证唯一且顺序与 SQL 比较一致。
-- **WAL 模式**：提交向 `-wal` 追加页帧（最后一帧为提交帧）并 fsync；读者取“最后一个提交帧”为快照；
-  没有读者时 checkpoint 把日志拷回数据文件。大事务的脏页可提前作为未提交帧写入日志，回滚时截断。
+- **WAL 模式**：提交向 `-wal` 追加页帧（最后一帧为提交帧）并 fsync；读者取“最后一个提交帧”为快照，
+  并在 `-shm` 的读槽里登记（读者标记）；checkpoint 只把日志拷到最老的读者标记为止。日志全部拷完后，
+  写者开一个新 generation 从头覆盖日志；读者总是跨越提交时写者最多等 0.1 秒让旧读者结束。
+  大事务的脏页可提前作为未提交帧写入日志，回滚时截断。
 
 ## 测试
 
@@ -206,8 +209,10 @@ Python 源码编译执行，见 DECISIONS.md D90）。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、聚合查询里裸列取自哪一行、常量传播 / 常量折叠
   决定的出错时机），MiniDB 不保证选择相同。
-- 一直有读者时 checkpoint 做不成，日志会持续变长；Windows 上没有 `fcntl`，不加锁。
-- 数据库文件不会收缩（空闲页只复用）；目录里会保留（可能为空的）`-wal` 与 `-lock` 文件。
+- 一个始终不结束的读事务仍会让日志变长（写者等 0.1 秒后放弃，之后日志每增长 4000 帧才再等一次）。
+  Windows 上没有 `fcntl`，不加锁。
+- 删除空闲页不会自动收缩文件，需要 `VACUUM`；目录里会保留（可能为空的）`-wal` 与 `-shm` 文件。
+  连接不能跨 `fork()` 使用。
 - 与 sqlite3 对照时，Python 3.11 的 sqlite3 没有 `autocommit` 参数，两组事务行为对照测试在
   3.11 上跳过（MiniDB 自身行为不随 Python 版本变化）。
 - 优化器是启发式代价模型，不支持 LEFT JOIN 的重排；只有第一张表的升序 ORDER BY 能利用

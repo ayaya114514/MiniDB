@@ -634,6 +634,7 @@ def run_seed(seed, statements, path=None, verbose=False):
 
     generator = Generator(seed)
     pair = Pair(path, loose_numbers=True)
+    snapshots = SnapshotReader(pair.mini, path, seed) if path is not None else None
     history = []
     try:
         setup = [(generator.create_table(), None) for _ in range(2)]
@@ -643,14 +644,63 @@ def run_seed(seed, statements, path=None, verbose=False):
             if verbose:
                 print(history[-1])
             pair.run(sql, parameters=parameters)
+            if snapshots is not None:
+                snapshots.step(history)
+        if snapshots is not None:
+            snapshots.finish()
         problems = pair.mini.integrity_check()
         if problems:
             raise AssertionError(f"integrity check failed: {problems}")
     except AssertionError as exc:
         return f"seed {seed}, statement {len(history)}:\n{exc}\n--- history ---\n" + ";\n".join(history)
     finally:
+        if snapshots is not None:
+            snapshots.reader.close()
         pair.close()
     return None
+
+
+class SnapshotReader:
+    """A second connection to a database file that holds read snapshots
+    while the main connection keeps writing; the main connection checkpoints
+    often, so partial checkpoints and log restarts happen under the reader.
+    Its snapshot must never change."""
+
+    def __init__(self, main, path, seed):
+        from minidb.database import Database
+
+        self.main = main
+        main.pager.checkpoint_frames = 8
+        main.pager.restart_wait = 0  # the reader is in this thread: waiting cannot help
+        self.reader = Database(path)
+        self.rng = random.Random(seed * 7919 + 1)
+        self.expected = None  # the reader's snapshot, while it holds one
+
+    def dump(self, db, tables):
+        return {name: db.execute(f"SELECT * FROM {name} ORDER BY rowid") for name in tables}
+
+    def step(self, history):
+        rng, main, reader = self.rng, self.main, self.reader
+        if not main.in_transaction and rng.random() < 0.05:
+            main.pager.checkpoint()
+        if self.expected is None:
+            if not main.in_transaction and rng.random() < 0.05:
+                reader.execute("BEGIN")
+                tables = sorted(reader.catalog.tables)
+                self.expected = self.dump(reader, tables)
+                if self.expected != self.dump(main, tables):
+                    raise AssertionError("a new snapshot differs from the committed state")
+                history.append("-- reader: BEGIN")
+        elif rng.random() < 0.08:
+            self.finish()
+            history.append("-- reader: COMMIT")
+
+    def finish(self):
+        if self.expected is not None:
+            if self.dump(self.reader, sorted(self.expected)) != self.expected:
+                raise AssertionError("the reader's snapshot changed")
+            self.reader.execute("COMMIT")
+            self.expected = None
 
 
 def parse_range(text):
