@@ -435,7 +435,10 @@ class Pager:
         database has never been committed."""
         self.file.seek(0, io.SEEK_END)
         size = self.file.tell()
-        if size % PAGE_SIZE:
+        if size % PAGE_SIZE and not self.frames:
+            # (With frames in the log it may be a checkpoint's torn write past
+            # the end: those pages are in the log, and the next checkpoint
+            # writes them again and truncates the file.)
             raise DatabaseError("database file size is not a multiple of the page size")
         if size == 0 and self._wal_frame_for(0) is None:
             return None
