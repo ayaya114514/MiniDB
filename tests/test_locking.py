@@ -148,3 +148,53 @@ def test_concurrency_on_the_windows_backend(tmp_path, windows, name):
     import test_concurrency
 
     getattr(test_concurrency, name)(database_with_one_row(str(tmp_path / "db")))
+
+
+def test_windows_upgrade_of_our_own_shared_lock(tmp_path):
+    """SQLite's protocol upgrades SHARED to EXCLUSIVE.  msvcrt cannot convert
+    a lock, so (as SQLite's winLock) the upgrade drops our shared byte, locks
+    the whole range, and takes a shared byte again if that fails."""
+    fake = FakeMsvcrt()
+    path = str(tmp_path / "db")
+    a, b = process(path, fake), process(path, fake)
+    owner, other = object(), object()
+    assert a.try_lock(owner, 5, False)
+    assert a.try_lock(owner, 5, True)  # alone: the upgrade works
+    assert not b.try_lock(other, 5, False)
+    assert a.try_lock(owner, 5, False)  # downgrade
+    assert b.try_lock(other, 5, False)
+    assert not a.try_lock(owner, 5, True)  # b shares it: no upgrade ...
+    assert a.held_by_others(other, 5) and b.held_by_others(other, 5)  # ... and a still shares
+    b.unlock(other, 5)
+    assert a.try_lock(owner, 5, True)
+    a.unlock(owner, 5)
+    assert fake.locked == {}
+    for lock_file in (a, b):
+        os.close(lock_file.fd)
+
+
+@pytest.mark.parametrize("format", ["sqlite", None])
+def test_databases_on_the_windows_backend(tmp_path, monkeypatch, format):
+    """Both file formats work on WindowsLocks (the fake msvcrt): creating a
+    file, writers and readers in one process, reopening.  (The SQLite
+    protocol upgrades its shared lock: this failed on real Windows.)"""
+    from minidb.database import Database
+
+    fake = FakeMsvcrt()
+    monkeypatch.setattr(locking, "BACKEND", WindowsLocks(fake))
+    path = str(tmp_path / "db")
+    with Database(path, format=format) as db:
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t (v) VALUES ('a'), ('b')")
+        with Database(path) as reader:
+            reader.execute("BEGIN")
+            assert reader.execute("SELECT count(*) FROM t") == [(2,)]
+            if format is None:  # (WAL: a writer need not wait for readers)
+                db.execute("INSERT INTO t (v) VALUES ('c')")
+                assert reader.execute("SELECT count(*) FROM t") == [(2,)]  # its snapshot
+            reader.execute("COMMIT")
+        db.execute("INSERT INTO t (v) VALUES ('d')")
+    with Database(path) as db:
+        assert db.execute("SELECT v FROM t ORDER BY id")[-1] == ("d",)
+        assert db.integrity_check() == []
+    assert fake.locked == {}
