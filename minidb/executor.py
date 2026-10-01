@@ -118,7 +118,7 @@ class NeedsAggregate(Exception):
 class ScopeEntry:
     """One table (or derived table) of a FROM clause."""
 
-    __slots__ = ("name", "table", "offset", "hidden", "using")
+    __slots__ = ("name", "table", "offset", "hidden", "using", "hint")
 
     def __init__(self, name: str, table: Source, offset: int) -> None:
         self.name = name  # alias or table name, lower case
@@ -126,6 +126,16 @@ class ScopeEntry:
         self.offset = offset  # position of its first column in a row
         self.hidden = set()  # columns only reachable when qualified (see Executor.using_condition)
         self.using = set()  # the columns of its own USING / NATURAL join (left out of *)
+        self.hint = None  # NOT_INDEXED, or the IndexInfo of INDEXED BY
+
+    def indexes(self) -> list[IndexInfo]:
+        """The indexes the planner may use for this table."""
+        if self.hint is None:
+            return self.table.indexes
+        return [] if self.hint is NOT_INDEXED else [self.hint]
+
+
+NOT_INDEXED = object()  # ScopeEntry.hint of a table marked NOT INDEXED
 
 
 class Merge:
@@ -1757,7 +1767,7 @@ def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: lis
     lower, upper = _bounds(constraints, ROWID)
     if lower or upper:
         candidates.append(RowidRange(tree, lower, upper, rows))
-    for info in table.indexes:
+    for info in scope.entries[index].indexes():
         if not info.ordered:
             continue  # (DESC columns in a SQLite file: not in key order)
         equal = []
@@ -1846,7 +1856,7 @@ def covering_index_scan(scope: Scope, index: int, catalog: Catalog, scan: FullSc
     width = sum(size_estimate(c.type) for c in table.columns) + (table.rowid_column is None)
     table_size = log_estimate(4 * width)
     best = best_cost = None
-    for info in table.indexes:
+    for info in scope.entries[index].indexes():
         if not info.ordered:
             continue
         index_size = log_estimate(4 * (sum(size_estimate(table.columns[p].type) for p in info.positions) + 1))
@@ -1892,6 +1902,13 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
         else:
             candidates.append(MultiScan(parts, catalog.table_tree(table), "OR"))
     best = min(candidates, key=lambda a: a.estimate()[1] * (FULL_SCAN_PENALTY if type(a) is FullScan else 1))
+    hint = scope.entries[index].hint
+    if hint is not None and isinstance(best, FullScan):
+        # As SQLite: no automatic index, and INDEXED BY never scans the table
+        # itself but the whole index.
+        if hint is not NOT_INDEXED and hint.ordered:
+            return IndexScan(hint, catalog.index_tree(hint), best.tree, [], None, None, rows)
+        return best
     if isinstance(best, FullScan):
         lookup = hash_lookup(scope, index, catalog, conjuncts, compiler, bound, best)
         if lookup is not None:
@@ -1899,7 +1916,7 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
     if isinstance(best, FullScan) and order_hint is not None and order_hint != ROWID:
         # Nothing narrows the scan, but ORDER BY ... LIMIT wants this column
         # first: walk an index on it in order and stop early.
-        for info in table.indexes:
+        for info in scope.entries[index].indexes():
             if info.ordered and info.positions[0] == order_hint:
                 tree = catalog.table_tree(table)
                 return IndexScan(info, catalog.index_tree(info), tree, [], None, None, rows)
@@ -2153,6 +2170,10 @@ class Executor:
                 table = self.catalog.get_table(ref.name)
                 self.catalog.check_index_hint(table, ref.indexed_by)
                 scope.add(table, ref.alias)
+                if ref.not_indexed:
+                    scope.entries[-1].hint = NOT_INDEXED
+                elif ref.indexed_by is not None:
+                    scope.entries[-1].hint = self.catalog.indexes[ascii_lower(ref.indexed_by)]
             if join.natural or join.using is not None:
                 join = self.using_condition(scope, index, join)
             normalized.append(join)
@@ -3545,13 +3566,15 @@ class DefaultRegisters:
 class PreparedSingleTable:
     """The part of UPDATE / DELETE that finds the rows matching WHERE."""
 
-    def __init__(self, executor: Executor, table_name: str, where: Expr | None, indexed_by: str | None = None) -> None:
+    def __init__(self, executor: Executor, table_name: str, where: Expr | None, indexed_by: str | None = None,
+                 not_indexed: bool = False) -> None:
         self.executor = executor
         self.table = executor.catalog.table_to_modify(table_name)
         executor.catalog.check_index_hint(self.table, indexed_by)
         self.tree = executor.catalog.table_tree(self.table)
         self.scope = Scope()
-        joins, _ = executor.build_from([Join(TableRef(self.table.name))], self.scope)
+        ref = TableRef(self.table.name, indexed_by=indexed_by, not_indexed=not_indexed)
+        joins, _ = executor.build_from([Join(ref)], self.scope)
         self.levels, self.constants = executor.plan_joins(self.scope, joins, where)
         self.rowid_slot = self.scope.rowid_slot(0)
 
@@ -3565,7 +3588,7 @@ class PreparedSingleTable:
 
 class PreparedUpdate(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Update) -> None:
-        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by)
+        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
         table, width = self.table, len(self.table.columns)
         compiler = Compiler(self.scope, executor=executor)
         self.assignments = []
@@ -3610,7 +3633,7 @@ class PreparedUpdate(PreparedSingleTable):
 
 class PreparedDelete(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Delete) -> None:
-        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by)
+        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         self.delete_all = stmt.where is None and self.returning is None
 

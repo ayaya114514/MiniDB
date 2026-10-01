@@ -1231,3 +1231,28 @@ def test_full_scan_through_a_covering_index():
         assert mine.replace("USING INDEX", "USING COVERING INDEX") == expected.replace(
             "USING INDEX", "USING COVERING INDEX"), sql  # (SQLite names the table)
     pair.close()
+
+
+def test_index_hints_steer_the_planner():
+    """As SQLite: NOT INDEXED reads the table itself (row id lookups only),
+    INDEXED BY uses that index alone, scanning all of it when nothing
+    narrows the search; row orders show which was used."""
+    pair = Pair()
+    pair.run("CREATE TABLE t1 (x INTEGER, y TEXT, z)")
+    pair.run("CREATE INDEX t1_x ON t1 (x)")
+    pair.run("CREATE INDEX t1_yx ON t1 (y, x)")
+    pair.run("INSERT INTO t1 VALUES (5, 'b', 1), (1, 'a', 2), (3, NULL, 3), (NULL, 'c', 4), (1, 'z', 5), (2.5, 'q', 6)")
+    for sql in [
+        "SELECT group_concat(x) FROM t1 NOT INDEXED", "SELECT group_concat(DISTINCT x) FROM t1 NOT INDEXED",
+        "SELECT group_concat(x) FROM t1 INDEXED BY t1_yx", "SELECT group_concat(z) FROM t1 INDEXED BY t1_x",
+        "SELECT group_concat(z) FROM t1 INDEXED BY t1_x WHERE x > 1",
+        "SELECT group_concat(z) FROM t1 NOT INDEXED WHERE x = 1 OR x = 3",
+        "SELECT group_concat(z) FROM t1 INDEXED BY t1_yx WHERE x = 1 OR x = 3",
+        "SELECT a.z, b.z FROM t1 AS a, t1 AS b NOT INDEXED WHERE a.x = b.x",
+        "SELECT group_concat(rowid) FROM t1 NOT INDEXED WHERE rowid IN (3, 1)",
+    ]:
+        pair.run(sql, ordered=True)
+    pair.run("UPDATE t1 NOT INDEXED SET z = z + 1 WHERE x = 1")
+    pair.run("DELETE FROM t1 INDEXED BY t1_x WHERE x = 3")
+    pair.run("SELECT * FROM t1 ORDER BY rowid")
+    pair.close()
