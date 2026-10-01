@@ -336,7 +336,7 @@ class Catalog:
         if self.sqlite:
             from minidb.sqlite_btree import SqliteTable
 
-            return SqliteTable(self.pager, table.root, table.affinities)
+            return SqliteTable(self.pager, table.root, table.affinities, rows=True)
         return BTree(self.pager, table.root)
 
     def index_tree(self, index: IndexInfo) -> BTree:
@@ -590,7 +590,7 @@ class Catalog:
         if stat is None:
             return
         for _, value in self.table_tree(stat).scan():
-            row = decode_record(value)[0] + [None, None, None]
+            row = value + [None, None, None]  # (a SQLite table tree gives rows)
             table, index_name, text = self.tables.get(ascii_lower(str(row[0]))), row[1], row[2]
             numbers = []
             for word in str(text).split():
@@ -624,7 +624,7 @@ class Catalog:
         if tree is None:
             return
         for rowid, value in list(tree.scan()):
-            row = decode_record(value)[0] + [None, None]
+            row = value + [None, None]
             if ascii_lower(str(row[0])) == ascii_lower(table) and (
                     index is None or (row[1] is not None and ascii_lower(str(row[1])) == ascii_lower(index))):
                 tree.delete(rowid)
