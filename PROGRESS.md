@@ -263,3 +263,17 @@
 - 崩溃模型不模拟目录项丢失和 `-shm` 内容（重开时清零），扇区固定 512 字节。
 - fuzz 种子 9661（文件模式）：`sum(DISTINCT ...)` 的整数溢出取决于累加顺序，SQLite 用覆盖索引 `i12` 做全表扫描（按 c1 顺序），MiniDB 扫表（按 rowid），属于已记录的“依赖查询计划”一类，未修。
 - 每个 autocommit 读语句多约 3 µs 的锁开销（见上）。
+
+## 阶段 19：展示（进行中，2026-10-01，等待发布确认）
+本地完成：
+- **Playground**（D99，`playground/`、`tools/build_playground.py`）：Pyodide 314 在 module Web Worker 里运行内存中的 MiniDB；每条语句显示结果和 EXPLAIN 计划，右侧画出所选表/索引的 B+ 树（分层、父子连线、叶子兄弟链、填充率）；5 个示例（B+ 树与索引、窗口函数、递归 CTE 曼德博集合、UPSERT/RETURNING/连接、事务回滚）。本机浏览器实测：桌面 1440×900 与移动端 390×844 无横向溢出，console 无报错，⌘/Ctrl+Enter、出错停止、BLOB/NULL/Inf 显示正常；首个示例 7 条语句约 70–100 ms。`tests/test_playground.py` 在本机 Python 上跑 bridge 和全部示例。
+- 做示例时发现并修复：`BETWEEN` 不能走索引（D97，计划现在与 SQLite 一致）。
+- fuzzer 加入 TRUE/FALSE 后发现并修复（D98）：`... FROM t WHERE FALSE` 报 "no such column"（长期存在）；解析期 `X AND 0` 折叠；`IS [NOT] TRUE/FALSE` 真值测试；多行 VALUES 第二行起不经名字解析的怪癖。以及 fuzz 种子 20016（AND 折叠）。
+- **系列文章草稿**（`docs/articles/`，5 篇 + 索引），素材来自 DECISIONS.md 与 PROGRESS.md 的实测数字，怪癖篇的每个 SQL 例子都在参考 SQLite 和 MiniDB 上核对过。未发布。
+- `.github/workflows/pages.yml`：推送到 master 时构建并部署到 GitHub Pages。
+
+验证：测试 957 个全部通过；fuzz 300 种子 × 400 语句 0 失败。
+
+未完成（需要 push，等待确认）：部署到 `https://ayaya114514.github.io/MiniDB/`（需要先在仓库设置里把 Pages 来源设为 GitHub Actions）并做线上检查；挂到 blog 工具栏。本地领先 origin/master 51 个提交（阶段 16–19），CI（含新的 windows-latest 任务）都还没在这些提交上运行过。
+
+已知问题：VALUES 行里的聚合（`VALUES (count(*))`，SQLite 合法）MiniDB 报 misuse；Playground 依赖 jsDelivr 上的 Pyodide（首次加载约 10 MB）。
