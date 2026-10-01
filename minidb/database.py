@@ -11,6 +11,7 @@ from minidb.errors import DatabaseError, OperationalError, ProgrammingError
 from minidb.executor import Executor, Result
 from minidb.locking import LockTimeout
 from minidb.pager import Pager
+from minidb.record import decode_record
 from minidb.sqlite_format import MAGIC as SQLITE_MAGIC
 from minidb.sqlite_pager import SqlitePager
 from minidb.parser import (
@@ -280,6 +281,11 @@ class Database:
         problems = [f"page {pgno}: bad checksum" for pgno in self.pager.check_checksums()]
         if problems:
             return problems
+        if self.catalog.sqlite:
+            roots = [1] + [decode_record(value)[0][3] for _, value in self.catalog.schema.scan()]
+            problems = self.pager.check_pages([root for root in roots if isinstance(root, int) and root > 0])
+            if problems:
+                return problems
         catalog = self.catalog
         trees = [("schema", catalog.schema)]
         for table in catalog.tables.values():
