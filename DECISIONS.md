@@ -804,4 +804,4 @@ EXCLUSIVE，`msvcrt.locking` 连同一句柄的重叠字节都锁不上，新建
 - 降级是原子的：同一句柄可以在自己的排他锁上再加共享锁，之后第一次解锁去掉的是排他锁（LockFileEx 文档的语义）。
 测试用一个按 LockFileEx 语义实现的假内核（按句柄；排他锁不与任何锁重叠，包括同一句柄；共享锁可与共享锁和同一
 句柄的排他锁重叠；解锁必须匹配、先去掉排他锁），包括“sqlite3 持有整个 SHARED 区间的共享锁时 MiniDB 能读不能写”。
-真实 Windows 上的结果见 PROGRESS.md。
+真实 Windows 上（CI）359 个测试通过，见 PROGRESS.md。
