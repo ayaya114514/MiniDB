@@ -278,3 +278,19 @@
 **CI**（第一次在这些提交上运行）：Linux 3.11–3.14、fuzz、sqllogictest（5,939,852 / 5,939,879）全部通过；新的 `windows-latest` 任务在真实 Windows 上 320 个测试通过。第一次运行时 Windows 与 Linux 3.14 各有一个失败：`test_threads_reading_and_writing` 断言“日志最长 < 700 帧”，CI 的 2 核机器上读线程在 GIL 下比写者的等待更久，日志到了约 1100 帧——这是依赖线程调度的断言，改为检查“日志在读者持续读时确实重启过”（长度上界由多进程测试检查）后全部通过。
 
 已知问题：VALUES 行里的聚合（`VALUES (count(*))`，SQLite 合法）MiniDB 报 misuse；Playground 依赖 jsDelivr 上的 Pyodide（首次加载约 10 MB）。
+
+## 阶段 20：SQLite 文件格式兼容（进行中，2026-10-01 暂停）
+已完成并提交（849ab1b、a731210 等，详见 DECISIONS.md D100–D101）：`minidb/sqlite_format.py`（varint、record、文件头、B-tree 页、overflow、freelist）、`minidb/sqlite_btree.py`（表 B+ 树、索引 B 树、SQLite 式兄弟平衡、自底向上构建）、`minidb/sqlite_pager.py`（SQLite 格式的回滚日志 + unix VFS 锁、热日志回放）；按文件头自动识别格式，`connect(..., format="sqlite")` / `--sqlite` 新建；sqlite_schema、autoindex、ANALYZE 写 sqlite_stat1、VACUUM / VACUUM INTO；不支持的对象保留并只读；integrity_check 核对每一页。与 sqlite3 互读互写、崩溃点 × 恢复方、与 sqlite3 进程并发加锁的测试在 `tests/test_sqlite_format.py`。
+
+阶段末验证（暂停前已跑完）：
+- sqllogictest 全量：MiniDB 格式与 SQLite 格式都是 5,939,852 / 5,939,879，失败与阶段 17 相同。
+- fuzz：SQLite 格式文件 300 × 400 0 失败；变形测试文件模式 300 × 300 0 失败；SQLite 格式内存 600 × 500、MiniDB 格式 600 × 500 各 1 个失败种子，两个都与文件格式无关（两种格式都复现）：
+  - 种子 4108：含 NUL 的文本做算术。SQLite 的 sqlite3AtoF 停在 NUL、sqlite3Atoi64 读过 NUL，所以只有 NUL 之前整体是数字时才是 REAL（`'5\0'+0` 是 5.0，`'5 x\0'+0` 是 5）。已修（e7764bf）。
+  - 种子 5512：依赖查询计划的行顺序（外层聚合的裸列）。
+
+暂停时的状态：
+- 与本记录一起提交：`minidb/executor.py` 的覆盖索引全扫描（SQLite whereLoopAddBtree 的 "full scan via index"：有索引包含查询用到的全部列且 szIdxRow < szTabRow 时扫这个索引，按 sqlite3AffinityType 的 szEst 与 LogEst 选最便宜的、同价取最新的；`size_estimate` / `log_estimate` / `covering_index_scan`），加 `tests/test_compare_queries.py::test_full_scan_through_a_covering_index`（结果按顺序比、计划与 SQLite 一致）。全量测试通过。这修掉阶段 18 记录的种子 9661 这一类。还没跑 sqllogictest 和 benchmark 复核。
+- 与本记录一起提交：`tests/benchmark.py --sqlite-format`（MiniDB 用 SQLite 格式跑同一套 benchmark），两种格式的数字还没测。
+- 种子 5512 的真正原因还没修：SQLite 对 `c >= -3 OR c < 2` 用 MULTI-INDEX OR（全表扫描按 3N 计价，`rSize + 16`，压过两个单边范围），且 OR 按项依次输出、用 RowSet 去重；IN 按值排序后逐个走索引。MiniDB 的全表扫描按 N 计价，所以选了扫表；MultiScan 又按 rowid 排序输出。试过只在 `plan_access` 选路时给全表扫描乘 3：OR 计划与 SQLite 一致了，但 `test_optimizer` 两个断言（`a = 1 OR a > 48` 期望 SCAN，SQLite 实际用 MULTI-INDEX OR；8 行时期望 SCAN，SQLite 实际仍用 t_k）需要按 SQLite 的实际计划改写，MultiScan 的输出顺序和 `order()` 也要跟着改。这部分已撤回，未提交。
+
+剩余步骤：决定是否做 OR/IN 输出顺序（上一条）→ 两种格式的 benchmark → 复跑 sqllogictest 与 fuzz → 写阶段 20 完成记录、勾选 CLAUDE.md。

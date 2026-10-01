@@ -22,14 +22,15 @@ CITIES = ["beijing", "shanghai", "tokyo", "paris", "london", "berlin", "rome", "
 
 
 class Engine:
-    def __init__(self, name, path):
+    def __init__(self, name, path, format=None):
         self.name = name
         self.path = path
+        self.format = format
         self.open()
 
     def open(self):
         if self.name == "minidb":
-            self.db = Database(self.path)
+            self.db = Database(self.path, format=self.format)
             self.run = self.db.execute
         else:
             self.db = sqlite3.connect(self.path, isolation_level=None)
@@ -154,11 +155,13 @@ def benchmark(engine, n, results):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--rows", type=int, default=100_000)
+    parser.add_argument("--sqlite-format", action="store_true", help="MiniDB uses SQLite's file format")
     args = parser.parse_args()
     results = {}
     with tempfile.TemporaryDirectory() as directory:
         for name in ("minidb", "sqlite3"):
-            engine = Engine(name, os.path.join(directory, f"{name}.db"))
+            format = "sqlite" if args.sqlite_format and name == "minidb" else None
+            engine = Engine(name, os.path.join(directory, f"{name}.db"), format)
             benchmark(engine, args.rows, results)
     print(f"| operation ({args.rows:,} rows) | MiniDB | sqlite3 | ratio |")
     print("|---|---:|---:|---:|")
