@@ -146,6 +146,8 @@ class Generator:
             # Bind the same value through a parameter instead.
             if text.startswith("x'"):
                 self.parameters.append(bytes.fromhex(text[2:-1]))
+            elif text in ("TRUE", "FALSE"):
+                self.parameters.append(int(text == "TRUE"))
             else:
                 self.parameters.append(eval(text.replace("NULL", "None")))  # noqa: S307 - our own literals
             return "?"
@@ -156,6 +158,8 @@ class Generator:
         kind = rng.random()
         if kind < 0.12:
             return "NULL"
+        if kind < 0.14:
+            return rng.choice(["TRUE", "FALSE"])  # names that are 1 and 0 unless a column
         if kind < 0.55:
             return str(rng.choice([0, 1, 2, 3, 5, 7, 10, -1, -4, rng.randint(-20, 40)]))
         if kind < 0.61:

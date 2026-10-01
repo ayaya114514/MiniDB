@@ -29,7 +29,7 @@ def plan(db, sql):
         ("id > 5", "SEARCH USING ROWID (range)"),
         ("id <= 5", "SEARCH USING ROWID (range)"),
         ("10 < id AND id < 20", "SEARCH USING ROWID (range)"),
-        ("id BETWEEN 1 AND 3", "SCAN"),
+        ("id BETWEEN 1 AND 3", "SEARCH USING ROWID (range)"),  # x >= 1 AND x <= 3, as SQLite
         ("id = 5 OR id = 6", "MULTI-INDEX OR (SEARCH USING ROWID (=); SEARCH USING ROWID (=))"),
         ("id != 5", "SCAN"),
         ("n = 5", "SCAN"),
