@@ -25,6 +25,7 @@ import heapq
 import itertools
 import os
 import random
+import re
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
@@ -1752,6 +1753,75 @@ def hash_lookup(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
     return None
 
 
+def size_estimate(type_name: str) -> int:
+    """SQLite's estimate of a column's width (an integer is 1), from its
+    declared type, as sqlite3AffinityType computes Column.szEst."""
+    name = type_name.encode("utf-8", "surrogateescape").lower()  # (ASCII letters only)
+    h, affinity, size_from = 0, "NUMERIC", None
+    for i, byte in enumerate(name):
+        h = ((h << 8) + byte) & 0xFFFFFFFF
+        if h == 0x63686172:  # char
+            affinity, size_from = "TEXT", i + 1
+        elif h in (0x636C6F62, 0x74657874):  # clob, text
+            affinity = "TEXT"
+        elif h == 0x626C6F62 and affinity in ("NUMERIC", "REAL"):  # blob
+            affinity = "BLOB"
+            if name[i + 1:i + 2] == b"(":
+                size_from = i + 1
+        elif h in (0x7265616C, 0x666C6F61, 0x646F7562) and affinity == "NUMERIC":  # real, floa, doub
+            affinity = "REAL"
+        elif h & 0xFFFFFF == 0x696E74:  # int
+            affinity = "INTEGER"
+            break
+    v = 0
+    if affinity in ("TEXT", "BLOB"):
+        if size_from is None:
+            v = 16  # TEXT, CLOB, BLOB: about 20 bytes
+        else:  # VARCHAR(k), BLOB(k): k bytes
+            digits = re.match(rb"\D*(\d*)", name[size_from:]).group(1)
+            v = int(digits) if digits and int(digits) < 2**31 else 0
+    return min(255, v // 4 + 1)
+
+
+def log_estimate(x: int) -> int:
+    """sqlite3LogEst: about 10 * log2(x)."""
+    if x < 2:
+        return 0
+    y = 40
+    if x < 8:
+        while x < 8:
+            y -= 10
+            x <<= 1
+    else:
+        shift = x.bit_length() - 4
+        y += shift * 10
+        x >>= shift
+    return (0, 2, 3, 5, 6, 7, 8, 9)[x & 7] + y - 10
+
+
+def covering_index_scan(scope: Scope, index: int, catalog: Catalog, scan: FullScan) -> IndexScan | None:
+    """Like SQLite, read the whole table through an index holding every
+    column the query uses when its rows are narrower than the table's
+    (whereLoopAddBtree's "full scan via index"): the rows then come in index
+    order.  The cheapest index wins, the newest of equals."""
+    table = scope.entries[index].table
+    width = sum(size_estimate(c.type) for c in table.columns) + (table.rowid_column is None)
+    table_size = log_estimate(4 * width)
+    best = best_cost = None
+    for info in table.indexes:
+        if not info.ordered:
+            continue
+        index_size = log_estimate(4 * (sum(size_estimate(table.columns[p].type) for p in info.positions) + 1))
+        cost = 15 * index_size // table_size
+        if index_size >= table_size or (best is not None and cost >= best_cost):
+            continue
+        candidate = IndexScan(info, catalog.index_tree(info), scan.tree, [], None, None, scan.rows)
+        candidate.cover_if_possible(scope, index)
+        if candidate.covering:
+            best, best_cost = candidate, cost
+    return best
+
+
 def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, order_hint: int | None = None, bound: set[int] | frozenset[int] | None = None) -> AccessPath:
     """Choose the cheapest way to read table ``index`` of ``scope``.
 
@@ -2203,6 +2273,8 @@ class Executor:
                                  bound=set(order[:level]))
             if covering and isinstance(access, IndexScan):
                 access.cover_if_possible(scope, index)
+            elif covering and type(access) is FullScan:
+                access = covering_index_scan(scope, index, self.catalog, access) or access
             levels.append(JoinLevel(entry.table, entry.offset, access,
                                     join.kind in ("LEFT", "FULL"), match, filters))
             if join.kind in ("RIGHT", "FULL"):

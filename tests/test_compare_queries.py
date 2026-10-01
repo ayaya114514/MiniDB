@@ -1195,3 +1195,32 @@ def test_values_rows_coded_without_resolving_names(sql):
         pair.run("INSERT INTO t " + sql)
         pair.run("SELECT * FROM t")
     pair.close()
+
+
+def test_full_scan_through_a_covering_index():
+    """Like SQLite, a full scan reads a narrower index holding every column the
+    query uses, so rows come in that index's order (seen by bare columns of
+    aggregates, group_concat and LIMIT without ORDER BY)."""
+    pair = Pair()
+    pair.run("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b VARCHAR(30), c FLOAT, d)")
+    pair.run("CREATE TABLE u (x INT UNIQUE, y VARCHAR(5))")
+    pair.run("CREATE INDEX t_c ON t (c)")
+    pair.run("CREATE INDEX t_ba ON t (b, a)")
+    pair.run("CREATE INDEX t_d ON t (d)")
+    pair.run("INSERT INTO t VALUES (1, 'q', 'z', 3.5, 2), (2, 'b', 'a', -1, 9), (3, NULL, 'm', 0, NULL), "
+             "(4, 'a', NULL, NULL, -4), (5, 'z', 'a', 7, 1)")
+    pair.run("INSERT INTO u VALUES (3, 'a'), (NULL, 'b'), (-1, 'c')")
+    for sql in [
+        "SELECT c FROM t", "SELECT id, c FROM t", "SELECT a, b FROM t", "SELECT group_concat(a) FROM t",
+        "SELECT sum(c), c FROM t", "SELECT d FROM t LIMIT 2", "SELECT rowid, d FROM t WHERE d > 0",
+        "SELECT x FROM u", "SELECT x, y FROM u", "SELECT * FROM t",
+        "SELECT (SELECT sum(t.c) FROM u WHERE t.c < u.x) FROM t",
+        "SELECT t.c, u.x FROM t CROSS JOIN u",
+    ]:
+        pair.run(sql, ordered=True)
+        theirs = next(r[-1] for r in pair.lite.execute("EXPLAIN QUERY PLAN " + sql) if r[-1].startswith(("SCAN", "SEARCH")))
+        mine = next(r[-1] for r in pair.mini.execute("EXPLAIN QUERY PLAN " + sql) if r[-1].startswith(("SCAN", "SEARCH")))
+        words = theirs.split(" ")
+        expected = " ".join(words[:1] + words[2:]).replace("sqlite_autoindex", "minidb_autoindex")
+        assert mine == expected, sql  # (SQLite names the table)
+    pair.close()
