@@ -269,8 +269,9 @@ class SelectItem:
 class TableRef:
     name: str
     alias: str | None = None
-    indexed_by: str | None = None  # INDEXED BY <index>: must exist; only checked
+    indexed_by: str | None = None  # INDEXED BY <index>: the only index the planner may use
     pos: int = field(default=-1, compare=False)  # of the name in the SQL text
+    not_indexed: bool = False  # NOT INDEXED: the planner uses no index
 
 
 @dataclass
@@ -382,6 +383,7 @@ class Update:
     returning: list | None = None
     indexed_by: str | None = None
     ctes: list | None = None
+    not_indexed: bool = False
 
 
 @dataclass
@@ -391,6 +393,7 @@ class Delete:
     returning: list | None = None
     indexed_by: str | None = None
     ctes: list | None = None
+    not_indexed: bool = False
 
 
 @dataclass
@@ -1194,32 +1197,34 @@ class Parser:
             alias = self.identifier("alias")
         elif self.tok.kind == "IDENT" and not self.at_word("INDEXED", "RIGHT", "FULL", "WINDOW"):
             alias = self.advance().value  # (RIGHT / FULL start a join, as LEFT does; WINDOW a clause)
-        return TableRef(name, alias, self.index_hint(), pos)
+        indexed_by, not_indexed = self.index_hint()
+        return TableRef(name, alias, indexed_by, pos, not_indexed)
 
-    def index_hint(self) -> str | None:
-        """``INDEXED BY <index>`` (returned) or ``NOT INDEXED`` (None).  They
-        are checked but do not steer the planner."""
+    def index_hint(self) -> tuple[str | None, bool]:
+        """(index name, False) for ``INDEXED BY <index>``, (None, True) for
+        ``NOT INDEXED``, (None, False) without either."""
         if self.at_word("INDEXED"):
             self.advance()
             self.expect_keyword("BY")
-            return self.identifier("index name")
+            return self.identifier("index name"), False
         if self.at_keyword("NOT") and self.tokens[self.i + 1].kind == "IDENT" \
                 and ascii_upper(self.tokens[self.i + 1].text) == "INDEXED":
             self.advance()
             self.advance()
-        return None
+            return None, True
+        return None, False
 
     def update(self) -> Update:
         self.expect_keyword("UPDATE")
         conflict = self.conflict_clause()
         table = self.identifier("table name")
-        indexed_by = self.index_hint()
+        indexed_by, not_indexed = self.index_hint()
         self.expect_keyword("SET")
         assignments = [self.assignment()]
         while self.accept_op(","):
             assignments.append(self.assignment())
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Update(table, assignments, where, conflict, self.returning(), indexed_by)
+        return Update(table, assignments, where, conflict, self.returning(), indexed_by, not_indexed=not_indexed)
 
     def assignment(self) -> tuple[str, Expr]:
         name = self.identifier("column name")
@@ -1230,9 +1235,9 @@ class Parser:
         self.expect_keyword("DELETE")
         self.expect_keyword("FROM")
         table = self.identifier("table name")
-        indexed_by = self.index_hint()
+        indexed_by, not_indexed = self.index_hint()
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Delete(table, where, self.returning(), indexed_by)
+        return Delete(table, where, self.returning(), indexed_by, not_indexed=not_indexed)
 
     # ---- expressions --------------------------------------------------
 
