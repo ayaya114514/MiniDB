@@ -472,3 +472,112 @@ def test_many_processes_on_a_sqlite_file(tmp_path):
         assert db.execute("SELECT sum(balance) FROM account") == [(5000,)]
         assert db.integrity_check() == []
     assert integrity(path) == [("ok",)]
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_btrees_against_a_model(seed):
+    """SQLite-format table and index trees under random inserts, replacements
+    and deletes (small and overflowing payloads, ascending and DESC index
+    columns): contents match a dict, structure checks pass, every page is
+    accounted for."""
+    from minidb import values
+    from minidb.btree import DuplicateKeyError
+    from minidb.sqlite_btree import IndexTree, SqliteIndex, SqliteTable, TableTree
+    from minidb.sqlite_pager import SqlitePager
+
+    rng = random.Random(seed)
+    pager = SqlitePager(None)
+    pager.begin_read()
+    pager.begin_write()
+    table = SqliteTable(pager, TableTree.create(pager), rows=True)
+    descending = [rng.random() < 0.5, False]
+    index = SqliteIndex(pager, IndexTree.create(pager), descending)
+    rows, keys = {}, set()
+
+    def key(value, rowid):
+        return (values.sort_key(value), values.sort_key(rowid))
+
+    def payload():
+        return rng.choice([rng.randrange(-5, 5), "t" * rng.choice([1, 30, 3000, 9000]), b"\x01" * rng.choice([2, 5000])])
+
+    def check():
+        assert dict((rowid, row) for rowid, row in table.scan()) == rows
+        assert table.check() == len(rows) == len(table)
+        assert table.last_key() == (max(rows) if rows else None)
+        assert [k for k, _ in index.scan()] == sorted(keys)
+        assert index.check() == len(keys) == len(index)
+        assert pager.check_pages([1, table.root, index.root]) == []
+
+    for step in range(1500):
+        rowid = rng.randrange(400) if rng.random() < 0.7 else rng.randrange(-50, 10**6)
+        action = rng.random()
+        if action < 0.55:
+            row = [payload(), rng.randrange(30)]
+            if rowid in rows:
+                with pytest.raises(DuplicateKeyError):
+                    table.insert(rowid, row)
+                table.insert(rowid, row, replace=True)
+                keys.discard(key(rows[rowid][1], rowid))
+                index.delete(key(rows[rowid][1], rowid))
+            else:
+                table.insert(rowid, row)
+            rows[rowid] = row
+            keys.add(key(row[1], rowid))
+            index.insert(key(row[1], rowid))
+            with pytest.raises(DuplicateKeyError):
+                index.insert(key(row[1], rowid))
+            index.insert(key(row[1], rowid), replace=True)
+        else:
+            assert table.delete(rowid) == (rowid in rows)
+            if rowid in rows:
+                old = key(rows.pop(rowid)[1], rowid)
+                keys.remove(old)
+                assert index.delete(old)
+            assert not index.delete(key(-1, rowid))
+        if step % 300 == 299:
+            check()
+            low, high = key(rng.randrange(30), 0), key(rng.randrange(30), 10**6)
+            expected = [k for k in sorted(keys) if low <= k <= high]
+            assert [k for k, _ in index.scan(low, high)] == expected
+            assert [k for k, _ in index.scan(low, high, False, False)] == [k for k in expected if low < k < high]
+            assert [r for r, _ in table.scan(100, 200, False)] == sorted(r for r in rows if 100 < r <= 200)
+    check()
+    assert table.depth() > 1 and index.tree.depth() > 1
+    copy = SqliteTable(pager, TableTree.create(pager), rows=True)
+    copy.bulk_load(sorted(rows.items()))  # bottom-up build
+    assert dict(copy.scan()) == rows and copy.check() == len(rows)
+    for tree in (table, index, copy):
+        tree.clear()
+        assert len(tree) == 0 and tree.check() == 0
+    table.destroy()
+    index.destroy()
+    copy.destroy()
+    assert pager.check_pages([1]) == []
+    pager.rollback()
+
+
+def test_deep_index_deletes():
+    """Long keys make a three-level index B-tree, so deleting an interior
+    entry takes its predecessor from a leaf two levels down."""
+    from minidb import values
+    from minidb.sqlite_btree import IndexTree, SqliteIndex
+    from minidb.sqlite_pager import SqlitePager
+
+    rng = random.Random(5)
+    pager = SqlitePager(None)
+    pager.begin_read()
+    pager.begin_write()
+    index = SqliteIndex(pager, IndexTree.create(pager), None)
+    keys = [(values.sort_key(f"{i:05}" + "k" * 400), values.sort_key(i)) for i in range(600)]
+    for key in rng.sample(keys, len(keys)):
+        index.insert(key)
+    assert index.tree.depth() >= 3 and index.check() == 600
+    assert index.last_key() == max(keys)
+    rng.shuffle(keys)
+    for n, key in enumerate(keys, 1):
+        assert index.delete(key)
+        if n % 50 == 0:
+            assert [k for k, _ in index.scan()] == sorted(keys[n:]) and index.check() == len(keys) - n
+            assert pager.check_pages([1, index.root]) == []
+    assert index.last_key() is None
+    pager.rollback()
