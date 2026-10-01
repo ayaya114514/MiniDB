@@ -675,7 +675,8 @@ SQLite 在没有 LockFileEx 时的方案：每把逻辑锁是 64 字节的区间
 锁层拆成 `PosixLocks` / `WindowsLocks` 两个后端。本机（macOS）无法运行 Windows：`tests/test_locking.py` 用一个
 按 `msvcrt.locking` 语义实现的假模块（按句柄、重叠即失败、解锁必须匹配）测试 Windows 后端的共享/排他/降级，并在
 这个后端上跑读者标记和并发测试。CI 增加了 `windows-latest` 任务，只跑不依赖参考 SQLite 版本的存储/并发/崩溃测试
-（Windows 上编译参考 SQLite 需要 C 工具链）——该任务尚未运行（未 push）。
+（Windows 上编译参考 SQLite 需要 C 工具链）。2026-10-01 第一次推送后在真实 Windows 上运行：320 个测试通过
+（第一次运行唯一的失败是一个依赖线程调度的断言，Linux 3.14 上同样失败，已改为检查“日志确实重启过”）。
 
 ## D96 UPSERT 的 excluded 看到被前一行转换过的默认值
 SQLite 把列的（常量）DEFAULT 在每条 INSERT 里只计算一次，直接放进构造行的寄存器（`sqlite3ExprCodeRunJustOnce`）；

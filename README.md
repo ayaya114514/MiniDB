@@ -167,7 +167,7 @@ eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启
 
 GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
 固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）；另外跑变形测试和
-sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest` 上跑存储、并发与崩溃测试（尚未运行过）。
+sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest` 上跑存储、并发与崩溃测试（Python 3.13，不跑与参考 SQLite 的版本对照）。
 
 - **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
   且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
@@ -227,8 +227,8 @@ Python 源码编译执行，见 DECISIONS.md D90）。
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、聚合查询里裸列取自哪一行、常量传播 / 常量折叠
   决定的出错时机），MiniDB 不保证选择相同。
 - 一个始终不结束的读事务仍会让日志变长（写者等 0.1 秒后放弃，之后日志每增长 4000 帧才再等一次）。
-- Windows 上用 `msvcrt.locking` 加锁（最多 64 个进程同时共享一把锁），只在模拟的 `msvcrt` 上测试过；
-  CI 的 `windows-latest` 任务已写好但尚未运行。
+- Windows 上用 `msvcrt.locking` 加锁（最多 64 个进程同时共享一把锁）。CI 在 `windows-latest` 上只跑存储、
+  并发与崩溃这部分测试，其余（与参考 SQLite 的对照）只在 Linux 和 macOS 上跑。
 - 删除空闲页不会自动收缩文件，需要 `VACUUM`；目录里会保留（可能为空的）`-wal` 与 `-shm` 文件。
   连接不能跨 `fork()` 使用。
 - 与 sqlite3 对照时，Python 3.11 的 sqlite3 没有 `autocommit` 参数，两组事务行为对照测试在
