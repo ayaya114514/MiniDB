@@ -697,28 +697,36 @@ class _Descending:
 
 class SqliteTable:
     """A table tree with the interface of ``minidb.btree.BTree``: row id ->
-    MiniDB record.  ``real`` lists the REAL columns (SQLite stores whole
-    REAL values as integers; they read back as REAL)."""
+    MiniDB record, or with ``rows`` the decoded row itself (a new list each
+    time; Executor.load_row takes either), which saves re-encoding every row
+    read.  Values to store may be either too.  ``real`` lists the REAL
+    columns (SQLite stores whole REAL values as integers; they read back as
+    REAL)."""
 
     def __init__(self, pager: Any, root: int, affinities: list[str] | None = None,
-                 on_change: Callable[[], None] | None = None) -> None:
+                 on_change: Callable[[], None] | None = None, rows: bool = False) -> None:
         self.tree = TableTree(pager, root)
         self.root = root
         self.real = [i for i, a in enumerate(affinities or []) if a == values.REAL]
         self.on_change = on_change
+        self.rows = rows
 
-    def _record(self, cell: Cell) -> bytes:
+    def _record(self, cell: Cell) -> bytes | list:
         row = decode_record(self.tree.payload(cell))
         for i in self.real:
             if i < len(row) and type(row[i]) is int:
                 row[i] = float(row[i])
-        return minidb_record.encode_record(row)
+        return row if self.rows else minidb_record.encode_record(row)
+
+    @staticmethod
+    def _payload(value: bytes | list) -> bytes:
+        return encode_record(value if type(value) is list else minidb_record.decode_record(value)[0])
 
     def _changed(self) -> None:
         if self.on_change is not None:
             self.on_change()
 
-    def get(self, key: int, default: bytes | None = None) -> bytes | None:
+    def get(self, key: int, default: bytes | None = None) -> bytes | list | None:
         _, leaf, i = self.tree._find(key)
         if i < len(leaf.cells) and leaf.cells[i].rowid == key:
             return self._record(leaf.cells[i])
@@ -730,14 +738,14 @@ class SqliteTable:
 
     def insert(self, key: int, value: bytes, replace: bool = False) -> None:
         self._changed()
-        self.tree.insert(key, encode_record(minidb_record.decode_record(value)[0]), replace)
+        self.tree.insert(key, self._payload(value), replace)
 
     def delete(self, key: int) -> bool:
         self._changed()
         return self.tree.delete(key)
 
     def scan(self, start: int | None = None, end: int | None = None, start_inclusive: bool = True,
-             end_inclusive: bool = True) -> Iterator[tuple[int, bytes]]:
+             end_inclusive: bool = True) -> Iterator[tuple[int, bytes | list]]:
         for rowid, cell in self.tree.scan(start, end, start_inclusive, end_inclusive):
             yield rowid, self._record(cell)
 
@@ -753,7 +761,7 @@ class SqliteTable:
     def bulk_load(self, items: Iterable[tuple[int, bytes]]) -> None:
         """Fill the (empty) tree with items in row id order."""
         self._changed()
-        rows = ((key, encode_record(minidb_record.decode_record(value)[0])) for key, value in items)
+        rows = ((key, self._payload(value)) for key, value in items)
         self.tree.clear()
         self.tree.adopt(TableTree.build(self.tree.pager, rows))
 

@@ -135,37 +135,56 @@ def encode_record(values: list[SQLValue]) -> bytes:
 
 
 def decode_record(data: bytes) -> list[SQLValue]:
+    """The values of a record.  As in minidb.record, each distinct header is
+    compiled once into a ``struct.Struct`` and an assembly function."""
     try:
-        header_size, pos = get_varint(data, 0)
-        body = header_size
-        values = []
-        while pos < header_size:
-            serial, pos = get_varint(data, pos)
-            if serial == 0:
-                values.append(None)
-            elif serial <= 6:
-                size = _INT_SIZES[serial]
-                values.append(int.from_bytes(data[body:body + size], "big", signed=True))
-                body += size
-            elif serial == 7:
-                values.append(_double.unpack_from(data, body)[0])
-                body += 8
-            elif serial == 8 or serial == 9:
-                values.append(serial - 8)
-            elif serial >= 12:
-                size = (serial - 12) >> 1
-                chunk = data[body:body + size]
-                if len(chunk) != size:
-                    raise corrupt("record too short")
-                values.append(chunk.decode("utf-8", "surrogateescape") if serial & 1 else bytes(chunk))
-                body += size
-            else:
-                raise corrupt(f"bad serial type {serial}")
-        if body > len(data):
-            raise corrupt("record too short")
-        return values
+        header_size = data[0]
+        if header_size >= 0x80:
+            header_size = get_varint(data, 0)[0]
+        header = bytes(data[:header_size])
+        decoder = _decoders.get(header)
+        if decoder is None:
+            decoder = _compile(header)
+            if len(_decoders) < _CACHE_LIMIT:
+                _decoders[header] = decoder
+        layout, assemble = decoder
+        return assemble(layout.unpack_from(data, header_size))
     except (IndexError, struct.error):
         raise corrupt("bad record") from None
+
+
+_decoders: dict = {}
+_CACHE_LIMIT = 20_000
+_FIXED = {1: "b", 2: "h", 4: "i", 6: "q", 7: "d"}
+
+
+def _compile(header: bytes) -> tuple[struct.Struct, object]:
+    pos = get_varint(header, 0)[1]
+    fmt, parts, field = [">"], [], 0
+    while pos < len(header):
+        serial, pos = get_varint(header, pos)
+        if serial == 0:
+            parts.append("None")
+            continue
+        if serial in (8, 9):
+            parts.append(str(serial - 8))
+            continue
+        if serial in _FIXED:
+            fmt.append(_FIXED[serial])
+            parts.append(f"f[{field}]")
+        elif serial in (3, 5):  # 24- and 48-bit integers
+            fmt.append(f"{_INT_SIZES[serial]}s")
+            parts.append(f"int.from_bytes(f[{field}], 'big', signed=True)")
+        elif serial >= 12:
+            fmt.append(f"{(serial - 12) >> 1}s")
+            parts.append(f"f[{field}].decode('utf-8', 'surrogateescape')" if serial & 1 else f"f[{field}]")
+        else:
+            raise corrupt(f"bad serial type {serial}")
+        field += 1
+    if pos != len(header):
+        raise corrupt("bad record header")
+    assemble = eval(f"lambda f: [{', '.join(parts)}]")  # noqa: S307 - built from serial types only
+    return struct.Struct("".join(fmt)), assemble
 
 
 # ---- the database header ------------------------------------------------------------
@@ -257,9 +276,13 @@ class Cell:
 
     ``local`` is the part of the payload stored in the page and
     ``overflow`` the first overflow page (0 if none); ``size`` is the total
-    payload size.  ``key`` caches the decoded key of an index cell."""
+    payload size.  ``key`` caches the decoded key of an index cell.
 
-    __slots__ = ("child", "rowid", "local", "size", "overflow", "key")
+    A cell on a page is never changed (the B-tree code copies one before
+    setting its child), so page copies share cells, and a cell caches its
+    size on a page of the last kind asked for."""
+
+    __slots__ = ("child", "rowid", "local", "size", "overflow", "key", "sized_for", "bytes")
 
     def __init__(self, child: int = 0, rowid: int = 0, local: bytes = b"", size: int = 0, overflow: int = 0) -> None:
         self.child = child
@@ -268,6 +291,7 @@ class Cell:
         self.size = size
         self.overflow = overflow
         self.key = None
+        self.sized_for = None
 
     def copy(self) -> Cell:
         cell = Cell(self.child, self.rowid, self.local, self.size, self.overflow)
@@ -276,12 +300,18 @@ class Cell:
 
     def byte_size(self, kind: int) -> int:
         """Bytes of this cell on a page of ``kind``, plus its 2-byte pointer."""
+        if self.sized_for == kind:
+            return self.bytes
         if kind == TABLE_INTERIOR:
-            return 6 + varint_size(self.rowid)
-        size = varint_size(self.size) + len(self.local) + (4 if self.overflow else 0) + 2
-        if kind == TABLE_LEAF:
-            return size + varint_size(self.rowid)
-        return size + (4 if kind == INDEX_INTERIOR else 0)
+            size = 6 + varint_size(self.rowid)
+        else:
+            size = varint_size(self.size) + len(self.local) + (4 if self.overflow else 0) + 2
+            if kind == TABLE_LEAF:
+                size += varint_size(self.rowid)
+            elif kind == INDEX_INTERIOR:
+                size += 4
+        self.sized_for, self.bytes = kind, size
+        return size
 
     def to_bytes(self, kind: int) -> bytes:
         if kind == TABLE_INTERIOR:
@@ -349,7 +379,10 @@ class BtreePage:
 
     def used(self) -> int:
         kind = self.kind
-        return sum(cell.byte_size(kind) for cell in self.cells)
+        total = 0
+        for cell in self.cells:
+            total += cell.bytes if cell.sized_for == kind else cell.byte_size(kind)
+        return total
 
     @classmethod
     def from_bytes(cls, pgno: int, data: bytes) -> BtreePage:
@@ -392,7 +425,7 @@ class BtreePage:
         return bytes(page)
 
     def copy(self) -> BtreePage:
-        return BtreePage(self.pgno, self.kind, [cell.copy() for cell in self.cells], self.right)
+        return BtreePage(self.pgno, self.kind, list(self.cells), self.right)  # (cells are not changed)
 
 
 class OverflowPage:
