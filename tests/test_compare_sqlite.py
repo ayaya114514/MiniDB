@@ -380,6 +380,9 @@ def test_blobs_and_text_with_nul(pair):
         f"length({text} || 'z')", f"total({text})", "avg(x'3500')", "CAST(x'ff' AS TEXT)",
         "CAST(CAST(x'ff80' AS TEXT) AS BLOB)", "length(CAST(x'ff80c3' AS TEXT))",
         "x'0102' < x'010203'", "x'' < 'a'", "'zzz' < x''", "max(x'01', 'a', 2)",
+        # a REAL only when the text before the NUL is a whole number
+        "x'35207800' + 0", "x'3520353900' / 2", "x'352000' + 0", "x'356500' / 2", "x'3500' / 2",
+        "x'20352000' / 2", "x'353500203500' / 2", "sum(x'35207800')", "CAST(x'35207800' AS NUMERIC)",
     ]:
         pair.run(f"SELECT {expr}")
     pair.run("CREATE TABLE t (b BLOB, s TEXT, n NUMERIC)")
