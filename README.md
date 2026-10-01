@@ -136,7 +136,7 @@ SQL 文本
   │  btree.py       B+ 树：按字节大小分裂/合并/借位，叶子兄弟链，范围扫描，overflow 页
   ▼
   │  pager.py       4 KB 页（带 CRC32）的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
-  │  locking.py     跨进程字节锁（fcntl / msvcrt，进程内共享一个文件描述符）与忙等超时
+  │  locking.py     跨进程字节锁（fcntl / LockFileEx，进程内共享一个文件描述符）与忙等超时
   │  sqlite_*.py    SQLite 文件格式：字节布局、B 树、rollback journal 与 SQLite 的锁
   ▼
 数据库文件 app.db + 预写日志 app.db-wal + 读者标记与锁 app.db-shm
@@ -246,8 +246,8 @@ Python 源码编译执行，见 DECISIONS.md D90）。
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、聚合查询里裸列取自哪一行、常量传播 / 常量折叠
   决定的出错时机），MiniDB 不保证选择相同。
 - 一个始终不结束的读事务仍会让日志变长（写者等 0.1 秒后放弃，之后日志每增长 4000 帧才再等一次）。
-- Windows 上用 `msvcrt.locking` 加锁（最多 64 个进程同时共享一把锁）。CI 在 `windows-latest` 上只跑存储、
-  并发与崩溃这部分测试，其余（与参考 SQLite 的对照）只在 Linux 和 macOS 上跑。
+- Windows 上用 `LockFileEx`（ctypes）加锁，与 SQLite 的 win32 VFS 相同，可以和 sqlite3 进程共享读锁。CI 在
+  `windows-latest` 上只跑存储、并发、崩溃与 SQLite 文件格式这部分测试，其余（与参考 SQLite 的对照）只在 Linux 和 macOS 上跑。
 - 删除空闲页不会自动收缩文件，需要 `VACUUM`；目录里会保留（可能为空的）`-wal` 与 `-shm` 文件。
   连接不能跨 `fork()` 使用。
 - 与 sqlite3 对照时，Python 3.11 的 sqlite3 没有 `autocommit` 参数，两组事务行为对照测试在

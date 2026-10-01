@@ -791,3 +791,17 @@ SQLite 格式第一版比 MiniDB 格式慢得多（参数化插入 10 倍、全�
 - 用户表的树直接把解码好的行交给执行器（`Executor.load_row` 两种都收），省掉“SQLite record → 值 → MiniDB
   record → 值”中间那一次编码和解码。写入方向仍是 MiniDB record → SQLite record，schema 和统计表仍走 bytes 接口。
 没有做的：每次插入仍要 O(页内单元格数) 地累加页面用量，平衡时重算分布；插入因此仍比 MiniDB 格式慢 1.6–2.4 倍。
+
+## D104 Windows 锁改用 LockFileEx（取代 D95 的 msvcrt.locking）
+D95 选 `msvcrt.locking` 是因为它不需要 ctypes；它只有排他锁，共享锁靠“锁区间里任意一个字节”模拟。MiniDB 自己的格式
+里这没问题（推送后真实 Windows 上通过），但 SQLite 文件格式要与 sqlite3 互操作：SQLite 在 NT 上用 `LockFileEx`
+给整个 SHARED 区间加*共享*锁（winGetReadLock），MiniDB 读者锁其中一个字节的排他锁必然与之冲突——sqlite3 读时 MiniDB
+读不了，反之亦然（Windows CI 的 `test_locks_against_a_sqlite_process`）。另外 SQLite 的协议要把 SHARED 升级为
+EXCLUSIVE，`msvcrt.locking` 连同一句柄的重叠字节都锁不上，新建 SQLite 格式文件就超时。
+改为 ctypes 调用 `LockFileEx` / `UnlockFileEx`（标准库，句柄来自 `msvcrt.get_osfhandle`）：
+- 共享 / 排他都是真的，每把锁一个字节（与 POSIX 后端相同的布局），不再有 64 个进程的上限；
+- 升级照 SQLite 的 winLock：解锁、排他加锁、失败则重新共享（SQLite 的协议只在持有 PENDING 时升级，期间没有新读者）；
+- 降级是原子的：同一句柄可以在自己的排他锁上再加共享锁，之后第一次解锁去掉的是排他锁（LockFileEx 文档的语义）。
+测试用一个按 LockFileEx 语义实现的假内核（按句柄；排他锁不与任何锁重叠，包括同一句柄；共享锁可与共享锁和同一
+句柄的排他锁重叠；解锁必须匹配、先去掉排他锁），包括“sqlite3 持有整个 SHARED 区间的共享锁时 MiniDB 能读不能写”。
+真实 Windows 上的结果见 PROGRESS.md。
