@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MiniDB</title>
+  <meta name="description" content="MiniDB：纯 Python 实现的 SQLite 式数据库，在浏览器里运行，数据不离开本机。">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css?v=__BUILD__">
+</head>
+<body>
+  <main>
+    <div class="brand">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <h1>MiniDB</h1>
+      <p>纯 Python 写的 SQLite 式数据库，在你的浏览器里运行（Pyodide），数据不离开本机。</p>
+    </div>
+    <div class="workspace">
+      <section class="left">
+        <div class="bar">
+          <button id="run" disabled>运行</button>
+          <select id="examples" aria-label="示例"></select>
+          <button id="reset" class="quiet" disabled>清空数据库</button>
+          <span id="status" role="status">正在加载 Python 运行时…</span>
+        </div>
+        <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
+        <div id="output"></div>
+      </section>
+      <section class="right">
+        <div class="bar">
+          <span class="label">B+ 树</span>
+          <select id="object" aria-label="表或索引"></select>
+          <span id="treeinfo"></span>
+        </div>
+        <div id="tree"><p class="empty">运行 SQL 之后，这里画出所选表或索引的 B+ 树。</p></div>
+      </section>
+    </div>
+  </main>
+  <script src="app.js?v=__BUILD__"></script>
+</body>
+</html>

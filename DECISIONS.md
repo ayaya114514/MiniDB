@@ -707,3 +707,15 @@ fuzzer 加入 TRUE / FALSE 字面量后发现的一组与 SQLite 解析/解析�
   last_insert_rowid、聚合不算，日期函数算）；若前一行是普通（解析过的）行，它也必须是常量且顶层没有 CAST（有亲和性）。
   `Parser.value_rows` 照此把这些行里的 `IS TRUE/FALSE` 改写成与 1 / 0 的普通比较。
 - 已知差异：VALUES 行里的聚合函数（SQLite 里回退成无 FROM 的 SELECT，`VALUES (count(*))` 合法）MiniDB 报 misuse，未处理。
+
+## D99 浏览器 Playground
+- Pyodide（v314.0.7，从 jsDelivr 加载）在 Web Worker 里运行，界面不卡顿；worker 必须是 ES module（`type: "module"`，
+  `import { loadPyodide } from ".../pyodide.mjs"`）：314 版在 classic worker 里 `importScripts` 后 `loadPyodide()` 永远不返回
+  （浏览器里实测）。数据库是内存数据库，SQL 和数据不离开浏览器（只从 CDN 下载 Pyodide 本身）。
+- MiniDB 源码打成 `minidb.zip` 和 `bridge.py` 一起解压进 Pyodide 的文件系统；`bridge.py` 只做三件事并返回 JSON：
+  按顶层 `;` 拆分并逐条执行（遇错停止，查询/UPDATE/DELETE 附带 EXPLAIN 的计划）、列出表和索引、按层导出 B+ 树
+  （每层最多 48 个节点，每个节点显示前 3 个和最后 1 个 key、填充率）。构建脚本把 `__BUILD__` 换成内容哈希，避免浏览器缓存旧文件。
+- 界面按用户偏好：只有暗色、无顶栏和宣传文案，名字 + 一句说明，左边编辑器与逐条结果（计划显示在结果上方），右边 B+ 树
+  （绝对定位布局：叶子等距排开，父节点居中于子节点之上，SVG 画父子连线和叶子兄弟链，初始滚动让根节点可见）。
+- `tests/test_playground.py` 在本机 Python 上跑 `bridge.py` 和 `app.js` 里的每个示例，避免 MiniDB 的改动悄悄弄坏 Playground。
+- 部署：`.github/workflows/pages.yml`（configure-pages / upload-pages-artifact / deploy-pages）。
