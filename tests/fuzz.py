@@ -634,13 +634,17 @@ class Generator:
         return self.select()
 
 
-def run_seed(seed, statements, path=None, verbose=False):
-    """Run one fuzzing session; returns None or a failure description."""
+def run_seed(seed, statements, path=None, verbose=False, format=None):
+    """Run one fuzzing session; returns None or a failure description.
+
+    With ``format="sqlite"`` MiniDB keeps the database in SQLite's file
+    format; at the end sqlite3 opens that file, checks it and compares its
+    content with sqlite3's own database."""
     from sqlcompare import Pair  # only here: the generator itself (metamorphic.py) needs no sqlite3
 
     generator = Generator(seed)
-    pair = Pair(path, loose_numbers=True)
-    snapshots = SnapshotReader(pair.mini, path, seed) if path is not None else None
+    pair = Pair(path, loose_numbers=True, format=format)
+    snapshots = SnapshotReader(pair.mini, path, seed) if path is not None and format != "sqlite" else None
     history = []
     try:
         setup = [(generator.create_table(), None) for _ in range(2)]
@@ -654,6 +658,8 @@ def run_seed(seed, statements, path=None, verbose=False):
                 snapshots.step(history)
         if snapshots is not None:
             snapshots.finish()
+        if format == "sqlite" and path is not None:
+            check_sqlite_file(pair, path)
         problems = pair.mini.integrity_check()
         if problems:
             raise AssertionError(f"integrity check failed: {problems}")
@@ -664,6 +670,41 @@ def run_seed(seed, statements, path=None, verbose=False):
             snapshots.reader.close()
         pair.close()
     return None
+
+
+def check_sqlite_file(pair, path):
+    """sqlite3 must find MiniDB's SQLite-format file intact, with the same
+    rows as sqlite3's own database (MiniDB holds no locks between statements)."""
+    import sqlite3
+
+    if pair.mini.in_transaction:
+        pair.run("COMMIT")
+    other = sqlite3.connect(path)
+    other.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
+    try:
+        result = other.execute("PRAGMA integrity_check").fetchall()
+        if result != [("ok",)]:
+            raise AssertionError(f"sqlite3's integrity_check on MiniDB's file: {result[:5]}")
+        tables = [row[0] for row in pair.lite.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        mine = [row[0] for row in other.execute(
+            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        if mine != tables:
+            raise AssertionError(f"tables in MiniDB's file: {mine}, in sqlite3's: {tables}")
+        for name in tables:
+            query = f'SELECT rowid, * FROM "{name}" ORDER BY rowid'
+            expected, found = pair.lite.execute(query).fetchall(), other.execute(query).fetchall()
+            if [sqlcompare_loose(r) for r in found] != [sqlcompare_loose(r) for r in expected]:
+                raise AssertionError(f"table {name} differs when sqlite3 reads MiniDB's file:\n"
+                                     f"  sqlite3's: {expected[:5]}\n  MiniDB's file: {found[:5]}")
+    finally:
+        other.close()
+
+
+def sqlcompare_loose(row):
+    from sqlcompare import loose
+
+    return loose(row)
 
 
 class SnapshotReader:
@@ -721,6 +762,7 @@ def main():
     parser.add_argument("--seeds", default="0-99")
     parser.add_argument("--statements", type=int, default=400)
     parser.add_argument("--file", action="store_true", help="use database files instead of memory")
+    parser.add_argument("--sqlite-format", action="store_true", help="MiniDB uses SQLite's file format")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     import tempfile
@@ -730,7 +772,7 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         for seed in seeds:
             path = os.path.join(directory, f"fuzz{seed}.db") if args.file else None
-            failure = run_seed(seed, args.statements, path, args.verbose)
+            failure = run_seed(seed, args.statements, path, args.verbose, "sqlite" if args.sqlite_format else None)
             if failure:
                 failures += 1
                 print(failure[:4000])

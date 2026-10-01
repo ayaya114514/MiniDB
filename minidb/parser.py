@@ -205,6 +205,7 @@ class CreateIndex:
     columns: list  # column names
     unique: bool = False
     if_not_exists: bool = False
+    descending: list = field(default_factory=list)  # per column: DESC?
 
 
 @dataclass
@@ -679,16 +680,20 @@ class Parser:
         self.expect_keyword("ON")
         table = self.identifier("table name")
         self.expect_op("(")
-        columns = [self.indexed_column()]
-        while self.accept_op(","):
-            columns.append(self.indexed_column())
+        columns, descending = [], []
+        while True:
+            columns.append(self.identifier("column name"))
+            descending.append(not self.accept_keyword("ASC") and bool(self.accept_keyword("DESC")))
+            if not self.accept_op(","):
+                break
         self.expect_op(")")
-        return CreateIndex(name, table, columns, unique, if_not_exists)
+        # (DESC only matters in SQLite-format files: MiniDB's own indexes are ascending)
+        return CreateIndex(name, table, columns, unique, if_not_exists, descending)
 
     def indexed_column(self) -> str:
         name = self.identifier("column name")
         if not self.accept_keyword("ASC"):
-            self.accept_keyword("DESC")  # accepted; the index order is always ascending
+            self.accept_keyword("DESC")
         return name
 
     def column_def(self) -> ColumnDef:

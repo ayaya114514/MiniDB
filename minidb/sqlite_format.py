@@ -1,0 +1,454 @@
+"""SQLite's file format: the pieces that are pure byte layout.
+
+(https://www.sqlite.org/fileformat2.html)  Used by ``minidb.sqlite_pager``
+and ``minidb.sqlite_btree`` for databases in SQLite's own format.
+
+* varints: 1 to 9 bytes, big-endian, 7 bits per byte with the high bit
+  saying "more"; the 9th byte carries 8 bits.  Row ids are signed 64-bit.
+* records: a header (its own size as a varint, then one serial type per
+  value) and the values.  Serial types: 0 NULL, 1-6 integers of 1, 2, 3,
+  4, 6, 8 bytes, 7 a big-endian double, 8 and 9 the integers 0 and 1,
+  even N >= 12 a BLOB of (N - 12) / 2 bytes, odd N >= 13 a text of
+  (N - 13) / 2 bytes (UTF-8).
+* page 1 starts with the 100-byte database header; every B-tree page has
+  an 8-byte (leaf) or 12-byte (interior) header, an array of 2-byte cell
+  offsets in key order, and the cells packed at the end of the page.
+* a cell's payload is stored in the page up to a limit that depends on the
+  page kind; the rest goes to a chain of overflow pages (4 bytes: next
+  page, then data).
+"""
+
+from __future__ import annotations
+
+import struct
+
+from minidb.errors import DatabaseError
+from minidb.values import SQLValue
+
+MAGIC = b"SQLite format 3\x00"
+PAGE_SIZE = 4096  # the only page size MiniDB writes or reads
+HEADER_SIZE = 100
+PENDING_BYTE = 0x40000000  # SQLite's locks live here; the page holding it is never used
+LOCK_PAGE = PENDING_BYTE // PAGE_SIZE + 1
+SQLITE_VERSION_NUMBER = 3053004  # written as "last writer" (the format version MiniDB follows)
+
+# B-tree page kinds (the first byte of the page header)
+INDEX_INTERIOR, TABLE_INTERIOR, INDEX_LEAF, TABLE_LEAF = 2, 5, 10, 13
+
+_u16 = struct.Struct(">H")
+_u32 = struct.Struct(">I")
+_double = struct.Struct(">d")
+
+
+def corrupt(detail: str) -> DatabaseError:
+    return DatabaseError(f"database disk image is malformed ({detail})")
+
+
+# ---- varints ----------------------------------------------------------------------
+
+
+def put_varint(value: int) -> bytes:
+    """The varint for ``value`` (taken as unsigned 64-bit)."""
+    value &= 0xFFFFFFFFFFFFFFFF
+    if value < 0x80:
+        return bytes((value,))
+    if value >> 56:
+        out = [value & 0xFF]
+        value >>= 8
+        for _ in range(8):
+            out.append((value & 0x7F) | 0x80)
+            value >>= 7
+        return bytes(reversed(out))
+    out = [value & 0x7F]
+    value >>= 7
+    while value:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    return bytes(reversed(out))
+
+
+def get_varint(data: bytes, pos: int) -> tuple[int, int]:
+    """(unsigned value, position after it)"""
+    value = 0
+    for i in range(8):
+        byte = data[pos + i]
+        value = (value << 7) | (byte & 0x7F)
+        if byte < 0x80:
+            return value, pos + i + 1
+    return (value << 8) | data[pos + 8], pos + 9
+
+
+def get_signed_varint(data: bytes, pos: int) -> tuple[int, int]:
+    value, pos = get_varint(data, pos)
+    return (value - (1 << 64) if value >> 63 else value), pos
+
+
+def varint_size(value: int) -> int:
+    value &= 0xFFFFFFFFFFFFFFFF
+    if value >> 56:
+        return 9
+    size = 1
+    while value >= 0x80:
+        value >>= 7
+        size += 1
+    return size
+
+
+# ---- records ------------------------------------------------------------------------
+
+_INT_TYPES = ((1, -0x80, 0x7F), (2, -0x8000, 0x7FFF), (3, -0x800000, 0x7FFFFF),
+              (4, -0x80000000, 0x7FFFFFFF), (5, -0x800000000000, 0x7FFFFFFFFFFF))
+_INT_SIZES = {1: 1, 2: 2, 3: 3, 4: 4, 5: 6, 6: 8}
+
+
+def _serial(value: SQLValue) -> tuple[int, bytes]:
+    if value is None:
+        return 0, b""
+    if isinstance(value, int):
+        if value == 0 or value == 1:
+            return 8 + value, b""
+        for serial, low, high in _INT_TYPES:
+            if low <= value <= high:
+                return serial, value.to_bytes(_INT_SIZES[serial], "big", signed=True)
+        return 6, value.to_bytes(8, "big", signed=True)
+    if isinstance(value, float):
+        return 7, _double.pack(value)
+    if isinstance(value, str):
+        data = value.encode("utf-8", "surrogateescape")
+        return 13 + 2 * len(data), data
+    if isinstance(value, bytes):
+        return 12 + 2 * len(value), value
+    raise TypeError(f"cannot store {type(value).__name__}")
+
+
+def encode_record(values: list[SQLValue]) -> bytes:
+    serials, bodies = [], []
+    for value in values:
+        serial, body = _serial(value)
+        serials.append(put_varint(serial))
+        bodies.append(body)
+    types = b"".join(serials)
+    size = len(types) + 1
+    if size >= 0x80:  # the header size counts its own varint
+        size = len(types) + varint_size(len(types) + 2)
+    return put_varint(size) + types + b"".join(bodies)
+
+
+def decode_record(data: bytes) -> list[SQLValue]:
+    try:
+        header_size, pos = get_varint(data, 0)
+        body = header_size
+        values = []
+        while pos < header_size:
+            serial, pos = get_varint(data, pos)
+            if serial == 0:
+                values.append(None)
+            elif serial <= 6:
+                size = _INT_SIZES[serial]
+                values.append(int.from_bytes(data[body:body + size], "big", signed=True))
+                body += size
+            elif serial == 7:
+                values.append(_double.unpack_from(data, body)[0])
+                body += 8
+            elif serial == 8 or serial == 9:
+                values.append(serial - 8)
+            elif serial >= 12:
+                size = (serial - 12) >> 1
+                chunk = data[body:body + size]
+                if len(chunk) != size:
+                    raise corrupt("record too short")
+                values.append(chunk.decode("utf-8", "surrogateescape") if serial & 1 else bytes(chunk))
+                body += size
+            else:
+                raise corrupt(f"bad serial type {serial}")
+        if body > len(data):
+            raise corrupt("record too short")
+        return values
+    except (IndexError, struct.error):
+        raise corrupt("bad record") from None
+
+
+# ---- the database header ------------------------------------------------------------
+
+
+class DbHeader:
+    """The first 100 bytes of page 1, kept as page 0 of the pager's cache."""
+
+    _format = struct.Struct(">16sHBBBBBBIIIIIIIIIIII20sII")
+
+    def __init__(self, data: bytes | None = None) -> None:
+        self.pgno = 0
+        if data is None:  # a new database
+            data = self._format.pack(
+                MAGIC, PAGE_SIZE, 1, 1, 0, 64, 32, 32, 0, 1, 0, 0, 0, 4, 0, 0, 1, 0, 0, 0,
+                b"\x00" * 20, 0, SQLITE_VERSION_NUMBER)
+        fields = list(self._format.unpack_from(data))
+        (self.magic, page_size, self.write_version, self.read_version, self.reserved, self.max_fraction,
+         self.min_fraction, self.leaf_fraction, self.change_counter, self.page_count, self.freelist_trunk,
+         self.freelist_count, self.schema_cookie, self.schema_format, self.cache_size, self.autovacuum_root,
+         self.encoding, self.user_version, self.incremental_vacuum, self.application_id, self.padding,
+         self.version_valid_for, self.version_number) = fields
+        self.page_size = 65536 if page_size == 1 else page_size
+
+    @classmethod
+    def from_bytes(cls, pgno: int, data: bytes) -> DbHeader:
+        return cls(data)
+
+    def check(self, file_pages: int) -> None:
+        """Refuse what MiniDB does not handle (and say why)."""
+        if self.magic != MAGIC:
+            raise DatabaseError("file is not a database")
+        if self.page_size != PAGE_SIZE:
+            raise DatabaseError(f"SQLite databases with a page size of {self.page_size} are not supported "
+                                f"(only {PAGE_SIZE}; VACUUM it with PRAGMA page_size = {PAGE_SIZE})")
+        if self.write_version == 2 or self.read_version == 2:
+            raise DatabaseError("SQLite databases in WAL mode are not supported: "
+                                "PRAGMA journal_mode = DELETE with sqlite3 first")
+        if self.write_version > 2 or self.read_version > 2:
+            raise DatabaseError("unsupported file format")
+        if self.reserved:
+            raise DatabaseError("SQLite databases with reserved bytes per page are not supported")
+        if self.encoding not in (0, 1):
+            raise DatabaseError("SQLite databases in UTF-16 are not supported")
+        if self.autovacuum_root:
+            raise DatabaseError("SQLite databases with auto_vacuum are not supported")
+        if not 1 <= self.schema_format <= 4:
+            raise DatabaseError("unsupported schema format")
+        if self.version_valid_for != self.change_counter or self.page_count == 0:
+            self.page_count = file_pages  # written by a version that did not keep it (as SQLite)
+
+    def to_bytes(self) -> bytes:
+        self.version_valid_for = self.change_counter
+        self.version_number = SQLITE_VERSION_NUMBER
+        return self._format.pack(
+            MAGIC, 1 if self.page_size == 65536 else self.page_size, self.write_version, self.read_version,
+            self.reserved, self.max_fraction, self.min_fraction, self.leaf_fraction, self.change_counter,
+            self.page_count, self.freelist_trunk, self.freelist_count, self.schema_cookie, self.schema_format,
+            self.cache_size, self.autovacuum_root, self.encoding or 1, self.user_version,
+            self.incremental_vacuum, self.application_id, self.padding, self.version_valid_for,
+            self.version_number)
+
+    def copy(self) -> DbHeader:
+        return DbHeader(self.to_bytes())
+
+
+# ---- payloads and cells -------------------------------------------------------------
+
+USABLE = PAGE_SIZE  # no reserved bytes
+_MIN_LOCAL = (USABLE - 12) * 32 // 255 - 23
+_TABLE_MAX_LOCAL = USABLE - 35
+_INDEX_MAX_LOCAL = (USABLE - 12) * 64 // 255 - 23
+OVERFLOW_DATA = USABLE - 4  # payload bytes per overflow page
+
+
+def local_size(payload: int, table: bool) -> int:
+    """How much of a payload of ``payload`` bytes is stored in the cell."""
+    max_local = _TABLE_MAX_LOCAL if table else _INDEX_MAX_LOCAL
+    if payload <= max_local:
+        return payload
+    size = _MIN_LOCAL + (payload - _MIN_LOCAL) % OVERFLOW_DATA
+    return size if size <= max_local else _MIN_LOCAL
+
+
+class Cell:
+    """A cell: for table leaves the row id and the payload (a record), for
+    table interiors a child page and the row id that bounds it, for index
+    pages the key record (plus the child page on interior pages).
+
+    ``local`` is the part of the payload stored in the page and
+    ``overflow`` the first overflow page (0 if none); ``size`` is the total
+    payload size.  ``key`` caches the decoded key of an index cell."""
+
+    __slots__ = ("child", "rowid", "local", "size", "overflow", "key")
+
+    def __init__(self, child: int = 0, rowid: int = 0, local: bytes = b"", size: int = 0, overflow: int = 0) -> None:
+        self.child = child
+        self.rowid = rowid
+        self.local = local
+        self.size = size
+        self.overflow = overflow
+        self.key = None
+
+    def copy(self) -> Cell:
+        cell = Cell(self.child, self.rowid, self.local, self.size, self.overflow)
+        cell.key = self.key
+        return cell
+
+    def byte_size(self, kind: int) -> int:
+        """Bytes of this cell on a page of ``kind``, plus its 2-byte pointer."""
+        if kind == TABLE_INTERIOR:
+            return 6 + varint_size(self.rowid)
+        size = varint_size(self.size) + len(self.local) + (4 if self.overflow else 0) + 2
+        if kind == TABLE_LEAF:
+            return size + varint_size(self.rowid)
+        return size + (4 if kind == INDEX_INTERIOR else 0)
+
+    def to_bytes(self, kind: int) -> bytes:
+        if kind == TABLE_INTERIOR:
+            return _u32.pack(self.child) + put_varint(self.rowid)
+        parts = [put_varint(self.size)]
+        if kind == TABLE_LEAF:
+            parts.append(put_varint(self.rowid))
+        elif kind == INDEX_INTERIOR:
+            parts.insert(0, _u32.pack(self.child))
+        parts.append(self.local)
+        if self.overflow:
+            parts.append(_u32.pack(self.overflow))
+        return b"".join(parts)
+
+
+def parse_cell(data: bytes, pos: int, kind: int) -> Cell:
+    cell = Cell()
+    if kind in (TABLE_INTERIOR, INDEX_INTERIOR):
+        cell.child = _u32.unpack_from(data, pos)[0]
+        pos += 4
+        if kind == TABLE_INTERIOR:
+            cell.rowid = get_signed_varint(data, pos)[0]
+            return cell
+    cell.size, pos = get_varint(data, pos)
+    if kind == TABLE_LEAF:
+        cell.rowid, pos = get_signed_varint(data, pos)
+    local = local_size(cell.size, kind == TABLE_LEAF)
+    cell.local = bytes(data[pos:pos + local])
+    if local < cell.size:
+        cell.overflow = _u32.unpack_from(data, pos + local)[0]
+    if len(cell.local) != local:
+        raise corrupt("cell runs past the page")
+    return cell
+
+
+# ---- pages ---------------------------------------------------------------------------
+
+
+class BtreePage:
+    """A decoded B-tree page.  On page 1 the B-tree part starts after the
+    database header (``offset`` 100)."""
+
+    def __init__(self, pgno: int, kind: int, cells: list[Cell] | None = None, right: int = 0) -> None:
+        self.pgno = pgno
+        self.kind = kind
+        self.cells = cells if cells is not None else []
+        self.right = right
+
+    @property
+    def offset(self) -> int:
+        return HEADER_SIZE if self.pgno == 1 else 0
+
+    @property
+    def is_leaf(self) -> bool:
+        return self.kind in (TABLE_LEAF, INDEX_LEAF)
+
+    @property
+    def header_size(self) -> int:
+        return 8 if self.is_leaf else 12
+
+    @property
+    def capacity(self) -> int:
+        """Bytes available for cells and their pointers."""
+        return USABLE - self.offset - self.header_size
+
+    def used(self) -> int:
+        kind = self.kind
+        return sum(cell.byte_size(kind) for cell in self.cells)
+
+    @classmethod
+    def from_bytes(cls, pgno: int, data: bytes) -> BtreePage:
+        offset = HEADER_SIZE if pgno == 1 else 0
+        kind = data[offset]
+        if kind not in (INDEX_INTERIOR, TABLE_INTERIOR, INDEX_LEAF, TABLE_LEAF):
+            raise corrupt(f"page {pgno} is not a B-tree page")
+        count = _u16.unpack_from(data, offset + 3)[0]
+        leaf = kind in (TABLE_LEAF, INDEX_LEAF)
+        right = 0 if leaf else _u32.unpack_from(data, offset + 8)[0]
+        pointers = offset + (8 if leaf else 12)
+        try:
+            cells = [parse_cell(data, _u16.unpack_from(data, pointers + 2 * i)[0], kind) for i in range(count)]
+        except (IndexError, struct.error):
+            raise corrupt(f"bad cell on page {pgno}") from None
+        return cls(pgno, kind, cells, right)
+
+    def to_bytes(self) -> bytes:
+        kind, offset = self.kind, self.offset
+        page = bytearray(USABLE)
+        top = USABLE
+        pointers = []
+        for cell in self.cells:
+            data = cell.to_bytes(kind)
+            top -= len(data)
+            page[top:top + len(data)] = data
+            pointers.append(top)
+        start = offset + self.header_size
+        if start + 2 * len(pointers) > top:
+            raise AssertionError(f"page {self.pgno} overfull")
+        page[offset] = kind
+        page[offset + 1:offset + 3] = b"\x00\x00"  # no freeblocks
+        page[offset + 3:offset + 5] = _u16.pack(len(self.cells))
+        page[offset + 5:offset + 7] = _u16.pack(top % 65536)
+        page[offset + 7] = 0  # no fragmented bytes
+        if not self.is_leaf:
+            page[offset + 8:offset + 12] = _u32.pack(self.right)
+        for i, pointer in enumerate(pointers):
+            page[start + 2 * i:start + 2 * i + 2] = _u16.pack(pointer)
+        return bytes(page)
+
+    def copy(self) -> BtreePage:
+        return BtreePage(self.pgno, self.kind, [cell.copy() for cell in self.cells], self.right)
+
+
+class OverflowPage:
+    def __init__(self, pgno: int, next_page: int = 0, data: bytes = b"") -> None:
+        self.pgno = pgno
+        self.next_page = next_page
+        self.data = data
+
+    @classmethod
+    def from_bytes(cls, pgno: int, data: bytes) -> OverflowPage:
+        return cls(pgno, _u32.unpack_from(data)[0], bytes(data[4:]))
+
+    def to_bytes(self) -> bytes:
+        return (_u32.pack(self.next_page) + self.data).ljust(USABLE, b"\x00")
+
+    def copy(self) -> OverflowPage:
+        return OverflowPage(self.pgno, self.next_page, self.data)
+
+
+class TrunkPage:
+    """A freelist trunk page: the next trunk and a list of free leaf pages."""
+
+    MAX_LEAVES = USABLE // 4 - 8  # what SQLite writes (it reads up to USABLE // 4 - 2)
+
+    def __init__(self, pgno: int, next_trunk: int = 0, leaves: list[int] | None = None) -> None:
+        self.pgno = pgno
+        self.next_trunk = next_trunk
+        self.leaves = leaves if leaves is not None else []
+
+    @classmethod
+    def from_bytes(cls, pgno: int, data: bytes) -> TrunkPage:
+        next_trunk, count = struct.unpack_from(">II", data)
+        if count > USABLE // 4 - 2:
+            raise corrupt(f"freelist trunk page {pgno}")
+        return cls(pgno, next_trunk, list(struct.unpack_from(f">{count}I", data, 8)))
+
+    def to_bytes(self) -> bytes:
+        data = struct.pack(f">II{len(self.leaves)}I", self.next_trunk, len(self.leaves), *self.leaves)
+        return data.ljust(USABLE, b"\x00")
+
+    def copy(self) -> TrunkPage:
+        return TrunkPage(self.pgno, self.next_trunk, list(self.leaves))
+
+
+class FreePage:
+    """A free leaf page: its content does not matter (written as zeros)."""
+
+    def __init__(self, pgno: int) -> None:
+        self.pgno = pgno
+
+    @classmethod
+    def from_bytes(cls, pgno: int, data: bytes) -> FreePage:
+        return cls(pgno)
+
+    def to_bytes(self) -> bytes:
+        return bytes(USABLE)
+
+    def copy(self) -> FreePage:
+        return FreePage(self.pgno)

@@ -11,7 +11,6 @@ import sys
 from collections.abc import Sequence
 from typing import TextIO
 
-from minidb.btree import BTree
 from minidb.database import Database
 from minidb.errors import Error
 from minidb.tokenizer import SQLSyntaxError, tokenize
@@ -81,7 +80,7 @@ class Shell:
                 self.write("Usage: .btree TABLE")
             else:
                 table = catalog.get_table(args[0])
-                for text in BTree(self.db.pager, table.root).dump():
+                for text in catalog.table_tree(table).dump():
                     self.write(text)
         else:
             self.write(f'Error: unknown command: {command}. Enter ".help" for help')
@@ -99,11 +98,13 @@ class Shell:
             self.write(f"Error: {exc}")
 
 
-def run(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout, path: str | None = None, interactive: bool | None = None) -> None:
-    """Run the shell on the database file ``path`` (``None`` = in memory)."""
+def run(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout, path: str | None = None, interactive: bool | None = None,
+        format: str | None = None) -> None:
+    """Run the shell on the database file ``path`` (``None`` = in memory);
+    ``format`` is for a new database (see ``Database``)."""
     if interactive is None:
         interactive = stdin.isatty()
-    with Database(path) as db:
+    with Database(path, format=format) as db:
         shell = Shell(db, stdout)
         buffer = ""
         while True:
@@ -131,11 +132,14 @@ def run(stdin: TextIO = sys.stdin, stdout: TextIO = sys.stdout, path: str | None
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) > 1:
-        sys.stderr.write("usage: python -m minidb [database-file]\n")
+    format = None
+    if argv and argv[0] == "--sqlite":  # a new database in SQLite's file format
+        format, argv = "sqlite", argv[1:]
+    if len(argv) > 1 or (argv and argv[0].startswith("-")):
+        sys.stderr.write("usage: python -m minidb [--sqlite] [database-file]\n")
         return 2
     try:
-        run(path=argv[0] if argv else None)
+        run(path=argv[0] if argv else None, format=format)
     except Error as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1

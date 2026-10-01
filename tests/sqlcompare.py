@@ -47,12 +47,13 @@ class Pair:
 
     open_pairs = set()  # not yet closed; conftest.py closes them after each test
 
-    def __init__(self, path=None, check_messages=False, loose_numbers=False):
+    def __init__(self, path=None, check_messages=False, loose_numbers=False, format=None):
         """``loose_numbers`` compares numbers by value only.  The fuzzer uses it:
         when several rows hold equal values of different types (1 and 1.0),
         which one DISTINCT, GROUP BY or MIN/MAX reports depends on the order
-        SQLite's query plan visits rows in."""
-        self.mini = Database(path)
+        SQLite's query plan visits rows in.  ``format``: MiniDB's file format
+        (see ``Database``)."""
+        self.mini = Database(path, format=format)
         self.lite = sqlite3.connect(":memory:", isolation_level=None)
         # Text made from a BLOB may not be valid UTF-8: keep the bytes, as
         # MiniDB does (sqlite3 would fail to decode it; see minidb.dbapi).

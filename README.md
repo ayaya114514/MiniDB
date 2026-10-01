@@ -102,6 +102,23 @@ with minidb.connect("app.db") as conn:             # ":memory:" 为内存数据�
 异常层次与 PEP 249 相同：`Error` → `InterfaceError`、`DatabaseError` → `OperationalError`
 （含语法错误 `SQLSyntaxError`）、`IntegrityError`、`ProgrammingError` 等。
 
+### SQLite 文件格式
+
+MiniDB 也能直接读写 SQLite 自己的数据库文件——sqlite3 建的文件 MiniDB 可以打开，MiniDB 建的 sqlite3 也可以：
+
+```sh
+python -m minidb --sqlite app.sqlite                 # 新建的文件用 SQLite 格式；已有文件按文件头自动识别
+```
+
+```python
+db = minidb.Database("app.sqlite", format="sqlite")   # 或 minidb.connect("app.sqlite", format="sqlite")
+```
+
+用的是 SQLite 的 rollback journal（`-journal`，崩溃后 sqlite3 和 MiniDB 都能回放对方留下的日志）和 SQLite 的文件锁，
+所以另一个进程里的 sqlite3 可以同时打开同一个文件。ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。只支持 4096 字节
+的页、UTF-8、非 WAL 模式、无 auto_vacuum（其他文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的
+对象（CHECK、触发器、表达式索引等）原样保留，用到时报 `NotSupportedError`。设计见 DECISIONS.md 的 D100。
+
 ## 架构
 
 ```text
@@ -118,7 +135,8 @@ SQL 文本
   │  btree.py       B+ 树：按字节大小分裂/合并/借位，叶子兄弟链，范围扫描，overflow 页
   ▼
   │  pager.py       4 KB 页（带 CRC32）的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
-  │  locking.py     跨进程字节锁（fcntl，进程内共享一个文件描述符）与忙等超时
+  │  locking.py     跨进程字节锁（fcntl / msvcrt，进程内共享一个文件描述符）与忙等超时
+  │  sqlite_*.py    SQLite 文件格式：字节布局、B 树、rollback journal 与 SQLite 的锁
   ▼
 数据库文件 app.db + 预写日志 app.db-wal + 读者标记与锁 app.db-shm
 ```

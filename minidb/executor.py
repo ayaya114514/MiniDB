@@ -32,7 +32,7 @@ from typing import Any, Protocol, Union
 from minidb import dates, functions, values, window
 from minidb.btree import BTree, IntKey
 from minidb.catalog import (
-    AUTO_INDEX_PREFIX, HIGH, RESERVED_PREFIX, Catalog, IndexInfo, IndexKeyCodec, TableInfo, ViewInfo,
+    HIGH, Catalog, IndexInfo, IndexKeyCodec, TableInfo, ViewInfo,
     constant_default,
     is_constant_default, quote,
 )
@@ -48,6 +48,7 @@ from minidb.tokenizer import tokenize
 from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, decode_row, encode_record
 from minidb.pager import Pager
+from minidb.sqlite_pager import SqlitePager
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")
 # Functions that read the connection's state: name -> Executor attribute.
@@ -1718,6 +1719,8 @@ def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: lis
     if lower or upper:
         candidates.append(RowidRange(tree, lower, upper, rows))
     for info in table.indexes:
+        if not info.ordered:
+            continue  # (DESC columns in a SQLite file: not in key order)
         equal = []
         for position in info.positions:
             key = next((c.key for c in constraints if c.position == position and c.op == "="), None)
@@ -1789,7 +1792,7 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
         # Nothing narrows the scan, but ORDER BY ... LIMIT wants this column
         # first: walk an index on it in order and stop early.
         for info in table.indexes:
-            if info.positions[0] == order_hint:
+            if info.ordered and info.positions[0] == order_hint:
                 tree = catalog.table_tree(table)
                 return IndexScan(info, catalog.index_tree(info), tree, [], None, None, rows)
     return best
@@ -2722,6 +2725,7 @@ class Executor:
     def alter_table(self, stmt: AlterTable) -> Result:
         catalog = self.catalog
         table = catalog.get_table(stmt.table)
+        catalog.check_writable(table, "altered")
         if stmt.action == "rename":
             self.rename_table(table, stmt.new_name)
         elif stmt.action == "rename column":
@@ -2757,7 +2761,7 @@ class Executor:
         lowered = ascii_lower(new)
         if lowered in catalog.tables or lowered in catalog.views or lowered in catalog.indexes:
             raise OperationalError(f"there is already another table or index with this name: {new}")
-        if lowered.startswith(RESERVED_PREFIX):
+        if lowered.startswith(catalog.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {new}")
         old = table.name
         for view in self._views():
@@ -2772,7 +2776,8 @@ class Executor:
         table.name = new
         for index in table.indexes:
             if index.is_auto:
-                index.name = AUTO_INDEX_PREFIX + new + index.name[len(AUTO_INDEX_PREFIX) + len(old):]
+                prefix = catalog.auto_prefix
+                index.name = prefix + new + index.name[len(prefix) + len(old):]
         catalog.rewrite_table_entries(table)
 
     def rename_column(self, table: TableInfo, old: str, new: str) -> None:
@@ -2871,7 +2876,7 @@ class Executor:
                 raise OperationalError("non-text filename")
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 raise OperationalError("output file already exists")
-            target = Pager(path)
+            target = SqlitePager(path) if self.catalog.sqlite else Pager(path)
             try:
                 self.copy_database(target, keep_rowids=True)
                 target.commit()
@@ -2881,21 +2886,28 @@ class Executor:
                 target.close_files()
             return Result()
         pager = self.catalog.pager
-        copy = Pager()
+        copy = SqlitePager() if self.catalog.sqlite else Pager()
         self.copy_database(copy, keep_rowids=False)
         count = copy.page_count
-        for pgno in range(1, count):
-            pager.write(copy.cache[pgno])
+        for pgno in range(1, count + self.catalog.sqlite):  # (SQLite's pages count from 1)
+            if pgno in copy.cache:
+                pager.write(copy.cache[pgno])
         pager.write(pager.header)
         pager.header.page_count = count
-        pager.header.freelist_head = 0
-        for pgno in [p for p in pager.cache if p >= count]:
+        last = count  # the last page kept
+        if self.catalog.sqlite:
+            pager.header.freelist_trunk = pager.header.freelist_count = 0
+            pager.note_schema_change()
+        else:
+            pager.header.freelist_head = 0
+            last = count - 1
+        for pgno in [p for p in pager.cache if p > last]:
             del pager.cache[pgno]
             pager.dirty.discard(pgno)
         self.catalog.load()
         return Result()
 
-    def copy_database(self, target: Pager, keep_rowids: bool) -> None:
+    def copy_database(self, target: Pager | SqlitePager, keep_rowids: bool) -> None:
         """Copy the schema, tables and indexes into the empty database ``target``
         (the schema table keeps its keys, objects get new root pages).
 
@@ -2903,6 +2915,9 @@ class Executor:
         neither an INTEGER PRIMARY KEY nor an index gets new rowids 1, 2, 3...
         in rowid order, as SQLite's VACUUM gives them (its transfer
         optimization keeps rowids only where they may be referenced)."""
+        if self.catalog.sqlite:
+            self._copy_sqlite_database(target, keep_rowids)
+            return
         catalog = Catalog(target)
         source = self.catalog
         for key, value in list(source.schema.scan()):
@@ -2918,6 +2933,33 @@ class Executor:
                 tree.bulk_load(entries)
                 root = tree.root
             catalog.schema.insert(key, encode_record([kind, name, table_name, root, sql]))
+
+    def _copy_sqlite_database(self, target: SqlitePager, keep_rowids: bool) -> None:
+        """copy_database for SQLite-format files: every tree is copied cell
+        by cell in its order, so even objects MiniDB cannot parse survive."""
+        from minidb.sqlite_btree import IndexTree, SqliteTable, TableTree
+
+        source = self.catalog
+        pager = source.pager
+        schema = SqliteTable(target, 1)
+        for key, value in list(source.schema.scan()):
+            row = decode_record(value)[0]
+            kind, name, root = row[0], row[1], row[3]
+            if kind in ("table", "index") and root:
+                if kind == "table":
+                    tree = TableTree(pager, root)
+                    table = source.tables.get(ascii_lower(name))
+                    renumber = (not keep_rowids and table is not None and table.rowid_column is None
+                                and not table.indexes)
+                    entries = ((n if renumber else rowid, tree.payload(cell))
+                               for n, (rowid, cell) in enumerate(tree.scan(), 1))
+                    row[3] = TableTree.build(target, entries)
+                else:
+                    tree = IndexTree(pager, root)
+                    row[3] = IndexTree.build(target, ((0, tree.payload(cell)) for cell in tree.cells()))
+            schema.insert(key, encode_record(row))
+        target.header.user_version = pager.header.user_version
+        target.header.application_id = pager.header.application_id
 
     def create_index(self, stmt: CreateIndex) -> Result:
         index = self.catalog.create_index(stmt)
