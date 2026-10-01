@@ -1256,6 +1256,7 @@ class AggregateCollector:
 # lookup.
 
 SEEK_COST = 4  # descending a B+ tree
+FULL_SCAN_PENALTY = 3  # like SQLite, choose a full scan only if lookups cost 3 times more
 FETCH_COST = 2  # looking a row up in the table after finding it in an index
 RANGE_FACTOR = 4  # a range condition keeps a quarter of the rows (one bound)
 # Without ANALYZE statistics, like SQLite: a table has at least this many rows
@@ -1545,8 +1546,10 @@ class HashLookup:
 
 
 class MultiScan:
-    """The union of several row id / index lookups: ``col IN (...)`` on an
-    index, or the terms of an OR.  Rows come in row id order."""
+    """The union of several row id / index lookups, in SQLite's order:
+    ``col IN (...)`` on an index walks the index in order (SQLite sorts the
+    IN values); the terms of an OR come one after another, each row once
+    (SQLite's MULTI-INDEX OR with its RowSet)."""
 
     def __init__(self, parts: list[AccessPath], table_tree: BTree, label: str) -> None:
         self.parts = parts
@@ -1554,10 +1557,19 @@ class MultiScan:
         self.label = label
 
     def rowids(self, row: Row) -> list[int]:
-        rowids = set()
+        if self.label == "IN":
+            keys = set()
+            for part in self.parts:
+                keys.update(part.keys(row))
+            return [key[-1][1] for key in sorted(keys)]
+        seen = set()
+        rowids = []
         for part in self.parts:
-            rowids.update(part.rowids(row))
-        return sorted(rowids)
+            for rowid in part.rowids(row):
+                if rowid not in seen:
+                    seen.add(rowid)
+                    rowids.append(rowid)
+        return rowids
 
     def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         get = self.table_tree.get
@@ -1567,7 +1579,9 @@ class MultiScan:
                 yield rowid, record
 
     def order(self) -> tuple[list[int], set[int]] | None:
-        return [ROWID], set()
+        if self.label == "IN":
+            return self.parts[0].index.positions + [ROWID], set()
+        return None
 
     def estimate(self) -> tuple[float, float]:
         rows = cost = 0
@@ -1658,6 +1672,9 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             expanded += [Binary(">=", conjunct.expr, conjunct.low), Binary("<=", conjunct.expr, conjunct.high)]
         else:
             expanded.append(conjunct)
+            terms = split_disjuncts(conjunct)
+            if len(terms) > 1:
+                expanded += or_to_in(terms, column_position, table.affinities, compiler)
     for conjunct in expanded:
         if isinstance(conjunct, InList) and not conjunct.negated:
             position = column_position(conjunct.expr)
@@ -1679,6 +1696,27 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             joined = bool(tables_referenced(right, scope) & bound)
             constraints.append(Constraint(position, op, key, conversions.get(key), joined))
     return constraints
+
+
+def or_to_in(terms: list[Expr], column_position: Callable[[Expr], int | None], affinities: list[str | None], compiler: Compiler) -> list[InList]:
+    """As SQLite (exprAnalyzeOrTerm), ``x = a OR x = b ...`` on one column
+    also gives the (virtual) term ``x IN (a, b, ...)`` when no right-hand
+    side has an affinity other than the column's; the OR is still tested."""
+    column, position, items = None, None, []
+    for term in terms:
+        if not isinstance(term, Binary) or term.op != "=":
+            return []
+        left, right = term.left, term.right
+        if column_position(left) is None or (position is not None and column_position(left) != position):
+            left, right = right, left
+        if column_position(left) is None or (position is not None and column_position(left) != position):
+            return []
+        column, position = column or left, column_position(left)
+        affinity = compiler.compile_with_affinity(right)[1]
+        if affinity is not None and affinity != (values.INTEGER if position == ROWID else affinities[position]):
+            return []
+        items.append(right)
+    return [InList(column, tuple(items))]
 
 
 def _bounds(constraints: list[Constraint], position: int) -> tuple[Bound, Bound]:
@@ -1853,7 +1891,7 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
             parts.append(min(options, key=lambda a: a.estimate()[1]))
         else:
             candidates.append(MultiScan(parts, catalog.table_tree(table), "OR"))
-    best = min(candidates, key=lambda a: a.estimate()[1])  # the first of equals wins
+    best = min(candidates, key=lambda a: a.estimate()[1] * (FULL_SCAN_PENALTY if type(a) is FullScan else 1))
     if isinstance(best, FullScan):
         lookup = hash_lookup(scope, index, catalog, conjuncts, compiler, bound, best)
         if lookup is not None:
@@ -1950,8 +1988,8 @@ class Executor:
     # ---- reading rows ------------------------------------------------------
 
     @staticmethod
-    def load_row(table: TableInfo, rowid: int, record: bytes) -> Row:
-        row = decode_row(record)
+    def load_row(table: TableInfo, rowid: int, record: bytes | list) -> Row:
+        row = record if type(record) is list else decode_row(record)  # (SQLite files: a row)
         if len(row) < len(table.columns):  # written before ALTER TABLE ADD COLUMN
             row.extend(table.padding[len(row):])
         if table.rowid_column is not None:

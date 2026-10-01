@@ -66,7 +66,7 @@ def test_statistics_change_the_plan():
     assert db.execute(sql + " ORDER BY id") == [(i, 1, i) for i in range(1991, 2001, 2)]
     db.execute("DELETE FROM t WHERE id > 8")
     db.execute("ANALYZE")
-    assert plan(db, sql) == ["SCAN"]  # 8 rows: scanning is cheapest
+    assert plan(db, sql) == ["SEARCH USING INDEX t_k (k>?)"]  # as SQLite, even for 8 rows
 
 
 def test_in_and_or_use_indexes(db):
@@ -81,8 +81,13 @@ def test_in_and_or_use_indexes(db):
         "MULTI-INDEX OR (SEARCH USING INDEX t_bc (b=? AND c=?); SEARCH USING ROWID (=); "
         "SEARCH USING INDEX t_a (a=?))"
     ]
-    # A one-sided range is guessed to keep a quarter of the rows: scanning is cheaper.
-    assert plan(db, "SELECT * FROM t WHERE a = 1 OR a > 48") == ["SCAN"]
+    # As SQLite, which prices a full scan at 3N: two lookups beat it.
+    assert plan(db, "SELECT * FROM t WHERE a = 1 OR a > 48") == [
+        "MULTI-INDEX OR (SEARCH USING INDEX t_a (a=?); SEARCH USING INDEX t_a (a>?))"
+    ]
+    assert plan(db, "SELECT * FROM t WHERE a = 1 OR a = 2") == [
+        "MULTI-INDEX IN (SEARCH USING INDEX t_a (a=?); SEARCH USING INDEX t_a (a=?))"
+    ]
     assert plan(db, "SELECT * FROM t WHERE a = 1 OR c = 2") == ["SCAN"]  # c alone has no index
 
 
