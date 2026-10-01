@@ -447,6 +447,7 @@ class Parser:
         self.text = text
         self.tokens = tokenize(text)
         self.i = 0
+        self.seen_with = False
         self.tok = self.tokens[0]  # the current token (only advance() moves on)
 
     # ---- token helpers ------------------------------------------------
@@ -521,6 +522,7 @@ class Parser:
                 return statements
             self.param_count = 0
             self.param_names = {}
+            self.seen_with = False  # see value_rows
             stmt = self.statement()
             stmt.param_count = self.param_count
             stmt.param_names = self.param_names
@@ -830,13 +832,34 @@ class Parser:
             stmt = Insert(table, columns, [], self.query(), conflict)
         else:
             self.expect_keyword("VALUES")
-            rows = [self.value_row()]
-            while self.accept_op(","):
-                rows.append(self.value_row())
-            stmt = Insert(table, columns, rows, None, conflict)
+            stmt = Insert(table, columns, self.value_rows(), None, conflict)
         stmt.upsert = self.upsert_clauses()
         stmt.returning = self.returning()
         return stmt
+
+    def value_rows(self) -> list[list[Expr]]:
+        """The rows after VALUES.
+
+        SQLite (sqlite3MultiValues) codes a row after the first directly,
+        without resolving its names, when the statement has had no WITH so
+        far, the row is constant, and either the previous row was coded so
+        too or it is constant and without affinity (no CAST); otherwise the
+        row becomes a resolved SELECT of a UNION ALL.  Unresolved, ``x IS
+        TRUE`` is not a truth test but ``x IS 1``: such rows get that."""
+        rows = [self.value_row()]
+        previous, direct = rows[0], False
+        while self.accept_op(","):
+            row = self.value_row()
+            if not self.seen_with and all(map(is_parse_constant, row)) and (
+                direct or (all(map(is_parse_constant, previous))
+                           and not any(isinstance(e, Cast) for e in previous))
+            ):
+                row = [plain_truth_tests(e) for e in row]
+                direct = True
+            else:
+                previous, direct = row, False
+            rows.append(row)
+        return rows
 
     def value_row(self) -> list[Expr]:
         self.expect_op("(")
@@ -859,6 +882,7 @@ class Parser:
         """``WITH [RECURSIVE] name [(columns)] AS [[NOT] MATERIALIZED] (query), ...``
         (RECURSIVE is optional: a CTE that names itself is recursive)."""
         self.advance()  # WITH
+        self.seen_with = True
         if self.at_word("RECURSIVE"):
             self.advance()
         ctes = []
@@ -883,9 +907,7 @@ class Parser:
 
     def values_core(self) -> Values:
         self.expect_keyword("VALUES")
-        rows = [self.value_row()]
-        while self.accept_op(","):
-            rows.append(self.value_row())
+        rows = self.value_rows()
         if any(len(row) != len(rows[0]) for row in rows):
             raise OperationalError("all VALUES must have the same number of terms")
         return Values(rows)
@@ -1238,7 +1260,7 @@ class Parser:
     def and_expr(self) -> Expr:
         left = self.not_expr()
         while self.accept_keyword("AND"):
-            left = Binary("AND", left, self.not_expr())
+            left = fold_and(left, self.not_expr())
         return left
 
     def not_expr(self) -> Expr:
@@ -1474,6 +1496,75 @@ class Parser:
         args = tuple(self.expr_list())
         self.expect_op(")")
         return self.window_suffix(Call(name, args, distinct))
+
+
+def fold_and(left: Expr, right: Expr) -> Expr:
+    """``left AND right`` as SQLite's parser builds it (sqlite3ExprAnd): the
+    integer 0 if a side is the integer literal 0 and neither side calls a
+    function (LIKE and GLOB are functions; subqueries do not count).  This
+    happens before names are resolved, so the other side may even name
+    columns that do not exist.  TRUE and FALSE are still names here."""
+    def is_zero(side: Expr) -> bool:
+        return isinstance(side, Literal) and type(side.value) is int and side.value == 0
+
+    if (is_zero(left) or is_zero(right)) and not any(
+        isinstance(node, (Call, Like)) for side in (left, right) for node in walk_expr(side)
+    ):
+        return Literal(0)
+    return Binary("AND", left, right)
+
+
+# Functions sqlite3ExprIsConstant does not take as constant at parse time:
+# the non-deterministic ones and aggregates (date and time functions count
+# as constant, 'now' or not).
+_NONCONSTANT_FUNCTIONS = frozenset((
+    "RANDOM", "RANDOMBLOB", "CHANGES", "TOTAL_CHANGES", "LAST_INSERT_ROWID",
+    "COUNT", "SUM", "TOTAL", "AVG", "GROUP_CONCAT", "STRING_AGG",
+))
+
+
+def is_parse_constant(expr: Expr) -> bool:
+    """Whether SQLite's parser takes ``expr`` as constant (sqlite3ExprIsConstant
+    before names are resolved): no columns other than TRUE and FALSE, no
+    subqueries, only deterministic scalar functions."""
+    for node in walk_expr(expr):
+        if isinstance(node, (Subquery, InSelect, Exists)):
+            return False
+        if isinstance(node, Column) and not is_true_false_name(node):
+            return False
+        if isinstance(node, Call) and (
+            node.name in _NONCONSTANT_FUNCTIONS or node.over is not None or node.filter is not None
+            or (node.name in ("MIN", "MAX") and len(node.args) < 2)
+        ):
+            return False
+    return True
+
+
+def is_true_false_name(expr: object) -> bool:
+    return isinstance(expr, Column) and expr.table is None and ascii_lower(expr.name) in ("true", "false")
+
+
+def plain_truth_tests(expr: object) -> object:
+    """``expr`` with ``x IS [NOT] TRUE / FALSE`` as plain ``x IS [NOT] 1 / 0``
+    comparisons (see Parser.value_rows)."""
+    if isinstance(expr, Binary) and expr.op in ("IS", "IS NOT") and is_true_false_name(expr.right):
+        value = int(ascii_lower(expr.right.name) == "true")
+        return Binary(expr.op, plain_truth_tests(expr.left), Literal(value))
+    if not dataclasses.is_dataclass(expr) or isinstance(expr, (Subquery, InSelect, Exists)):
+        return expr
+    changes = {}
+    for f in dataclasses.fields(expr):
+        value = getattr(expr, f.name)
+        if isinstance(value, (list, tuple)):
+            new = type(value)(
+                tuple(plain_truth_tests(part) for part in item) if isinstance(item, tuple) else plain_truth_tests(item)
+                for item in value
+            )
+        else:
+            new = plain_truth_tests(value)
+        if new != value:
+            changes[f.name] = new
+    return dataclasses.replace(expr, **changes) if changes else expr
 
 
 def walk_expr(expr: object) -> Iterator[object]:

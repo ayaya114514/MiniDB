@@ -296,6 +296,12 @@ def walk(expr: Expr) -> Iterator[Expr]:
             yield from walk(expr.else_)
 
 
+def is_true_false(expr: Column) -> bool:
+    """Whether a column name that did not resolve is TRUE or FALSE (which
+    SQLite takes as 1 and 0 unless there is such a column)."""
+    return expr.table is None and ascii_lower(expr.name) in ("true", "false")
+
+
 def tables_referenced(expr: Expr, scope: Scope) -> set[int]:
     """Indexes of the tables of ``scope`` that ``expr`` uses.  An expression
     with a subquery counts as using all of them (it may be correlated)."""
@@ -306,6 +312,10 @@ def tables_referenced(expr: Expr, scope: Scope) -> set[int]:
                 _, _, index, depth = scope.resolve(e)
             except AliasReference:
                 continue  # an enclosing query's result column
+            except OperationalError:
+                if is_true_false(e):
+                    continue
+                raise
             if depth == 0:
                 tables.add(index)
         elif isinstance(e, (Subquery, InSelect, Exists)):
@@ -559,6 +569,9 @@ class Compiler:
         op = expr.op
         if op == "AND" and folded_literal(expr) == Literal(0):
             return "0", None  # see _binary
+        test = self._truth_test(expr)
+        if test is not None:
+            return f"{source.value(test)}(row)", None
         left, left_affinity = self._source(expr.left, source, depth)
         right, right_affinity = self._source(expr.right, source, depth)
         x, y = source.name(), source.name()
@@ -598,8 +611,8 @@ class Compiler:
             except AliasReference as reference:
                 return self._outer_alias(reference)
             except OperationalError:
-                if expr.table is None and ascii_lower(expr.name) in ("true", "false"):
-                    value = int(ascii_lower(expr.name) == "true")  # TRUE and FALSE, unless a column
+                if is_true_false(expr):
+                    value = int(ascii_lower(expr.name) == "true")
                     return (lambda row: value), None
                 raise
             hook = self.executor.column_hook if self.executor is not None else None
@@ -667,12 +680,40 @@ class Compiler:
         logical_not = values.logical_not
         return lambda row: logical_not(operand(row))
 
+    def _truth_test(self, expr: Binary) -> RowFunction | None:
+        """``x IS [NOT] TRUE`` and ``x IS [NOT] FALSE`` test the truth of x
+        (SQLite's TK_TRUTH / OP_IsTrue) - when TRUE / FALSE is not a column
+        name.  A NULL x IS TRUE / FALSE is 0, IS NOT TRUE / FALSE is 1."""
+        right = expr.right
+        if expr.op not in ("IS", "IS NOT") or not isinstance(right, Column) or not is_true_false(right):
+            return None
+        try:
+            self.scope.resolve(right)
+            return None  # a column named TRUE or FALSE
+        except AliasReference:
+            return None
+        except OperationalError:
+            pass
+        operand = self.compile(expr.left)
+        is_true = ascii_lower(right.name) == "true"
+        invert = int(is_true != (expr.op == "IS"))
+        if_null = int(not is_true)
+        truth = values.truth
+
+        def test(row):
+            value = truth(operand(row))
+            return (if_null if value is None else int(value)) ^ invert
+        return test
+
     def _binary(self, expr: Binary) -> RowFunction:
         op = expr.op
         if op == "AND" and folded_literal(expr) == Literal(0):
             # SQLite's parser replaces this by 0: the operands are never
             # resolved, so e.g. a missing table in a subquery there is no error.
             return lambda row: 0
+        test = self._truth_test(expr)
+        if test is not None:
+            return test
         left, left_affinity = self.compile_with_affinity(expr.left)
         right, right_affinity = self.compile_with_affinity(expr.right)
         truth = values.truth
@@ -1571,6 +1612,10 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             slot, _, table_index, depth = scope.resolve(expr)
         except AliasReference:
             return None
+        except OperationalError:
+            if is_true_false(expr):
+                return None
+            raise
         if depth or table_index != index:
             return None
         if slot == rowid_slot or slot - offset == table.rowid_column:
@@ -1603,7 +1648,15 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
         conversions[converted] = convert
         return converted
 
+    expanded = []
     for conjunct in conjuncts:
+        if isinstance(conjunct, Between) and not conjunct.negated:
+            # As SQLite: x BETWEEN a AND b also gives the (virtual) terms
+            # x >= a and x <= b; the BETWEEN itself is still tested.
+            expanded += [Binary(">=", conjunct.expr, conjunct.low), Binary("<=", conjunct.expr, conjunct.high)]
+        else:
+            expanded.append(conjunct)
+    for conjunct in expanded:
         if isinstance(conjunct, InList) and not conjunct.negated:
             position = column_position(conjunct.expr)
             if position is not None:
@@ -3070,6 +3123,10 @@ class CompiledSelect:
                 slot, _, table_index, depth = self.scope.resolve(expr)
             except AliasReference:
                 return None
+            except OperationalError:
+                if is_true_false(expr):
+                    return None
+                raise
             if depth or table_index != 0:
                 return None
             position = slot - entry.offset

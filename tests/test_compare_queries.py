@@ -1102,3 +1102,96 @@ def test_join_of_many_tables():
     pair.run(f"SELECT a0, b21 FROM {', '.join(names)} WHERE {where}")
     pair.run(f"SELECT count(*) FROM {', '.join(names)} WHERE a0 = 0 AND {where}")
     pair.close()
+
+
+def test_between_uses_indexes_with_the_same_results():
+    pair = Pair()
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT, c)",
+        "CREATE INDEX ta ON t (a)", "CREATE INDEX tb ON t (b, a)", "CREATE INDEX tc ON t (c)",
+        "INSERT INTO t (a, b, c) VALUES (1, 'x', 1), (5, 'x', '5'), (NULL, 'y', NULL), (10, '10', 2.5), "
+        "(7, 'y', x'00'), (3, '3', 'abc'), (-2, 'x', 7)",
+    ]:
+        pair.run(sql)
+    for where in [
+        "a BETWEEN 1 AND 7", "a BETWEEN '1' AND '7'", "a BETWEEN 7 AND 1", "a BETWEEN NULL AND 5",
+        "id BETWEEN 2 AND 5", "id BETWEEN '2' AND 5.5", "b = 'x' AND a BETWEEN 0 AND 5",
+        "b BETWEEN 1 AND 5", "b BETWEEN '1' AND '5'", "c BETWEEN 1 AND 6", "c BETWEEN '1' AND 'b'",
+        "4 BETWEEN a AND 20", "a NOT BETWEEN 1 AND 5", "a BETWEEN 1 AND 7 OR b = 'y'",
+    ]:
+        pair.run(f"SELECT id FROM t WHERE {where} ORDER BY id")
+    pair.close()
+    db = Database()
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
+    db.execute("CREATE INDEX ta ON t (a)")
+    assert db.execute("EXPLAIN SELECT count(*) FROM t WHERE a BETWEEN 3 AND 5") == [
+        ("t", "SEARCH USING COVERING INDEX ta (a>=? AND a<=?)")]
+
+
+def test_parser_folds_and_with_zero():
+    """SQLite's parser turns X AND 0 into 0 before names are resolved, unless
+    a side calls a function: the other side may name missing columns."""
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (c0, c1)")
+    pair.run("INSERT INTO t VALUES (35, 1), (2, 2)")
+    for sql in [
+        "SELECT * FROM t WHERE (0 AND nope AND c0 < 1) OR c0 = 35",
+        "SELECT c0 AS k FROM t WHERE (0 AND (x'' != NOT (nope))) OR k = 35",
+        "SELECT * FROM t WHERE (1 AND 0) AND nope", "SELECT * FROM t WHERE (0) AND nope",
+        "SELECT * FROM t AS a JOIN t AS b ON 0 AND nope", "SELECT 0 AND nope, 0x0 AND 1 FROM t",
+        "SELECT * FROM t WHERE 0 AND (SELECT abs(nope))",
+        "SELECT * FROM t WHERE 0 AND abs(nope)", "SELECT * FROM t WHERE 0 AND nope LIKE 1",
+        "SELECT * FROM t WHERE -0 AND nope", "SELECT * FROM t WHERE 0.0 AND nope",
+        "SELECT * FROM t WHERE FALSE AND nope",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_true_and_false_everywhere():
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t (c0, c1)", "CREATE INDEX t0 ON t (c0)", "INSERT INTO t VALUES (1, 2), (0, 1), (2, 0)",
+        "SELECT * FROM t WHERE FALSE", "SELECT * FROM t WHERE TRUE ORDER BY c0",
+        "SELECT * FROM t WHERE c0 = true", "SELECT * FROM t WHERE true = c0 OR c0 IN (false, 5) ORDER BY true, c0",
+        "SELECT * FROM t AS a JOIN t AS b ON true WHERE b.c0 = true OR false ORDER BY a.c0, b.c0",
+        "SELECT count(*) FROM t GROUP BY true HAVING true", "UPDATE t SET c1 = true WHERE c0 = false",
+        "DELETE FROM t WHERE c1 = false", "SELECT * FROM t ORDER BY c0",
+        "CREATE TABLE u (\"true\", b)", "INSERT INTO u VALUES (7, 1)", "SELECT * FROM u WHERE true = 7",
+        "SELECT b IS TRUE, b IS NOT TRUE FROM u",  # a column named true: a plain IS
+        "SELECT x, x IS TRUE, x IS FALSE, x IS NOT TRUE, x IS NOT FALSE, x IS 1, x IS NOT 0 FROM "
+        "(SELECT NULL AS x UNION ALL SELECT 0 UNION ALL SELECT 48 UNION ALL SELECT -0.5 UNION ALL SELECT 'abc' "
+        "UNION ALL SELECT '12x' UNION ALL SELECT x'01' UNION ALL SELECT 0.0) ORDER BY 1",
+        "SELECT * FROM t WHERE c0 IS TRUE AND c1 IS NOT FALSE ORDER BY c0",
+    ]:
+        pair.run(sql)
+    pair.run("SELECT ? IS NOT FALSE, ? IS TRUE, ? IS FALSE", parameters=[None, "7", 0.0])
+    pair.close()
+
+
+@pytest.mark.parametrize("sql", [
+    "VALUES (1, 2), (2, (5 IS NOT TRUE)), (3, 5 IS TRUE), (4, NULL IS NOT FALSE), (5, 'x' IS FALSE)",
+    "WITH x AS (SELECT 1) SELECT * FROM (VALUES (1, 2), (2, (5 IS NOT TRUE)))",
+    "VALUES (CAST(1 AS INT), 2), (2, (5 IS NOT TRUE))",
+    "VALUES (+CAST(1 AS INT), 2), (2, (5 IS NOT TRUE))",
+    "VALUES ((SELECT 1), 2), (2, (5 IS NOT TRUE))",
+    "VALUES (1, 2), (abs(2) + (2 LIKE 2), (5 IS NOT TRUE))",
+    "VALUES (1, 2), (random() * 0, (5 IS NOT TRUE)), (3, 5 IS NOT TRUE)",
+    "VALUES (1, 2), (CAST(2 AS INT), 3), (3, (5 IS NOT TRUE))",
+    "VALUES (1, 2), (CASE WHEN 1 THEN 2 END, NOT (5 IS TRUE) + (3 IN (1, 2)) * 10)",
+    "VALUES (5 IS NOT TRUE, 2), (5 IS NOT TRUE, 3)",
+    "SELECT 1, 2 UNION ALL VALUES (2, (5 IS NOT TRUE))",
+    "WITH v AS (VALUES (1, 2), (2, (5 IS NOT TRUE))) SELECT * FROM v",
+    "VALUES (1, 2), (2, (5 IS NOT TRUE)), ((WITH x AS (SELECT 3) SELECT * FROM x), 4)",
+    "VALUES (1, 2), (date('2020-01-01') IS NULL, 5 IS NOT TRUE), (CURRENT_DATE IS NULL, 5 IS TRUE)",
+])
+def test_values_rows_coded_without_resolving_names(sql):
+    """SQLite codes later VALUES rows directly when it can (sqlite3MultiValues):
+    their ``x IS TRUE`` is then ``x IS 1``, not a truth test."""
+    pair = Pair()
+    pair.run(sql)
+    pair.run("CREATE TABLE t (a, b)")
+    if sql.startswith("VALUES"):
+        pair.run("INSERT INTO t " + sql)
+        pair.run("SELECT * FROM t")
+    pair.close()

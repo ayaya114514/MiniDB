@@ -683,3 +683,27 @@ SQLite 把列的（常量）DEFAULT 在每条 INSERT 里只计算一次，直接
 语句中某一行走到了这一步，之后各行 upsert 的 `excluded` 里的默认值就是转换过的（`VARCHAR DEFAULT -1.5` 变成
 文本 `'-1.5'`），而第一行冲突时看到的是原值。显式给出的值每行重新计算，不受影响。MiniDB 用 `DefaultRegisters`
 记录“是否已转换”照做（D83 的 raw excluded 之上）。文件模式 fuzz 种子 9791 发现。
+
+## D97 BETWEEN 也能走索引
+SQLite 的 `exprAnalyze` 把 `x BETWEEN a AND b` 额外拆成两个虚拟项 `x >= a`、`x <= b` 供索引规划使用，原 BETWEEN
+仍然照常求值。`find_constraints` 现在同样展开（NOT BETWEEN 不展开），所以 `age BETWEEN 30 AND 35` 走
+`SEARCH USING COVERING INDEX ... (age>=? AND age<=?)`、主键上走 rowid 范围，计划选择与 SQLite 一致。结果不受影响
+（过滤仍按 BETWEEN 求值），比较亲和性与两个比较相同。在做 Playground 示例时发现。
+
+## D98 解析期的 AND 折叠、TRUE / FALSE、IS TRUE、多行 VALUES 的直接编码
+fuzzer 加入 TRUE / FALSE 字面量后发现的一组与 SQLite 解析/解析名字时机相关的行为，逐条照搬：
+- `sqlite3ExprAnd`：解析时只要一侧是整数字面量 0（`0`、`(0)`、`0x0`，不含 `-0`、`0.0`、`'0'`、FALSE）且两侧都没有
+  函数调用（LIKE/GLOB 算函数，子查询里的不算），整个 AND 就变成整数 0——在名字解析之前，所以另一侧可以引用不存在的列
+  而不报错。原来只在编译期折叠，规划器的预处理（`tables_referenced` 等）仍会去解析那些名字；现在在 `Parser.and_expr`
+  里折叠（`fold_and`），且层层传递（`(1 AND 0) AND nope` → 0）。
+- TRUE / FALSE 在表达式里是名字：有同名列时是列，否则是 1 / 0。编译器早就这样做，但规划器的几处（连接条件放置、索引约束、
+  ORDER BY 走索引）直接解析列名，`SELECT ... FROM t WHERE FALSE` 都会报 "no such column: FALSE"——长期存在的 bug，
+  fuzzer 以前不生成 TRUE/FALSE 所以没发现。统一用 `is_true_false()` 判断。
+- `x IS [NOT] TRUE/FALSE`（右侧是解析成常量的 TRUE/FALSE）是真值测试（SQLite 的 TK_TRUTH / OP_IsTrue）：`48 IS NOT TRUE`
+  为 0，`NULL IS TRUE` 为 0，`NULL IS NOT FALSE` 为 1，而不是与 1 / 0 比较。
+- 怪癖：多行 VALUES 的第二行起，SQLite（`sqlite3MultiValues`）在可以时把行直接编码进协程、不经过名字解析，于是其中的
+  `x IS TRUE` 不会变成真值测试，就是 `x IS 1`（`VALUES (1, 2), (2, 5 IS NOT TRUE)` 第二行是 1）。条件逐项实测：语句里此前
+  出现过 WITH 则不用；该行必须是常量（无列名，TRUE/FALSE 除外；无子查询；函数须是确定性的标量函数——random、changes、
+  last_insert_rowid、聚合不算，日期函数算）；若前一行是普通（解析过的）行，它也必须是常量且顶层没有 CAST（有亲和性）。
+  `Parser.value_rows` 照此把这些行里的 `IS TRUE/FALSE` 改写成与 1 / 0 的普通比较。
+- 已知差异：VALUES 行里的聚合函数（SQLite 里回退成无 FROM 的 SELECT，`VALUES (count(*))` 合法）MiniDB 报 misuse，未处理。
