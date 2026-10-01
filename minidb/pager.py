@@ -122,27 +122,35 @@ class FreePage:
 
 
 class Header:
-    """Page 0: magic string, page count, free list head and change counter."""
+    """Page 0: magic string, page count, free list head, change counter,
+    and (as in SQLite's header) the user version, application id and schema
+    version, which PRAGMA reads and sets (files from before they existed
+    have zeros there)."""
 
-    _format = struct.Struct(">16sIII")
+    _format = struct.Struct(">16sIIIiiI")
 
-    def __init__(self, pgno: int = 0, page_count: int = 1, freelist_head: int = 0, change_counter: int = 0) -> None:
+    def __init__(self, pgno: int = 0, page_count: int = 1, freelist_head: int = 0, change_counter: int = 0,
+                 user_version: int = 0, application_id: int = 0, schema_version: int = 0) -> None:
         self.pgno = pgno
         self.page_count = page_count
         self.freelist_head = freelist_head
         self.change_counter = change_counter
+        self.user_version = user_version
+        self.application_id = application_id
+        self.schema_version = schema_version
 
     @classmethod
     def from_bytes(cls, pgno: int, data: bytes) -> Self:
-        _magic, page_count, freelist_head, counter = cls._format.unpack_from(data)
-        return cls(pgno, page_count, freelist_head, counter)
+        return cls(pgno, *cls._format.unpack_from(data)[1:])
 
     def to_bytes(self) -> bytes:
-        data = self._format.pack(MAGIC, self.page_count, self.freelist_head, self.change_counter)
+        data = self._format.pack(MAGIC, self.page_count, self.freelist_head, self.change_counter,
+                                 self.user_version, self.application_id, self.schema_version)
         return data.ljust(USABLE_SIZE, b"\x00")
 
     def copy(self) -> Self:
-        return Header(self.pgno, self.page_count, self.freelist_head, self.change_counter)
+        return Header(self.pgno, self.page_count, self.freelist_head, self.change_counter,
+                      self.user_version, self.application_id, self.schema_version)
 
 
 def with_checksum(data: bytes) -> bytes:
@@ -259,6 +267,7 @@ class Pager(PageCache):
         self.path = path
         self.wal_path = None if path is None else path + "-wal"
         self.crash_hook = None
+        self.schema_changed = False  # (see note_schema_change)
         self.checkpoint_frames = 1000  # a writer copies a log this long first
         self.restart_wait = 0.1  # seconds a writer waits for readers of a long log
         self.cache = {}
@@ -704,6 +713,9 @@ class Pager(PageCache):
             self.begin_write()
         self.write(self.header)
         self.header.change_counter = (self.header.change_counter + 1) & 0xFFFFFFFF
+        if self.schema_changed:
+            self.header.schema_version = (self.header.schema_version + 1) & 0xFFFFFFFF
+            self.schema_changed = False
         pages = [(pgno, with_checksum(self.cache[pgno].to_bytes())) for pgno in sorted(self.dirty)]
         if self.wal is None:
             for pgno, image in pages:
@@ -728,8 +740,13 @@ class Pager(PageCache):
         self._append_frames(pages, commit=False)
         self.dirty.clear()
 
+    def note_schema_change(self) -> None:
+        """The transaction changes the schema: commit bumps the schema version."""
+        self.schema_changed = True
+
     def rollback(self) -> None:
         """Discard every uncommitted change, including spilled frames."""
+        self.schema_changed = False
         for pgno in self.dirty:
             self.cache.pop(pgno, None)
         self.dirty.clear()

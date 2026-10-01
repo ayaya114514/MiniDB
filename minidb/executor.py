@@ -30,7 +30,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
 
-from minidb import dates, functions, values, window
+from minidb import dates, functions, pragmas, values, window
 from minidb.btree import BTree, IntKey
 from minidb.catalog import (
     HIGH, Catalog, IndexInfo, IndexKeyCodec, TableInfo, ViewInfo,
@@ -41,8 +41,8 @@ from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalE
 from minidb.parser import (
     AlterTable, Analyze, Between, Binary, Call, Case, Cast, Collate, Column, Compound, CreateIndex, CreateTable,
     CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
-    InSelect, Insert, Join, Like, Literal, Parameter, Reindex, Select, SelectItem, Star, Subquery,
-    TableRef, Unary, Update, Upsert, Vacuum, Values, Frame, WindowDef,
+    InSelect, Insert, Join, Like, Literal, Parameter, Pragma, Reindex, Select, SelectItem, Star, Subquery,
+    TableFunction, TableRef, Unary, Update, Upsert, Vacuum, Values, Frame, WindowDef,
 )
 from minidb.parser import CheckConstraint, ColumnDef, Expr, ForeignKey, KeyConstraint, Statement, parse
 from minidb.tokenizer import tokenize
@@ -249,9 +249,10 @@ class Scope:
             if table_name is not None and ascii_lower(table_name) != entry.name:
                 continue
             found = True
+            hidden = getattr(entry.table, "hidden_columns", ())
             for column in entry.table.columns:
                 lowered = ascii_lower(column.name)
-                if table_name is None and lowered in entry.using:
+                if (table_name is None and lowered in entry.using) or lowered in hidden:
                     continue
                 if i < self.last_right and any(lowered in e.using for e in self.entries[i + 1:]):
                     result.append((None, column.name))
@@ -2048,7 +2049,7 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
         bound = set(range(index))
     if isinstance(table, DerivedSource):
         scan = DerivedScan(table)
-        if type(table) is DerivedSource:  # (not a CTE's working table, which changes)
+        if type(table) in (DerivedSource, PragmaSource):  # (not a CTE's working table, which changes)
             return hash_lookup(scope, index, catalog, conjuncts, compiler, bound, scan) or scan
         return scan
     rows = table_rows(catalog, table)
@@ -2104,6 +2105,12 @@ class Executor:
         self.statement_journal = True  # see PreparedInsert.statement_journal
         self.changes = 0  # changes() and total_changes(), kept up to date by Database
         self.total_changes = 0
+        # PRAGMA settings of the connection (see minidb.pragmas).
+        self.settings = {"foreign_keys": 0, "defer_foreign_keys": 0, "ignore_check_constraints": 0,
+                         "recursive_triggers": 0, "cache_size": -2000, "synchronous": 2}
+        self.data_version = 1  # PRAGMA data_version: bumped when another connection commits
+        self.integrity_problems = None  # Database.integrity_check, for PRAGMA integrity_check
+        self.in_transaction = lambda: False  # set by Database
 
     def execute(self, stmt: Statement, parameters: Sequence[SQLValue] = ()) -> Result:
         """Execute a parsed statement with the given parameter values (a list
@@ -2145,7 +2152,14 @@ class Executor:
         if isinstance(stmt, Analyze):
             self.catalog.analyze(stmt.name)
             return Result()
+        if isinstance(stmt, Pragma):
+            rows, columns = pragmas.run(self, stmt.name, stmt.value, stmt.schema)
+            return Result(rows, columns)
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
+
+    def foreign_key_violations(self, table_name: object = None) -> list[tuple]:
+        """PRAGMA foreign_key_check: (table, rowid, parent, foreign key number) rows."""
+        return []
 
     def prepare(self, stmt: Select | Compound | Insert | Update | Delete) -> PreparedStatement:
         """The compiled plan of a SELECT/INSERT/UPDATE/DELETE.  Plans are kept
@@ -2321,6 +2335,19 @@ class Executor:
                 source = DerivedSource(ref.alias or "", compiled)
                 derived.append(source)
                 scope.add(source, ref.alias or "")
+            elif isinstance(ref, TableFunction) or (
+                    pragmas.function_spec(ref.name) is not None and self.find_cte(ref.name) is None
+                    and not self.catalog.has_table(ref.name) and self.catalog.find_view(ref.name) is None):
+                if not isinstance(ref, TableFunction):
+                    ref = TableFunction(ascii_lower(ref.name), [], ref.alias, ref.pos)
+                source, condition = self.table_function_source(ref, scope)
+                derived.append(source)
+                if source.correlated:
+                    scope.uses_outer = True
+                scope.add(source, ref.alias or ref.name)
+                if condition is not None:  # its argument comes from a table before it in FROM
+                    on = Binary("=", Column("arg", ref.alias or ref.name), condition)
+                    join = dataclasses.replace(join, on=on if join.on is None else Binary("AND", join.on, on))
             elif self.find_cte(ref.name) is not None:
                 source = self.cte_source(self.find_cte(ref.name), scope)
                 if not isinstance(source, WorkingSource):
@@ -2344,6 +2371,28 @@ class Executor:
                 join = self.using_condition(scope, index, join)
             normalized.append(join)
         return normalized, derived
+
+    def table_function_source(self, ref: TableFunction, scope: Scope) -> tuple[PragmaSource, Expr | None]:
+        """The source of ``pragma_<name>(arg, schema)`` in FROM, and an
+        expression the hidden column ``arg`` must equal, when the argument
+        uses a table before it in the FROM clause."""
+        spec = pragmas.function_spec(ref.name)
+        if spec is None:
+            raise OperationalError(f"no such table: {ref.name}")
+        takes_arg = spec.arg is not None
+        if len(ref.args) > 1 + takes_arg:
+            raise OperationalError(f"too many arguments on {ref.name}() - max {1 + takes_arg}")
+        arg = ref.args[0] if takes_arg and ref.args else None
+        schema = ref.args[-1] if len(ref.args) > takes_arg else None
+        compiler = Compiler(scope, executor=self)
+        if schema is not None:
+            if tables_referenced(schema, scope):
+                raise OperationalError(f"MiniDB needs a constant schema argument for {ref.name}()")
+            schema = compiler.compile(schema)
+        lateral = arg is not None and bool(tables_referenced(arg, scope))
+        source = PragmaSource(self, ref.name, spec, None if lateral or arg is None else compiler.compile(arg),
+                              schema, lateral, scope)
+        return source, (Collate(arg, "NOCASE") if lateral else None)
 
     @staticmethod
     def using_condition(scope: Scope, index: int, join: Join) -> Join:
@@ -2986,7 +3035,7 @@ class Executor:
             rowid = self.new_rowid(tree, sequence)
         if table.rowid_column is not None:
             row[table.rowid_column] = raw[table.rowid_column] = rowid
-        if table.checks:
+        if table.checks and not self.settings["ignore_check_constraints"]:
             # (SQLite applies the column affinities in place before it tests CHECK constraints.)
             if defaults is not None:
                 defaults.converted = True
@@ -3007,7 +3056,7 @@ class Executor:
         # it checks the first index (or a CHECK constraint); an upsert's
         # "excluded" row shows them converted only if the conflict was found
         # after that.
-        converted = bool(table.checks)
+        converted = bool(table.checks) and not self.settings["ignore_check_constraints"]
         for constraint in constraints:
             if constraint == "rowid":
                 other = rowid if rowid in tree else None
@@ -3057,7 +3106,7 @@ class Executor:
             if violation[1] == "IGNORE":
                 return None
             raise self.constraint_error(*violation)
-        if table.checks:
+        if table.checks and not self.settings["ignore_check_constraints"]:
             if changed is not None and table.rowid_column in changed:
                 changed = changed | {width}
             violation = self.check_violation(table, row + [new_rowid], conflict, changed)
@@ -4315,6 +4364,52 @@ class DerivedSource:
 
     def materialize(self) -> None:
         self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+
+
+class PragmaSource(DerivedSource):
+    """``pragma_<name>(arg, schema)`` in FROM: the pragma's rows, with the
+    hidden columns ``arg`` and ``schema`` (left out of ``*``).  With an
+    argument from an earlier table of the FROM clause (``lateral``), the rows
+    for every possible argument, which the join then matches on ``arg``."""
+
+    def __init__(self, executor: Executor, name: str, spec: pragmas.Spec, arg: RowFunction | None,
+                 schema: RowFunction | None, lateral: bool, scope: Scope) -> None:
+        self.name = name
+        self.executor = executor
+        self.spec = spec
+        self.arg = arg
+        self.schema = schema
+        self.lateral = lateral
+        self.scope = scope
+        names = list(spec.columns) + (["arg"] if spec.arg is not None else []) + ["schema"]
+        self.columns = [ColumnName(n) for n in names]
+        self.hidden_columns = {"arg", "schema"}
+        self.affinities = [None] * len(names)
+        self.collations = [None] * len(names)
+        self.positions = {ascii_lower(n): i for i, n in enumerate(names)}
+        self.rows = []
+
+    @property
+    def correlated(self) -> bool:
+        return False  # (its arguments read the enclosing query's row through scope.cell)
+
+    def materialize(self) -> None:
+        row = [None] * self.scope.width
+        schema = self.schema(row) if self.schema is not None else None
+        if schema is not None:
+            pragmas.check_schema(str(schema), quoted=True)
+        spec, executor = self.spec, self.executor
+        if self.lateral:
+            arguments = pragmas.argument_domain(executor, spec)
+        elif spec.arg is not None:
+            arguments = [self.arg(row) if self.arg is not None else None]
+        else:
+            arguments = [None]
+        rows = []
+        for argument in arguments:
+            for result in spec.rows(executor, argument):
+                rows.append(list(result) + ([argument] if spec.arg is not None else []) + [schema])
+        self.rows = [row + [i] for i, row in enumerate(rows, 1)]
 
 
 class CteInfo:
