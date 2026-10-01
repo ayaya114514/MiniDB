@@ -118,6 +118,7 @@ db = minidb.Database("app.sqlite", format="sqlite")   # 或 minidb.connect("app.
 所以另一个进程里的 sqlite3 可以同时打开同一个文件。ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。只支持 4096 字节
 的页、UTF-8、非 WAL 模式、无 auto_vacuum（其他文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的
 对象（CHECK、触发器、表达式索引等）原样保留，用到时报 `NotSupportedError`。设计见 DECISIONS.md 的 D100。
+SQLite 格式下查询与 MiniDB 格式相差 10–45%，逐行插入慢 1.6–2.4 倍（benchmark 见 PROGRESS.md 阶段 20）。
 
 ## 架构
 

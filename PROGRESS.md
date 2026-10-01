@@ -279,18 +279,42 @@
 
 已知问题：VALUES 行里的聚合（`VALUES (count(*))`，SQLite 合法）MiniDB 报 misuse；Playground 依赖 jsDelivr 上的 Pyodide（首次加载约 10 MB）。
 
-## 阶段 20：SQLite 文件格式兼容（进行中，2026-10-01 暂停）
-已完成并提交（849ab1b、a731210 等，详见 DECISIONS.md D100–D101）：`minidb/sqlite_format.py`（varint、record、文件头、B-tree 页、overflow、freelist）、`minidb/sqlite_btree.py`（表 B+ 树、索引 B 树、SQLite 式兄弟平衡、自底向上构建）、`minidb/sqlite_pager.py`（SQLite 格式的回滚日志 + unix VFS 锁、热日志回放）；按文件头自动识别格式，`connect(..., format="sqlite")` / `--sqlite` 新建；sqlite_schema、autoindex、ANALYZE 写 sqlite_stat1、VACUUM / VACUUM INTO；不支持的对象保留并只读；integrity_check 核对每一页。与 sqlite3 互读互写、崩溃点 × 恢复方、与 sqlite3 进程并发加锁的测试在 `tests/test_sqlite_format.py`。
+## 阶段 20：SQLite 文件格式兼容（完成，2026-10-01）
+- **SQLite 文件格式**（D100–D101）：`minidb/sqlite_format.py`（varint、record、100 字节文件头、B-tree 页与本地负载 / overflow 公式、freelist trunk/leaf）、`minidb/sqlite_btree.py`（表 B+ 树与索引 B 树，SQLite 式的最多 3 个兄弟页重分布、顺序追加时的 balance_quick、自底向上批量构建）、`minidb/sqlite_pager.py`（与 SQLite 逐字节相同的 rollback journal、SQLite unix VFS 的 PENDING/RESERVED/SHARED 锁、多段热日志回放）。按文件头自动识别格式；`Database(path, format="sqlite")`、`connect(..., format=)`、`python -m minidb --sqlite` 新建。catalog 直接用 `sqlite_schema`、`sqlite_autoindex_*`、schema cookie；ANALYZE 写 `sqlite_stat1`（行与数字与 SQLite 相同），VACUUM / VACUUM INTO 照 SQLite；SQLite 写下而 MiniDB 解析不了的对象原样保留、相关表只读；integrity_check 核对每一页的归属。两种格式都能读 `sqlite_schema` / `sqlite_master`。
+- 对照测试（`tests/test_sqlite_format.py`，38 个）：record 与 sqlite3 逐字节相同；sqlite3 写的文件 MiniDB 读、MiniDB 写的文件 sqlite3 读并 `PRAGMA integrity_check`；两者轮流写同一个文件；提交的每个崩溃点 × 由 sqlite3 / MiniDB 恢复；MiniDB 回放真实 sqlite3 进程死掉留下的热日志；与另一个进程里的 sqlite3 双向加锁互斥；拒绝的文件（页大小、WAL、UTF-16、auto_vacuum）；ANALYZE / VACUUM 结果与 SQLite 相同；B 树对模型的随机测试（含 overflow、DESC 列、三层索引的内部项删除、页面归属）。fuzzer 的 `--sqlite-format` 模式在每个种子结束时让 sqlite3 检查 MiniDB 的文件并逐表比较内容；`tools/sqllogictest.py --format sqlite`、`tests/benchmark.py --sqlite-format`。
+- 阶段末 fuzz 发现并修复（两种格式都复现，与文件格式无关）：
+  - 种子 4108：含 NUL 的文本做算术——SQLite 的 sqlite3AtoF 停在 NUL 而 sqlite3Atoi64 读过 NUL，所以只有 NUL 之前整体是数字时才是 REAL（`'5\0'+0` 是 5.0，`'5 x\0'+0` 是 5）。
+  - sqllogictest 发现：`NOT INDEXED` / `INDEXED BY` 以前只检查不影响计划，覆盖索引扫描之后就看得出来了。现在照 SQLite：NOT INDEXED 只用表本身（rowid 查找可以），INDEXED BY 只用那个索引、没有条件可用时扫整个索引，两者都不用自动索引（hash join）；SELECT、UPDATE、DELETE 都适用。
+  - 种子 5512 与阶段 18 记录未修的 9661：没有 ORDER BY 时的行顺序（裸列、`group_concat`、`sum` 溢出）。按 SQLite 改了访问路径（D102）：覆盖索引全扫描（按 SQLite 的 szEst / LogEst 选索引）、全表扫描按 3N 计价、`x = a OR x = b` 生成虚拟的 IN、IN 按索引顺序输出、MULTI-INDEX OR 逐项输出去重。三个种子现在都与 SQLite 一致。
+- 性能（D103）：剖析 SQLite 格式后只动热点——单元格缓存字节数、页拷贝共享单元格、record 按 header 编译 `struct` 解码、用户表直接交出解码好的行。
 
-阶段末验证（暂停前已跑完）：
-- sqllogictest 全量：MiniDB 格式与 SQLite 格式都是 5,939,852 / 5,939,879，失败与阶段 17 相同。
-- fuzz：SQLite 格式文件 300 × 400 0 失败；变形测试文件模式 300 × 300 0 失败；SQLite 格式内存 600 × 500、MiniDB 格式 600 × 500 各 1 个失败种子，两个都与文件格式无关（两种格式都复现）：
-  - 种子 4108：含 NUL 的文本做算术。SQLite 的 sqlite3AtoF 停在 NUL、sqlite3Atoi64 读过 NUL，所以只有 NUL 之前整体是数字时才是 REAL（`'5\0'+0` 是 5.0，`'5 x\0'+0` 是 5）。已修（e7764bf）。
-  - 种子 5512：依赖查询计划的行顺序（外层聚合的裸列）。
+**benchmark**（10 万行，同一台机器；“阶段 19 末”是 e7764bf，规划器改动之前）：
 
-暂停时的状态：
-- 与本记录一起提交：`minidb/executor.py` 的覆盖索引全扫描（SQLite whereLoopAddBtree 的 "full scan via index"：有索引包含查询用到的全部列且 szIdxRow < szTabRow 时扫这个索引，按 sqlite3AffinityType 的 szEst 与 LogEst 选最便宜的、同价取最新的；`size_estimate` / `log_estimate` / `covering_index_scan`），加 `tests/test_compare_queries.py::test_full_scan_through_a_covering_index`（结果按顺序比、计划与 SQLite 一致）。全量测试通过。这修掉阶段 18 记录的种子 9661 这一类。还没跑 sqllogictest 和 benchmark 复核。
-- 与本记录一起提交：`tests/benchmark.py --sqlite-format`（MiniDB 用 SQLite 格式跑同一套 benchmark），两种格式的数字还没测。
-- 种子 5512 的真正原因还没修：SQLite 对 `c >= -3 OR c < 2` 用 MULTI-INDEX OR（全表扫描按 3N 计价，`rSize + 16`，压过两个单边范围），且 OR 按项依次输出、用 RowSet 去重；IN 按值排序后逐个走索引。MiniDB 的全表扫描按 N 计价，所以选了扫表；MultiScan 又按 rowid 排序输出。试过只在 `plan_access` 选路时给全表扫描乘 3：OR 计划与 SQLite 一致了，但 `test_optimizer` 两个断言（`a = 1 OR a > 48` 期望 SCAN，SQLite 实际用 MULTI-INDEX OR；8 行时期望 SCAN，SQLite 实际仍用 t_k）需要按 SQLite 的实际计划改写，MultiScan 的输出顺序和 `order()` 也要跟着改。这部分已撤回，未提交。
+| 操作 | 阶段 19 末 | 阶段 20 末 MiniDB 格式 | SQLite 格式第一版 | SQLite 格式优化后 | sqlite3 |
+|---|---:|---:|---:|---:|---:|
+| 逐条 INSERT，一个事务 | 3.06 s | 2.89 s | 14.11 s | 4.78 s | 0.25 s |
+| 逐条 INSERT，`?` 参数 | 1.08 s | 1.08 s | 10.83 s | 2.59 s | 0.08 s |
+| 每条 INSERT 1000 行 | 2.59 s | 2.48 s | 9.65 s | 3.98 s | 0.07 s |
+| 1000 次 autocommit 插入 | 0.148 s | 0.142 s | 0.568 s | 0.564 s | 0.199 s |
+| 1 万次主键点查 | 0.839 s | 0.843 s | 0.999 s | 0.883 s | 0.066 s |
+| 1 万次主键点查，`?` 参数 | 0.148 s | 0.149 s | 0.170 s | 0.145 s | 0.042 s |
+| 100 次主键范围扫描 | 0.091 s | 0.089 s | 0.295 s | 0.100 s | 0.023 s |
+| 全扫 count(*) WHERE | 0.066 s | 0.065 s | 0.265 s | 0.075 s | 0.003 s |
+| 全扫 SELECT * | 0.076 s | 0.073 s | 0.297 s | 0.107 s | 0.039 s |
+| GROUP BY 3 个聚合 | 0.098 s | 0.098 s | 0.299 s | 0.108 s | 0.034 s |
+| CREATE INDEX | 0.492 s | 0.475 s | 0.600 s | 0.412 s | 0.023 s |
+| 73 次索引等值查找 | 0.082 s | 0.076 s | 0.184 s | 0.137 s | 0.002 s |
+| 索引嵌套循环连接 | 0.170 s | 0.166 s | 0.406 s | 0.199 s | 0.006 s |
+| 文件大小 | 14.8 MB | 14.8 MB | 13.4 MB | 13.4 MB | 9.3 MB |
 
-剩余步骤：决定是否做 OR/IN 输出顺序（上一条）→ 两种格式的 benchmark → 复跑 sqllogictest 与 fuzz → 写阶段 20 完成记录、勾选 CLAUDE.md。
+规划器改动对 MiniDB 格式在噪声范围内。
+
+**验证**：测试 1001 个全部通过；fuzz：SQLite 格式文件模式 300 × 400、SQLite 格式内存 600 × 500、MiniDB 格式内存 600 × 500、MiniDB 格式文件 200 × 400 全部 0 失败（含先前失败的 4108、5512 所在区间），变形测试文件模式 300 × 300 0 失败；sqllogictest 全量（规划器改动后）两种格式都是 5,939,846 / 5,939,879：比阶段 17 多出的 6 个失败都是 `... FROM t1 NOT INDEXED` 的 `group_concat` 顺序——覆盖索引扫描没有理会 NOT INDEXED。随后让 `NOT INDEXED` / `INDEXED BY` 照 SQLite 约束规划器（见下），这 6 个恢复；用到这两个提示的只有 evidence 目录的 3 个文件，该目录两种格式复跑都回到原来的 27 个失败，所以全量应回到 5,939,852 / 5,939,879（加提示后没有再跑全量）。覆盖率（只跑 test_sqlite_format）：sqlite_btree 92.4%、sqlite_format 94.1%、sqlite_pager 92.3%。
+
+**已知问题 / 做得不扎实的地方**：
+- 只支持 4096 字节页、UTF-8、rollback journal（不支持 WAL 模式的 SQLite 文件）、无 auto_vacuum；SQLite 格式的大事务脏页全在内存。
+- SQLite 格式下插入仍比 MiniDB 格式慢 1.6–2.4 倍：每次插入都 O(页内单元格数) 地累加页面用量，写入时还要先编码 MiniDB record 再转成 SQLite record。
+- DESC 索引在 SQLite 格式里只维护、不用于查找和排序（扫描时整体排序）；MiniDB 格式里 DESC 仍按升序存。
+- Windows：`test_sqlite_format.py` 已加入 CI 的 windows-latest 任务，但阶段 20 的提交还没推送，Windows 上未运行；与 sqlite3 进程并发的测试只在 macOS 上跑过。同一进程里的 sqlite3 模块与 MiniDB 不互斥（POSIX 记录锁属于进程，与 SQLite 自己相同）。
+- 行顺序：连接顺序仍是 MiniDB 自己的代价模型，可能与 SQLite 不同；MULTI-INDEX 的子项不做覆盖读取。
+- sqlite_stat1 在 ≥10 张表时的行顺序与 SQLite 可能不同（D101 的测试只覆盖少量表）。
