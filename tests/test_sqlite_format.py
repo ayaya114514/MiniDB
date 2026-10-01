@@ -14,7 +14,7 @@ import pytest
 import minidb
 from minidb import sqlite_format as F
 from minidb.database import Database
-from minidb.errors import DatabaseError, NotSupportedError, OperationalError, ProgrammingError
+from minidb.errors import DatabaseError, IntegrityError, NotSupportedError, OperationalError, ProgrammingError
 from sqlcompare import REFERENCE_VERSION, typed
 from test_transactions import SimulatedCrash, crash_at
 
@@ -394,8 +394,8 @@ def test_objects_minidb_cannot_parse(tmp_path):
     with Database(path) as db:
         assert db.execute("SELECT * FROM plain") == [(1, "x")]
         db.execute("INSERT INTO plain VALUES (2, 'y')")
-        with pytest.raises(NotSupportedError, match="checked"):
-            db.execute("SELECT * FROM checked")
+        with pytest.raises(IntegrityError, match="CHECK constraint failed: a > 0"):
+            db.execute("INSERT INTO checked VALUES (0)")  # (CHECK is supported now)
         assert db.execute("SELECT * FROM logged") == []
         with pytest.raises(NotSupportedError, match="trigger"):
             db.execute("INSERT INTO logged VALUES (1)")  # (the trigger would not run)

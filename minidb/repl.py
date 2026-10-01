@@ -69,10 +69,10 @@ class Shell:
                 view = catalog.find_view(args[0])
                 tables, views = ([], [view]) if view else ([catalog.get_table(args[0])], [])
             for table in tables:
-                self.write(table.sql() + ";")
+                self.write(table.sql + ";")
                 for index in reversed(table.indexes):
                     if not index.is_auto:
-                        self.write(index.sql() + ";")
+                        self.write(index.sql + ";")
             for view in views:
                 self.write(view.sql + ";")
         elif command == ".btree":

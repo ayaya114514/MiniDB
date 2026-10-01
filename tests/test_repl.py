@@ -48,9 +48,9 @@ def test_meta_commands():
         ".tables\n.schema\n.schema a\n.btree a\n.help\n.nope\n.btree\n.btree zz\n"
     )
     assert output[0] == "a b"
-    assert output[1] == 'CREATE TABLE "a" ("y" TEXT NOT NULL);'
-    assert output[2] == 'CREATE TABLE "b" ("x" INTEGER);'
-    assert output[3] == 'CREATE TABLE "a" ("y" TEXT NOT NULL);'
+    assert output[1] == "CREATE TABLE a (y TEXT NOT NULL);"  # as written, like SQLite
+    assert output[2] == "CREATE TABLE b (x INTEGER);"
+    assert output[3] == "CREATE TABLE a (y TEXT NOT NULL);"
     assert output[4].startswith("- leaf (page")
     assert any(line.startswith(".btree") for line in output)
     assert 'Error: unknown command: .nope. Enter ".help" for help' in output
@@ -64,9 +64,9 @@ def test_schema_lists_indexes():
         "CREATE UNIQUE INDEX t_ab ON t (a, b);\n.schema t\n"
     )
     assert output == [
-        'CREATE TABLE "t" ("a" INTEGER, "b" TEXT UNIQUE);',
-        'CREATE INDEX "t_a" ON "t" ("a");',
-        'CREATE UNIQUE INDEX "t_ab" ON "t" ("a", "b");',
+        "CREATE TABLE t (a INTEGER, b TEXT UNIQUE);",
+        "CREATE INDEX t_a ON t (a);",
+        "CREATE UNIQUE INDEX t_ab ON t (a, b);",
     ]
 
 
@@ -135,7 +135,7 @@ def test_views_in_tables_and_schema():
     )
     assert output == [
         "t v",
-        'CREATE TABLE "t" ("a" INTEGER);',
+        "CREATE TABLE t (a INTEGER);",
         "CREATE VIEW v AS SELECT a FROM t;",
         "CREATE VIEW v AS SELECT a FROM t;",
     ]

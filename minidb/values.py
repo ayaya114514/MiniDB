@@ -232,6 +232,18 @@ def type_name(value: SQLValue) -> str:
 
 # ---- comparison ------------------------------------------------------------
 
+# The built-in collations: how text compares (other values compare alike under all).
+COLLATIONS = ("BINARY", "NOCASE", "RTRIM")
+
+
+def collation_name(name: str) -> str:
+    """The canonical name of a collation (an error for unknown ones)."""
+    upper = ascii_upper(name)
+    if upper not in COLLATIONS:
+        raise OperationalError(f"no such collation sequence: {name}")
+    return upper
+
+
 
 def _text_key(text: str) -> str:
     """Text as a string whose order is SQLite's: its UTF-8 bytes compared

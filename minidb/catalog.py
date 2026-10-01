@@ -32,13 +32,16 @@ columns (like SQLite's sqlite_stat1).
 
 from __future__ import annotations
 
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 
 from minidb import values
 from minidb.btree import BTree
 from minidb.errors import DatabaseError, NotSupportedError, OperationalError
 from minidb.pager import Pager
-from minidb.parser import ColumnDef, CreateIndex, CreateTable, CreateView, Literal, Unary, parse
+from minidb.parser import (
+    CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateView, ForeignKey, KeyConstraint, Literal, Unary,
+    parse,
+)
 from minidb.record import decode_record, encode_record, encoded_size
 from minidb.values import SQLValue, ascii_lower
 
@@ -94,22 +97,52 @@ class IndexKeyCodec:
 # ---- schema objects ----------------------------------------------------------------
 
 
+class AutoIndex:
+    """The index a PRIMARY KEY or UNIQUE constraint needs (SQLite's
+    ``sqlite_autoindex_<table>_<n>``)."""
+
+    def __init__(self, positions: list[int], collations: list[str], descending: list[bool],
+                 conflict: str | None, primary: bool) -> None:
+        self.positions = positions
+        self.collations = collations
+        self.descending = descending
+        self.conflict = conflict
+        self.origin = "pk" if primary else "u"
+
+
 class TableInfo:
     has_rowid = True
 
-    def __init__(self, name: str, columns: list[ColumnDef], root: int, schema_key: int | None = None) -> None:
+    def __init__(self, name: str, columns: list[ColumnDef], root: int, schema_key: int | None = None,
+                 constraints: Sequence[object] = (), sql: str | None = None) -> None:
         self.name = name
         self.columns = columns
         self.root = root
         self.schema_key = schema_key
+        self.sql = sql  # the CREATE TABLE statement the schema stores
         self.indexes = []  # newest first, the order SQLite checks UNIQUE constraints in
         self.stat_rows = None  # row count from ANALYZE
         self.stat_key = None
         self.positions = {ascii_lower(column.name): i for i, column in enumerate(columns)}
-        # An INTEGER PRIMARY KEY column is an alias for the row id (as in SQLite).
-        self.rowid_column = next(
-            (i for i, c in enumerate(columns) if c.primary_key and c.type == "INTEGER"), None
-        )  # only the type name INTEGER itself: "INT PRIMARY KEY" is an ordinary column
+        # The constraints in the order SQLite meets them: each column's, then the table's.
+        everything = [c for column in columns for c in column.constraints] + list(constraints)
+        self.table_constraints = list(constraints)
+        self.keys = [c for c in everything if isinstance(c, KeyConstraint)]
+        self.checks = [c for c in everything if isinstance(c, CheckConstraint)]
+        self.foreign_keys = [c for c in everything if isinstance(c, ForeignKey)]
+        self.primary_key = next((k for k in self.keys if k.primary), None)
+        # An INTEGER PRIMARY KEY column is an alias for the row id (as in
+        # SQLite): only for the type name INTEGER itself ("INT PRIMARY KEY"
+        # is an ordinary column), and not for a column's PRIMARY KEY DESC.
+        self.rowid_column = None
+        key = self.primary_key
+        if key is not None and len(key.columns) == 1 and not (key.column_level and key.columns[0].descending):
+            position = self.column_index(key.columns[0].name)
+            if position is not None and columns[position].type == "INTEGER":
+                self.rowid_column = position
+        self.autoincrement = self.rowid_column is not None and key.autoincrement
+        self.compiled_checks = None  # (the executor's, see Executor.check_violation)
+        self.collations = [values.collation_name(c.collation) if c.collation else "BINARY" for c in columns]
         self.affinities = [values.type_affinity(c.type) for c in columns]
         self.read_only = None  # why the table cannot be changed (SQLite files), or None
         self.is_schema = False  # sqlite_schema / sqlite_master
@@ -121,14 +154,71 @@ class TableInfo:
     def column_index(self, name: str) -> int | None:
         return self.positions.get(ascii_lower(name))
 
-    def auto_index_columns(self) -> list[str]:
-        """Columns that need an automatic unique index, in column order."""
-        return [
-            c.name for i, c in enumerate(self.columns)
-            if (c.unique or c.primary_key) and i != self.rowid_column
-        ]
+    def rowid_conflict(self) -> str | None:
+        """The ON CONFLICT clause of an INTEGER PRIMARY KEY."""
+        return self.primary_key.conflict if self.rowid_column is not None else None
 
-    def sql(self) -> str:
+    def auto_indexes(self, check: bool = False) -> list[AutoIndex]:
+        """The indexes the PRIMARY KEY and UNIQUE constraints need, in the
+        order SQLite numbers them: a constraint whose columns and collations
+        an earlier one has gets none (a PRIMARY KEY then takes over the
+        earlier index, and an ON CONFLICT clause goes to it).  ``check``:
+        raise on conflicting ON CONFLICT clauses and unknown columns."""
+        found = []
+        for key in self.keys:
+            if key is self.primary_key and self.rowid_column is not None:
+                continue
+            positions = []
+            for column in key.columns:
+                position = self.column_index(column.name)
+                if position is None:
+                    if not check:
+                        return found  # (cannot happen in a schema SQLite wrote)
+                    raise OperationalError(f"no such column: {column.name}")
+                positions.append(position)
+            collations = [values.collation_name(c.collation) if c.collation else self.collations[p]
+                          for c, p in zip(key.columns, positions)]
+            for earlier in found:
+                if earlier.positions == positions and earlier.collations == collations:
+                    if earlier.conflict != key.conflict and earlier.conflict is not None \
+                            and key.conflict is not None and check:
+                        raise OperationalError("conflicting ON CONFLICT clauses specified")
+                    if earlier.conflict is None:
+                        earlier.conflict = key.conflict
+                    if key.primary:
+                        earlier.origin = "pk"
+                    break
+            else:
+                found.append(AutoIndex(positions, collations, [c.descending for c in key.columns],
+                                       key.conflict, key.primary))
+        return found
+
+    def validate(self) -> None:
+        """The checks of CREATE TABLE (a schema SQLite wrote passes them)."""
+        seen = set()
+        for column in self.columns:
+            if ascii_lower(column.name) in seen:
+                raise OperationalError(f"duplicate column name: {column.name}")
+            seen.add(ascii_lower(column.name))
+        if sum(k.primary for k in self.keys) > 1:
+            raise OperationalError(f'table "{self.name}" has more than one primary key')
+        if any(k.autoincrement for k in self.keys) and not self.autoincrement:
+            raise OperationalError("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+        self.auto_indexes(check=True)
+        for key in self.foreign_keys:
+            for name in key.columns:
+                if self.column_index(name) is None:
+                    raise OperationalError(f'unknown column "{name}" in foreign key definition')
+            if key.parent_columns and len(key.parent_columns) != len(key.columns):
+                if len(key.columns) == 1 and any(key is c for c in self.columns[self.column_index(key.columns[0])].constraints):
+                    raise OperationalError(f"foreign key on {key.columns[0]} should reference only one "
+                                           f"column of table {key.parent}")
+                raise OperationalError("number of columns in foreign key does not match the number of "
+                                       "columns in the referenced table")
+
+    def canonical_sql(self) -> str:
+        """A CREATE TABLE statement for the columns alone (MiniDB's REPL
+        before tables kept their SQL)."""
         parts = []
         for column in self.columns:
             text = f"{quote(column.name)} {column.type}".rstrip()
@@ -161,7 +251,9 @@ def is_constant_default(expr: object) -> bool:
 
 class IndexInfo:
     def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int,
-                 schema_key: int | None = None, auto: bool = False, descending: list[bool] | None = None) -> None:
+                 schema_key: int | None = None, auto: bool = False, descending: list[bool] | None = None,
+                 collations: list[str | None] | None = None, conflict: str | None = None,
+                 origin: str = "c", sql: str | None = None) -> None:
         self.name = name
         self.auto = auto
         # DESC columns (kept only in SQLite-format files): the index is then
@@ -170,7 +262,13 @@ class IndexInfo:
         self.table = table
         self.column_names = [table.columns[table.column_index(c)].name for c in column_names]
         self.positions = [table.column_index(c) for c in column_names]
+        # Each column's collation: its own COLLATE, else the table column's.
+        self.collations = [values.collation_name(c) if c else table.collations[p]
+                           for c, p in zip(collations or [None] * len(self.positions), self.positions)]
         self.unique = unique
+        self.conflict = conflict  # ON CONFLICT of its PRIMARY KEY or UNIQUE constraint
+        self.origin = origin  # "c" (CREATE INDEX), "u" (UNIQUE) or "pk", as PRAGMA index_list says
+        self.sql = sql  # the CREATE INDEX statement the schema stores (None for automatic indexes)
         self.root = root
         self.schema_key = schema_key
         self.stat_average = None  # rows per distinct prefix value, from ANALYZE
@@ -188,11 +286,16 @@ class IndexInfo:
     def key(self, row: Sequence[SQLValue], rowid: int) -> IndexKey:
         return index_key([row[p] for p in self.positions], rowid)
 
-    def sql(self) -> str:
-        columns = ", ".join(quote(c) + (" DESC" if self.descending and self.descending[i] else "")
-                            for i, c in enumerate(self.column_names))
-        unique = "UNIQUE " if self.unique else ""
-        return f"CREATE {unique}INDEX {quote(self.name)} ON {quote(self.table.name)} ({columns})"
+
+def add_index(table: TableInfo, index: IndexInfo) -> None:
+    """Add an index to the table's list, newest first - except that, as in
+    SQLite, indexes whose constraint says ON CONFLICT REPLACE come last."""
+    indexes = table.indexes
+    if index.conflict != "REPLACE" or not indexes or indexes[0].conflict == "REPLACE":
+        indexes.insert(0, index)
+        return
+    position = next((i for i, other in enumerate(indexes) if other.conflict == "REPLACE"), len(indexes))
+    indexes.insert(position, index)
 
 
 class ViewInfo:
@@ -239,7 +342,7 @@ class Catalog:
             try:
                 if kind == "table":
                     stmt = parse(sql)
-                    self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key)
+                    self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key, stmt.constraints, sql)
                 elif kind == "view":
                     self.views[ascii_lower(name)] = ViewInfo(parse(sql), key)
             except Exception as exc:  # (only SQLite files can hold such SQL)
@@ -255,16 +358,23 @@ class Catalog:
             try:
                 if kind == "trigger":
                     raise NotSupportedError("triggers are not supported")
-                if sql is None:  # SQLite's automatic index for a UNIQUE / PRIMARY KEY
+                if ascii_lower(name).startswith(self.auto_prefix):
+                    # The automatic index of a UNIQUE / PRIMARY KEY (no SQL;
+                    # MiniDB's files once stored some, for column constraints)
                     number = int(name[len(self.auto_prefix) + len(table.name) + 1:])
-                    columns, unique, descending, auto = [table.auto_index_columns()[number - 1]], True, None, True
+                    auto = table.auto_indexes()[number - 1]
+                    columns = [table.columns[p].name for p in auto.positions]
+                    descending = auto.descending if self.sqlite else None
+                    index = IndexInfo(name, table, columns, True, root, key, True, descending,
+                                      auto.collations, auto.conflict, auto.origin)
                 else:
                     stmt = parse(sql)
-                    columns, unique, descending = stmt.columns, stmt.unique, stmt.descending
-                    auto = ascii_lower(name).startswith(self.auto_prefix)  # (MiniDB's files store their SQL)
-                    if not self.sqlite:
-                        descending = None
-                index = IndexInfo(name, table, columns, unique, root, key, auto, descending)
+                    for column in stmt.columns:
+                        if table.column_index(column) is None:
+                            raise OperationalError(f"no such column: {column}")
+                    descending = stmt.descending if self.sqlite else None
+                    index = IndexInfo(name, table, stmt.columns, stmt.unique, root, key, False, descending,
+                                      stmt.collations, sql=sql)
             except Exception as exc:
                 if not self.sqlite:
                     raise
@@ -272,7 +382,7 @@ class Catalog:
                 self.unsupported[ascii_lower(name)] = f"{kind} {name}: {exc}"
                 continue
             self.indexes[ascii_lower(name)] = index
-            table.indexes.insert(0, index)
+            add_index(table, index)
         if self.sqlite:
             self._load_sqlite_stats()
         for kind, name, _table_name, _root, sql, key in entries:
@@ -362,11 +472,13 @@ class Catalog:
         self.schema.insert(key, encode_record([kind, name, table_name, root, sql]))
         return key
 
-    def _check_new_name(self, name: str) -> None:
-        lowered = ascii_lower(name)
-        if lowered.startswith(self.reserved_prefixes):
+    def _check_reserved(self, name: str) -> None:
+        if ascii_lower(name).startswith(self.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {name}")
-        if lowered in self.indexes:
+
+    def _check_new_name(self, name: str) -> None:
+        """(After _check_reserved and _exists, as in SQLite.)"""
+        if ascii_lower(name) in self.indexes:
             raise OperationalError(f"there is already an index named {name}")
 
     def _exists(self, name: str, if_not_exists: bool) -> bool:
@@ -382,25 +494,32 @@ class Catalog:
         kind = "table" if lowered in self.tables else "view"
         raise OperationalError(f"{kind} {name} already exists")
 
-    def create_table(self, stmt: CreateTable) -> TableInfo | None:
+    def create_table(self, stmt: CreateTable, check: Callable[[TableInfo], None] | None = None) -> TableInfo | None:
+        """Create a table; ``check`` (the executor's) checks its CHECK constraints."""
+        self._check_reserved(stmt.name)
         if self._exists(stmt.name, stmt.if_not_exists):
             return None
         self._check_new_name(stmt.name)
-        seen = set()
-        for column in stmt.columns:
-            if ascii_lower(column.name) in seen:
-                raise OperationalError(f"duplicate column name: {column.name}")
-            seen.add(ascii_lower(column.name))
-        if sum(column.primary_key for column in stmt.columns) > 1:
-            raise OperationalError(f'table "{stmt.name}" has more than one primary key')
+        table = TableInfo(stmt.name, stmt.columns, 0, None, stmt.constraints, stmt.sql)
+        table.validate()
+        if check is not None:
+            check(table)
         self.version += 1
-        root = self._new_tree(index=False)
-        table = TableInfo(stmt.name, stmt.columns, root)
-        table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql())
+        table.root = root = self._new_tree(index=False)
+        table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql)
         self.tables[ascii_lower(stmt.name)] = table
-        for n, column in enumerate(table.auto_index_columns(), 1):
+        for n, auto in enumerate(table.auto_indexes(), 1):
             name = f"{self.auto_prefix}{table.name}_{n}"
-            self._create_index(name, table, [column], unique=True, auto=True)
+            columns = [table.columns[p].name for p in auto.positions]
+            descending = auto.descending if self.sqlite else None
+            self._create_index(name, table, columns, True, True, descending, auto.collations, auto.conflict,
+                               auto.origin)
+        if table.autoincrement and "sqlite_sequence" not in self.tables:
+            sql = "CREATE TABLE sqlite_sequence(name,seq)"
+            root = self._new_tree(index=False)
+            sequence = TableInfo("sqlite_sequence", parse(sql).columns, root, None, (), sql)
+            sequence.schema_key = self._add_entry("table", sequence.name, sequence.name, root, sql)
+            self.tables["sqlite_sequence"] = sequence
         return table
 
     def create_view(self, stmt: CreateView) -> None:
@@ -412,13 +531,14 @@ class Catalog:
                     return
                 raise OperationalError(f"view {stmt.name} already exists")
             self.version += 1
-            self.temp_views[ascii_lower(stmt.name)] = ViewInfo(stmt)
+            self.temp_views[ascii_lower(stmt.name)] = ViewInfo(parse(stmt.sql))
             return
+        self._check_reserved(stmt.name)
         if self._exists(stmt.name, stmt.if_not_exists):
             return
         self._check_new_name(stmt.name)
         self.version += 1
-        view = ViewInfo(stmt)
+        view = ViewInfo(parse(stmt.sql))  # (positions in its own text, for ALTER TABLE)
         view.schema_key = self._add_entry("view", stmt.name, stmt.name, 0, stmt.sql)
         self.views[ascii_lower(stmt.name)] = view
 
@@ -447,8 +567,10 @@ class Catalog:
             if if_exists:
                 return
             raise OperationalError(f"no such table: {name}")
-        self.version += 1
         table = self.tables[ascii_lower(name)]
+        if ascii_lower(table.name) == "sqlite_sequence":
+            raise OperationalError("table sqlite_sequence may not be dropped")
+        self.version += 1
         self.check_writable(table, "dropped")
         for index in list(table.indexes):
             self._drop_index(index)
@@ -459,6 +581,13 @@ class Catalog:
         del self.tables[ascii_lower(name)]
         self.table_tree(table).destroy()
         self.schema.delete(table.schema_key)
+        sequence = self.tables.get("sqlite_sequence")
+        if table.autoincrement and sequence is not None:
+            tree = self.table_tree(sequence)
+            for rowid, record in list(tree.scan()):
+                row = record if type(record) is list else decode_record(record)[0]
+                if row and row[0] == table.name:
+                    tree.delete(rowid)
 
     def create_index(self, stmt: CreateIndex) -> IndexInfo | None:
         """Create an index; returns it (still empty) or None if it already exists."""
@@ -481,18 +610,24 @@ class Catalog:
         for column in stmt.columns:
             if table.column_index(column) is None:
                 raise OperationalError(f"no such column: {column}")
+        for collation in stmt.collations:
+            if collation is not None:
+                values.collation_name(collation)
         self.check_writable(table, "indexed")
         descending = stmt.descending if self.sqlite else None
-        return self._create_index(stmt.name, table, stmt.columns, stmt.unique, descending=descending)
+        return self._create_index(stmt.name, table, stmt.columns, stmt.unique, descending=descending,
+                                  collations=stmt.collations, sql=stmt.sql)
 
     def _create_index(self, name: str, table: TableInfo, columns: list[str], unique: bool, auto: bool = False,
-                      descending: list[bool] | None = None) -> IndexInfo:
+                      descending: list[bool] | None = None, collations: list[str | None] | None = None,
+                      conflict: str | None = None, origin: str = "c", sql: str | None = None) -> IndexInfo:
         self.version += 1
         root = self._new_tree(index=True)
-        index = IndexInfo(name, table, columns, unique, root, None, auto, descending)
-        index.schema_key = self._add_entry("index", name, table.name, root, self.index_sql(index))
+        index = IndexInfo(name, table, columns, unique, root, None, auto, descending, collations, conflict,
+                          origin, sql)
+        index.schema_key = self._add_entry("index", name, table.name, root, sql)
         self.indexes[ascii_lower(name)] = index
-        table.indexes.insert(0, index)
+        add_index(table, index)
         return index
 
     def drop_index(self, name: str, if_exists: bool = False) -> None:
@@ -525,10 +660,10 @@ class Catalog:
         statistics again, under their old keys; then reload the schema."""
         self.version += 1
         self.schema.insert(table.schema_key, encode_record(
-            ["table", table.name, table.name, table.root, table.sql()]), replace=True)
+            ["table", table.name, table.name, table.root, table.sql]), replace=True)
         for index in table.indexes:
             self.schema.insert(index.schema_key, encode_record(
-                ["index", index.name, table.name, index.root, self.index_sql(index)]), replace=True)
+                ["index", index.name, table.name, index.root, index.sql]), replace=True)
             if index.stat_key is not None:
                 text = " ".join(f"{n:g}" if isinstance(n, float) else str(n)
                                 for n in [table.stat_rows or 0] + index.stat_average)
@@ -544,11 +679,6 @@ class Catalog:
             self.temp_views[ascii_lower(view.name)] = ViewInfo(parse(sql))
             return
         self.schema.insert(view.schema_key, encode_record(["view", view.name, view.name, 0, sql]), replace=True)
-
-    def index_sql(self, index: IndexInfo) -> str | None:
-        """What the schema table stores for an index: SQLite stores no SQL
-        for automatic indexes."""
-        return None if self.sqlite and index.auto else index.sql()
 
     # ---- statistics ---------------------------------------------------------
 

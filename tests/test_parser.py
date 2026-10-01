@@ -1,7 +1,8 @@
 import pytest
 
 from minidb.parser import (
-    Between, Binary, Call, Column, ColumnDef, Compound, CreateTable, Delete, DropTable, DropView,
+    Between, Binary, Call, CheckConstraint, Collate, Column, ColumnDef, Compound, CreateTable, ForeignKey,
+    IndexedColumn, KeyConstraint, Delete, DropTable, DropView,
     InList, InSelect, Insert, Join, Like, Literal, OrderItem, Select, SelectItem, Star, TableRef,
     Unary, Update, Upsert, parse, parse_script,
 )
@@ -28,11 +29,49 @@ def test_create_table():
     assert parse(
         "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL, age integer, email text UNIQUE NULL)"
     ) == CreateTable("users", [
-        ColumnDef("id", "INTEGER", primary_key=True),
+        ColumnDef("id", "INTEGER", primary_key=True, constraints=[
+            KeyConstraint(True, [IndexedColumn("id")], column_level=True)]),
         ColumnDef("name", "TEXT", not_null=True),
         ColumnDef("age", "INTEGER"),
-        ColumnDef("email", "TEXT", unique=True),
+        ColumnDef("email", "TEXT", unique=True, constraints=[
+            KeyConstraint(False, [IndexedColumn("email")], column_level=True)]),
     ])
+
+
+def test_constraints():
+    stmt = parse(
+        "create table t (a int constraint pos check (a > 0) collate NoCase references p(x) on delete cascade "
+        "deferrable initially deferred, b not null on conflict ignore unique on conflict replace, "
+        "c integer primary key desc on conflict fail autoincrement, "
+        "constraint k unique (a collate rtrim desc, b) primary key(c) check(b<>a) on conflict abort "
+        "foreign key (a, b) references q on update set null match full) ;"
+    )
+    a, b, c = stmt.columns
+    assert a.collation == "NoCase" and a.constraints == [
+        CheckConstraint(Binary(">", Column("a"), lit(0)), "a > 0", "pos"),
+        ForeignKey(["a"], "p", ["x"], on_delete="CASCADE", deferred=True),
+    ]
+    assert b.not_null and b.not_null_conflict == "IGNORE"
+    assert b.constraints == [KeyConstraint(False, [IndexedColumn("b")], "REPLACE", column_level=True)]
+    assert c.constraints == [KeyConstraint(True, [IndexedColumn("c", None, True)], "FAIL", True, column_level=True)]
+    assert stmt.constraints == [
+        KeyConstraint(False, [IndexedColumn("a", "rtrim", True), IndexedColumn("b")], name="k"),
+        KeyConstraint(True, [IndexedColumn("c")]),
+        CheckConstraint(Binary("!=", Column("b"), Column("a")), "b<>a"),
+        ForeignKey(["a", "b"], "q", [], on_update="SET NULL", match="FULL"),
+    ]
+    assert stmt.sql.startswith("CREATE TABLE t (a int constraint") and stmt.sql.endswith("match full)")
+    assert parse("create table t(a, b, constraint x primary key (a) unique(b))").constraints == [
+        KeyConstraint(True, [IndexedColumn("a")], name="x"), KeyConstraint(False, [IndexedColumn("b")])]
+    with pytest.raises(OperationalError, match="expressions prohibited"):
+        parse("create table t(a, unique(a + 1))")
+    with pytest.raises(NotSupportedError, match="WITHOUT ROWID"):
+        parse("create table t(a primary key) without rowid")
+
+
+def test_collate_operator():
+    assert parse("select -a collate nocase || b collate rtrim").items[0].expr == Binary(
+        "||", Collate(Unary("-", Column("a")), "nocase"), Collate(Column("b"), "rtrim"))
 
 
 def test_declared_type_names():
@@ -418,7 +457,7 @@ def test_conflict_clauses_upsert_and_returning():
     assert parse("INSERT OR IGNORE INTO t VALUES (1)").conflict == "IGNORE"
     assert parse("REPLACE INTO t VALUES (1)").conflict == "REPLACE"
     assert parse("UPDATE OR ROLLBACK t SET a = 1").conflict == "ROLLBACK"
-    assert parse("INSERT INTO t VALUES (1)").conflict == "ABORT"
+    assert parse("INSERT INTO t VALUES (1)").conflict is None  # each constraint's own, else ABORT
     stmt = parse("INSERT INTO t VALUES (1, 2) ON CONFLICT (a) DO UPDATE SET b = excluded.b WHERE b > 1 "
                  "ON CONFLICT DO NOTHING RETURNING *, a AS x")
     assert stmt.upsert == [

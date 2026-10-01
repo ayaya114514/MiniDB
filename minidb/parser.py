@@ -99,6 +99,14 @@ class Like:
 
 
 @dataclass(frozen=True)
+class Collate:
+    """``expr COLLATE name``: the value of expr, compared with that collation."""
+
+    expr: object
+    collation: str  # as written
+
+
+@dataclass(frozen=True)
 class Case:
     """``CASE [base] WHEN a THEN b ... [ELSE c] END``."""
 
@@ -172,6 +180,53 @@ class Call:
 
 
 @dataclass
+class IndexedColumn:
+    """A column of a PRIMARY KEY, UNIQUE or index: ``name [COLLATE c] [ASC|DESC]``."""
+
+    name: str
+    collation: str | None = None
+    descending: bool = False
+    pos: int = field(default=-1, compare=False)  # of the name in the SQL text
+
+
+@dataclass
+class KeyConstraint:
+    """PRIMARY KEY or UNIQUE, of a column or of the table."""
+
+    primary: bool
+    columns: list  # IndexedColumns
+    conflict: str | None = None  # ON CONFLICT <resolution>
+    autoincrement: bool = False
+    name: str | None = None  # CONSTRAINT <name>
+    column_level: bool = False
+
+
+@dataclass
+class CheckConstraint:
+    expr: object
+    text: str  # the expression as written: the error message names it (or the constraint)
+    name: str | None = None
+
+
+@dataclass
+class ForeignKey:
+    """``[FOREIGN KEY (columns)] REFERENCES parent [(columns)] [actions]``."""
+
+    columns: list  # the child columns' names
+    parent: str
+    parent_columns: list  # empty: the parent's primary key
+    on_delete: str = "NO ACTION"  # SET NULL, SET DEFAULT, CASCADE, RESTRICT or NO ACTION
+    on_update: str = "NO ACTION"
+    deferred: bool = False  # DEFERRABLE INITIALLY DEFERRED
+    name: str | None = None
+    match: str = "NONE"
+    # Where the names are in the SQL text (for ALTER TABLE's rewriting).
+    column_pos: list = field(default_factory=list, compare=False)
+    parent_pos: int = field(default=-1, compare=False)
+    parent_column_pos: list = field(default_factory=list, compare=False)
+
+
+@dataclass
 class ColumnDef:
     name: str
     type: str  # the declared type in upper case, e.g. "INTEGER", "VARCHAR(30)", "" for none
@@ -180,6 +235,12 @@ class ColumnDef:
     unique: bool = False
     default: object = None  # DEFAULT expression, or None
     default_text: str | None = None  # its SQL text
+    collation: str | None = None  # COLLATE <name>
+    not_null_conflict: str | None = None  # NOT NULL ON CONFLICT <resolution>
+    constraints: list = field(default_factory=list)  # its KeyConstraints, CheckConstraints and ForeignKeys
+    declared: str = field(default="", compare=False)  # the type as written
+    pos: int = field(default=-1, compare=False)  # of the name in the SQL text
+    end: int = field(default=-1, compare=False)  # where the definition ends in the SQL text
 
 
 @dataclass
@@ -189,6 +250,8 @@ class AlterTable:
     column: str | None = None  # the column renamed or dropped
     new_name: str | None = None
     definition: object = None  # ColumnDef of ADD COLUMN
+    definition_text: str = ""  # its SQL text
+    new_quoted: bool = False  # whether the new name was written quoted
 
 
 @dataclass
@@ -196,6 +259,10 @@ class CreateTable:
     name: str
     columns: list
     if_not_exists: bool = False
+    constraints: list = field(default_factory=list)  # table constraints, in order
+    sql: str = field(default="", compare=False)  # what the schema stores, as SQLite does
+    name_pos: int = field(default=-1, compare=False)
+    columns_end: int = field(default=-1, compare=False)  # where ADD COLUMN inserts (see Catalog)
 
 
 @dataclass
@@ -206,6 +273,10 @@ class CreateIndex:
     unique: bool = False
     if_not_exists: bool = False
     descending: list = field(default_factory=list)  # per column: DESC?
+    collations: list = field(default_factory=list)  # per column: COLLATE name or None
+    sql: str = field(default="", compare=False)  # what the schema stores, as SQLite does
+    table_pos: int = field(default=-1, compare=False)
+    column_pos: list = field(default_factory=list, compare=False)
 
 
 @dataclass
@@ -252,7 +323,7 @@ class Insert:
     columns: list | None
     rows: list  # list of lists of expressions (VALUES)
     query: object = None  # or a Select / Compound (INSERT ... SELECT)
-    conflict: str = "ABORT"  # INSERT OR <conflict>: ABORT, FAIL, IGNORE, REPLACE or ROLLBACK
+    conflict: str | None = None  # INSERT OR <conflict>: ABORT, FAIL, IGNORE, REPLACE or ROLLBACK
     upsert: list = field(default_factory=list)  # Upsert clauses, in order
     returning: list | None = None  # SelectItems of RETURNING
     ctes: list | None = None  # WITH ...
@@ -379,7 +450,7 @@ class Update:
     table: str
     assignments: list  # (column name, expression) pairs
     where: object = None
-    conflict: str = "ABORT"
+    conflict: str | None = None
     returning: list | None = None
     indexed_by: str | None = None
     ctes: list | None = None
@@ -412,7 +483,7 @@ class Vacuum:
 # Any expression node, and any statement.
 Expr = Union[
     Literal, Parameter, Column, Star, Unary, Binary, Between, InList, Like, Case, Cast,
-    Subquery, InSelect, Exists, Call,
+    Subquery, InSelect, Exists, Call, Collate,
 ]
 Statement = Union[
     CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Vacuum, Values, AlterTable, Insert, Select, Compound, Update, Delete,
@@ -616,13 +687,184 @@ class Parser:
             raise NotSupportedError("temporary tables are not supported")
         self.expect_keyword("TABLE")
         if_not_exists = self.if_not_exists()
+        name_pos = self.tok.pos
         name = self.identifier("table name")
         self.expect_op("(")
         columns = [self.column_def()]
+        constraints = []
         while self.accept_op(","):
+            if self.at_table_constraint():
+                columns_end = self.tokens[self.i - 1].pos
+                constraints.append(self.table_constraint())
+                while self.accept_op(",") or self.at_table_constraint():
+                    constraints.append(self.table_constraint())
+                break
             columns.append(self.column_def())
+        else:
+            columns_end = self.tok.pos
         self.expect_op(")")
-        return CreateTable(name, columns, if_not_exists)
+        options = []
+        while self.at_word("WITHOUT", "STRICT"):
+            if self.advance().value.upper() == "WITHOUT":
+                self.expect_word("ROWID")
+                options.append("WITHOUT ROWID")
+            else:
+                options.append("STRICT")
+            if not self.accept_op(","):
+                break
+        if options:
+            raise NotSupportedError(f"{options[0]} tables are not supported")
+        stmt = CreateTable(name, columns, if_not_exists, constraints)
+        stmt.sql = "CREATE TABLE " + self.text[name_pos:self.end_of_previous()]
+        stmt.name_pos, stmt.columns_end = name_pos, columns_end
+        return stmt
+
+    def end_of_previous(self) -> int:
+        """Where the token before the current one ends in the SQL text."""
+        last = self.tokens[self.i - 1]
+        return last.pos + len(last.text)
+
+    def at_table_constraint(self) -> bool:
+        return self.at_keyword("PRIMARY", "UNIQUE") or self.at_word("CONSTRAINT", "CHECK", "FOREIGN")
+
+    def table_constraint(self) -> KeyConstraint | CheckConstraint | ForeignKey:
+        name = None
+        if self.at_word("CONSTRAINT"):
+            self.advance()
+            name = self.identifier("constraint name")
+            if not self.at_table_constraint():
+                raise self.error("PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY")
+        if self.accept_keyword("PRIMARY") or self.at_keyword("UNIQUE"):
+            primary = self.tokens[self.i - 1].value == "PRIMARY" and not self.at_keyword("UNIQUE")
+            if primary:
+                self.expect_word("KEY")
+            else:
+                self.advance()
+            self.expect_op("(")
+            columns = [self.key_column()]
+            while self.accept_op(","):
+                columns.append(self.key_column())
+            autoincrement = primary and self.accept_word("AUTOINCREMENT")
+            self.expect_op(")")
+            return KeyConstraint(primary, columns, self.on_conflict(), autoincrement, name)
+        if self.at_word("CHECK"):
+            check = self.check_constraint(name)
+            self.on_conflict()  # (allowed, and ignored, as in SQLite)
+            return check
+        self.expect_word("FOREIGN")
+        self.expect_word("KEY")
+        self.expect_op("(")
+        columns, positions = [], []
+        while True:
+            positions.append(self.tok.pos)
+            columns.append(self.identifier("column name"))
+            if not self.accept_op(","):
+                break
+        self.expect_op(")")
+        self.expect_word("REFERENCES")
+        key = self.references(name)
+        key.columns, key.column_pos = columns, positions
+        if self.at_keyword("NOT") or self.at_word("DEFERRABLE"):
+            key.deferred = self.deferrable()
+        return key
+
+    def key_column(self) -> IndexedColumn:
+        """A column of a table's PRIMARY KEY or UNIQUE: only names, as in SQLite."""
+        token = self.tok
+        expr = self.expr()
+        collation = None
+        if isinstance(expr, Collate):
+            expr, collation = expr.expr, expr.collation
+        if not isinstance(expr, Column) or expr.table is not None:
+            raise OperationalError("expressions prohibited in PRIMARY KEY and UNIQUE constraints")
+        descending = not self.accept_keyword("ASC") and bool(self.accept_keyword("DESC"))
+        return IndexedColumn(expr.name, collation, descending, token.pos)
+
+    def accept_word(self, word: str) -> bool:
+        if self.at_word(word):
+            self.advance()
+            return True
+        return False
+
+    def on_conflict(self) -> str | None:
+        """``ON CONFLICT <resolution>`` of a constraint, or None."""
+        if not self.at_keyword("ON"):
+            return None
+        self.advance()
+        self.expect_word("CONFLICT")
+        if self.accept_keyword("ROLLBACK"):
+            return "ROLLBACK"
+        for word in ("ABORT", "FAIL", "IGNORE", "REPLACE"):
+            if self.accept_word(word):
+                return word
+        raise self.error("ROLLBACK, ABORT, FAIL, IGNORE or REPLACE")
+
+    def check_constraint(self, name: str | None) -> CheckConstraint:
+        self.expect_word("CHECK")
+        self.expect_op("(")
+        start = self.tok.pos
+        expr = self.expr()
+        text = self.text[start:self.end_of_previous()]
+        self.expect_op(")")
+        return CheckConstraint(expr, text, name)
+
+    def references(self, name: str | None) -> ForeignKey:
+        """After REFERENCES: ``parent [(columns)]`` and the actions."""
+        parent_pos = self.tok.pos
+        key = ForeignKey([], self.identifier("table name"), [], name=name, parent_pos=parent_pos)
+        if self.accept_op("("):
+            while True:
+                key.parent_column_pos.append(self.tok.pos)
+                key.parent_columns.append(self.identifier("column name"))
+                if self.at_word("COLLATE"):  # (allowed, and ignored)
+                    self.advance()
+                    self.identifier("collation name")
+                if not self.accept_keyword("ASC"):
+                    self.accept_keyword("DESC")
+                if not self.accept_op(","):
+                    break
+            self.expect_op(")")
+        while True:
+            if self.at_word("MATCH"):
+                self.advance()
+                key.match = ascii_upper(self.identifier("match type"))
+            elif self.at_keyword("ON") and self.tokens[self.i + 1].kind in ("KEYWORD", "IDENT") \
+                    and ascii_upper(self.tokens[self.i + 1].text) in ("DELETE", "UPDATE", "INSERT"):
+                self.advance()
+                event = ascii_upper(self.advance().text)
+                action = self.foreign_key_action()
+                if event == "DELETE":
+                    key.on_delete = action
+                elif event == "UPDATE":
+                    key.on_update = action
+            else:
+                return key
+
+    def foreign_key_action(self) -> str:
+        if self.accept_keyword("SET"):
+            if self.accept_keyword("NULL"):
+                return "SET NULL"
+            self.expect_word("DEFAULT")
+            return "SET DEFAULT"
+        if self.accept_word("CASCADE"):
+            return "CASCADE"
+        if self.accept_word("RESTRICT"):
+            return "RESTRICT"
+        self.expect_word("NO")
+        self.expect_word("ACTION")
+        return "NO ACTION"
+
+    def deferrable(self) -> bool:
+        """``[NOT] DEFERRABLE [INITIALLY DEFERRED | IMMEDIATE]``: deferred?"""
+        negated = bool(self.accept_keyword("NOT"))
+        self.expect_word("DEFERRABLE")
+        deferred = False
+        if self.accept_word("INITIALLY"):
+            if self.accept_word("DEFERRED"):
+                deferred = True
+            else:
+                self.expect_word("IMMEDIATE")
+        return deferred and not negated
 
     def if_not_exists(self) -> bool:
         if self.accept_keyword("IF"):
@@ -644,12 +886,15 @@ class Parser:
                 self.advance()
             column = self.identifier("column name")
             self.expect_word("TO")
-            return AlterTable(table, "rename column", column, self.identifier("column name"))
+            quoted = self.tok.text[:1] in ('"', "[", "`", "'")
+            return AlterTable(table, "rename column", column, self.identifier("column name"), new_quoted=quoted)
         if self.at_word("ADD"):
             self.advance()
             if self.at_word("COLUMN"):
                 self.advance()
-            return AlterTable(table, "add", definition=self.column_def())
+            definition = self.column_def()
+            return AlterTable(table, "add", definition=definition,
+                              definition_text=self.text[definition.pos:definition.end])
         if self.accept_keyword("DROP"):
             if self.at_word("COLUMN"):
                 self.advance()
@@ -679,19 +924,34 @@ class Parser:
         unique = bool(self.accept_keyword("UNIQUE"))
         self.expect_keyword("INDEX")
         if_not_exists = self.if_not_exists()
+        name_pos = self.tok.pos
         name = self.identifier("index name")
         self.expect_keyword("ON")
+        table_pos = self.tok.pos
         table = self.identifier("table name")
         self.expect_op("(")
-        columns, descending = [], []
+        columns = []
         while True:
-            columns.append(self.identifier("column name"))
-            descending.append(not self.accept_keyword("ASC") and bool(self.accept_keyword("DESC")))
+            token = self.tok
+            expr = self.expr()
+            collation = None
+            if isinstance(expr, Collate):
+                expr, collation = expr.expr, expr.collation
+            if not isinstance(expr, Column) or expr.table is not None:
+                raise NotSupportedError("indexes on expressions are not supported")
+            descending = not self.accept_keyword("ASC") and bool(self.accept_keyword("DESC"))
+            columns.append(IndexedColumn(expr.name, collation, descending, token.pos))
             if not self.accept_op(","):
                 break
         self.expect_op(")")
+        if self.accept_keyword("WHERE"):
+            raise NotSupportedError("partial indexes are not supported")
         # (DESC only matters in SQLite-format files: MiniDB's own indexes are ascending)
-        return CreateIndex(name, table, columns, unique, if_not_exists, descending)
+        stmt = CreateIndex(name, table, [c.name for c in columns], unique, if_not_exists,
+                           [c.descending for c in columns], [c.collation for c in columns])
+        stmt.sql = f"CREATE{' UNIQUE' if unique else ''} INDEX " + self.text[name_pos:self.end_of_previous()]
+        stmt.table_pos, stmt.column_pos = table_pos, [c.pos for c in columns]
+        return stmt
 
     def indexed_column(self) -> str:
         name = self.identifier("column name")
@@ -700,27 +960,61 @@ class Parser:
         return name
 
     def column_def(self) -> ColumnDef:
+        pos = self.tok.pos
         name = self.identifier("column name")
-        column = ColumnDef(name, ascii_upper(self.type_name(required=False)))
+        declared = self.type_name(required=False)
+        column = ColumnDef(name, ascii_upper(" ".join(declared.split())), declared=declared, pos=pos)
+        name = None  # of the next constraint (CONSTRAINT <name>)
         while True:
+            if self.at_word("CONSTRAINT"):
+                self.advance()
+                name = self.identifier("constraint name")
+                continue
             if self.accept_keyword("PRIMARY"):
                 self.expect_word("KEY")
                 column.primary_key = True
+                descending = not self.accept_keyword("ASC") and bool(self.accept_keyword("DESC"))
+                conflict = self.on_conflict()
+                key = KeyConstraint(True, [IndexedColumn(column.name, None, descending, pos)], conflict,
+                                    self.accept_word("AUTOINCREMENT"), name, column_level=True)
+                column.constraints.append(key)
             elif self.accept_keyword("NOT"):
                 self.expect_keyword("NULL")
                 column.not_null = True
+                column.not_null_conflict = self.on_conflict()
             elif self.accept_keyword("NULL"):
-                pass
+                self.on_conflict()
             elif self.accept_keyword("UNIQUE"):
                 column.unique = True
+                column.constraints.append(KeyConstraint(
+                    False, [IndexedColumn(column.name, None, False, pos)], self.on_conflict(), name=name,
+                    column_level=True))
             elif self.at_word("DEFAULT"):
                 self.advance()
                 start = self.tok.pos
                 column.default = self.default_value(column.name)
-                last = self.tokens[self.i - 1]
-                column.default_text = self.text[start:last.pos + len(last.text)]
+                column.default_text = self.text[start:self.end_of_previous()]
+            elif self.at_word("CHECK"):
+                column.constraints.append(self.check_constraint(name))
+            elif self.at_word("COLLATE"):
+                self.advance()
+                column.collation = self.identifier("collation name")
+            elif self.at_word("REFERENCES"):
+                self.advance()
+                key = self.references(name)
+                key.columns, key.column_pos = [column.name], [pos]
+                column.constraints.append(key)
+            elif self.at_keyword("NOT") and self.tokens[self.i + 1].kind == "IDENT" or self.at_word("DEFERRABLE"):
+                key = next((c for c in reversed(column.constraints) if isinstance(c, ForeignKey)), None)
+                deferred = self.deferrable()
+                if key is not None:
+                    key.deferred = deferred
+            elif self.at_word("GENERATED") or self.at_keyword("AS"):
+                raise NotSupportedError("generated columns are not supported")
             else:
+                column.end = self.end_of_previous()
                 return column
+            name = None
 
     def default_value(self, column: str) -> Expr:
         """DEFAULT <literal>, <signed number>, <identifier> (as text),
@@ -767,10 +1061,11 @@ class Parser:
         what = {DropIndex: "index name", DropView: "view name", DropTable: "table name"}[kind]
         return kind(self.identifier(what), if_exists)
 
-    def conflict_clause(self) -> str:
-        """``OR <resolution>`` after INSERT or UPDATE (ABORT if absent)."""
+    def conflict_clause(self) -> str | None:
+        """``OR <resolution>`` after INSERT or UPDATE (None if absent: each
+        constraint's own ON CONFLICT, else ABORT)."""
         if not self.accept_keyword("OR"):
-            return "ABORT"
+            return None
         if self.accept_keyword("ROLLBACK"):
             return "ROLLBACK"
         for word in ("ABORT", "FAIL", "IGNORE", "REPLACE"):
@@ -1368,9 +1663,17 @@ class Parser:
         return left
 
     def concat(self) -> Expr:
-        left = self.unary()
+        left = self.collate()
         while self.accept_op("||"):
-            left = Binary("||", left, self.unary())
+            left = Binary("||", left, self.collate())
+        return left
+
+    def collate(self) -> Expr:
+        """``x COLLATE name`` binds tighter than ``||``, looser than unary operators."""
+        left = self.unary()
+        while self.at_word("COLLATE"):
+            self.advance()
+            left = Collate(left, self.identifier("collation name"))
         return left
 
     def unary(self) -> Expr:
@@ -1414,7 +1717,7 @@ class Parser:
             self.expect_op("(")
             expr = self.expr()
             self.expect_keyword("AS")
-            type_name = self.type_name()
+            type_name = " ".join(self.type_name().split())
             self.expect_op(")")
             return Cast(expr, type_name)
         if token.kind == "KEYWORD" and token.value in ("LIKE", "IF") and self.tokens[self.i + 1].text == "(":
@@ -1466,7 +1769,7 @@ class Parser:
                 if not self.accept_op(","):
                     break
             self.expect_op(")")
-        return " ".join(self.text[start:self.tok.pos].split())
+        return self.text[start:self.end_of_previous()]
 
     def at_type_word(self) -> bool:
         return self.tok.kind == "IDENT" and ascii_upper(self.tok.text) not in CONSTRAINT_WORDS
