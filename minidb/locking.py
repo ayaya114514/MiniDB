@@ -65,6 +65,10 @@ class PosixLocks:
     def lock(self, fd: int, span: Span, exclusive: bool) -> bool:
         return self._lockf(fd, span, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
 
+    def upgrade(self, fd: int, span: Span) -> bool | None:
+        """Shared to exclusive: True, or False still sharing (None: lost)."""
+        return self._lockf(fd, span, fcntl.LOCK_EX)  # atomic for record locks
+
     def downgrade(self, fd: int, span: Span) -> bool:
         return self._lockf(fd, span, fcntl.LOCK_SH)  # atomic for record locks
 
@@ -93,9 +97,11 @@ class WindowsLocks:
     As SQLite does on Windows without LockFileEx: a shared holder locks one
     byte of the range (any free one), an exclusive holder all of it; MiniDB's
     own locks are ranges of ``WIDTH`` bytes, so up to ``WIDTH`` processes can
-    share one.  Converting a lock is not atomic: an upgrade just fails while
-    we share, and a downgrade may lose the lock to another process (callers
-    check)."""
+    share one.  Converting a lock is not atomic: an upgrade (as SQLite's
+    winLock) unlocks our byte, locks the range and, failing, takes a byte
+    again; a downgrade may lose the lock to another process (callers check).
+    SQLite's protocol upgrades only while holding PENDING, which keeps new
+    sharers out meanwhile."""
 
     WIDTH = 64
 
@@ -125,6 +131,15 @@ class WindowsLocks:
                 self.shared[fd, base] = offset
                 return True
         return False
+
+    def upgrade(self, fd: int, span: Span) -> bool | None:
+        """Shared to exclusive: True, or False still sharing (None: lost)."""
+        offset = self.shared.pop((fd, span[0]), None)
+        if offset is not None:
+            self._locking(fd, self.msvcrt.LK_UNLCK, offset, 1)
+        if self._locking(fd, self.msvcrt.LK_NBLCK, *span):
+            return True
+        return False if self.lock(fd, span, False) else None
 
     def downgrade(self, fd: int, span: Span) -> bool:
         self._locking(fd, self.msvcrt.LK_UNLCK, *span)
@@ -228,7 +243,13 @@ class _LockFile:
                     return True
                 if holder is not None or sharers - {owner}:
                     return False
-                if not backend.lock(self.fd, self.span(byte), True):
+                if owner in sharers:
+                    upgraded = backend.upgrade(self.fd, self.span(byte))
+                    if upgraded is None:
+                        sharers.discard(owner)  # (lost while converting)
+                    if not upgraded:
+                        return False
+                elif not backend.lock(self.fd, self.span(byte), True):
                     return False
                 sharers.discard(owner)
                 self.exclusive[byte] = owner
