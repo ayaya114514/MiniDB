@@ -761,3 +761,33 @@ fuzzer 加入 TRUE / FALSE 字面量后发现的一组与 SQLite 解析/解析�
 两种格式都可以读 `sqlite_schema` 和 `sqlite_master`（只读；改、删、建索引、ALTER 的报错与 SQLite 逐字相同）。
 SQLite 格式里它就是第 1 页的表；MiniDB 格式里是 schema 表去掉统计行、自动索引的 sql 显示为 NULL，但自动索引的名字是
 `minidb_autoindex_...`，表的 sql 是 MiniDB 规范化重写过的，rootpage 也是 MiniDB 的页号。MiniDB 格式也保留 `sqlite_` 前缀。
+
+## D102 访问路径与行顺序照 SQLite：覆盖索引全扫描、OR 转 IN、MULTI-INDEX 的输出顺序
+没有 ORDER BY 时的行顺序本不属于语义，但它会被看到：聚合里的裸列取“最后一行”、`group_concat` 的拼接顺序、不带
+ORDER BY 的 LIMIT、`sum` 的整数溢出与否（取决于累加顺序）。fuzz 种子 9661 与 5512 都是这一类。与其在 fuzzer 里回避，
+不如让常见情形的计划和顺序与 SQLite 一致：
+- 覆盖索引全扫描（whereLoopAddBtree 的 "full scan via index"）：选了全表扫描、且有索引包含查询用到的全部列、且
+  `szIdxRow < szTabRow` 时，改扫该索引。宽度照 SQLite 估：`sqlite3AffinityType` 给每列的 szEst（整数为 1，
+  TEXT/BLOB/CLOB 为 5，`VARCHAR(k)` 为 k/4+1，无类型为 1），表宽 = 列宽之和（没有 INTEGER PRIMARY KEY 时 +1），
+  索引宽 = 索引列之和 + 1（rowid），再取 `sqlite3LogEst(4 * 宽)`；在满足条件的索引里取 `15 * szIdxRow / szTabRow`
+  （整数除法）最小的，同价取 `table.indexes` 里靠前的——它与 SQLite 的 `pTab->pIndex` 一样新建的在前。
+  只在已选定全表扫描后替换，不进入代价比较（SQLite 里这个代价总低于 3N 的全扫，所以效果相同）。
+- 全表扫描按 3N 计价（SQLite 的 `rSize + 16`，有意压低全扫）：只用在单表选路，连接顺序的估算仍用原值，避免牵动
+  连接顺序。效果是两个单边范围的 OR 走 MULTI-INDEX OR，8 行的表也走索引——都与 SQLite 一致。
+- `x = a OR x = b ...`（同一列，右边没有亲和性或与列相同）另外生成虚拟项 `x IN (a, b, ...)`
+  （exprAnalyzeOrTerm），OR 本身照样检查；亲和性不同时仍是 MULTI-INDEX OR，也与 SQLite 一致。
+- MultiScan 不再按 rowid 排序输出：IN 按索引 key 顺序（SQLite 把 IN 列表排序后逐个查），OR 逐项输出、每行一次
+  （SQLite 的 RowSet）。相应地 `order()`：IN 给出索引顺序，OR 给不出顺序（ORDER BY id 时要排序，SQLite 也用临时
+  B 树排序）。
+- `NOT INDEXED` / `INDEXED BY` 从“只检查”改为约束规划器（SQLite 的 notIndexed / isIndexedBy）：前者不用任何索引
+  （rowid 查找照用），后者只用那个索引、不扫表本身（没有可用条件时扫整个索引），都不用自动索引。
+仍然不同的：连接顺序（MiniDB 自己的代价模型）、IN/OR 子项是否覆盖、DESC 索引（SQLite 格式里不用于查找）。
+
+## D103 SQLite 格式的性能：只在热点上动，转码层保留
+SQLite 格式第一版比 MiniDB 格式慢得多（参数化插入 10 倍、全扫 3.5 倍）。剖析后只改三处：
+- 单元格缓存自己的字节数（按页类型），页拷贝（语句日志）共享单元格对象——B 树代码在改单元格前总是先 copy，
+  所以页上的单元格从不被原地修改；
+- SQLite record 解码像 `minidb.record` 一样，每种 header 编译一次成 `struct.Struct` + 组装函数并缓存；
+- 用户表的树直接把解码好的行交给执行器（`Executor.load_row` 两种都收），省掉“SQLite record → 值 → MiniDB
+  record → 值”中间那一次编码和解码。写入方向仍是 MiniDB record → SQLite record，schema 和统计表仍走 bytes 接口。
+没有做的：每次插入仍要 O(页内单元格数) 地累加页面用量，平衡时重算分布；插入因此仍比 MiniDB 格式慢 1.6–2.4 倍。
