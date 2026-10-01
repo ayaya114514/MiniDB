@@ -16,8 +16,9 @@ from minidb.sqlite_format import MAGIC as SQLITE_MAGIC
 from minidb.sqlite_pager import SqlitePager
 from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, CreateView, Delete, DropIndex, DropTable,
-    AlterTable, DropView, Insert, Reindex, Rollback, Update, Vacuum, parse_script,
+    AlterTable, DropView, Insert, Pragma, Reindex, Rollback, Update, Vacuum, parse_script,
 )
+from minidb import pragmas
 from minidb.values import INT_MAX, INT_MIN, SQLValue
 
 # Values for ?-parameters: by position, or by name.
@@ -90,6 +91,8 @@ class Database:
             self.pager.close_files()
             raise
         self.executor = Executor(self.catalog)
+        self.executor.integrity_problems = self._integrity_check
+        self.executor.in_transaction = lambda: self.in_transaction
         self.in_transaction = False
         self.broken = False
         self.total_changes = 0
@@ -168,7 +171,8 @@ class Database:
             self.rollback()
             pager.end_transaction()
             return Result()
-        writes = isinstance(stmt, WRITE_STATEMENTS)
+        writes = isinstance(stmt, WRITE_STATEMENTS) or (
+            isinstance(stmt, Pragma) and pragmas.is_write(stmt.name, stmt.value))
         if isinstance(stmt, Vacuum):
             if self.in_transaction:
                 raise OperationalError("cannot VACUUM from within a transaction")
@@ -244,6 +248,7 @@ class Database:
     def _begin_read(self) -> None:
         if self.pager.begin_read():
             self.catalog.load()  # another connection committed: the schema may differ
+            self.executor.data_version += 1
 
     def _commit(self) -> None:
         try:

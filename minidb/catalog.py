@@ -33,6 +33,7 @@ columns (like SQLite's sqlite_stat1).
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Sequence
+from typing import Any
 
 from minidb import values
 from minidb.btree import BTree
@@ -116,9 +117,10 @@ class AutoIndex:
     ``sqlite_autoindex_<table>_<n>``)."""
 
     def __init__(self, positions: list[int], collations: list[str], descending: list[bool],
-                 conflict: str | None, primary: bool) -> None:
+                 conflict: str | None, primary: bool, written: list[str | None]) -> None:
         self.positions = positions
         self.collations = collations
+        self.written = written  # the COLLATE names as the constraint wrote them
         self.descending = descending
         self.conflict = conflict
         self.origin = "pk" if primary else "u"
@@ -204,7 +206,7 @@ class TableInfo:
                     break
             else:
                 found.append(AutoIndex(positions, collations, [c.descending for c in key.columns],
-                                       key.conflict, key.primary))
+                                       key.conflict, key.primary, [c.collation for c in key.columns]))
         return found
 
     def validate(self) -> None:
@@ -267,7 +269,7 @@ class IndexInfo:
     def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int,
                  schema_key: int | None = None, auto: bool = False, descending: list[bool] | None = None,
                  collations: list[str | None] | None = None, conflict: str | None = None,
-                 origin: str = "c", sql: str | None = None) -> None:
+                 origin: str = "c", sql: str | None = None, declared: list[bool] | None = None) -> None:
         self.name = name
         self.auto = auto
         # DESC columns (kept only in SQLite-format files): the index is then
@@ -277,8 +279,14 @@ class IndexInfo:
         self.column_names = [table.columns[table.column_index(c)].name for c in column_names]
         self.positions = [table.column_index(c) for c in column_names]
         # Each column's collation: its own COLLATE, else the table column's.
+        written = collations or [None] * len(self.positions)
         self.collations = [values.collation_name(c) if c else table.collations[p]
-                           for c, p in zip(collations or [None] * len(self.positions), self.positions)]
+                           for c, p in zip(written, self.positions)]
+        # As PRAGMA index_xinfo shows them: the COLLATE names as written (in
+        # the index, else on the column) and the DESC flags as declared.
+        self.collation_names = [c if c is not None else table.columns[p].collation or "BINARY"
+                                for c, p in zip(written, self.positions)]
+        self.declared_descending = list(declared or descending or [False] * len(self.positions))
         # Each column's sort key function (values.collation_sort_key).
         self.key_functions = [values.collation_sort_key(c) for c in self.collations]
         self.collated = any(c != "BINARY" for c in self.collations)
@@ -351,7 +359,7 @@ class Catalog:
                 tree = BTree.create(pager)
                 if tree.root != SCHEMA_ROOT:
                     raise DatabaseError("could not create the schema table")
-            self.schema = BTree(pager, SCHEMA_ROOT)
+            self.schema = _SchemaTree(pager, SCHEMA_ROOT)
         self.load()
 
     def load(self) -> None:
@@ -390,7 +398,7 @@ class Catalog:
                     columns = [table.columns[p].name for p in auto.positions]
                     descending = auto.descending if self.sqlite else None
                     index = IndexInfo(name, table, columns, True, root, key, True, descending,
-                                      auto.collations, auto.conflict, auto.origin)
+                                      auto.written, auto.conflict, auto.origin, declared=auto.descending)
                 else:
                     stmt = parse(sql)
                     for column in stmt.columns:
@@ -398,7 +406,7 @@ class Catalog:
                             raise OperationalError(f"no such column: {column}")
                     descending = stmt.descending if self.sqlite else None
                     index = IndexInfo(name, table, stmt.columns, stmt.unique, root, key, False, descending,
-                                      stmt.collations, sql=sql)
+                                      stmt.collations, sql=sql, declared=stmt.descending)
             except Exception as exc:
                 if not self.sqlite:
                     raise
@@ -537,8 +545,8 @@ class Catalog:
             name = f"{self.auto_prefix}{table.name}_{n}"
             columns = [table.columns[p].name for p in auto.positions]
             descending = auto.descending if self.sqlite else None
-            self._create_index(name, table, columns, True, True, descending, auto.collations, auto.conflict,
-                               auto.origin)
+            self._create_index(name, table, columns, True, True, descending, auto.written, auto.conflict,
+                               auto.origin, declared=auto.descending)
         if table.autoincrement and "sqlite_sequence" not in self.tables:
             sql = "CREATE TABLE sqlite_sequence(name,seq)"
             root = self._new_tree(index=False)
@@ -641,15 +649,16 @@ class Catalog:
         self.check_writable(table, "indexed")
         descending = stmt.descending if self.sqlite else None
         return self._create_index(stmt.name, table, stmt.columns, stmt.unique, descending=descending,
-                                  collations=stmt.collations, sql=stmt.sql)
+                                  collations=stmt.collations, sql=stmt.sql, declared=stmt.descending)
 
     def _create_index(self, name: str, table: TableInfo, columns: list[str], unique: bool, auto: bool = False,
                       descending: list[bool] | None = None, collations: list[str | None] | None = None,
-                      conflict: str | None = None, origin: str = "c", sql: str | None = None) -> IndexInfo:
+                      conflict: str | None = None, origin: str = "c", sql: str | None = None,
+                      declared: list[bool] | None = None) -> IndexInfo:
         self.version += 1
         root = self._new_tree(index=True)
         index = IndexInfo(name, table, columns, unique, root, None, auto, descending, collations, conflict,
-                          origin, sql)
+                          origin, sql, declared)
         index.schema_key = self._add_entry("index", name, table.name, root, sql)
         self.indexes[ascii_lower(name)] = index
         add_index(table, index)
@@ -835,6 +844,18 @@ class Catalog:
         text = " ".join(f"{n:g}" if isinstance(n, float) else str(n) for n in numbers)
         table_name = owner.name if isinstance(owner, TableInfo) else owner.table.name
         owner.stat_key = self._add_entry("stat", name, table_name, 0, text)
+
+
+class _SchemaTree(BTree):
+    """MiniDB's schema table: a change makes the commit bump the schema version."""
+
+    def insert(self, *args: Any, **kwargs: Any) -> None:
+        self.pager.note_schema_change()
+        super().insert(*args, **kwargs)
+
+    def delete(self, key: int) -> bool:
+        self.pager.note_schema_change()
+        return super().delete(key)
 
 
 class _SchemaRows:
