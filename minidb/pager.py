@@ -159,7 +159,58 @@ def verify_page(pgno: int, image: bytes) -> bytes:
     return data
 
 
-class Pager:
+class PageCache:
+    """The in-memory side of a pager: decoded pages, the set of dirty ones,
+    and the statement journal (see the module docstring).  Page 0 is the
+    database header.  Subclasses read and write the file."""
+
+    cache: dict
+    dirty: set
+    journal: dict | None
+    journal_dirty: set | None
+    header: Any
+
+    def write(self, page: Page) -> None:
+        """Declare that ``page`` is about to be modified (or replaced by ``page``)."""
+        pgno = page.pgno
+        if self.journal is not None and pgno not in self.journal:
+            old = self.cache.get(pgno)
+            self.journal[pgno] = old.copy() if old is not None else None
+        self.dirty.add(pgno)
+        self.cache[pgno] = page
+
+    def begin_statement(self) -> None:
+        self.journal = {}
+        self.journal_dirty = set(self.dirty)
+
+    def end_statement(self) -> None:
+        self.journal = None
+        self.journal_dirty = None
+
+    def rollback_statement(self) -> None:
+        """Undo every change made since ``begin_statement()``."""
+        for pgno, old in self.journal.items():
+            if old is None:
+                self.cache.pop(pgno, None)
+            else:
+                self.cache[pgno] = old
+        self.dirty = self.journal_dirty
+        self.header = self.cache[0]
+        self.end_statement()
+
+    def shrink_cache(self, limit: int = 10_000) -> None:
+        """Drop clean pages from the cache once it holds more than ``limit`` pages.
+
+        Only call this between statements: B+ tree code holds page objects
+        while it works.
+        """
+        if len(self.cache) > limit:
+            self.cache = {
+                pgno: page for pgno, page in self.cache.items() if pgno in self.dirty or pgno == 0
+            }
+
+
+class Pager(PageCache):
     """Reads, caches and commits the pages of one database file.
 
     File databases use a write-ahead log in ``<path>-wal`` (SQLite's WAL
@@ -246,6 +297,10 @@ class Pager:
     @property
     def page_count(self) -> int:
         return self.header.page_count
+
+    @property
+    def closed(self) -> bool:
+        return self.file.closed
 
     @property
     def is_new(self) -> bool:
@@ -470,36 +525,6 @@ class Pager:
             self.cache[pgno] = page
         return page
 
-    def write(self, page: Page) -> None:
-        """Declare that ``page`` is about to be modified (or replaced by ``page``)."""
-        pgno = page.pgno
-        if self.journal is not None and pgno not in self.journal:
-            old = self.cache.get(pgno)
-            self.journal[pgno] = old.copy() if old is not None else None
-        self.dirty.add(pgno)
-        self.cache[pgno] = page
-
-    # ---- statements ---------------------------------------------------
-
-    def begin_statement(self) -> None:
-        self.journal = {}
-        self.journal_dirty = set(self.dirty)
-
-    def end_statement(self) -> None:
-        self.journal = None
-        self.journal_dirty = None
-
-    def rollback_statement(self) -> None:
-        """Undo every change made since ``begin_statement()``."""
-        for pgno, old in self.journal.items():
-            if old is None:
-                self.cache.pop(pgno, None)
-            else:
-                self.cache[pgno] = old
-        self.dirty = self.journal_dirty
-        self.header = self.cache[0]
-        self.end_statement()
-
     # ---- allocation ---------------------------------------------------
 
     def allocate(self, page_class: Callable[..., Page], *args: Any) -> Any:
@@ -547,17 +572,6 @@ class Pager:
             return damaged
         finally:
             self.frame_total = saved
-
-    def shrink_cache(self, limit: int = 10_000) -> None:
-        """Drop clean pages from the cache once it holds more than ``limit`` pages.
-
-        Only call this between statements: B+ tree code holds page objects
-        while it works.
-        """
-        if len(self.cache) > limit:
-            self.cache = {
-                pgno: page for pgno, page in self.cache.items() if pgno in self.dirty or pgno == 0
-            }
 
     # ---- transactions -------------------------------------------------
 

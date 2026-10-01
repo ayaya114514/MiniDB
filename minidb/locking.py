@@ -51,25 +51,33 @@ class LockTimeout(OperationalError):
     """A lock stayed busy for the whole timeout ("database is locked")."""
 
 
+Span = tuple[int, int]  # (offset, length) of a locked range
+
+
 class PosixLocks:
-    """Process-level locks on bytes of a file: POSIX record locks (fcntl)."""
-
-    def lock(self, fd: int, byte: int, exclusive: bool) -> bool:
-        return self._lockf(fd, byte, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-
-    def downgrade(self, fd: int, byte: int) -> bool:
-        return self._lockf(fd, byte, fcntl.LOCK_SH)  # atomic for record locks
-
-    def unlock(self, fd: int, byte: int) -> None:
-        self._lockf(fd, byte, fcntl.LOCK_UN)
+    """Process-level locks on ranges of a file: POSIX record locks (fcntl)."""
 
     @staticmethod
-    def _lockf(fd: int, byte: int, operation: int) -> bool:
-        """Change the process's lock on ``byte`` without waiting."""
+    def span(byte: int) -> Span:
+        """Where MiniDB's lock number ``byte`` lives in ``<db>-shm``."""
+        return LOCK_OFFSET + byte, 1
+
+    def lock(self, fd: int, span: Span, exclusive: bool) -> bool:
+        return self._lockf(fd, span, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+
+    def downgrade(self, fd: int, span: Span) -> bool:
+        return self._lockf(fd, span, fcntl.LOCK_SH)  # atomic for record locks
+
+    def unlock(self, fd: int, span: Span) -> None:
+        self._lockf(fd, span, fcntl.LOCK_UN)
+
+    @staticmethod
+    def _lockf(fd: int, span: Span, operation: int) -> bool:
+        """Change the process's lock on a range without waiting."""
         try:
             if operation != fcntl.LOCK_UN:
                 operation |= fcntl.LOCK_NB
-            fcntl.lockf(fd, operation, 1, LOCK_OFFSET + byte, os.SEEK_SET)
+            fcntl.lockf(fd, operation, span[1], span[0], os.SEEK_SET)
             return True
         except OSError as exc:
             if exc.errno in (errno.EACCES, errno.EAGAIN):
@@ -78,22 +86,25 @@ class PosixLocks:
 
 
 class WindowsLocks:
-    """Process-level locks on bytes of a file with ``msvcrt.locking``, which
+    """Process-level locks on ranges of a file with ``msvcrt.locking``, which
     has exclusive locks only (per handle, and mandatory: they also block
     reads and writes of the locked bytes, so they lie past the data).
 
-    As SQLite does on Windows without LockFileEx: every lock is a range of
-    ``WIDTH`` bytes; a shared holder locks one byte of it (any free one), an
-    exclusive holder all of them.  So up to ``WIDTH`` processes can share a
-    lock, and an exclusive lock needs all the others gone.  Converting a
-    lock is not atomic: an upgrade just fails while we share, and a
-    downgrade may lose the lock to another process (callers check)."""
+    As SQLite does on Windows without LockFileEx: a shared holder locks one
+    byte of the range (any free one), an exclusive holder all of it; MiniDB's
+    own locks are ranges of ``WIDTH`` bytes, so up to ``WIDTH`` processes can
+    share one.  Converting a lock is not atomic: an upgrade just fails while
+    we share, and a downgrade may lose the lock to another process (callers
+    check)."""
 
     WIDTH = 64
 
     def __init__(self, module: object = None) -> None:
         self.msvcrt = module if module is not None else msvcrt
-        self.shared = {}  # (fd, byte) -> the offset of the byte we lock
+        self.shared = {}  # (fd, offset of the range) -> the offset of the byte we lock
+
+    def span(self, byte: int) -> Span:
+        return LOCK_OFFSET + byte * self.WIDTH, self.WIDTH
 
     def _locking(self, fd: int, mode: int, offset: int, size: int) -> bool:
         os.lseek(fd, offset, os.SEEK_SET)  # (callers hold _LockFile._mutex)
@@ -103,28 +114,28 @@ class WindowsLocks:
         except OSError:
             return False
 
-    def lock(self, fd: int, byte: int, exclusive: bool) -> bool:
-        base = LOCK_OFFSET + byte * self.WIDTH
+    def lock(self, fd: int, span: Span, exclusive: bool) -> bool:
+        base, width = span
         if exclusive:
-            return self._locking(fd, self.msvcrt.LK_NBLCK, base, self.WIDTH)
-        start = int.from_bytes(os.urandom(2), "big") % self.WIDTH
-        for i in range(self.WIDTH):
-            offset = base + (start + i) % self.WIDTH
+            return self._locking(fd, self.msvcrt.LK_NBLCK, base, width)
+        start = int.from_bytes(os.urandom(2), "big") % width
+        for i in range(width):
+            offset = base + (start + i) % width
             if self._locking(fd, self.msvcrt.LK_NBLCK, offset, 1):
-                self.shared[fd, byte] = offset
+                self.shared[fd, base] = offset
                 return True
         return False
 
-    def downgrade(self, fd: int, byte: int) -> bool:
-        self._locking(fd, self.msvcrt.LK_UNLCK, LOCK_OFFSET + byte * self.WIDTH, self.WIDTH)
-        return self.lock(fd, byte, False)
+    def downgrade(self, fd: int, span: Span) -> bool:
+        self._locking(fd, self.msvcrt.LK_UNLCK, *span)
+        return self.lock(fd, span, False)
 
-    def unlock(self, fd: int, byte: int) -> None:
-        offset = self.shared.pop((fd, byte), None)
+    def unlock(self, fd: int, span: Span) -> None:
+        offset = self.shared.pop((fd, span[0]), None)
         if offset is not None:
             self._locking(fd, self.msvcrt.LK_UNLCK, offset, 1)
         else:
-            self._locking(fd, self.msvcrt.LK_UNLCK, LOCK_OFFSET + byte * self.WIDTH, self.WIDTH)
+            self._locking(fd, self.msvcrt.LK_UNLCK, *span)
 
 
 if fcntl is not None:
@@ -142,16 +153,20 @@ class _LockFile:
     _open = {}  # (device, inode) -> _LockFile
     _mutex = threading.Lock()  # guards everything below, in every instance
 
-    def __init__(self, fd: int, key: tuple[int, int], backend: object = None) -> None:
+    def __init__(self, fd: int, key: tuple[int, int], backend: object = None, spans: dict | None = None) -> None:
         self.fd = fd
         self.key = key
         self.backend = backend if backend is not None else BACKEND
+        self.spans = spans  # lock number -> range; by default MiniDB's bytes in -shm
         self.users = 0
         self.exclusive = {}  # byte -> owner
         self.shared = {}  # byte -> set of owners
 
+    def span(self, byte: int) -> Span:
+        return self.spans[byte] if self.spans is not None else self.backend.span(byte)
+
     @classmethod
-    def acquire(cls, path: str) -> _LockFile:
+    def acquire(cls, path: str, spans: dict | None = None) -> _LockFile:
         with cls._mutex:
             try:
                 st = os.stat(path)
@@ -162,7 +177,7 @@ class _LockFile:
                 # Never opened (and so never closed) twice: see the module docstring.
                 fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
                 st = os.fstat(fd)
-                lock_file = cls(fd, (st.st_dev, st.st_ino))
+                lock_file = cls(fd, (st.st_dev, st.st_ino), spans=spans)
                 cls._open[lock_file.key] = lock_file
             lock_file.users += 1
             return lock_file
@@ -189,6 +204,15 @@ class _LockFile:
             os.lseek(self.fd, offset, os.SEEK_SET)
             os.write(self.fd, data)
 
+    def size(self) -> int:
+        return os.fstat(self.fd).st_size
+
+    def truncate(self, size: int) -> None:
+        os.ftruncate(self.fd, size)
+
+    def sync(self) -> None:
+        os.fsync(self.fd)
+
     def try_lock(self, owner: object, byte: int, exclusive: bool) -> bool:
         """Take (or convert to) a shared or exclusive lock on ``byte``
         without waiting; returns whether ``owner`` now holds it so.  A
@@ -204,7 +228,7 @@ class _LockFile:
                     return True
                 if holder is not None or sharers - {owner}:
                     return False
-                if not backend.lock(self.fd, byte, True):
+                if not backend.lock(self.fd, self.span(byte), True):
                     return False
                 sharers.discard(owner)
                 self.exclusive[byte] = owner
@@ -213,9 +237,9 @@ class _LockFile:
                 return True
             if holder is owner:
                 del self.exclusive[byte]
-                if not backend.downgrade(self.fd, byte):
+                if not backend.downgrade(self.fd, self.span(byte)):
                     return False
-            elif holder is not None or (not sharers and not backend.lock(self.fd, byte, False)):
+            elif holder is not None or (not sharers and not backend.lock(self.fd, self.span(byte), False)):
                 return False
             sharers.add(owner)
             return True
@@ -236,13 +260,13 @@ class _LockFile:
         with self._mutex:
             if self.exclusive.get(byte) is owner:
                 del self.exclusive[byte]
-                self.backend.unlock(self.fd, byte)
+                self.backend.unlock(self.fd, self.span(byte))
                 return
             sharers = self.shared.get(byte, set())
             if owner in sharers:
                 sharers.discard(owner)
                 if not sharers:
-                    self.backend.unlock(self.fd, byte)
+                    self.backend.unlock(self.fd, self.span(byte))
 
     def held_by_others(self, owner: object, byte: int) -> bool:
         """Whether a connection other than ``owner`` holds ``byte`` (which
@@ -253,9 +277,9 @@ class _LockFile:
             holder = self.exclusive.get(byte)
             if (holder is not None and holder is not owner) or self.shared.get(byte, set()) - {owner}:
                 return True
-            if not self.backend.lock(self.fd, byte, True):
+            if not self.backend.lock(self.fd, self.span(byte), True):
                 return True  # another process
-            self.backend.unlock(self.fd, byte)
+            self.backend.unlock(self.fd, self.span(byte))
             return False
 
 
