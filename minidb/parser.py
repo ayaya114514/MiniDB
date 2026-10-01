@@ -315,6 +315,7 @@ class Upsert:
     assignments: list | None = None  # (column name, expression) pairs; None for DO NOTHING
     where: object = None
     target_where: object = None  # would name a partial index (MiniDB has none)
+    collations: list | None = field(default=None, compare=False)  # the target's COLLATE names (None: none given)
 
 
 @dataclass
@@ -473,6 +474,26 @@ class Reindex:
 
 
 @dataclass
+class Pragma:
+    """``PRAGMA [schema.]name [= value | (value)]``; ``value`` is the text of
+    a name or number (a number keeps its sign), a string's value, or None."""
+
+    name: str  # lower case
+    value: object = None
+    schema: str | None = None
+
+
+@dataclass
+class TableFunction:
+    """A table-valued function in FROM, such as ``pragma_table_info('t')``."""
+
+    name: str  # lower case
+    args: list
+    alias: str | None = None
+    pos: int = field(default=-1, compare=False)
+
+
+@dataclass
 class Vacuum:
     """``VACUUM [schema] [INTO <file name>]``."""
 
@@ -487,7 +508,7 @@ Expr = Union[
 ]
 Statement = Union[
     CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Vacuum, Values, AlterTable, Insert, Select, Compound, Update, Delete,
-    Begin, Commit, Rollback, Analyze, Explain,
+    Begin, Commit, Rollback, Analyze, Explain, Pragma,
 ]
 
 
@@ -661,6 +682,8 @@ class Parser:
             if self.accept_op("."):  # schema.name: only the main schema exists
                 name = self.identifier("index or table name")
             return Reindex(name)
+        if self.at_word("PRAGMA"):
+            return self.pragma()
         if self.at_word("VACUUM"):
             self.advance()
             stmt = Vacuum()
@@ -673,6 +696,36 @@ class Parser:
                 stmt.into = self.expr()
             return stmt
         raise self.error("a statement")
+
+    def pragma(self) -> Pragma:
+        self.advance()  # PRAGMA
+        schema = None
+        name = self.identifier("pragma name")
+        if self.accept_op("."):
+            schema, name = name, self.identifier("pragma name")
+        stmt = Pragma(ascii_lower(name), schema=schema)
+        if self.accept_op("="):
+            stmt.value = self.pragma_value()
+        elif self.accept_op("("):
+            stmt.value = self.pragma_value()
+            self.expect_op(")")
+        return stmt
+
+    def pragma_value(self) -> str:
+        """A signed number, a name (keywords such as ON too) or a string."""
+        sign = ""
+        if self.at_op("+", "-"):
+            sign = self.advance().value
+        token = self.tok
+        if token.kind in ("INTEGER", "FLOAT"):
+            self.advance()
+            return ("-" if sign == "-" else "") + token.text
+        if sign:
+            raise self.error("number")
+        if token.kind in ("IDENT", "KEYWORD", "STRING"):
+            self.advance()
+            return token.value if token.kind != "KEYWORD" else token.text
+        raise self.error("pragma value")
 
     def create(self) -> CreateTable | CreateIndex | CreateView:
         create = self.expect_keyword("CREATE")
@@ -953,11 +1006,16 @@ class Parser:
         stmt.table_pos, stmt.column_pos = table_pos, [c.pos for c in columns]
         return stmt
 
-    def indexed_column(self) -> str:
+    def indexed_column(self) -> tuple[str, str | None]:
+        """``name [COLLATE c] [ASC | DESC]`` of an upsert target: (name, collation)."""
         name = self.identifier("column name")
+        collation = None
+        if self.at_word("COLLATE"):
+            self.advance()
+            collation = self.identifier("collation name")
         if not self.accept_keyword("ASC"):
             self.accept_keyword("DESC")
-        return name
+        return name, collation
 
     def column_def(self) -> ColumnDef:
         pos = self.tok.pos
@@ -1090,10 +1148,12 @@ class Parser:
             self.expect_word("CONFLICT")
             clause = Upsert(None)
             if self.accept_op("("):
-                clause.columns = [self.indexed_column()]
+                targets = [self.indexed_column()]
                 while self.accept_op(","):
-                    clause.columns.append(self.indexed_column())
+                    targets.append(self.indexed_column())
                 self.expect_op(")")
+                clause.columns = [name for name, _ in targets]
+                clause.collations = [collation for _, collation in targets]
                 if self.accept_keyword("WHERE"):
                     clause.target_where = self.expr()
             self.expect_word("DO")
@@ -1487,11 +1547,18 @@ class Parser:
             return DerivedTable(query, alias)
         pos = self.tok.pos
         name = self.identifier("table name")
+        function = None
+        if self.accept_op("("):  # a table-valued function
+            function = TableFunction(ascii_lower(name), [] if self.at_op(")") else self.expr_list(), pos=pos)
+            self.expect_op(")")
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
         elif self.tok.kind == "IDENT" and not self.at_word("INDEXED", "RIGHT", "FULL", "WINDOW"):
             alias = self.advance().value  # (RIGHT / FULL start a join, as LEFT does; WINDOW a clause)
+        if function is not None:
+            function.alias = alias
+            return function
         indexed_by, not_indexed = self.index_hint()
         return TableRef(name, alias, indexed_by, pos, not_indexed)
 

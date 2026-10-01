@@ -60,7 +60,7 @@ CONNECTION_FUNCTIONS = {
 Row = list  # the values of every table of a query, each followed by its row id
 RowFunction = Callable[[Row], Any]  # a compiled expression
 Record = tuple[tuple, tuple]  # (result row, extra ORDER BY values)
-OrderTerm = tuple[str, int, bool, bool]  # (source, index, descending, NULLs first)
+OrderTerm = tuple[str, int, bool, bool, Union[str, None]]  # (source, index, descending, NULLs first, collation)
 Bound = Union[tuple[RowFunction, bool], None]  # (key function, inclusive)
 Source = Union[TableInfo, "DerivedSource"]  # a table or a subquery in FROM
 CompiledQuery = Union["CompiledSelect", "CompiledCompound"]
@@ -308,6 +308,43 @@ def walk(expr: Expr) -> Iterator[Expr]:
             yield from walk(expr.else_)
 
 
+def strip_collate(expr: Expr) -> Expr:
+    while isinstance(expr, Collate):
+        expr = expr.expr
+    return expr
+
+
+def has_collate(expr: Expr) -> bool:
+    """Whether an explicit COLLATE is part of ``expr`` (SQLite's EP_Collate),
+    not counting subqueries."""
+    return any(isinstance(node, Collate) for node in walk(expr))
+
+
+def collation_children(expr: Expr) -> list[Expr]:
+    """The operands sqlite3ExprCollSeq looks into, in its order: the left
+    operand, the list (arguments, IN items, BETWEEN bounds, CASE parts), the
+    right operand.  (LIKE / GLOB are calls whose first argument is the pattern.)"""
+    if isinstance(expr, Binary):
+        return [expr.left, expr.right]
+    if isinstance(expr, Unary):
+        return [expr.operand]
+    if isinstance(expr, Between):
+        return [expr.expr, expr.low, expr.high]
+    if isinstance(expr, InList):
+        return [expr.expr, *expr.items]
+    if isinstance(expr, InSelect):
+        return [expr.expr]
+    if isinstance(expr, Like):
+        return [p for p in (expr.pattern, expr.expr, expr.escape) if p is not None]
+    if isinstance(expr, Call):
+        return list(expr.args)
+    if isinstance(expr, Case):
+        parts = [] if expr.base is None else [expr.base]
+        parts += [part for when in expr.whens for part in when]
+        return parts + ([] if expr.else_ is None else [expr.else_])
+    return []
+
+
 def is_true_false(expr: Column) -> bool:
     """Whether a column name that did not resolve is TRUE or FALSE (which
     SQLite takes as 1 and 0 unless there is such a column)."""
@@ -400,12 +437,14 @@ _AFFINITY_FUNCTIONS = {
 _FLIPPED = {"=": "=", "!=": "!=", "<": ">", "<=": ">=", ">": "<", ">=": "<="}
 
 
-def value_comparator(op: str, left_affinity: str | None, right_affinity: str | None) -> Callable[[SQLValue, SQLValue], int | None]:
+def value_comparator(op: str, left_affinity: str | None, right_affinity: str | None,
+                     collation: str | None = None) -> Callable[[SQLValue, SQLValue], int | None]:
     """A function (a, b) -> 1, 0 or None comparing two values with SQLite's
     rules: the comparison affinity applies to both operands, TEXT only when
-    one of them is text (as in SQLite's OP_Eq and friends)."""
+    one of them is text (as in SQLite's OP_Eq and friends); two texts
+    compare by the collation."""
     affinity = values.comparison_affinity(left_affinity, right_affinity)
-    compare = values.compare
+    compare = values.collation_compare(collation)
     if affinity in values.NUMERIC_AFFINITIES:
         numeric = values.numeric_affinity
 
@@ -520,6 +559,61 @@ class Compiler:
     def compile(self, expr: Expr) -> RowFunction:
         return self.compile_with_affinity(expr)[0]
 
+    # ---- collations ---------------------------------------------------------
+
+    def collation(self, expr: Expr) -> str | None:
+        """The collation of ``expr`` (SQLite's sqlite3ExprCollSeq): its
+        COLLATE, a column's own (BINARY if it has none), through CAST and
+        unary +; else that of the operand holding an explicit COLLATE, if
+        any (None: no collation, which comparisons take as BINARY)."""
+        while True:
+            if isinstance(expr, Collate):
+                return values.collation_name(expr.collation)
+            if isinstance(expr, Cast):
+                expr = expr.expr
+            elif isinstance(expr, Unary) and expr.op == "+":
+                expr = expr.operand
+            elif isinstance(expr, Column):
+                return self.column_collation(expr)
+            else:
+                expr = next((child for child in collation_children(expr) if has_collate(child)), None)
+                if expr is None:
+                    return None
+
+    def column_collation(self, expr: Column) -> str | None:
+        try:
+            slot, _, index, depth = self.scope.resolve(expr)
+        except AliasReference as reference:
+            outer = self.scope.ancestor(reference.depth)
+            return Compiler(outer, executor=self.executor).collation(reference.item.expr)
+        except OperationalError:
+            return None  # TRUE / FALSE
+        scope = self.scope.ancestor(depth)
+        entry = scope.entries[index]
+        position = slot - entry.offset
+        if not 0 <= position < len(entry.table.columns):
+            merge = next((m for m in scope.merged.values() if m.slot == slot), None)
+            if merge is None:
+                return "BINARY"  # the row id
+            first = scope.entries[merge.index]  # (a FULL JOIN's USING column: its first table's)
+            for e in scope.entries:
+                if e.offset <= merge.parts[0] < e.offset + len(e.table.columns):
+                    first = e
+            entry, position = first, merge.parts[0] - first.offset
+        return entry.table.collations[position] or "BINARY"
+
+    def comparison_collation(self, left: Expr, right: Expr) -> str:
+        """The collation comparing ``left`` with ``right`` (SQLite's
+        sqlite3BinaryCompareCollSeq): an explicit COLLATE on the left, else
+        on the right, else the left's collation, else the right's."""
+        if has_collate(left):
+            collation = self.collation(left)
+        elif has_collate(right):
+            collation = self.collation(right)
+        else:
+            collation = self.collation(left) or self.collation(right)
+        return collation or "BINARY"
+
     def compile_with_affinity(self, expr: Expr) -> tuple[RowFunction, str | None]:
         """Return (function, affinity); only column references have an affinity.
 
@@ -602,7 +696,8 @@ class Compiler:
                     f"{values.INT_MIN} <= ({s_} := {x} {op} {y}) <= {values.INT_MAX} else {function}({x}, {y}))"), None
         if op in _ARITHMETIC:
             return f"{source.value(_ARITHMETIC[op])}({left}, {right})", None
-        comparator = source.value(value_comparator(op, left_affinity, right_affinity))
+        collation = self.comparison_collation(expr.left, expr.right)
+        comparator = source.value(value_comparator(op, left_affinity, right_affinity, collation))
         if op in _PYTHON_COMPARISONS:
             numbers = source.value(_NUMBER_TYPES)
             return (f"((1 if {x} {_PYTHON_COMPARISONS[op]} {y} else 0) if {both} and type({x}) in {numbers} "
@@ -754,15 +849,16 @@ class Compiler:
         if op in _ARITHMETIC:
             function = _ARITHMETIC[op]
             return lambda row: function(left(row), right(row))
-        comparator = value_comparator(op, left_affinity, right_affinity)
+        collation = self.comparison_collation(expr.left, expr.right)
+        comparator = value_comparator(op, left_affinity, right_affinity, collation)
         return lambda row: comparator(left(row), right(row))
 
     def _between(self, expr: Between) -> RowFunction:
         value, affinity = self.compile_with_affinity(expr.expr)
         low, low_affinity = self.compile_with_affinity(expr.low)
         high, high_affinity = self.compile_with_affinity(expr.high)
-        at_least = value_comparator(">=", affinity, low_affinity)
-        at_most = value_comparator("<=", affinity, high_affinity)
+        at_least = value_comparator(">=", affinity, low_affinity, self.comparison_collation(expr.expr, expr.low))
+        at_most = value_comparator("<=", affinity, high_affinity, self.comparison_collation(expr.expr, expr.high))
         logical_and, logical_not = values.logical_and, values.logical_not
         negated = expr.negated
 
@@ -780,7 +876,12 @@ class Compiler:
             return lambda row: result
         items = [self.compile(item) for item in expr.items]
         convert = _AFFINITY_FUNCTIONS.get(affinity)
-        compare = values.compare
+        # SQLite makes x IN (y) x = y; otherwise the left side's collation applies.
+        if len(expr.items) == 1:
+            collation = self.comparison_collation(expr.expr, expr.items[0])
+        else:
+            collation = self.collation(expr.expr)
+        compare = values.collation_compare(collation)
         found, missing = (0, 1) if expr.negated else (1, 0)
 
         def in_list(row):
@@ -832,9 +933,10 @@ class Compiler:
                 whens.append((self.compile(condition), self.compile(result)))
         else:
             base, base_affinity = self.compile_with_affinity(expr.base)
-            for value, result in expr.whens:
-                value, value_affinity = self.compile_with_affinity(value)
-                whens.append(((value, value_comparator("=", base_affinity, value_affinity)),
+            for when, result in expr.whens:
+                value, value_affinity = self.compile_with_affinity(when)
+                collation = self.comparison_collation(expr.base, when)
+                whens.append(((value, value_comparator("=", base_affinity, value_affinity, collation)),
                               self.compile(result)))
         otherwise = self.compile(expr.else_) if expr.else_ is not None else (lambda row: None)
         if expr.base is None:
@@ -899,7 +1001,16 @@ class Compiler:
         value, value_affinity = self.compile_with_affinity(expr.expr)
         affinity = in_select_affinity(value_affinity, compiled.affinities[-1])
         convert = _AFFINITY_FUNCTIONS.get(affinity)
-        sort_key = values.sort_key
+        # The collation comparing x with the subquery's column (SQLite's
+        # sqlite3BinaryCompareCollSeq of x and that column's expression).
+        right, explicit = compiled.result_collation(0)
+        if has_collate(expr.expr):
+            collation = self.collation(expr.expr)
+        elif explicit:
+            collation = right
+        else:
+            collation = self.collation(expr.expr) or right
+        sort_key = values.collation_sort_key(collation)
 
         def summarize(rows):
             keys, has_null = set(), False
@@ -947,6 +1058,11 @@ class Compiler:
         if expr.filter is not None:
             raise OperationalError(f"FILTER may not be used with non-aggregate {ascii_lower(name)}()")
         args = [self.compile(arg) for arg in expr.args]
+        if name in values.COLLATING_FUNCTIONS:
+            # The first argument with a collation decides how texts compare.
+            collation = next((c for c in map(self.collation, expr.args) if c is not None), None)
+            if collation not in (None, "BINARY"):
+                function = values.COLLATING_FUNCTIONS[name](values.collation_compare(collation))
         if not args:
             return lambda row: function()
         if len(args) == 1:
@@ -1018,7 +1134,11 @@ class Compiler:
         filter_ = None
         if expr.filter is not None:
             filter_ = Compiler(self.scope, executor=self.executor).compile(expr.filter)
-        return itemgetter(self.aggregates.add(name, args, expr.distinct, filter_))
+        # MIN / MAX and DISTINCT compare by the argument's collation.
+        collation = None
+        if expr.args and not star and (expr.distinct or name in ("MIN", "MAX")):
+            collation = self.collation(expr.args[0])
+        return itemgetter(self.aggregates.add(name, args, expr.distinct, filter_, collation))
 
     def _window(self, expr: Call) -> RowFunction:
         """A window function call: its result is read from the row, where
@@ -1060,7 +1180,8 @@ class Compiler:
                          allow_aggregates=self.allow_aggregates)  # no window functions inside
         args = [] if star else [inner.compile(arg) for arg in expr.args]
         filter_ = inner.compile(expr.filter) if expr.filter is not None else None
-        number = self.windows.add(definition, frame, name, args, filter_, inner)
+        collation = inner.collation(expr.args[0]) if name in ("MIN", "MAX") and args else None
+        number = self.windows.add(definition, frame, name, args, filter_, inner, collation)
         windows = self.windows
         return lambda row: row[windows.base + number]
 
@@ -1147,8 +1268,9 @@ class WindowCollector:
     def resolve(self, over: WindowDef | str) -> WindowDef:
         return self.find(over) if isinstance(over, str) else self.chain(over)
 
-    def add(self, definition: WindowDef, frame: Frame, name: str, args: list[RowFunction], filter_: RowFunction | None, compiler: Compiler) -> int:
-        """Register a call; returns its number."""
+    def add(self, definition: WindowDef, frame: Frame, name: str, args: list[RowFunction], filter_: RowFunction | None,
+            compiler: Compiler, collation: str | None = None) -> int:
+        """Register a call; returns its number.  ``collation``: its first argument's."""
         key = (definition.partition, definition.order_by, frame)
         group = next((g for k, g in self.groups if k == key), None)  # (the key may not be hashable)
         if group is None:
@@ -1160,11 +1282,13 @@ class WindowCollector:
                 frame.end,
                 None if frame.end_offset is None else compiler.compile(frame.end_offset),
                 frame.exclude,
+                [compiler.collation(e) for e in definition.partition],
+                [compiler.collation(e) for e, _, _ in definition.order_by],
             )
             self.groups.append((key, group))
         number = self.count
         self.count += 1
-        group.functions.append(window.WindowFunction(name, args, filter_, number))
+        group.functions.append(window.WindowFunction(name, args, filter_, number, collation))
         return number
 
     def apply(self, rows: Iterable[Row]) -> list[Row]:
@@ -1184,22 +1308,22 @@ class AggregateCollector:
     def __init__(self, base_width: int) -> None:
         self.base_width = base_width  # aggregate results follow the row's slots
         self.calls = []  # (name, argument functions, distinct, FILTER function or None)
+        self.collations = []  # of each call's argument, for MIN / MAX and DISTINCT
         self.loop = None  # the generated grouping loop
 
-    def add(self, name: str, args: list[RowFunction], distinct: bool, filter_: RowFunction | None = None) -> int:
+    def add(self, name: str, args: list[RowFunction], distinct: bool, filter_: RowFunction | None = None,
+            collation: str | None = None) -> int:
         self.calls.append((name, args, distinct, filter_))
+        self.collations.append(collation)
         return self.base_width + len(self.calls) - 1
-
-    @property
-    def tracks_extreme(self) -> bool:
-        """A lone MIN()/MAX() makes bare columns come from its row, as in SQLite."""
-        return len(self.calls) == 1 and self.calls[0][0] in ("MIN", "MAX")
 
     def new_state(self) -> list[tuple[Any, set | None]]:
         state = []
-        for name, args, distinct, _ in self.calls:
+        for (name, args, distinct, _), collation in zip(self.calls, self.collations):
             if name == "COUNT" and not args:
                 aggregate = values.CountStarAggregate()
+            elif name in ("MIN", "MAX") and collation not in (None, "BINARY"):
+                aggregate = values.MinMaxAggregate(-1 if name == "MIN" else 1, values.collation_compare(collation))
             else:
                 aggregate = values.AGGREGATE_FUNCTIONS[name][0]()
             state.append((aggregate, set() if distinct else None))
@@ -1209,27 +1333,47 @@ class AggregateCollector:
     def results(state: list[tuple[Any, set | None]]) -> list[SQLValue]:
         return [aggregate.result() for aggregate, _ in state]
 
-    def grouping_loop(self, group_functions: list[RowFunction]) -> Callable[[Iterable[Row], dict, Callable], None]:
+    def grouping_loop(self, group_functions: list[RowFunction],
+                      group_keys: list[Callable[[SQLValue], tuple]]) -> Callable[[Iterable[Row], dict, Callable], None]:
         """A generated function (rows, groups, new_state) that puts each row in
         its group (key -> [representative row, state]) and steps the
-        group's aggregates, as ``step`` does, in straight-line code."""
+        group's aggregates, as ``step`` does, in straight-line code.
+        ``group_keys``: the sort key function of each GROUP BY term (its collation)."""
         if self.loop is not None:
             return self.loop
-        env = {"_sort_key": values.sort_key, "_truth": values.truth}
-        key = ", ".join(f"_sort_key(_group{i}(row))" for i in range(len(group_functions)))
+        env = {"_truth": values.truth}
+        for i, sort_key in enumerate(group_keys):
+            env[f"_key{i}"] = sort_key
+        key = ", ".join(f"_key{i}(_group{i}(row))" for i in range(len(group_functions)))
+        # Which row a group's bare columns (and its GROUP BY values, which a
+        # collation may let differ within the group) come from, as SQLite's
+        # updateAccumulator decides: a register "hit", kept from row to row,
+        # is set by each MIN / MAX step (0: load this row's values; 1: it
+        # skipped - no new extreme, or a NULL once there is one); before the
+        # FILTER of a MIN / MAX it is set to "not the group's first row"
+        # (without GROUP BY only if every MIN / MAX has a FILTER).  Without
+        # MIN / MAX: only the group's first row.
+        extreme = [name in ("MIN", "MAX") for name, _, _, _ in self.calls]
+        grouped = bool(group_functions)
+        use_flag = grouped or not any(e and f is None for e, (_, _, _, f) in zip(extreme, self.calls))
         lines = ["def loop(rows, groups, new_state):",
+                 "    hit = 0",
                  "    for row in rows:",
                  f"        key = ({key}{',' if len(group_functions) == 1 else ''})",
                  "        group = groups.get(key)",
                  "        if group is None:",
-                 "            group = groups[key] = [list(row), new_state()]",
+                 "            group = groups[key] = [None, new_state()]",
+                 "            used = 0",
+                 "        else:",
+                 "            used = 1",
                  "        state = group[1]"]
         for i, function in enumerate(group_functions):
             env[f"_group{i}"] = function
-        tracks = self.tracks_extreme
         for i, (_, args, distinct, filter_) in enumerate(self.calls):
             indent = "        "
             if filter_ is not None:
+                if extreme[i] and use_flag:
+                    lines.append(f"{indent}hit = used")
                 env[f"_filter{i}"] = filter_
                 lines.append(f"{indent}_v = _filter{i}(row)")
                 lines.append(f"{indent}if _v is not None and ((_v != 0) if type(_v) is int else _truth(_v)):")
@@ -1239,17 +1383,21 @@ class AggregateCollector:
             arguments = ", ".join(f"_arg{i}_{j}(row)" for j in range(len(args)))
             call = f"state[{i}][0].step({arguments})"
             if distinct:
+                env[f"_distinct{i}"] = values.collation_sort_key(self.collations[i])
                 lines.append(f"{indent}_a = _arg{i}_0(row)")
                 lines.append(f"{indent}_seen = state[{i}][1]")
-                lines.append(f"{indent}if _a is not None and (_key := _sort_key(_a)) not in _seen:")
+                lines.append(f"{indent}if _a is not None and (_key := _distinct{i}(_a)) not in _seen:")
                 lines.append(f"{indent}    _seen.add(_key)")
                 indent += "    "
                 call = f"state[{i}][0].step(_a)"
-            if tracks:
-                lines.append(f"{indent}if {call}:")
-                lines.append(f"{indent}    group[0] = list(row)")
+            if extreme[i]:
+                lines.append(f"{indent}hit = 0 if {call} else 1")
             else:
                 lines.append(f"{indent}{call}")
+        if not any(extreme):
+            lines.append("        hit = used")
+        lines.append("        if not hit or group[0] is None:")
+        lines.append("            group[0] = list(row)")
         text = "\n".join(lines)
         code = _CODE_CACHE.get(text)
         if code is None:
@@ -1416,14 +1564,15 @@ class IndexScan:
 
     def keys(self, row: Row) -> Iterator[tuple]:
         """The index keys in range, in order."""
-        sort_key = values.sort_key
+        key_functions = self.index.key_functions
         prefix = []
-        for key_function in self.equal:
+        for key_function, sort_key in zip(self.equal, key_functions):
             value = key_function(row)
             if value is None:
                 return iter(())  # col = NULL is never true
             prefix.append(sort_key(value))
         prefix = tuple(prefix)
+        sort_key = key_functions[len(prefix)] if len(prefix) < len(key_functions) else values.sort_key
         start, start_inclusive = prefix, True
         end, end_inclusive = prefix + (HIGH,), True
         if self.lower or self.upper:
@@ -1471,9 +1620,10 @@ class IndexScan:
             rowid = key[-1][1]
             yield rowid, get(rowid)
 
-    def order(self) -> tuple[list[int], set[int]] | None:
-        positions = self.index.positions
-        return positions[len(self.equal):] + [ROWID], set(positions[:len(self.equal)])
+    def order(self) -> tuple[list, set] | None:
+        """(Index columns as (position, collation).)"""
+        columns = list(zip(self.index.positions, self.index.collations))
+        return columns[len(self.equal):] + [ROWID], set(columns[:len(self.equal)])
 
     def estimate(self) -> tuple[float, float]:
         rows = self.table_rows
@@ -1510,13 +1660,14 @@ class HashLookup:
 
     yields_rows = True
 
-    def __init__(self, table: Source, tree: BTree | None, position: int, key: RowFunction, convert: Callable[[SQLValue], SQLValue] | None, scan: AccessPath) -> None:
+    def __init__(self, table: Source, tree: BTree | None, position: int, key: RowFunction, convert: Callable[[SQLValue], SQLValue] | None, scan: AccessPath, collation: str = "BINARY") -> None:
         self.table = table
         self.tree = tree  # None for a derived table
         self.position = position
         self.key = key
         self.convert = convert
         self.scan = scan  # the full scan it replaces (for its estimate)
+        self.sort_key = values.collation_sort_key(collation)  # (the equality's collation)
         self.hashed = None
 
     def reset(self) -> None:
@@ -1529,7 +1680,7 @@ class HashLookup:
             load_row, table = Executor.load_row, self.table
             rows = (load_row(table, rowid, record) for rowid, record in self.tree.scan())
         hashed = {}
-        position, convert, sort_key = self.position, self.convert, values.sort_key
+        position, convert, sort_key = self.position, self.convert, self.sort_key
         for row in rows:
             value = row[position]
             if value is not None and convert is not None:
@@ -1544,7 +1695,7 @@ class HashLookup:
         key = self.key(row)
         if key is None:
             return iter(())
-        return ((found[-1], found) for found in hashed.get(values.sort_key(key), ()))
+        return ((found[-1], found) for found in hashed.get(self.sort_key(key), ()))
 
     def order(self) -> tuple[list[int], set[int]] | None:
         return None
@@ -1592,7 +1743,8 @@ class MultiScan:
 
     def order(self) -> tuple[list[int], set[int]] | None:
         if self.label == "IN":
-            return self.parts[0].index.positions + [ROWID], set()
+            index = self.parts[0].index
+            return list(zip(index.positions, index.collations)) + [ROWID], set()
         return None
 
     def estimate(self) -> tuple[float, float]:
@@ -1613,12 +1765,13 @@ ROWID = -1  # column position standing for the row id in constraints
 class Constraint:
     """A WHERE/ON conjunct of the form ``column op key`` usable by an access path."""
 
-    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction], convert: Callable[[SQLValue], SQLValue] | None = None, joined: bool = False) -> None:
+    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction], convert: Callable[[SQLValue], SQLValue] | None = None, joined: bool = False, collation: str = "BINARY") -> None:
         self.position = position  # column position in the table, or ROWID
         self.op = op  # "=", "<", "<=", ">", ">=" or "IN"
         self.key = key  # key function(s) evaluated on the outer row
         self.convert = convert  # the affinity conversion the key gets
         self.joined = joined  # the key uses a table joined before this one
+        self.collation = collation  # of the comparison: an index must have the same
 
 
 def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int]) -> list[Constraint]:
@@ -1634,6 +1787,7 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
     constraints = []
 
     def column_position(expr):
+        expr = strip_collate(expr)  # (as SQLite's sqlite3ExprSkipCollate)
         if not isinstance(expr, Column):
             return None
         try:
@@ -1693,7 +1847,11 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             if position is not None:
                 keys = [key_function(position, item, "IN") for item in conjunct.items]
                 if all(keys):
-                    constraints.append(Constraint(position, "IN", keys))
+                    if len(conjunct.items) == 1:
+                        collation = compiler.comparison_collation(conjunct.expr, conjunct.items[0])
+                    else:
+                        collation = compiler.collation(conjunct.expr) or "BINARY"
+                    constraints.append(Constraint(position, "IN", keys, collation=collation))
             continue
         if not isinstance(conjunct, Binary) or conjunct.op not in _FLIPPED or conjunct.op == "!=":
             continue
@@ -1706,7 +1864,8 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
         key = key_function(position, right)
         if key is not None:
             joined = bool(tables_referenced(right, scope) & bound)
-            constraints.append(Constraint(position, op, key, conversions.get(key), joined))
+            collation = compiler.comparison_collation(conjunct.left, conjunct.right)
+            constraints.append(Constraint(position, op, key, conversions.get(key), joined, collation))
     return constraints
 
 
@@ -1724,6 +1883,8 @@ def or_to_in(terms: list[Expr], column_position: Callable[[Expr], int | None], a
         if column_position(left) is None or (position is not None and column_position(left) != position):
             return []
         column, position = column or left, column_position(left)
+        if has_collate(left) or has_collate(right):
+            return []  # (the IN would compare by the column's collation)
         affinity = compiler.compile_with_affinity(right)[1]
         if affinity is not None and affinity != (values.INTEGER if position == ROWID else affinities[position]):
             return []
@@ -1772,19 +1933,22 @@ def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: lis
     for info in scope.entries[index].indexes():
         if not info.ordered:
             continue  # (DESC columns in a SQLite file: not in key order)
+        # Only comparisons with the index column's collation can use it.
+        usable = [c for c in constraints if c.position == ROWID or c.position not in info.positions
+                  or c.collation == info.collations[info.positions.index(c.position)]]
         equal = []
         for position in info.positions:
-            key = next((c.key for c in constraints if c.position == position and c.op == "="), None)
+            key = next((c.key for c in usable if c.position == position and c.op == "="), None)
             if key is None:
                 break
             equal.append(key)
         lower = upper = None
         if len(equal) < len(info.positions):
-            lower, upper = _bounds(constraints, info.positions[len(equal)])
+            lower, upper = _bounds(usable, info.positions[len(equal)])
         if equal or lower or upper:
             candidates.append(IndexScan(info, catalog.index_tree(info), tree, equal, lower, upper, rows))
         first = info.positions[0]
-        for c in constraints:
+        for c in usable:
             if c.position == first and c.op == "IN":
                 index_tree = catalog.index_tree(info)
                 parts = [IndexScan(info, index_tree, tree, [key], None, None, rows) for key in c.key]
@@ -1799,7 +1963,7 @@ def hash_lookup(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
         if c.op == "=" and c.position != ROWID and c.joined:
             table = scope.entries[index].table
             tree = None if isinstance(table, DerivedSource) else catalog.table_tree(table)
-            return HashLookup(table, tree, c.position, c.key, c.convert, scan)
+            return HashLookup(table, tree, c.position, c.key, c.convert, scan, c.collation)
     return None
 
 
@@ -1919,7 +2083,7 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
         # Nothing narrows the scan, but ORDER BY ... LIMIT wants this column
         # first: walk an index on it in order and stop early.
         for info in scope.entries[index].indexes():
-            if info.ordered and info.positions[0] == order_hint:
+            if info.ordered and (info.positions[0], info.collations[0]) == order_hint:
                 tree = catalog.table_tree(table)
                 return IndexScan(info, catalog.index_tree(info), tree, [], None, None, rows)
     return best
@@ -2091,7 +2255,7 @@ class Executor:
         initial = self.compile_query(initial_stmt, parent)
         check_cte_columns(cte, initial.names)
         names = cte.columns or unique_names(initial.names)
-        working = WorkingSource(cte.name, names, initial.affinities, parent)
+        working = WorkingSource(cte.name, names, initial.affinities, parent, initial.collations)
         compiled_parts = []
         for part in parts[k:]:
             if isinstance(part, Select) and (part.group_by or any(
@@ -2526,29 +2690,36 @@ class Executor:
         return None
 
     def order_terms(self, stmt: Select, exprs: list[Expr], names: list[str], compiler: Compiler) -> tuple[list[OrderTerm], list[RowFunction]]:
-        """Returns ([(source, index, descending, nulls first)], [functions]).
+        """Returns ([(source, index, descending, nulls first, collation)], [functions]).
 
         ``source`` is "output" (index into the result row) or "key" (index into
-        the extra sort values computed by ``functions``)."""
+        the extra sort values computed by ``functions``).  A COLLATE on a
+        column number or alias applies to that result column."""
         terms, functions = [], []
         for position, item in enumerate(stmt.order_by, 1):
             nulls_first = item.nulls_first if item.nulls_first is not None else not item.descending
-            index = self.result_column_reference(item.expr, names, "ORDER BY", position, compiler.scope)
+            inner = strip_collate(item.expr)
+            index = self.result_column_reference(inner, names, "ORDER BY", position, compiler.scope)
             if index is not None:
-                terms.append(("output", index, item.descending, nulls_first))
+                collation = compiler.collation(item.expr if inner is not item.expr else exprs[index])
+                terms.append(("output", index, item.descending, nulls_first, collation))
             else:
-                terms.append(("key", len(functions), item.descending, nulls_first))
+                terms.append(("key", len(functions), item.descending, nulls_first, compiler.collation(item.expr)))
                 functions.append(compiler.compile(item.expr))
         return terms, functions
 
     @staticmethod
-    def compound_order_terms(stmt: Compound, parts: list[CompiledSelect]) -> list[OrderTerm]:
+    def compound_order_terms(stmt: Compound, parts: list[CompiledSelect],
+                             collations: list[str | None] | None = None) -> list[OrderTerm]:
         """ORDER BY of a compound SELECT: every term must name a result column
-        (by number, by name or alias, or as the same expression)."""
+        (by number, by name or alias, or as the same expression).  A term
+        sorts by its COLLATE, else by the column's ``collations``."""
         terms = []
         count = len(parts[0].names)
         for position, item in enumerate(stmt.order_by, 1):
             nulls_first = item.nulls_first if item.nulls_first is not None else not item.descending
+            explicit = item.expr
+            item = dataclasses.replace(item, expr=strip_collate(item.expr))
             index = constant_integer(item.expr)
             if index is not None:
                 if not 1 <= index <= count:
@@ -2571,27 +2742,41 @@ class Executor:
                     raise OperationalError(
                         f"{ordinal(position)} ORDER BY term does not match any column in the result set"
                     )
-            terms.append(("output", index, item.descending, nulls_first))
+            if explicit is not item.expr:
+                collation = values.collation_name(explicit.collation)
+            else:
+                collation = collations[index] if collations else None
+            terms.append(("output", index, item.descending, nulls_first, collation))
         return terms
 
-    def group_functions(self, stmt: Select, exprs: list[Expr], names: list[str], scope: Scope) -> list[RowFunction]:
+    def group_functions(self, stmt: Select, exprs: list[Expr], names: list[str],
+                        scope: Scope) -> tuple[list[RowFunction], list[Callable[[SQLValue], tuple]]]:
+        """The GROUP BY terms' functions and sort key functions (by their
+        collations; a COLLATE on a column number or alias applies to it)."""
         compiler = Compiler(
             scope, misuse="aggregate functions are not allowed in the GROUP BY clause", executor=self
         )
-        functions = []
+        functions, keys = [], []
         for position, expr in enumerate(stmt.group_by, 1):
-            index = self.result_column_reference(expr, names, "GROUP BY", position, scope)
+            inner = strip_collate(expr)
+            index = self.result_column_reference(inner, names, "GROUP BY", position, scope)
+            collation = compiler.collation(expr)
             if index is not None:
+                if inner is expr:
+                    collation = compiler.collation(exprs[index])
                 expr = exprs[index]
             functions.append(compiler.compile(expr))
-        return functions
+            keys.append(values.collation_sort_key(collation))
+        return functions, keys
 
     @staticmethod
-    def group_rows(rows: Iterable[Row], scope: Scope, group_functions: list[RowFunction], aggregates: AggregateCollector) -> Iterator[Row]:
+    def group_rows(rows: Iterable[Row], scope: Scope, group_functions: list[RowFunction], aggregates: AggregateCollector,
+                   group_keys: list[Callable[[SQLValue], tuple]] | None = None) -> Iterator[Row]:
         """Aggregate ``rows`` into groups; yield each group's representative row
         followed by its aggregate results, ordered by group key."""
         groups = {}
-        aggregates.grouping_loop(group_functions)(rows, groups, aggregates.new_state)
+        keys = group_keys if group_keys is not None else [values.sort_key] * len(group_functions)
+        aggregates.grouping_loop(group_functions, keys)(rows, groups, aggregates.new_state)
         if not groups and not group_functions:
             groups[()] = [[None] * scope.width, aggregates.new_state()]
         for key in sorted(groups):
@@ -2614,6 +2799,8 @@ class Executor:
 
         def bounds():
             count = integer(limit)
+            if count == 0:
+                return 0, 0  # (SQLite stops here: the OFFSET is not evaluated)
             start = max(integer(offset), 0) if offset is not None else 0
             return start, None if count < 0 else start + count
         return bounds
@@ -2689,13 +2876,7 @@ class Executor:
         checks = []
         for check in table.checks:
             test = compiler.compile(check.expr)
-            positions = set()
-            for node in walk(check.expr):
-                if isinstance(node, Column):
-                    position = table.column_index(node.name)
-                    if position is None or position == table.rowid_column:
-                        position = width  # the row id
-                    positions.add(position)
+            positions = check_positions(table, check)
 
             def failed(row, test=test):
                 value = test(row)
@@ -2718,7 +2899,7 @@ class Executor:
         key_values = [row[p] for p in index.positions]
         if any(v is None for v in key_values):
             return None  # NULLs never conflict
-        prefix = tuple(values.sort_key(v) for v in key_values)
+        prefix = index.prefix(key_values)
         for key, _ in self.catalog.index_tree(index).scan(prefix, prefix + (HIGH,)):
             if key[-1][1] != own_rowid:
                 return key[-1][1]
@@ -2740,14 +2921,13 @@ class Executor:
 
         NULLs never conflict.  Indexes are checked newest first, like SQLite.
         """
-        sort_key = values.sort_key
         for index in table.indexes:
             if not index.unique:
                 continue
             key_values = [row[p] for p in index.positions]
             if any(v is None for v in key_values):
                 continue
-            prefix = tuple(sort_key(v) for v in key_values)
+            prefix = index.prefix(key_values)
             for key, _ in self.catalog.index_tree(index).scan(prefix, prefix + (HIGH,)):
                 if key[-1][1] != rowid:
                     columns = ", ".join(f"{table.name}.{c}" for c in index.column_names)
@@ -2807,6 +2987,9 @@ class Executor:
         if table.rowid_column is not None:
             row[table.rowid_column] = raw[table.rowid_column] = rowid
         if table.checks:
+            # (SQLite applies the column affinities in place before it tests CHECK constraints.)
+            if defaults is not None:
+                defaults.converted = True
             violation = self.check_violation(table, row + [rowid], conflict)
             if violation is not None:
                 if violation[1] == "IGNORE":
@@ -2821,9 +3004,10 @@ class Executor:
             unique.insert(0, "rowid")
         constraints += [c for c in unique if c not in constraints]
         # SQLite applies the column affinities to the new values in place when
-        # it checks the first index; an upsert's "excluded" row shows them
-        # converted only if the conflict was found after that.
-        converted = False
+        # it checks the first index (or a CHECK constraint); an upsert's
+        # "excluded" row shows them converted only if the conflict was found
+        # after that.
+        converted = bool(table.checks)
         for constraint in constraints:
             if constraint == "rowid":
                 other = rowid if rowid in tree else None
@@ -3266,7 +3450,9 @@ class Executor:
         for key, value in list(source.schema.scan()):
             kind, name, table_name, root, sql = decode_record(value)[0]
             if kind in ("table", "index"):
-                codec = IntKey if kind == "table" else IndexKeyCodec
+                index = source.indexes.get(ascii_lower(name)) if kind == "index" else None
+                # (an index's own codec: NOCASE / RTRIM keys must stay collation keys in the page cache)
+                codec = IntKey if kind == "table" else index.codec if index is not None else IndexKeyCodec
                 tree = BTree.create(target, codec)
                 entries = BTree(source.pager, root, codec).scan()
                 if kind == "table" and not keep_rowids:
@@ -3420,6 +3606,8 @@ class CompiledSelect:
                             executor=executor, allow_aggregates=True, windows=self.windows)
         scope.phase = "outputs"
         self.output_row, self.affinities = compiler.compile_tuple(self.exprs)
+        self.collation_compiler = Compiler(scope, executor=executor)
+        self._collations = None
         scope.aliases = aliases
         scope.phase = "order"
         self.order_terms, order_functions = executor.order_terms(
@@ -3430,7 +3618,7 @@ class CompiledSelect:
         compiler.windows = None
         self.having = compiler.compile(stmt.having) if stmt.having is not None else None
         scope.phase = "group"
-        self.group_functions = executor.group_functions(stmt, self.exprs, self.names, scope)
+        self.group_functions, self.group_keys = executor.group_functions(stmt, self.exprs, self.names, scope)
         scope.phase = "where"
         self.levels = None
         self.constants = []  # conditions tested once, before the loop
@@ -3457,6 +3645,20 @@ class CompiledSelect:
             and follows_order(order_columns, self.levels[0].access.order())
         )
 
+    @property
+    def collations(self) -> list[str | None]:
+        """The result columns' collations (None: none), as a subquery's
+        columns have them; computed when first needed (an unknown collation
+        is an error only then, as in SQLite)."""
+        if self._collations is None:
+            self._collations = [self.collation_compiler.collation(e) for e in self.exprs]
+        return self._collations
+
+    def result_collation(self, i: int) -> tuple[str | None, bool]:
+        """(collation, whether an explicit COLLATE gives it) of result column ``i``."""
+        expr = self.exprs[i]
+        return self.collation_compiler.collation(expr), has_collate(expr)
+
     def substitute_aliases(self, stmt: Select, joins: list[Join], aliases: dict[str, SelectItem]) -> tuple[Select, list[Join]]:
         """Replace references to result column aliases in WHERE, ON, GROUP BY,
         HAVING and ORDER BY with the aliased expressions, as SQLite does for
@@ -3480,14 +3682,15 @@ class CompiledSelect:
         def term(expr, replace):
             return expr if isinstance(expr, Column) else substitute_columns(expr, replace)
 
+        # (SQLite's parser has already folded "X AND 0": an alias there is never resolved.)
         stmt = dataclasses.replace(
             stmt,
-            where=substitute_columns(stmt.where, restricted),
-            having=substitute_columns(stmt.having, restricted),
+            where=substitute_columns(fold_and(stmt.where), restricted),
+            having=substitute_columns(fold_and(stmt.having), restricted),
             group_by=[term(e, restricted) for e in stmt.group_by],
             order_by=[dataclasses.replace(item, expr=term(item.expr, ordering)) for item in stmt.order_by],
         )
-        joins = [dataclasses.replace(join, on=substitute_columns(join.on, restricted)) for join in joins]
+        joins = [dataclasses.replace(join, on=substitute_columns(fold_and(join.on), restricted)) for join in joins]
         return stmt, joins
 
     def order_columns(self, stmt: Select) -> list[int] | None:
@@ -3500,8 +3703,8 @@ class CompiledSelect:
         table = entry.table
         rowid_slot = self.scope.rowid_slot(0)
         columns = []
-        for (source, index, descending, nulls_first), item in zip(self.order_terms, stmt.order_by):
-            expr = self.exprs[index] if source == "output" else item.expr
+        for (source, index, descending, nulls_first, collation), item in zip(self.order_terms, stmt.order_by):
+            expr = strip_collate(self.exprs[index] if source == "output" else item.expr)
             if descending or not nulls_first or not isinstance(expr, Column):
                 return None
             try:
@@ -3517,6 +3720,8 @@ class CompiledSelect:
             position = slot - entry.offset
             if slot == rowid_slot or position == table.rowid_column:
                 position = ROWID
+            else:
+                position = (position, collation or "BINARY")  # (an index must sort by the same collation)
             columns.append(position)
         return columns
 
@@ -3527,6 +3732,10 @@ class CompiledSelect:
     def run(self, max_rows: int | None = None) -> list[tuple]:
         """The result rows (tuples).  ``max_rows`` lets a caller that needs
         only the first rows (EXISTS, scalar subqueries) stop early."""
+        # (SQLite computes LIMIT first; with LIMIT 0 nothing else runs.)
+        start, end = self.limit() if self.limit is not None else (0, None)
+        if end is not None and end <= start:
+            return []
         if not passes_constants(self.constants, self.scope):
             rows = []
         elif self.levels is not None:
@@ -3536,7 +3745,6 @@ class CompiledSelect:
         else:
             rows = [[]]
         output_row, order_key = self.output_row, self.order_key
-        start, end = self.limit() if self.limit is not None else (0, None)
         if max_rows is not None and not self.order_terms and not self.distinct:
             end = max_rows if end is None else min(end, start + max_rows)
         if self.is_aggregate:
@@ -3544,7 +3752,7 @@ class CompiledSelect:
             rows = (
                 group_row
                 for group_row in self.executor.group_rows(
-                    rows, self.scope, self.group_functions, self.aggregates
+                    rows, self.scope, self.group_functions, self.aggregates, self.group_keys
                 )
                 if having is None or truth(having(group_row))
             )
@@ -3552,7 +3760,7 @@ class CompiledSelect:
             rows = self.windows.apply(rows)
         records = ((output_row(row), order_key(row)) for row in rows)
         if self.distinct:
-            records = distinct_records(records)
+            records = distinct_records(records, self.collations)
         if self.presorted or not self.order_terms:
             # Rows already come in ORDER BY order: stop as soon as LIMIT is met.
             records = itertools.islice(records, start, end)
@@ -3605,18 +3813,35 @@ class CompiledCompound:
         self.exprs = self.parts[0].exprs
         # SQLite takes a compound's affinity from its last SELECT.
         self.affinities = self.parts[-1].affinities
-        self.order_terms = executor.compound_order_terms(stmt, self.parts)
+        # Rows compare by each column's collation in the leftmost SELECT that
+        # has one (SQLite's multiSelectCollSeq) - where they compare at all.
+        self.key_collations = None
+        if stmt.order_by or any(operator != "UNION ALL" for operator in self.operators):
+            self.key_collations = [next((c for c in (part.collations[i] for part in self.parts) if c), None)
+                                   for i in range(count)]
+        self.order_terms = executor.compound_order_terms(stmt, self.parts, self.key_collations)
         self.limit = executor.compile_limit(stmt)
+
+    @property
+    def collations(self) -> list[str | None]:
+        """As a subquery's columns: the leftmost SELECT's."""
+        return self.parts[0].collations
+
+    def result_collation(self, i: int) -> tuple[str | None, bool]:
+        """(For IN (SELECT ...): the last SELECT's, as in SQLite.)"""
+        return self.parts[-1].result_collation(i)
 
     @property
     def correlated(self) -> bool:
         return any(part.correlated for part in self.parts)
 
     def run(self, max_rows: int | None = None) -> list[tuple]:
+        start, end = self.limit() if self.limit is not None else (0, None)
+        if end is not None and end <= start:
+            return []
         rows = self.parts[0].run()
         for operator, part in zip(self.operators, self.parts[1:]):
-            rows = combine(operator, rows, part.run())
-        start, end = self.limit() if self.limit is not None else (0, None)
+            rows = combine(operator, rows, part.run(), self.key_collations)
         records = order_records([(row, ()) for row in rows], self.order_terms, start, end)
         return [row for row, _ in records]
 
@@ -3632,6 +3857,14 @@ class CompiledValues:
         self.names = [f"column{i}" for i in range(1, width + 1)]
         self.affinities = [None] * width
         self.exprs = list(stmt.rows[0])
+        self.collation_compiler = compiler
+
+    @property
+    def collations(self) -> list[str | None]:
+        return [self.collation_compiler.collation(e) for e in self.exprs]
+
+    def result_collation(self, i: int) -> tuple[str | None, bool]:
+        return self.collation_compiler.collation(self.exprs[i]), has_collate(self.exprs[i])
 
     @property
     def correlated(self) -> bool:
@@ -3709,8 +3942,9 @@ class PreparedInsert:
         if any(c.not_null and (conflict or c.not_null_conflict or "ABORT") in ("ABORT", "REPLACE")
                for c in table.columns):
             return True  # REPLACE fixes NOT NULL with a default value; MiniDB has none
-        if table.checks and conflict in (None, "ABORT", "REPLACE"):
-            return True
+        if table.checks and (conflict in (None, "ABORT", "REPLACE")
+                             or any(calls_function(check.expr) for check in table.checks)):
+            return True  # (a function call in a CHECK may raise an error, like one in the statement)
 
         def handled(constraint, own):
             return (conflict or own or "ABORT") != "ABORT" or any(
@@ -3722,6 +3956,7 @@ class PreparedInsert:
             return True
         checked = {i for i, c in enumerate(table.columns) if c.not_null}
         checked.update(p for index in table.indexes if index.unique for p in index.positions)
+        checked.update(p for check in table.checks for p in check_positions(table, check))
         checked.update((table.rowid_column, len(table.columns)))
         return any(u.assignments and any(p in checked for p, _ in u.assignments) for u in self.upserts)
 
@@ -3833,7 +4068,9 @@ class PreparedUpdate(PreparedSingleTable):
         self.statement_journal = calls_function(stmt) or any(
             (conflict or table.columns[p].not_null_conflict or "ABORT") in ("ABORT", "REPLACE")
             for p in changed if p < width and table.columns[p].not_null
-        ) or (bool(table.checks) and conflict in (None, "ABORT", "REPLACE")) or (
+        ) or any(conflict in (None, "ABORT", "REPLACE") or calls_function(check.expr)
+                 for check in table.checks
+                 if (changed | ({width} if rowid_changed else set())) & check_positions(table, check)) or (
             rowid_changed and (conflict or table.rowid_conflict() or "ABORT") == "ABORT"
         ) or any(index.unique and changed & set(index.positions) and (conflict or index.conflict or "ABORT") == "ABORT"
                  for index in table.indexes)
@@ -3932,10 +4169,14 @@ class PreparedUpsert:
                     raise OperationalError(f"no such column: {name}")
             if len(wanted) == 1 and wanted[0] in (alias, *ROWID_NAMES):
                 return "rowid"
+            # A target column with a COLLATE matches only an index column of that collation.
+            given = {ascii_lower(c): values.collation_name(k) for c, k in zip(clause.columns, clause.collations or ())
+                     if k is not None}
             for index in table.indexes:
                 names = [ascii_lower(c) for c in index.column_names]
                 if (index.unique and alias not in names and len(names) == len(wanted)
-                        and set(names) == set(wanted)):
+                        and set(names) == set(wanted)
+                        and all(given.get(n, k) == k for n, k in zip(names, index.collations))):
                     return index
         raise OperationalError("ON CONFLICT clause does not match any PRIMARY KEY or UNIQUE constraint")
 
@@ -3952,7 +4193,8 @@ class PreparedUpsert:
         new = list(old)
         for position, function in self.assignments:
             new[position] = function(context)
-        return "update", executor.update_row(table, tree, rowid, old, new, None,
+        # (SQLite runs DO UPDATE as an UPDATE OR ABORT: the constraints' own ON CONFLICT does not apply.)
+        return "update", executor.update_row(table, tree, rowid, old, new, "ABORT",
                                              {position for position, _ in self.assignments})
 
 
@@ -3983,28 +4225,36 @@ def returning_result(returning: tuple[list[RowFunction], list[str]] | None, rows
     return Result([tuple(f(row) for f in functions) for row in rows], names, rowcount=len(rows))
 
 
-def combine(operator: str, left: list[tuple], right: list[tuple]) -> list[tuple]:
-    """Apply a compound operator.  Like SQLite, the distinct forms return rows
-    in sorted order, and a later duplicate replaces an earlier one."""
+def combine(operator: str, left: list[tuple], right: list[tuple], collations: list[str | None] | None = None) -> list[tuple]:
+    """Apply a compound operator.  Like SQLite (which merges the sorted
+    sides), the distinct forms return rows in sorted order, comparing values
+    by the columns' ``collations``; of equal rows UNION keeps the right
+    side's first, the others the left side's first."""
     if operator == "UNION ALL":
         return left + right
-    sort_key = values.sort_key
-
-    def key(row):
-        return tuple(sort_key(v) for v in row)
-
+    key = row_key(collations or [None] * len(left[0] if left else right[0] if right else ()))
     kept = {}
+    for row in left:
+        kept.setdefault(key(row), row)
     if operator == "UNION":
-        for row in left + right:
-            kept[key(row)] = row
+        first = {}
+        for row in right:
+            first.setdefault(key(row), row)
+        kept.update(first)
     else:
         right_keys = {key(row) for row in right}
         want = operator == "INTERSECT"
-        for row in left:
-            k = key(row)
-            if (k in right_keys) == want:
-                kept[k] = row
+        kept = {k: row for k, row in kept.items() if (k in right_keys) == want}
     return [kept[k] for k in sorted(kept)]
+
+
+def row_key(collations: list[str | None]) -> Callable[[tuple], tuple]:
+    """A function row -> the tuple of its values' sort keys under ``collations``."""
+    functions = [values.collation_sort_key(c) for c in collations]
+    if all(f is values.sort_key for f in functions):
+        sort_key = values.sort_key
+        return lambda row: tuple(sort_key(v) for v in row)
+    return lambda row: tuple(f(v) for f, v in zip(functions, row))
 
 
 class ExcludedSource:
@@ -4020,6 +4270,7 @@ class ExcludedSource:
         self.columns = table.columns
         self.rowid_column = table.rowid_column
         self.affinities = [None] * len(table.columns)
+        self.collations = table.collations
         self.column_index = table.column_index
 
 
@@ -4049,6 +4300,7 @@ class DerivedSource:
             )
         self.columns = [ColumnName(n) for n in names]
         self.affinities = list(compiled.affinities)
+        self.collations = list(compiled.collations)
         self.positions = {}
         for i, n in enumerate(names):
             self.positions.setdefault(ascii_lower(n), i)
@@ -4085,6 +4337,18 @@ def walk_nodes(node: object) -> Iterator[object]:
         for f in dataclasses.fields(node):
             if f.compare:
                 yield from walk_nodes(getattr(node, f.name))
+
+
+def check_positions(table: TableInfo, check: CheckConstraint) -> set[int]:
+    """The columns a CHECK constraint uses (the row id as len(columns))."""
+    positions = set()
+    for node in walk(check.expr):
+        if isinstance(node, Column):
+            position = table.column_index(node.name)
+            if position is None or position == table.rowid_column:
+                position = len(table.columns)
+            positions.add(position)
+    return positions
 
 
 def all_constraints(stmt: CreateTable) -> list[object]:
@@ -4130,10 +4394,12 @@ class WorkingSource(DerivedSource):
     """A recursive CTE as its recursive part sees it: the one row being
     processed (set by RecursiveSource before each run)."""
 
-    def __init__(self, name: str, names: list[str], affinities: list, parent_scope: Scope | None) -> None:
+    def __init__(self, name: str, names: list[str], affinities: list, parent_scope: Scope | None,
+                 collations: list[str | None] | None = None) -> None:
         self.name = name
         self.columns = [ColumnName(n) for n in names]
         self.affinities = list(affinities)
+        self.collations = list(collations or [None] * len(names))
         self.positions = {}
         for i, n in enumerate(names):
             self.positions.setdefault(ascii_lower(n), i)
@@ -4176,11 +4442,11 @@ class RecursiveSource(DerivedSource):
         queue = []  # a heap of (key, arrival, row) with ORDER BY, else a FIFO
         arrivals = itertools.count()
         head = 0
-        sort_key, key = values.sort_key, self.order_key
+        identify, key = row_key(self.collations), self.order_key
 
         def push(row: tuple) -> None:
             if self.distinct:
-                identity = tuple(sort_key(v) for v in row)
+                identity = identify(row)
                 if identity in seen:
                     return
                 seen.add(identity)
@@ -4287,13 +4553,15 @@ def ordinal(n: int) -> str:
     return f"{n}{suffix}"
 
 
-def distinct_records(records: Iterable[Record]) -> Iterator[Record]:
+def distinct_records(records: Iterable[Record], collations: list[str | None] | None = None) -> Iterator[Record]:
     """Drop records with duplicate output rows, keeping the first;
-    1 and 1.0 count as equal."""
+    1 and 1.0 count as equal, and texts equal under the columns' collations."""
     seen = set()
-    sort_key = values.sort_key
+    key_of = None
     for record in records:
-        key = tuple(sort_key(v) for v in record[0])
+        if key_of is None:
+            key_of = row_key(collations or [None] * len(record[0]))
+        key = key_of(record[0])
         if key not in seen:
             seen.add(key)
             yield record
@@ -4316,15 +4584,14 @@ class Descending:
 
 def order_key(terms: list[OrderTerm]) -> Callable[[Record], list]:
     """A key function for (output, keys) records ordering by ``terms``."""
-    sort_key = values.sort_key
     parts = []
-    for source, index, descending, nulls_first in terms:
+    for source, index, descending, nulls_first, collation in terms:
         parts.append((0 if source == "output" else 1, index, descending,
-                      (0,) if nulls_first else (2,)))
+                      (0,) if nulls_first else (2,), values.collation_sort_key(collation)))
 
     def key(record):
         result = []
-        for column, index, descending, null_key in parts:
+        for column, index, descending, null_key, sort_key in parts:
             value = record[column][index]
             if value is None:
                 result.append(null_key)

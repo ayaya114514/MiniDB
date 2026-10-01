@@ -222,3 +222,126 @@ def test_alter_table_edits_the_sql(pair):
         SELECT * FROM t;
         SELECT * FROM v;
         """ + SCHEMA)
+
+
+# ---- collations ------------------------------------------------------------------
+
+COLLATION_DATA = """
+    CREATE TABLE t (a TEXT COLLATE NOCASE, b TEXT, c TEXT COLLATE RTRIM, n);
+    INSERT INTO t VALUES ('abc', 'ABC', 'x ', 1), ('ABC', 'abc', 'x', 2), ('b', 'B', 'y  ', 3),
+        ('Abc', '_', 'x  ', 4), ('_', 'b', NULL, 5), (NULL, 'Ab', 'y', 6), (10, 'é', 'É ', 7), ('É', 'É', 'é', 8);
+    """
+
+
+@pytest.mark.parametrize("sql", [
+    "SELECT a = b, b = a, a = b COLLATE binary, b COLLATE rtrim = a, a COLLATE nocase = c FROM t",
+    "SELECT (a || '') = 'ABC', (a COLLATE binary || '') = 'abc', a + 0 = 'ABC', -a, +a = 'ABC' FROM t",
+    "SELECT cast(a AS text) = 'ABC', (a) = 'ABC', c = 'x', c = 'y', c < 'x', c >= 'y ' FROM t",
+    "SELECT 'A' COLLATE nocase || 'b' = 'aB', 'x' = 'X' COLLATE nocase COLLATE binary, 'a' < 'B' COLLATE nocase",
+    "SELECT 'a' IN ('A' COLLATE nocase), 'a' COLLATE nocase IN ('A', 'z'), 'a' IN ('A' COLLATE nocase, 'z')",
+    "SELECT a IN ('ABC', 'x'), b IN ('abc', 'x'), c IN ('x', 'z'), a NOT IN ('B', 'Z') FROM t",
+    "SELECT b IN (SELECT a FROM t), a IN (SELECT b FROM t), 'abc' IN (SELECT a FROM t) FROM t",
+    "SELECT 'a' IN (SELECT 'A' COLLATE nocase), 'a' IN (SELECT 'b' UNION SELECT 'A' COLLATE nocase)",
+    "SELECT 'a' IN (SELECT 'A' COLLATE nocase UNION SELECT 'b')",
+    "SELECT a BETWEEN 'AAA' AND 'ABD', b BETWEEN 'a' AND 'b' COLLATE nocase FROM t",
+    "SELECT CASE a WHEN 'ABC' THEN 1 ELSE 0 END, CASE 'ABC' WHEN a THEN 1 END, CASE b WHEN 'abc' COLLATE nocase THEN 1 END FROM t",
+    "SELECT a LIKE 'ABC', a GLOB 'A*' FROM t",
+    "SELECT max(a, 'Z'), min(b, 'aaa'), nullif(a, 'ABC'), min('B' COLLATE nocase, 'a'), max(b, a) FROM t",
+    "SELECT (SELECT a FROM t LIMIT 1) = 'ABC'",
+    "SELECT * FROM t t1 JOIN t t2 ON t1.a = t2.b",
+    "SELECT t1.n, t2.n FROM t t1 JOIN t t2 ON t2.b = t1.a",
+    "SELECT x FROM (SELECT a AS x FROM t) WHERE x = 'ABC'",
+    "SELECT x FROM (SELECT b AS x FROM t UNION SELECT a FROM t) WHERE x = 'abc'",
+    "SELECT x FROM (SELECT a AS x FROM t UNION ALL SELECT b FROM t) WHERE x = 'abc'",
+    "SELECT x FROM (SELECT 'a' COLLATE nocase AS x UNION SELECT 'b') WHERE x = 'A'",
+    "SELECT x FROM (SELECT 'a' AS x UNION SELECT 'b' COLLATE nocase) WHERE x = 'A'",
+    "WITH w(x) AS (SELECT a FROM t) SELECT x FROM w WHERE x = 'abc'",
+    "SELECT a FROM t UNION SELECT b FROM t", "SELECT b FROM t UNION SELECT a FROM t",
+    "SELECT b FROM t INTERSECT SELECT a FROM t", "SELECT a FROM t EXCEPT SELECT 'ABC'",
+    "SELECT a FROM t INTERSECT SELECT 'ABC'", "SELECT b FROM t EXCEPT SELECT 'B' COLLATE nocase",
+    "SELECT c FROM t UNION SELECT 'x'", "SELECT a FROM t UNION SELECT b FROM t ORDER BY 1 DESC",
+    "SELECT a, n FROM t UNION SELECT b, n FROM t ORDER BY 1 COLLATE binary, 2",
+    "SELECT a FROM t ORDER BY a, n", "SELECT b FROM t ORDER BY b COLLATE nocase, n", "SELECT c FROM t ORDER BY c, n DESC",
+    "SELECT a FROM t ORDER BY a DESC, n", "SELECT a COLLATE binary FROM t ORDER BY 1",
+    "SELECT a FROM t ORDER BY a COLLATE binary", "SELECT a AS z FROM t ORDER BY z COLLATE binary",
+    "SELECT a AS z FROM t ORDER BY 1 COLLATE rtrim, n",
+    "SELECT DISTINCT a FROM t", "SELECT DISTINCT c FROM t", "SELECT DISTINCT a, b COLLATE nocase FROM t",
+    "SELECT a, count(*) FROM t GROUP BY a", "SELECT a, b, count(*) FROM t GROUP BY a",
+    "SELECT a, b, max(n) FROM t GROUP BY a", "SELECT a FROM t GROUP BY a COLLATE binary",
+    "SELECT a, b FROM t GROUP BY 1", "SELECT b, count(*) FROM t GROUP BY 1 COLLATE nocase",
+    "SELECT x, count(*) FROM (SELECT a AS x FROM t) GROUP BY x", "SELECT c, count(*) FROM t GROUP BY c",
+    "SELECT max(a), min(b), max(b COLLATE nocase), min(c), count(DISTINCT a), count(DISTINCT c) FROM t",
+    "SELECT group_concat(DISTINCT a), sum(DISTINCT a), group_concat(DISTINCT b COLLATE nocase) FROM t",
+    "SELECT min(a) FROM (SELECT 'b' COLLATE nocase AS a UNION ALL SELECT 'B')",
+    "SELECT group_concat(a) OVER (PARTITION BY a ORDER BY n), max(b) OVER (ORDER BY a ROWS 1 PRECEDING) FROM t",
+    "SELECT a, row_number() OVER (ORDER BY a, n), rank() OVER (ORDER BY a), max(a) OVER () FROM t",
+    "SELECT a, min(a) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
+    "SELECT a COLLATE foo = 'x' FROM t", "SELECT 'x' COLLATE foo", "SELECT * FROM (SELECT 'x' COLLATE foo)",
+    "SELECT 'x' COLLATE foo UNION SELECT 'y'", "SELECT 'x' COLLATE foo UNION ALL SELECT 'y'",
+    "SELECT DISTINCT 'x' COLLATE foo", "SELECT 1 IN (SELECT 'x' COLLATE foo)",
+])
+def test_collation_semantics(pair, sql):
+    run_all(pair, COLLATION_DATA)
+    pair.run(sql)
+
+
+def test_collated_indexes(pair):
+    run_all(pair, COLLATION_DATA + """;
+        CREATE INDEX ta ON t (a);
+        CREATE INDEX tb ON t (b COLLATE nocase);
+        CREATE INDEX tc ON t (c, n);
+        CREATE TABLE u (k TEXT UNIQUE COLLATE nocase, v, UNIQUE (v COLLATE rtrim));
+        INSERT INTO u VALUES ('x', 'a');
+        INSERT INTO u VALUES ('X', 'b');
+        INSERT INTO u VALUES ('y', 'a  ');
+        INSERT OR REPLACE INTO u VALUES ('X', 'c');
+        UPDATE u SET k = 'Y' WHERE k = 'X';
+        SELECT * FROM u;
+        CREATE UNIQUE INDEX ub ON t (b);
+        CREATE UNIQUE INDEX ua ON t (a);
+        DELETE FROM t WHERE a = 'ABC';
+        SELECT * FROM t ORDER BY n
+        """)
+    for sql in [
+        "SELECT n FROM t WHERE a = 'ABC'", "SELECT n FROM t WHERE a = 'ABC' COLLATE binary",
+        "SELECT n FROM t WHERE b = 'ab'", "SELECT n FROM t WHERE b COLLATE nocase = 'ab'",
+        "SELECT n FROM t WHERE b > 'A' COLLATE nocase", "SELECT n FROM t WHERE a > 'B' AND a < 'z'",
+        "SELECT n FROM t WHERE c = 'y'", "SELECT n FROM t WHERE c = 'y' AND n > 2",
+        "SELECT n FROM t WHERE a IN ('B', 'abc')", "SELECT a, n FROM t ORDER BY a LIMIT 3",
+        "SELECT a, n FROM t ORDER BY a COLLATE binary LIMIT 3", "SELECT b, n FROM t ORDER BY b COLLATE nocase LIMIT 3",
+        "SELECT b FROM t ORDER BY b", "SELECT a FROM t WHERE a > 'a'", "SELECT k FROM u WHERE k = 'x'",
+    ]:
+        pair.run(sql)
+        theirs = [r[-1] for r in pair.lite.execute("EXPLAIN QUERY PLAN " + sql)
+                  if not r[-1].startswith("USE TEMP B-TREE")]  # (MiniDB shows the tables only)
+        mine = [r[-1] for r in pair.mini.execute("EXPLAIN QUERY PLAN " + sql)]
+        mine = [p.split("(", 1)[1].split(";")[0] if p.startswith("MULTI-INDEX IN") else p
+                for p in mine]  # (SQLite shows IN as one search)
+        assert [" ".join(p.split(" ")[:1] + p.split(" ")[2:]) if p.startswith(("SCAN", "SEARCH")) else p
+                for p in theirs] == [p.replace("minidb_autoindex", "sqlite_autoindex") for p in mine], sql
+
+
+def test_sqlite_checks_collated_indexes_minidb_wrote(tmp_path):
+    """The records of a NOCASE / RTRIM index hold the values themselves, in
+    the order SQLite's collations give."""
+    import sqlite3
+    from contextlib import closing
+
+    from minidb.database import Database
+
+    path = str(tmp_path / "db")
+    with Database(path, format="sqlite") as db:
+        db.execute("CREATE TABLE t (a TEXT COLLATE nocase UNIQUE, b COLLATE rtrim, c)")
+        db.execute("CREATE INDEX tb ON t (b, c COLLATE nocase DESC)")
+        words = ["Apple", "apricot", "BANANA", "banana split", "_x", "Zeta", "zebra", "é", "É", "a  ", "A b"]
+        for i, word in enumerate(words):
+            db.execute("INSERT INTO t VALUES (?, ?, ?)", (word, word + " " * (i % 3), word.swapcase()))
+        db.execute("DELETE FROM t WHERE a = 'BANANA'")
+        db.execute("UPDATE t SET b = upper(b) WHERE a > 'y'")
+        rows = db.execute("SELECT a, b, c FROM t ORDER BY a")
+        assert db.execute("SELECT a FROM t WHERE a = 'APPLE'") == [("Apple",)]
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        assert connection.execute("SELECT a, b, c FROM t ORDER BY a").fetchall() == rows
+        assert connection.execute("SELECT a FROM t INDEXED BY sqlite_autoindex_t_1 WHERE a = 'zeta'").fetchall() == [
+            ("Zeta",)]
