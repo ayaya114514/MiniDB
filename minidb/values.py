@@ -169,9 +169,12 @@ def to_number(value: SQLValue) -> int | float | None:
     if not match:
         return 0
     number = _parse_number(match.group(1))
-    # SQLite's conversion sees a number in text with a NUL character as a
-    # REAL ('5\0' + 0 is 5.0).
-    return float(number) if "\x00" in value else number
+    # sqlite3AtoF stops at a NUL but sqlite3Atoi64 reads past it, so text that
+    # is a whole number up to a NUL counts as a REAL ('5\0' + 0 is 5.0, while
+    # '5 x\0' + 0 is 5).
+    if "\x00" in value and _WHOLE_NUMBER.match(value.split("\x00", 1)[0]):
+        return float(number)
+    return number
 
 
 def numeric_prefix(value: SQLValue) -> int | float | None:
