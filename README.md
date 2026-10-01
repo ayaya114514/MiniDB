@@ -8,6 +8,9 @@
 只依赖 Python 标准库（3.11–3.14），测试用 pytest。约 9,300 行实现代码（不含空行和注释），
 全部带类型注解。
 
+**Playground**：<https://ayaya114514.github.io/MiniDB/> —— 浏览器里（Pyodide）运行 MiniDB，
+每条查询显示计划，并画出所选表或索引的 B+ 树；数据只在本机内存里，不上传。
+
 ## 功能
 
 **SQL**
@@ -136,6 +139,18 @@ SQL 文本
   并在 `-shm` 的读槽里登记（读者标记）；checkpoint 只把日志拷到最老的读者标记为止。日志全部拷完后，
   写者开一个新 generation 从头覆盖日志；读者总是跨越提交时写者最多等 0.1 秒让旧读者结束。
   大事务的脏页可提前作为未提交帧写入日志，回滚时截断。
+
+## Playground
+
+`playground/` 是一个静态页面：`worker.js` 在 Web Worker（ES module）里加载 Pyodide 314（CDN），
+解压 `minidb.zip`（`minidb` 包 + `bridge.py`），之后页面通过 `bridge.py` 的 `run` / `objects` / `tree`
+拿 JSON 结果。本地构建与预览：
+
+```sh
+python tools/build_playground.py && python -m http.server -d site    # http://localhost:8000
+```
+
+`.github/workflows/pages.yml` 在推送到 master 时构建并部署到 GitHub Pages。
 
 ## 测试
 
