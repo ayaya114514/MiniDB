@@ -50,8 +50,9 @@ MiniDB 照做：
 读槽要 9 把锁，加上写锁、WAL_READ，用 `flock`（只能锁整个文件）就得有十几个旁路文件。改成 POSIX 记录锁锁 `-shm`
 文件里的单个字节之后，旁路文件只剩 `-wal` 和 `-shm`。但记录锁属于进程而不是打开的文件：同一进程的两个连接不会互斥，
 关闭任何一个描述符还会丢掉整个进程在该文件上的所有锁。解决办法和 SQLite 的 `unixInodeInfo` 一样：每个进程按
-(device, inode) 只打开一次 `-shm`，进程内的连接之间用一张登记表仲裁。Windows 上只有排他的 `msvcrt.locking`，照
-SQLite 的老办法用“锁区间里任意一个字节 = 共享，锁整个区间 = 排他”来模拟（只在模拟的 `msvcrt` 上测过）。
+(device, inode) 只打开一次 `-shm`，进程内的连接之间用一张登记表仲裁。Windows 上最初用只有排他锁的 `msvcrt.locking`，
+照 SQLite 的老办法用“锁区间里任意一个字节 = 共享，锁整个区间 = 排他”来模拟；后来支持 SQLite 文件格式时发现它和
+sqlite3 的共享读锁互相冲突，改用 ctypes 调 `LockFileEx`——和 SQLite 自己在 Windows 上一样。
 
 ## 崩溃：比“进程死掉”更狠的模型
 

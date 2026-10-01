@@ -1,11 +1,12 @@
 """The lock layer: in-process arbitration and the Windows backend.
 
 Windows itself is not available here: ``WindowsLocks`` runs against a fake
-``msvcrt`` with the semantics of ``msvcrt.locking`` (exclusive byte-range
-locks per handle; locking bytes that are already locked fails, also for the
-same handle; unlocking must match a locked range)."""
+kernel with the semantics of ``LockFileEx`` / ``UnlockFileEx``: shared and
+exclusive byte-range locks per handle; an exclusive lock overlaps no other
+lock, also not of the same handle; a shared lock overlaps shared locks and
+exclusive ones of the same handle; an unlock must match a locked range and
+drops its exclusive lock first."""
 
-import errno
 import os
 
 import pytest
@@ -14,40 +15,37 @@ import minidb.locking as locking
 from minidb.locking import LOCK_OFFSET, FileLocks, WindowsLocks, _LockFile
 
 
-class FakeMsvcrt:
-    LK_UNLCK, LK_NBLCK = 0, 2
-
+class FakeKernel:
     def __init__(self):
-        self.locked = {}  # (device, inode, offset) -> fd
+        self.locks = []  # [file, fd, offset, length, exclusive]
 
-    def locking(self, fd, mode, size):
+    def lock(self, fd, offset, length, exclusive):
         st = os.fstat(fd)
-        position = os.lseek(fd, 0, os.SEEK_CUR)
-        keys = [(st.st_dev, st.st_ino, offset) for offset in range(position, position + size)]
-        if mode == self.LK_NBLCK:
-            if any(key in self.locked for key in keys):
-                raise OSError(errno.EACCES, "locked")
-            for key in keys:
-                self.locked[key] = fd
-        elif mode == self.LK_UNLCK:
-            if any(self.locked.get(key) != fd for key in keys):
-                raise OSError(errno.EACCES, "not locked")
-            for key in keys:
-                del self.locked[key]
-        else:  # pragma: no cover
-            raise ValueError(mode)
+        file = (st.st_dev, st.st_ino)
+        for other, handle, start, size, held_exclusively in self.locks:
+            if other == file and start < offset + length and offset < start + size:
+                if exclusive or (held_exclusively and handle != fd):
+                    return False
+        self.locks.append([file, fd, offset, length, exclusive])
+        return True
+
+    def unlock(self, fd, offset, length):
+        st = os.fstat(fd)
+        mine = [lock for lock in self.locks if lock[:4] == [(st.st_dev, st.st_ino), fd, offset, length]]
+        assert mine, f"unlocking a range that is not locked: {offset}+{length}"
+        self.locks.remove(next((lock for lock in mine if lock[4]), mine[0]))
 
 
-def process(path, fake):
+def process(path, kernel):
     """A _LockFile as another process would have it: its own handle."""
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
-    return _LockFile(fd, ("fake", fd), WindowsLocks(fake))
+    return _LockFile(fd, ("fake", fd), WindowsLocks(kernel))
 
 
 def test_windows_backend_shares_and_excludes(tmp_path):
-    fake = FakeMsvcrt()
+    kernel = FakeKernel()
     path = str(tmp_path / "db-shm")
-    a, b, c = (process(path, fake) for _ in range(3))
+    a, b, c = (process(path, kernel) for _ in range(3))
     owner = object()
     assert a.try_lock(owner, 5, False) and b.try_lock(owner, 5, False)  # shared by two processes
     assert not c.try_lock(owner, 5, True)
@@ -58,34 +56,57 @@ def test_windows_backend_shares_and_excludes(tmp_path):
     assert not c.held_by_others(owner, 5)
     assert c.try_lock(owner, 5, True)
     assert not a.try_lock(owner, 5, False) and not a.try_lock(owner, 5, True)
-    assert c.try_lock(owner, 5, False)  # downgrade
+    assert c.try_lock(owner, 5, False)  # downgrade (atomic)
     assert a.try_lock(owner, 5, False)
     assert not c.try_lock(owner, 5, True)  # an upgrade while another shares: no
     c.unlock(owner, 5)
     a.unlock(owner, 5)
-    assert fake.locked == {}
+    assert kernel.locks == []
     for lock_file in (a, b, c):
         os.close(lock_file.fd)
 
 
 def test_windows_locks_lie_past_the_data(tmp_path):
-    fake = FakeMsvcrt()
+    kernel = FakeKernel()
     path = str(tmp_path / "db-shm")
-    a = process(path, fake)
+    a = process(path, kernel)
     assert a.try_lock(object(), 0, True)
-    assert min(offset for _, _, offset in fake.locked) >= LOCK_OFFSET
+    assert min(offset for _, _, offset, _, _ in kernel.locks) >= LOCK_OFFSET
     os.close(a.fd)
 
 
-def test_windows_backend_shares_among_width_processes(tmp_path):
-    fake = FakeMsvcrt()
+def test_windows_backend_shares_among_many_processes(tmp_path):
+    kernel = FakeKernel()
     path = str(tmp_path / "db-shm")
-    processes = [process(path, fake) for _ in range(WindowsLocks.WIDTH + 1)]
+    processes = [process(path, kernel) for _ in range(100)]
     owner = object()
-    assert all(p.try_lock(owner, 1, False) for p in processes[:-1])
-    assert not processes[-1].try_lock(owner, 1, False)  # a documented limit
+    assert all(p.try_lock(owner, 1, False) for p in processes)  # no limit (msvcrt had one)
     for p in processes:
+        p.unlock(owner, 1)
         os.close(p.fd)
+    assert kernel.locks == []
+
+
+def test_windows_backend_shares_sqlites_read_lock(tmp_path):
+    """sqlite3 on Windows reads under a shared LockFileEx lock on the whole
+    SHARED range: MiniDB's readers share it, its writers wait."""
+    from minidb.sqlite_pager import SHARED, SPANS
+
+    kernel = FakeKernel()
+    path = str(tmp_path / "db")
+    sqlite_fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    assert kernel.lock(sqlite_fd, *SPANS[SHARED], False)  # what winGetReadLock takes
+    fd = os.open(path, os.O_RDWR)
+    mine = _LockFile(fd, ("fake", fd), WindowsLocks(kernel), spans=SPANS)
+    owner = object()
+    assert mine.try_lock(owner, SHARED, False)
+    assert not mine.try_lock(owner, SHARED, True)
+    kernel.unlock(sqlite_fd, *SPANS[SHARED])
+    assert mine.try_lock(owner, SHARED, True)
+    mine.unlock(owner, SHARED)
+    assert kernel.locks == []
+    os.close(fd)
+    os.close(sqlite_fd)
 
 
 def test_connections_in_one_process_arbitrate(tmp_path):
@@ -109,8 +130,8 @@ def test_connections_in_one_process_arbitrate(tmp_path):
 
 @pytest.fixture
 def windows(monkeypatch):
-    """Run the pager on the Windows backend (with the fake msvcrt)."""
-    monkeypatch.setattr(locking, "BACKEND", WindowsLocks(FakeMsvcrt()))
+    """Run the pager on the Windows backend (with the fake kernel)."""
+    monkeypatch.setattr(locking, "BACKEND", WindowsLocks(FakeKernel()))
 
 
 def database_with_one_row(path):
@@ -151,12 +172,12 @@ def test_concurrency_on_the_windows_backend(tmp_path, windows, name):
 
 
 def test_windows_upgrade_of_our_own_shared_lock(tmp_path):
-    """SQLite's protocol upgrades SHARED to EXCLUSIVE.  msvcrt cannot convert
-    a lock, so (as SQLite's winLock) the upgrade drops our shared byte, locks
-    the whole range, and takes a shared byte again if that fails."""
-    fake = FakeMsvcrt()
+    """SQLite's protocol upgrades SHARED to EXCLUSIVE.  LockFileEx cannot
+    convert a lock, so (as SQLite's winLock) the upgrade unlocks, locks
+    exclusively, and shares again if that fails."""
+    kernel = FakeKernel()
     path = str(tmp_path / "db")
-    a, b = process(path, fake), process(path, fake)
+    a, b = process(path, kernel), process(path, kernel)
     owner, other = object(), object()
     assert a.try_lock(owner, 5, False)
     assert a.try_lock(owner, 5, True)  # alone: the upgrade works
@@ -168,20 +189,20 @@ def test_windows_upgrade_of_our_own_shared_lock(tmp_path):
     b.unlock(other, 5)
     assert a.try_lock(owner, 5, True)
     a.unlock(owner, 5)
-    assert fake.locked == {}
+    assert kernel.locks == []
     for lock_file in (a, b):
         os.close(lock_file.fd)
 
 
 @pytest.mark.parametrize("format", ["sqlite", None])
 def test_databases_on_the_windows_backend(tmp_path, monkeypatch, format):
-    """Both file formats work on WindowsLocks (the fake msvcrt): creating a
+    """Both file formats work on WindowsLocks (the fake kernel): creating a
     file, writers and readers in one process, reopening.  (The SQLite
     protocol upgrades its shared lock: this failed on real Windows.)"""
     from minidb.database import Database
 
-    fake = FakeMsvcrt()
-    monkeypatch.setattr(locking, "BACKEND", WindowsLocks(fake))
+    kernel = FakeKernel()
+    monkeypatch.setattr(locking, "BACKEND", WindowsLocks(kernel))
     path = str(tmp_path / "db")
     with Database(path, format=format) as db:
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
@@ -197,4 +218,4 @@ def test_databases_on_the_windows_backend(tmp_path, monkeypatch, format):
     with Database(path) as db:
         assert db.execute("SELECT v FROM t ORDER BY id")[-1] == ("d",)
         assert db.integrity_check() == []
-    assert fake.locked == {}
+    assert kernel.locks == []

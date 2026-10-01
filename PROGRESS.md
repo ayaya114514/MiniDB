@@ -315,6 +315,6 @@
 - 只支持 4096 字节页、UTF-8、rollback journal（不支持 WAL 模式的 SQLite 文件）、无 auto_vacuum；SQLite 格式的大事务脏页全在内存。
 - SQLite 格式下插入仍比 MiniDB 格式慢 1.6–2.4 倍：每次插入都 O(页内单元格数) 地累加页面用量，写入时还要先编码 MiniDB record 再转成 SQLite record。
 - DESC 索引在 SQLite 格式里只维护、不用于查找和排序（扫描时整体排序）；MiniDB 格式里 DESC 仍按升序存。
-- Windows：推送后第一次在 windows-latest 上运行，SQLite 格式的测试全部 LockTimeout——SQLite 的协议要把 SHARED 升级为 EXCLUSIVE，而 `msvcrt.locking` 不能转换锁（同一句柄也不能锁重叠的字节）。改为照 SQLite 的 winLock：放掉自己的共享字节、锁整个范围、失败则重新取一个共享字节（持有 PENDING 时不会有新读者插进来）；在假 msvcrt 上加了复现测试。同一次运行里 `test_threads_reading_and_writing` 又因线程调度没等到日志重启，改为读者停下后必须重启（读者持续读时的上界由多进程测试检查）。修复后 Windows 上的结果见下一次 CI。同一进程里的 sqlite3 模块与 MiniDB 不互斥（POSIX 记录锁属于进程，与 SQLite 自己相同）。
+- Windows：推送后第一次在 windows-latest 上运行，SQLite 格式的 23 个测试失败。(1) SQLite 的协议要把 SHARED 升级为 EXCLUSIVE，`msvcrt.locking` 不能转换锁，新建文件就超时——先照 SQLite 的 winLock 先解锁再加锁，修掉 19 个；(2) 第二次运行剩下的`test_locks_against_a_sqlite_process` 暴露了真问题：sqlite3 在 NT 上对 SHARED 区间加的是共享锁，MiniDB 用排他字节模拟共享锁必然冲突，于是 Windows 后端改用 ctypes 的 LockFileEx（D104）；(3) 两个 fuzz 种子是 Windows 上 Python 自带的 SQLite 版本不同（REAL 转文本、求和精度），该测试改为只在参考版本上运行；(4) 多进程测试里读者 2 秒内只读到 1 次（回滚日志模式读写互斥，Windows 上 fsync 慢），断言改为至少 1 次。同一次运行里 `test_threads_reading_and_writing` 又因线程调度没等到日志重启，改为读者停下后必须重启（读者持续读时的上界由多进程测试检查）。LockFileEx 后端在真实 Windows 上的结果见下一次 CI。
 - 行顺序：连接顺序仍是 MiniDB 自己的代价模型，可能与 SQLite 不同；MULTI-INDEX 的子项不做覆盖读取。
 - sqlite_stat1 在 ≥10 张表时的行顺序与 SQLite 可能不同（D101 的测试只覆盖少量表）。

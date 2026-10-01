@@ -17,7 +17,7 @@ in SQLite, a process opens ``<db>-shm`` once (``_LockFile``, found by device
 and inode, shared by its connections and closed with the last one) and
 arbitrates between its own connections itself: the process holds the lock
 on a byte while any of its connections does.  On Windows the process-level
-locks are ``msvcrt.locking`` ranges (``WindowsLocks``).  A lock that is busy is retried
+locks are LockFileEx ranges (``WindowsLocks``).  A lock that is busy is retried
 until ``timeout`` seconds have passed, then ``OperationalError("database is
 locked")`` is raised, like SQLite's busy timeout.
 """
@@ -89,68 +89,82 @@ class PosixLocks:
             raise
 
 
-class WindowsLocks:
-    """Process-level locks on ranges of a file with ``msvcrt.locking``, which
-    has exclusive locks only (per handle, and mandatory: they also block
-    reads and writes of the locked bytes, so they lie past the data).
+class _Kernel32:
+    """LockFileEx / UnlockFileEx through ctypes (Windows only)."""
 
-    As SQLite does on Windows without LockFileEx: a shared holder locks one
-    byte of the range (any free one), an exclusive holder all of it; MiniDB's
-    own locks are ranges of ``WIDTH`` bytes, so up to ``WIDTH`` processes can
-    share one.  Converting a lock is not atomic: an upgrade (as SQLite's
-    winLock) unlocks our byte, locks the range and, failing, takes a byte
-    again; a downgrade may lose the lock to another process (callers check).
-    SQLite's protocol upgrades only while holding PENDING, which keeps new
-    sharers out meanwhile."""
+    def __init__(self) -> None:
+        import ctypes
+        from ctypes import wintypes
 
-    WIDTH = 64
+        class Overlapped(ctypes.Structure):
+            _fields_ = [("Internal", ctypes.c_size_t), ("InternalHigh", ctypes.c_size_t),
+                        ("Offset", wintypes.DWORD), ("OffsetHigh", wintypes.DWORD), ("hEvent", wintypes.HANDLE)]
 
-    def __init__(self, module: object = None) -> None:
-        self.msvcrt = module if module is not None else msvcrt
-        self.shared = {}  # (fd, offset of the range) -> the offset of the byte we lock
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self._lock = kernel32.LockFileEx
+        self._lock.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                               wintypes.DWORD, ctypes.POINTER(Overlapped)]
+        self._lock.restype = wintypes.BOOL
+        self._unlock = kernel32.UnlockFileEx
+        self._unlock.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD,
+                                 ctypes.POINTER(Overlapped)]
+        self._unlock.restype = wintypes.BOOL
+        self._overlapped = Overlapped
+        self._ctypes = ctypes
 
-    def span(self, byte: int) -> Span:
-        return LOCK_OFFSET + byte * self.WIDTH, self.WIDTH
-
-    def _locking(self, fd: int, mode: int, offset: int, size: int) -> bool:
-        os.lseek(fd, offset, os.SEEK_SET)  # (callers hold _LockFile._mutex)
-        try:
-            self.msvcrt.locking(fd, mode, size)
+    def lock(self, fd: int, offset: int, length: int, exclusive: bool) -> bool:
+        flags = 1 | (2 if exclusive else 0)  # LOCKFILE_FAIL_IMMEDIATELY | LOCKFILE_EXCLUSIVE_LOCK
+        where = self._overlapped(0, 0, offset & 0xFFFFFFFF, offset >> 32, None)
+        if self._lock(msvcrt.get_osfhandle(fd), flags, 0, length, 0, self._ctypes.byref(where)):
             return True
-        except OSError:
+        error = self._ctypes.get_last_error()
+        if error in (33, 997):  # ERROR_LOCK_VIOLATION, ERROR_IO_PENDING
             return False
+        raise OSError(error, f"LockFileEx failed (error {error})")
+
+    def unlock(self, fd: int, offset: int, length: int) -> None:
+        where = self._overlapped(0, 0, offset & 0xFFFFFFFF, offset >> 32, None)
+        self._unlock(msvcrt.get_osfhandle(fd), 0, length, 0, self._ctypes.byref(where))
+
+
+class WindowsLocks:
+    """Process-level locks on ranges of a file with LockFileEx, as SQLite's
+    win32 VFS takes them: shared and exclusive, per handle, and mandatory
+    (they also block other handles' reads and writes of the locked bytes),
+    so they lie past the data.  (``msvcrt.locking`` has exclusive locks only:
+    a MiniDB reader then could not share SQLite's read lock.)
+
+    A lock cannot be converted.  An upgrade, as in SQLite's winLock, unlocks
+    and locks the range exclusively, sharing it again if that fails (SQLite's
+    protocol upgrades only while holding PENDING, which keeps new sharers out
+    meanwhile).  A downgrade is atomic: a handle may share a range it holds
+    exclusively, and the first unlock then drops the exclusive lock."""
+
+    def __init__(self, kernel: object = None) -> None:
+        self.kernel = kernel if kernel is not None else _Kernel32()
+
+    @staticmethod
+    def span(byte: int) -> Span:
+        return LOCK_OFFSET + byte, 1
 
     def lock(self, fd: int, span: Span, exclusive: bool) -> bool:
-        base, width = span
-        if exclusive:
-            return self._locking(fd, self.msvcrt.LK_NBLCK, base, width)
-        start = int.from_bytes(os.urandom(2), "big") % width
-        for i in range(width):
-            offset = base + (start + i) % width
-            if self._locking(fd, self.msvcrt.LK_NBLCK, offset, 1):
-                self.shared[fd, base] = offset
-                return True
-        return False
+        return self.kernel.lock(fd, span[0], span[1], exclusive)
 
     def upgrade(self, fd: int, span: Span) -> bool | None:
         """Shared to exclusive: True, or False still sharing (None: lost)."""
-        offset = self.shared.pop((fd, span[0]), None)
-        if offset is not None:
-            self._locking(fd, self.msvcrt.LK_UNLCK, offset, 1)
-        if self._locking(fd, self.msvcrt.LK_NBLCK, *span):
+        self.kernel.unlock(fd, *span)
+        if self.kernel.lock(fd, span[0], span[1], True):
             return True
-        return False if self.lock(fd, span, False) else None
+        return False if self.kernel.lock(fd, span[0], span[1], False) else None
 
     def downgrade(self, fd: int, span: Span) -> bool:
-        self._locking(fd, self.msvcrt.LK_UNLCK, *span)
-        return self.lock(fd, span, False)
+        if not self.kernel.lock(fd, span[0], span[1], False):  # pragma: no cover - our own range
+            return False
+        self.kernel.unlock(fd, *span)  # (drops the exclusive lock)
+        return True
 
     def unlock(self, fd: int, span: Span) -> None:
-        offset = self.shared.pop((fd, span[0]), None)
-        if offset is not None:
-            self._locking(fd, self.msvcrt.LK_UNLCK, offset, 1)
-        else:
-            self._locking(fd, self.msvcrt.LK_UNLCK, *span)
+        self.kernel.unlock(fd, *span)
 
 
 if fcntl is not None:
