@@ -256,7 +256,7 @@
 **benchmark**（阶段 17 末 → 阶段 18 末，同一台机器，10 万行）：autocommit 的 `?` 点查 0.116 → 0.145 s（每个读事务多约 3 µs：拿/放读槽和 WAL_READ 共 4 次 lockf，外加读 `-shm`）；逐条 autocommit 插入 0.126 → 0.140 s；其余在噪声范围内（单条 INSERT 2.97 → 2.85 s，批量 1.93 → 1.86 s，范围扫描、全表扫描、GROUP BY、连接基本不变）。CREATE INDEX 在 benchmark 里 0.42 → 0.475 s，但单独测量和 cProfile 显示两个版本调用完全相同（1.316 vs 1.333 s），差异是 benchmark 进程内的噪声。
 
 **已知问题 / 做得不扎实的地方**：
-- **Windows 从未真正运行过**：只在按 `msvcrt.locking` 语义写的假模块上测试；CI 的 `windows-latest` 任务未运行（没有 push）。Windows 上最多 64 个进程同时共享一把锁；降级不是原子的（丢锁时放弃该槽重试）。
+- Windows：阶段 18 结束时只在假的 `msvcrt` 上测过；2026-10-01 推送后 CI 的 `windows-latest` 上 320 个测试通过（见阶段 19）。Windows 上最多 64 个进程同时共享一把锁；降级不是原子的（丢锁时放弃该槽重试）；Windows 上不跑与参考 SQLite 的对照测试。
 - 一个始终不结束的读事务仍会让日志变长：写者等 0.1 秒后放弃，之后日志每增长 4000 帧才再等一次。
 - `-shm` 的读写依赖小 pread/pwrite 的原子性，没有 SQLite 那样的双份头 + 校验和防撕裂读。
 - 连接不能跨 `fork()` 使用；删除正在使用的 `-shm` 会让新旧连接各锁各的（与 SQLite 相同）。
@@ -264,7 +264,7 @@
 - fuzz 种子 9661（文件模式）：`sum(DISTINCT ...)` 的整数溢出取决于累加顺序，SQLite 用覆盖索引 `i12` 做全表扫描（按 c1 顺序），MiniDB 扫表（按 rowid），属于已记录的“依赖查询计划”一类，未修。
 - 每个 autocommit 读语句多约 3 µs 的锁开销（见上）。
 
-## 阶段 19：展示（进行中，2026-10-01，等待发布确认）
+## 阶段 19：展示（完成，2026-10-01）
 本地完成：
 - **Playground**（D99，`playground/`、`tools/build_playground.py`）：Pyodide 314 在 module Web Worker 里运行内存中的 MiniDB；每条语句显示结果和 EXPLAIN 计划，右侧画出所选表/索引的 B+ 树（分层、父子连线、叶子兄弟链、填充率）；5 个示例（B+ 树与索引、窗口函数、递归 CTE 曼德博集合、UPSERT/RETURNING/连接、事务回滚）。本机浏览器实测：桌面 1440×900 与移动端 390×844 无横向溢出，console 无报错，⌘/Ctrl+Enter、出错停止、BLOB/NULL/Inf 显示正常；首个示例 7 条语句约 70–100 ms。`tests/test_playground.py` 在本机 Python 上跑 bridge 和全部示例。
 - 做示例时发现并修复：`BETWEEN` 不能走索引（D97，计划现在与 SQLite 一致）。
@@ -274,6 +274,7 @@
 
 验证：测试 957 个全部通过；fuzz 300 种子 × 400 语句 0 失败。
 
-未完成（需要 push，等待确认）：部署到 `https://ayaya114514.github.io/MiniDB/`（需要先在仓库设置里把 Pages 来源设为 GitHub Actions）并做线上检查；挂到 blog 工具栏。本地领先 origin/master 51 个提交（阶段 16–19），CI（含新的 windows-latest 任务）都还没在这些提交上运行过。
+**发布**（用户确认后）：本地领先的 52 个提交（阶段 16–19）推送到 GitHub；仓库 Pages 来源设为 GitHub Actions，`pages` 工作流部署成功；线上 `https://ayaya114514.github.io/MiniDB/` 各文件 HTTP 200，浏览器实测首个示例 7 条语句 67 ms，console 无报错。blog 工具栏末尾加入 MiniDB（缩写 MDB），blog 本地构建通过、部署成功，线上 `/tools/` 显示“共 11 个”且卡片正常。
+**CI**（第一次在这些提交上运行）：Linux 3.11–3.14、fuzz、sqllogictest（5,939,852 / 5,939,879）全部通过；新的 `windows-latest` 任务在真实 Windows 上 320 个测试通过。第一次运行时 Windows 与 Linux 3.14 各有一个失败：`test_threads_reading_and_writing` 断言“日志最长 < 700 帧”，CI 的 2 核机器上读线程在 GIL 下比写者的等待更久，日志到了约 1100 帧——这是依赖线程调度的断言，改为检查“日志在读者持续读时确实重启过”（长度上界由多进程测试检查）后全部通过。
 
 已知问题：VALUES 行里的聚合（`VALUES (count(*))`，SQLite 合法）MiniDB 报 misuse；Playground 依赖 jsDelivr 上的 Pyodide（首次加载约 10 MB）。
