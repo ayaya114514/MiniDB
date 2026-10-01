@@ -805,3 +805,49 @@ EXCLUSIVE，`msvcrt.locking` 连同一句柄的重叠字节都锁不上，新建
 测试用一个按 LockFileEx 语义实现的假内核（按句柄；排他锁不与任何锁重叠，包括同一句柄；共享锁可与共享锁和同一
 句柄的排他锁重叠；解锁必须匹配、先去掉排他锁），包括“sqlite3 持有整个 SHARED 区间的共享锁时 MiniDB 能读不能写”。
 真实 Windows 上（CI）359 个测试通过，见 PROGRESS.md。
+
+## D105 约束与 schema 文本：照 SQLite 存原文，ALTER TABLE 改文本
+阶段 21 让 MiniDB 读懂 SQLite 的全部列约束和表约束（`CONSTRAINT` 名字、带列和 `COLLATE` / `ASC` / `DESC` / `ON CONFLICT`
+的 `PRIMARY KEY` / `UNIQUE`、`CHECK`、`REFERENCES` 及动作和 `DEFERRABLE`、`AUTOINCREMENT`）。三个连带的决定：
+- **schema 存原文**。之前 MiniDB 重新生成规范化的 `CREATE TABLE "t" ("a" INT ...)`；约束多了以后要把 CHECK 表达式等
+  再打印回 SQL，容易丢东西。现在照 SQLite 存 `"CREATE TABLE " + 从表名开始的原文`（索引是 `CREATE [UNIQUE] INDEX` +
+  从索引名开始的原文），两种格式都一样，`sqlite_schema.sql` 和 sqlite3 逐字相同。旧的 MiniDB 文件里是规范化文本，照样能读。
+- **ALTER TABLE 改文本**，与 SQLite 的 alter.c 相同：RENAME TO 把表名记号换成 `"新名"`（自己的定义、各个索引、其它表
+  外键里的父表名）；RENAME COLUMN 换掉列名记号（列定义、CHECK 里的引用、表级 PRIMARY KEY / UNIQUE / FOREIGN KEY 的列、
+  其它表外键里的父列、索引列），原来是带引号的或新名字写了引号就写 `"新名"`；ADD COLUMN 把定义原文（去掉结尾的 `;`
+  和空白）插到列表末尾（表约束之前，SQLite 的 addColOffset）；DROP COLUMN 删掉从该列名到下一列名的文本（最后一列则
+  从前一个逗号起），再把结果当作新的定义校验，错误写成 “error in table t after drop column: ...”。这样 SQLite 写的、
+  MiniDB 并不完全理解的表经过 ALTER 也不丢内容。
+- **约束的 ON CONFLICT**：语句没写 `OR ...` 时（解析结果改为 None）才用约束自己的子句，再缺省为 ABORT；UPSERT 的
+  DO UPDATE 照 SQLite 固定是 `UPDATE OR ABORT`。自动索引按 SQLite 的规则编号：约束出现顺序、列与排序规则都相同的
+  合并到前一个（PRIMARY KEY 接管它、ON CONFLICT 冲突时报错），`ON CONFLICT REPLACE` 的索引排在检查顺序的最后，
+  rowid 的 REPLACE 推迟到其它唯一约束之后。表级 `PRIMARY KEY(a)` 对 INTEGER 列也是 rowid 别名（列级的 `PRIMARY KEY
+  DESC` 不是）。
+CHECK 照 SQLite：在亲和性转换和 rowid 分配之后求值（所以有 CHECK 时 upsert 的 excluded 行总是转换过的），NULL 算通过，
+UPDATE 只检查用到被改列的约束，`OR IGNORE` 跳过该行、`OR REPLACE` 当 ABORT，报错是 `CHECK constraint failed: <名字或
+原文>`；建表时拒绝子查询、参数、聚合和窗口函数；含函数调用的 CHECK 让语句需要语句日志（与语句里的函数调用相同）。
+AUTOINCREMENT 维护 `sqlite_sequence`，计数在语句成功结束时写回（SQLite 的 autoIncEnd，FAIL 中途失败时不写）。
+
+## D106 排序规则：表达式推导照 SQLite，索引键用排序键
+BINARY / NOCASE / RTRIM 三种内置规则，其它名字报 “no such collation sequence”（只在真的用到时报，与 SQLite 相同）。
+- **推导**照 `sqlite3ExprCollSeq`：`COLLATE` 本身；列（没有 COLLATE 的列是 BINARY，而不是“没有”）；穿过 CAST 和一元 +；
+  其它运算只在某个操作数里有显式 COLLATE 时才有排序规则（按左操作数、参数列表、右操作数的顺序找）。比较用
+  `sqlite3BinaryCompareCollSeq`：左边的显式 COLLATE，再右边的，再左边的，再右边的。`IN (列表)` 只看左边（单项的
+  `x IN (y)` 被 SQLite 改写成 `x = y`），`IN (SELECT)` 与子查询列比较（复合子查询取最后一个 SELECT），CASE 的比较、
+  BETWEEN、`min()` / `max()` / `nullif()`（第一个有排序规则的参数）、DISTINCT 聚合、ORDER BY / GROUP BY / DISTINCT、
+  窗口的 PARTITION BY 和 ORDER BY 都照此。子查询（FROM 里的、视图、CTE）的列带上结果表达式的排序规则（复合查询取
+  最左边的 SELECT）；复合查询去重和排序用 SQLite 的 multiSelectCollSeq（每列最左边有排序规则的那个）。ORDER BY /
+  GROUP BY 的 `1 COLLATE x`、`别名 COLLATE x` 作用在那一列上。
+- **值的比较**：`values.collation_compare(c)` 只改变两个文本之间的比较。NOCASE 把 ASCII 大写变小写逐字节比，再比长度
+  ——但遇到第一个文本里的 NUL 就停（sqlite3StrNICmp），两边在同一位置有 NUL 时只比长度；RTRIM 去掉末尾空格再按字节比。
+- **键**：`values.collation_sort_key(c)` 对文本给出 `Collated`——一个按排序键比较和哈希的 str 子类，同时记住原值。
+  分组、去重、哈希连接、IN 子查询的集合都用它，相等的判断自然就按排序规则；索引键里也是它，所以索引按排序规则排序、
+  相同排序键的条目按 rowid 排（与 SQLite 一样），而 `plain_value` 能还原原值——覆盖索引读出的、SQLite 格式索引
+  record 里写的都是原值（sqlite3 的 `integrity_check` 通过，有测试）。MiniDB 格式的索引用每个索引自己的 codec
+  （`CollatedKeyCodec`）解码，页缓存里的键因此总是排序键（VACUUM 复制时也要用它，fuzz 找到过这个坑）。
+- **规划**：索引列只服务排序规则相同的比较（找列时照 SQLite 剥掉 COLLATE），ORDER BY 只在每项的排序规则与索引列
+  相同时免排序，自动索引（哈希连接）用等式本身的排序规则。
+顺带修正（fuzz 找到）：复合查询里相等的行，UNION 保留右边那一边的第一行、INTERSECT / EXCEPT 保留左边的第一行（SQLite
+是把两边排好序后归并，此前 MiniDB 取最后一行，1 与 1.0 时就能看出来）；裸列（以及在一个 NOCASE 分组里各不相同的
+GROUP BY 值）取哪一行照 SQLite 的 updateAccumulator：每个 `min()` / `max()` 设置“命中”寄存器（跳过即不载入；值为 NULL
+而已有最值时也算跳过），带 FILTER 的先设成“不是组内第一行”，没有 min/max 时只取组内第一行。

@@ -268,13 +268,75 @@ def sort_key(value: SQLValue) -> tuple:
 
 
 def plain_value(pair: tuple) -> SQLValue:
-    """The value of a sort key (the inverse of sort_key)."""
+    """The value of a sort key (the inverse of sort_key and collation_sort_key)."""
     rank = pair[0]
     if rank == 0:
         return None
-    if rank == 2 and not pair[1].isascii():
-        return pair[1].encode("latin-1").decode("utf-8", "surrogateescape")
+    if rank == 2:
+        text = pair[1]
+        if text.__class__ is Collated:
+            return text.original
+        if not text.isascii():
+            return text.encode("latin-1").decode("utf-8", "surrogateescape")
     return pair[1]
+
+
+class Collated(str):
+    """The key of a text value under a collation (NOCASE, RTRIM): a string
+    that compares and hashes as the key and remembers the value itself."""
+
+    original: str
+
+
+def _nocase_key(text: str) -> str:
+    """NOCASE compares text with ASCII upper case letters made lower case
+    (sqlite3StrNICmp), byte by byte up to the shorter length, and then by
+    length - but it stops at a NUL in the first text: two texts with a NUL
+    at the same place after equal bytes compare by their lengths alone."""
+    key = ascii_lower(_text_key(text))
+    nul = key.find("\x00")
+    if nul < 0:
+        return key
+    return f"{key[:nul + 1]}{len(key):020d}"
+
+
+def _rtrim_key(text: str) -> str:
+    """RTRIM compares text without its trailing spaces."""
+    return _text_key(text).rstrip(" ")
+
+
+_COLLATION_KEYS = {"NOCASE": _nocase_key, "RTRIM": _rtrim_key}
+
+
+@lru_cache(maxsize=None)
+def collation_sort_key(collation: str | None) -> Callable[[SQLValue], tuple]:
+    """sort_key under a collation (None or BINARY: sort_key itself)."""
+    text_key = _COLLATION_KEYS.get(collation)
+    if text_key is None:
+        return sort_key
+
+    def collated_sort_key(value: SQLValue) -> tuple:
+        if isinstance(value, str):
+            key = Collated(text_key(value))
+            key.original = value
+            return (2, key)
+        return sort_key(value)
+    return collated_sort_key
+
+
+@lru_cache(maxsize=None)
+def collation_compare(collation: str | None) -> Callable[[SQLValue, SQLValue], int]:
+    """compare under a collation: it decides how two texts compare."""
+    text_key = _COLLATION_KEYS.get(collation)
+    if text_key is None:
+        return compare
+
+    def collated_compare(a: SQLValue, b: SQLValue) -> int:
+        if type(a) is str and type(b) is str:
+            a, b = text_key(a), text_key(b)
+            return (a > b) - (a < b)
+        return compare(a, b)
+    return collated_compare
 
 
 def compare(a: int | float | str | bytes, b: int | float | str | bytes) -> int:
@@ -508,30 +570,42 @@ def _fn_coalesce(*values: SQLValue) -> SQLValue:
     return None
 
 
-def _fn_nullif(a: SQLValue, b: SQLValue) -> SQLValue:
-    return None if a is not None and b is not None and compare(a, b) == 0 else a
+def _nullif_function(compare: Callable[[SQLValue, SQLValue], int]) -> Callable[..., SQLValue]:
+    def nullif(a: SQLValue, b: SQLValue) -> SQLValue:
+        return None if a is not None and b is not None and compare(a, b) == 0 else a
+    return nullif
 
 
-def _fn_min(*values: SQLValue) -> SQLValue:
-    """Scalar MIN: among equal values (1 and 1.0) SQLite returns the last one."""
-    if any(v is None for v in values):
-        return None
-    best = values[0]
-    for value in values[1:]:
-        if compare(best, value) >= 0:
-            best = value
-    return best
+def _min_function(compare: Callable[[SQLValue, SQLValue], int]) -> Callable[..., SQLValue]:
+    def minimum(*values: SQLValue) -> SQLValue:
+        """Scalar MIN: among equal values (1 and 1.0) SQLite returns the last one."""
+        if any(v is None for v in values):
+            return None
+        best = values[0]
+        for value in values[1:]:
+            if compare(best, value) >= 0:
+                best = value
+        return best
+    return minimum
 
 
-def _fn_max(*values: SQLValue) -> SQLValue:
-    """Scalar MAX: among equal values SQLite returns the first one."""
-    if any(v is None for v in values):
-        return None
-    best = values[0]
-    for value in values[1:]:
-        if compare(best, value) < 0:
-            best = value
-    return best
+def _max_function(compare: Callable[[SQLValue, SQLValue], int]) -> Callable[..., SQLValue]:
+    def maximum(*values: SQLValue) -> SQLValue:
+        """Scalar MAX: among equal values SQLite returns the first one."""
+        if any(v is None for v in values):
+            return None
+        best = values[0]
+        for value in values[1:]:
+            if compare(best, value) < 0:
+                best = value
+        return best
+    return maximum
+
+
+_fn_nullif, _fn_min, _fn_max = _nullif_function(compare), _min_function(compare), _max_function(compare)
+# The scalar functions that compare text by their arguments' collation
+# (SQLite's SQLITE_FUNC_NEEDCOLL): name -> function of a compare function.
+COLLATING_FUNCTIONS = {"MIN": _min_function, "MAX": _max_function, "NULLIF": _nullif_function}
 
 
 # name -> (function, minimum argument count, maximum argument count or None)
@@ -697,14 +771,17 @@ class CountStarAggregate(CountAggregate):
 class MinMaxAggregate:
     """MIN or MAX; ``step`` reports whether the current extreme changed."""
 
-    def __init__(self, want: int) -> None:
+    def __init__(self, want: int, compare: Callable[[SQLValue, SQLValue], int] = compare) -> None:
         self.want = want  # -1 for MIN, 1 for MAX
+        self.compare = compare  # (under the argument's collation)
         self.value = None
 
     def step(self, value: SQLValue) -> bool:
+        """Whether SQLite would load the bare columns from this row (it
+        skips that for a NULL once there is a value, and for no new extreme)."""
         if value is None:
-            return False
-        if self.value is None or compare(value, self.value) == self.want:
+            return self.value is None
+        if self.value is None or self.compare(value, self.value) == self.want:
             self.value = value
             return True
         return False

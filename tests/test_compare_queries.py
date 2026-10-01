@@ -1256,3 +1256,55 @@ def test_index_hints_steer_the_planner():
     pair.run("DELETE FROM t1 INDEXED BY t1_x WHERE x = 3")
     pair.run("SELECT * FROM t1 ORDER BY rowid")
     pair.close()
+
+
+def test_which_row_compounds_and_groups_keep():
+    """Equal rows of a compound: UNION keeps the right side's first, INTERSECT
+    and EXCEPT the left side's first (SQLite merges the sorted sides).  Bare
+    columns come from the rows the last min() / max() does not skip (a NULL
+    is skipped once there is a value; FILTER first sets "not the first row");
+    without min() / max() from the group's first row."""
+    pair = Pair()
+    for sql in [
+        "SELECT x FROM (SELECT 1 x UNION ALL SELECT 1.0) UNION SELECT 5",
+        "SELECT x FROM (SELECT 1.0 x UNION ALL SELECT 1) UNION SELECT 5", "SELECT 1 UNION SELECT 1.0",
+        "SELECT 1.0 UNION SELECT 1", "SELECT 1 UNION SELECT 1.0 UNION SELECT 1",
+        "SELECT x FROM (SELECT 1 x UNION ALL SELECT 1.0) INTERSECT SELECT 1", "SELECT 1.0 INTERSECT SELECT 1",
+        "SELECT x FROM (SELECT 1.0 x UNION ALL SELECT 1) EXCEPT SELECT 5", "SELECT 1 UNION ALL SELECT 1.0 UNION SELECT 5",
+    ]:
+        pair.run(sql)
+    pair.run("CREATE TABLE t (a COLLATE nocase, b, n)")
+    pair.run("INSERT INTO t VALUES ('abc', 1, NULL), ('ABC', 2, NULL), ('Abc', 3, 5), ('b', 4, NULL), ('B', 5, 1), "
+             "('x', 1, 1), ('X', 2, 1), ('y', 7, 2), ('Y', 3, NULL), ('Y', 9, 8)")
+    aggregates = ["max(n)", "min(n)", "max(b)", "count(*)", "max(n) FILTER (WHERE b > 2)",
+                  "min(b) FILTER (WHERE n IS NULL)", "max(DISTINCT n)", "min(n) FILTER (WHERE b < 3)"]
+    for first in aggregates:
+        for second in [None] + aggregates:
+            calls = first if second is None else f"{first}, {second}"
+            pair.run(f"SELECT a, b, {calls} FROM t GROUP BY a")
+            pair.run(f"SELECT a, b, {calls} FROM t")
+    pair.close()
+
+
+def test_limit_zero_runs_nothing():
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (a)")
+    pair.run("INSERT INTO t VALUES (9223372036854775807), (1)")
+    for sql in ["SELECT sum(a) FROM t LIMIT 0", "SELECT sum(a) OVER () FROM t LIMIT 0 OFFSET 1",
+                "SELECT 1 LIMIT 0 OFFSET 'x'", "SELECT a FROM t UNION SELECT abs(-9223372036854775808) LIMIT 0",
+                "SELECT 1 LIMIT 2 OFFSET 'x'", "SELECT a FROM t LIMIT -1 OFFSET 1"]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_folded_and_hides_aliases():
+    """SQLite's parser folds '<literal> IS NULL' to 0 and 'X AND 0' to 0, so
+    an alias (even of a window function) in the folded part is never resolved."""
+    pair = Pair(check_messages=True)
+    pair.run("CREATE TABLE t (a, b)")
+    pair.run("INSERT INTO t VALUES (1, 2)")
+    for sql in ["SELECT sum(a) OVER () AS k FROM t WHERE ('' IS NULL AND a) AND k > 0",
+                "SELECT sum(a) OVER () AS k FROM t WHERE k > 0", "SELECT a AS k FROM t WHERE (5 IS NULL) AND k",
+                "SELECT count(*) AS k FROM t GROUP BY b HAVING (- 'x' IS NULL AND b) AND k"]:
+        pair.run(sql)
+    pair.close()

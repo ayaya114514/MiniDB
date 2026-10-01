@@ -22,7 +22,8 @@ from typing import Any
 
 from minidb.errors import OperationalError
 from minidb.values import (
-    INT_MAX, INT_MIN, SQLValue, SumAccumulator, add, compare, numeric_affinity, numeric_type_value, sort_key,
+    INT_MAX, INT_MIN, SQLValue, SumAccumulator, add, collation_compare, collation_sort_key, compare,
+    numeric_affinity, numeric_type_value, sort_key,
     subtract, to_int64, to_number, to_text, truth,
 )
 
@@ -130,13 +131,14 @@ class WindowCount:
 class WindowMinMax:
     """min() / max() while the frame only grows (SQLite's minmaxStep)."""
 
-    def __init__(self, want: int) -> None:
+    def __init__(self, want: int, compare: Callable = compare) -> None:
         self.want = want  # 1 for MAX, -1 for MIN
+        self.compare = compare  # (under the argument's collation)
         self.best = None
 
     def step(self, args: tuple) -> None:
         value = args[0]
-        if value is not None and (self.best is None or compare(value, self.best) == self.want):
+        if value is not None and (self.best is None or self.compare(value, self.best) == self.want):
             self.best = value
 
     def inverse(self, args: tuple) -> None:  # pragma: no cover - SQLite has no xInverse
@@ -153,8 +155,9 @@ class WindowMinMaxIndex:
     index ordered by (value, sequence number), MIN descending, and returns
     its last entry; xInverse deletes the first entry equal to the value."""
 
-    def __init__(self, want: int) -> None:
+    def __init__(self, want: int, compare: Callable = compare) -> None:
         self.want = want
+        self.compare = compare
         self.entries = []  # (value, sequence number), unordered
         self.sequence = 0
 
@@ -167,7 +170,7 @@ class WindowMinMaxIndex:
         value = args[0]
         if value is None:
             return
-        equal = [entry for entry in self.entries if compare(entry[0], value) == 0]
+        equal = [entry for entry in self.entries if self.compare(entry[0], value) == 0]
         if equal:
             self.entries.remove(min(equal, key=lambda entry: entry[1]))
 
@@ -177,7 +180,7 @@ class WindowMinMaxIndex:
             if best is None:
                 best = entry
                 continue
-            order = compare(entry[0], best[0])
+            order = self.compare(entry[0], best[0])
             if order == self.want or (order == 0 and entry[1] > best[1]):
                 best = entry
         return None if best is None else best[0]
@@ -458,11 +461,13 @@ class WindowFunction:
     its number among the query's window functions (its result goes to that
     slot after the row's other values)."""
 
-    def __init__(self, name: str, args: list[Callable], filter_: Callable | None, number: int) -> None:
+    def __init__(self, name: str, args: list[Callable], filter_: Callable | None, number: int,
+                 collation: str | None = None) -> None:
         self.name = name
         self.args = args
         self.filter = filter_
         self.number = number
+        self.compare = collation_compare(collation)  # (min() and max() compare by the argument's collation)
 
     def accumulator(self, sliding: bool, full_scan: bool) -> Any:
         name = self.name
@@ -472,7 +477,8 @@ class WindowFunction:
             return WindowCount()
         if name in ("MIN", "MAX"):
             want = 1 if name == "MAX" else -1
-            return WindowMinMaxIndex(want) if sliding and not full_scan else WindowMinMax(want)
+            return (WindowMinMaxIndex(want, self.compare) if sliding and not full_scan
+                    else WindowMinMax(want, self.compare))
         if name in ("GROUP_CONCAT", "STRING_AGG"):
             return WindowGroupConcat()
         if name == "ROW_NUMBER":
@@ -507,9 +513,10 @@ class _Descending:
         return self.key == other.key
 
 
-def _same(a: Sequence[SQLValue], b: Sequence[SQLValue]) -> bool:
-    """OP_Compare equality: NULLs are equal to each other."""
-    for x, y in zip(a, b):
+def _same(a: Sequence[SQLValue], b: Sequence[SQLValue], compares: Sequence[Callable]) -> bool:
+    """OP_Compare equality: NULLs are equal to each other; each term
+    compares by its own collation (``compares``)."""
+    for x, y, compare in zip(a, b, compares):
         if x is None or y is None:
             if x is not y:
                 return False
@@ -527,9 +534,17 @@ class WindowGroup:
 
     def __init__(self, partition: list[Callable], order: list[tuple[Callable, bool, bool | None]],
                  unit: str, start: str, start_offset: Callable | None, end: str,
-                 end_offset: Callable | None, exclude: str | None) -> None:
+                 end_offset: Callable | None, exclude: str | None,
+                 partition_collations: list[str | None] | None = None,
+                 order_collations: list[str | None] | None = None) -> None:
         self.partition = partition
         self.order = order
+        partition_collations = partition_collations or [None] * len(partition)
+        order_collations = order_collations or [None] * len(order)
+        self.partition_keys = [collation_sort_key(c) for c in partition_collations]
+        self.order_keys = [collation_sort_key(c) for c in order_collations]
+        self.partition_compares = [collation_compare(c) for c in partition_collations]
+        self.peer_compares = [collation_compare(c) for c in order_collations]
         self.unit = unit
         self.start = start
         self.start_offset = start_offset
@@ -544,16 +559,16 @@ class WindowGroup:
         """The key of a row: its PARTITION BY values ascending, then its ORDER BY
         values (NULLs first unless NULLS LAST, reversed for DESC)."""
         part, peer = keys
-        result = [(0,) if v is None else (1, sort_key(v)) for v in part]
-        for value, (_, descending, nulls_first) in zip(peer, self.order):
+        result = [(0,) if v is None else (1, key(v)) for v, key in zip(part, self.partition_keys)]
+        for value, (_, descending, nulls_first), key in zip(peer, self.order, self.order_keys):
             if nulls_first is None:
                 nulls_first = not descending
             if value is None:
                 result.append((0,) if nulls_first else (2,))
             elif descending:
-                result.append((1, _Descending(sort_key(value))))
+                result.append((1, _Descending(key(value))))
             else:
-                result.append((1, sort_key(value)))
+                result.append((1, key(value)))
         return result
 
     def run(self, rows: list[list], base: int) -> list[list]:
@@ -576,7 +591,7 @@ class WindowGroup:
         ]
         begin = 0
         for i in range(1, len(ordered) + 1):
-            if i == len(ordered) or not _same(part_keys[i], part_keys[begin]):
+            if i == len(ordered) or not _same(part_keys[i], part_keys[begin], self.partition_compares):
                 _Partition(self, ordered[begin:i], peers[begin:i],
                            [a[begin:i] for a in args],
                            [None if f is None else f[begin:i] for f in filters]).run()
@@ -700,7 +715,7 @@ class _Partition:
             if exclude == "CURRENT ROW" and i == index:
                 continue
             if exclude in ("GROUP", "TIES") and not (exclude == "TIES" and i == index):
-                if not group.order or _same(self.peers[i], current):
+                if not group.order or _same(self.peers[i], current, group.peer_compares):
                     continue
             for k, function in enumerate(group.functions):
                 filters = self.filters[k]
@@ -805,7 +820,7 @@ class _Partition:
                     return jump_on_eof
                 if peers:
                     saved = cursor + "_peer"
-                    if _same(self.peer(position), getattr(self, saved)):
+                    if _same(self.peer(position), getattr(self, saved), self.group.peer_compares):
                         continue
                     setattr(self, saved, self.peer(position))
                 break
@@ -849,7 +864,7 @@ class _Partition:
                 index += 1
                 continue
             if unit != "ROWS":
-                if not order or _same(self.peers[index], self.reg_peer):
+                if not order or _same(self.peers[index], self.reg_peer, self.group.peer_compares):
                     index += 1
                     continue
                 self.reg_peer = self.peers[index]

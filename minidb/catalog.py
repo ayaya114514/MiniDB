@@ -94,6 +94,20 @@ class IndexKeyCodec:
         return encoded_size([cls._plain(pair) for pair in key])
 
 
+class CollatedKeyCodec(IndexKeyCodec):
+    """IndexKeyCodec for an index with NOCASE or RTRIM columns: their keys
+    are collation keys (values.Collated), the records hold the values."""
+
+    def __init__(self, key_functions: list) -> None:
+        self.key_functions = key_functions + [values.sort_key]  # (the last: the row id)
+
+    def decode(self, data: bytes, pos: int) -> tuple[IndexKey, int]:
+        row, end = decode_record(data, pos)
+        functions = self.key_functions
+        return tuple(functions[i](v) if i < len(functions) else values.sort_key(v)
+                     for i, v in enumerate(row)), end
+
+
 # ---- schema objects ----------------------------------------------------------------
 
 
@@ -265,6 +279,10 @@ class IndexInfo:
         # Each column's collation: its own COLLATE, else the table column's.
         self.collations = [values.collation_name(c) if c else table.collations[p]
                            for c, p in zip(collations or [None] * len(self.positions), self.positions)]
+        # Each column's sort key function (values.collation_sort_key).
+        self.key_functions = [values.collation_sort_key(c) for c in self.collations]
+        self.collated = any(c != "BINARY" for c in self.collations)
+        self.codec = CollatedKeyCodec(self.key_functions) if self.collated else IndexKeyCodec
         self.unique = unique
         self.conflict = conflict  # ON CONFLICT of its PRIMARY KEY or UNIQUE constraint
         self.origin = origin  # "c" (CREATE INDEX), "u" (UNIQUE) or "pk", as PRAGMA index_list says
@@ -284,7 +302,13 @@ class IndexInfo:
         return self.descending is None
 
     def key(self, row: Sequence[SQLValue], rowid: int) -> IndexKey:
-        return index_key([row[p] for p in self.positions], rowid)
+        if not self.collated:
+            return index_key([row[p] for p in self.positions], rowid)
+        return self.prefix([row[p] for p in self.positions]) + ((1, rowid),)
+
+    def prefix(self, key_values: Sequence[SQLValue]) -> IndexKey:
+        """The start of the keys of entries with these values (in column order)."""
+        return tuple(f(v) for f, v in zip(self.key_functions, key_values))
 
 
 def add_index(table: TableInfo, index: IndexInfo) -> None:
@@ -454,8 +478,9 @@ class Catalog:
             from minidb.sqlite_btree import SqliteIndex
 
             return SqliteIndex(self.pager, index.root, index.descending,
-                               [index.table.affinities[p] for p in index.positions])
-        return BTree(self.pager, index.root, IndexKeyCodec)
+                               [index.table.affinities[p] for p in index.positions],
+                               index.key_functions if index.collated else None)
+        return BTree(self.pager, index.root, index.codec)
 
     def _new_tree(self, index: bool) -> int:
         """Create an empty table (or index) tree; returns its root page."""

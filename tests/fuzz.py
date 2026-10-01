@@ -39,7 +39,10 @@ DATE_MODIFIERS = ["'+1 day'", "'-3 months'", "'start of month'", "'weekday 2'", 
                   "'floor'", "'+1-01-01'", "'subsec'"]
 PRINTF_FORMATS = ["'%d'", "'%5.2f'", "'%s|%x'", "'%.3e'", "'%-6s|'", "'%q'", "'%c'", "'%,d'", "'%g'",
                   "'%!.17g'", "'%05.1f'", "'%X-%o'"]
-TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz"]
+TEXTS = ["", "a", "b", "abc", "B", "ab%", "x_y", "1", "10", "2.5", " 7", "0x1", "-3", "é", "Zz", "A", "AbC", "b ",
+         "ab  "]
+COLLATIONS = ["NOCASE", "RTRIM", "BINARY", "nocase"]
+RESOLUTIONS = ["IGNORE", "REPLACE", "FAIL", "ABORT", "ROLLBACK"]
 
 
 def no_max_rowid(value):
@@ -95,14 +98,36 @@ class Generator:
             col_type = rng.choice(["INTEGER", "TEXT", "INTEGER", "TEXT", "REAL", "NUMERIC", "",
                                    "BLOB", "VARCHAR(5)", "INT", "FLOAT"])
             constraint = rng.choice(["", "", "", "NOT NULL", "UNIQUE"])
+            if constraint and rng.random() < 0.15:
+                constraint += " ON CONFLICT " + rng.choice(RESOLUTIONS)
             if rng.random() < 0.3:
                 constraint = (constraint + " DEFAULT " + rng.choice(
                     ["0", "'x'", "-1.5", "NULL", "(2 * 3)", "x'61'", "'10'"])).strip()
+            if rng.random() < 0.25:
+                constraint = (constraint + " COLLATE " + rng.choice(COLLATIONS)).strip()
+            if rng.random() < 0.15:
+                constraint = (constraint + f" CHECK ({self.check(f'c{i}')})").strip()
             columns.append((f"c{i}", col_type, constraint))
         table = Table(name, columns, rowid_alias)
         self.tables.append(table)
-        definitions = ", ".join(" ".join(p for p in c if p) for c in columns)
-        return f"CREATE TABLE {name} ({definitions})"
+        definitions = [" ".join(p for p in c if p) for c in columns]
+        if rng.random() < 0.15:
+            pair = rng.sample([c[0] for c in columns[-2:]], 2)
+            collate = f" COLLATE {rng.choice(COLLATIONS)}" if rng.random() < 0.3 else ""
+            conflict = f" ON CONFLICT {rng.choice(RESOLUTIONS)}" if rng.random() < 0.3 else ""
+            definitions.append(f"UNIQUE ({pair[0]}{collate}, {pair[1]}){conflict}")
+            table.unique_columns.update(pair)
+            table.unique_targets.append(tuple(pair))
+        if rng.random() < 0.15:
+            definitions.append(f"CHECK ({self.check(rng.choice(columns)[0])} OR c0 IS c1)")
+        return f"CREATE TABLE {name} ({', '.join(definitions)})"
+
+    def check(self, column):
+        """A CHECK constraint that some rows fail."""
+        return self.rng.choice([
+            f"{column} IS NULL OR {column} > -2", f"typeof({column}) != 'blob'", f"length({column}) < 3",
+            f"{column} != 'b'", f"{column} COLLATE nocase != 'abc'", f"{column} NOT IN (0, 'x')",
+        ])
 
     def create_index(self):
         rng = self.rng
@@ -116,7 +141,8 @@ class Generator:
             table.unique_columns.update(columns)
             table.unique_targets.append(tuple(columns))
         self.index_info[name] = (table, tuple(columns), bool(unique))
-        return f"CREATE {unique}INDEX {name} ON {table.name} ({', '.join(columns)})"
+        written = [c + (f" COLLATE {rng.choice(COLLATIONS)}" if rng.random() < 0.2 else "") for c in columns]
+        return f"CREATE {unique}INDEX {name} ON {table.name} ({', '.join(written)})"
 
     def add_column(self):
         """ALTER TABLE ADD COLUMN (old rows read the constant default)."""
@@ -219,8 +245,10 @@ class Generator:
             op = rng.choice(["+", "-", "*", "/", "%", "=", "!=", "<", "<=", ">", ">=", "AND", "OR", "IS",
                              "IS NOT", "&", "|", "<<", ">>"])
             return f"({sub()} {op} {sub()})"
-        if kind < 0.45:
+        if kind < 0.42:
             return f"({sub(True)} || {sub(True)})"
+        if kind < 0.45:
+            return f"({sub(True)} COLLATE {rng.choice(COLLATIONS)})"
         if kind < 0.55:
             return f"{rng.choice(['-', '+', 'NOT ', '~'])}({sub()})"
         if kind < 0.62:

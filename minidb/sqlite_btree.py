@@ -524,10 +524,14 @@ class IndexTree(_Tree):
 
     table = False
 
-    def __init__(self, pager: Any, root: int, descending: list[bool] | None = None, real: list[int] | None = None) -> None:
+    def __init__(self, pager: Any, root: int, descending: list[bool] | None = None, real: list[int] | None = None,
+                 key_functions: list | None = None) -> None:
         super().__init__(pager, root)
         self.descending = [i for i, d in enumerate(descending or []) if d]
         self.real = real or []  # positions of REAL columns (stored as integers when whole)
+        # The columns' sort key functions, for NOCASE / RTRIM columns (see
+        # values.collation_sort_key); None: all BINARY.
+        self.key_functions = key_functions
 
     def key(self, cell: Cell) -> tuple:
         if cell.key is None:
@@ -535,7 +539,12 @@ class IndexTree(_Tree):
             for i in self.real:
                 if i < len(row) - 1 and type(row[i]) is int:
                     row[i] = float(row[i])
-            cell.key = tuple(values.sort_key(v) for v in row)
+            functions = self.key_functions
+            if functions is None:
+                cell.key = tuple(values.sort_key(v) for v in row)
+            else:
+                cell.key = tuple(functions[i](v) if i < len(functions) else values.sort_key(v)
+                                 for i, v in enumerate(row))
         return cell.key
 
     def order(self, key: tuple) -> tuple:
@@ -794,9 +803,9 @@ class SqliteIndex:
     such indexes for lookups; they are only kept up to date)."""
 
     def __init__(self, pager: Any, root: int, descending: list[bool] | None = None,
-                 affinities: list[str] | None = None) -> None:
+                 affinities: list[str] | None = None, key_functions: list | None = None) -> None:
         real = [i for i, a in enumerate(affinities or []) if a == values.REAL]
-        self.tree = IndexTree(pager, root, descending, real)
+        self.tree = IndexTree(pager, root, descending, real, key_functions)
         self.root = root
 
     def get(self, key: tuple, default: bytes | None = None) -> bytes | None:
