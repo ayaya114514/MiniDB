@@ -40,7 +40,7 @@ from minidb.locking import LockTimeout, _LockFile, fsync_directory
 from minidb.pager import PageCache
 from minidb.sqlite_format import (
     HEADER_SIZE, LOCK_PAGE, PAGE_SIZE, PENDING_BYTE, TABLE_LEAF, BtreePage, DbHeader, FreePage,
-    TrunkPage, corrupt,
+    OverflowPage, TrunkPage, corrupt,
 )
 
 PENDING, RESERVED, SHARED = 0, 1, 2  # lock numbers (see SPANS)
@@ -301,6 +301,43 @@ class SqlitePager(PageCache):
 
     def check_checksums(self) -> list[int]:
         return []  # SQLite's format has no page checksums
+
+    def check_pages(self, roots: list[int]) -> list[str]:
+        """Every page must belong to exactly one B-tree (rooted at one of
+        ``roots``), overflow chain or the freelist, as sqlite3's
+        integrity_check demands ("never used", "2nd reference")."""
+        from minidb.sqlite_btree import TableTree
+
+        owner = {}
+        problems = []
+
+        def claim(pgno: int, what: str) -> bool:
+            if pgno in owner:
+                problems.append(f"page {pgno}: used by {owner[pgno]} and by {what}")
+                return False
+            owner[pgno] = what
+            return True
+
+        for root in roots:
+            for page in TableTree(self, root)._pages():
+                claim(page.pgno, f"the tree at page {root}")
+                for cell in page.cells:
+                    pgno = cell.overflow
+                    while pgno and claim(pgno, f"an overflow chain of the tree at page {root}"):
+                        pgno = self.get(pgno, OverflowPage).next_page
+        pgno, count = self.header.freelist_trunk, 0
+        while pgno and claim(pgno, "the freelist"):
+            trunk = self.get(pgno, TrunkPage)
+            for leaf in trunk.leaves:
+                claim(leaf, "the freelist")
+            count += 1 + len(trunk.leaves)
+            pgno = trunk.next_trunk
+        if count != self.header.freelist_count:
+            problems.append(f"freelist: {count} pages, the header says {self.header.freelist_count}")
+        unused = [p for p in range(1, self.header.page_count + 1) if p not in owner and p != LOCK_PAGE]
+        if unused:
+            problems.append(f"pages never used: {unused[:10]}")
+        return problems
 
     def shrink_cache(self, limit: int = 10_000) -> None:
         super().shrink_cache(limit)

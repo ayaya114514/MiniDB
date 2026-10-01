@@ -241,12 +241,12 @@ def classify(exc: BaseException) -> str:
     return message[:100]
 
 
-def run_file(path: str, verbose: bool = False) -> Outcome:
+def run_file(path: str, verbose: bool = False, format: str | None = None) -> Outcome:
     outcome = Outcome(os.path.relpath(path, CORPUS) if path.startswith(CORPUS) else path)
     with open(path, encoding="utf-8", errors="replace") as f:
         records = parse(f.read())
     started = time.perf_counter()
-    db = Database(None)
+    db = Database(None, format=format)
     threshold = 0
     try:
         for record in records:
@@ -415,6 +415,7 @@ def main() -> None:
     parser.add_argument("--pin", metavar="CHECKIN", help="download CHECKIN and rewrite the manifest")
     parser.add_argument("-v", "--verbose", action="store_true", help="print every failure")
     parser.add_argument("--jobs", type=int, default=1, help="files to run in parallel")
+    parser.add_argument("--format", choices=["minidb", "sqlite"], help="MiniDB's file format (in memory)")
     parser.add_argument("--top", type=int, default=40, help="failure categories to list")
     parser.add_argument("--json", metavar="PATH", help="write the summary as JSON")
     parser.add_argument("--min-passed", type=int, default=0,
@@ -431,9 +432,9 @@ def main() -> None:
         sys.exit(f"no test files; run `python {sys.argv[0]} --fetch` first")
     if args.jobs > 1:
         with concurrent.futures.ProcessPoolExecutor(args.jobs) as pool:
-            outcomes = list(pool.map(run_file, files, [args.verbose] * len(files)))
+            outcomes = list(pool.map(run_file, files, [args.verbose] * len(files), [args.format] * len(files)))
     else:
-        outcomes = [run_file(path, args.verbose) for path in files]
+        outcomes = [run_file(path, args.verbose, args.format) for path in files]
     summary = report(outcomes, args.top)
     if args.json:
         with open(args.json, "w") as f:
