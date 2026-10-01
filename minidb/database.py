@@ -11,6 +11,8 @@ from minidb.errors import DatabaseError, OperationalError, ProgrammingError
 from minidb.executor import Executor, Result
 from minidb.locking import LockTimeout
 from minidb.pager import Pager
+from minidb.sqlite_format import MAGIC as SQLITE_MAGIC
+from minidb.sqlite_pager import SqlitePager
 from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, CreateView, Delete, DropIndex, DropTable,
     AlterTable, DropView, Insert, Reindex, Rollback, Update, Vacuum, parse_script,
@@ -29,6 +31,30 @@ WRITE_STATEMENTS = (
 )
 
 
+def file_format(path: str) -> str | None:
+    """The format of an existing database file: "sqlite", "minidb", or None
+    for a missing or empty file."""
+    try:
+        with open(path, "rb") as f:
+            start = f.read(16)
+    except FileNotFoundError:
+        return None
+    if not start:
+        return None
+    return "sqlite" if start == SQLITE_MAGIC else "minidb"
+
+
+def open_pager(path: str | None, timeout: float, format: str | None) -> Pager | SqlitePager:
+    if format not in (None, "minidb", "sqlite"):
+        raise ProgrammingError(f'unknown database format "{format}" (use "minidb" or "sqlite")')
+    found = file_format(path) if path is not None else None
+    if found is not None and format is not None and found != format:
+        raise OperationalError(f"{path} is a database in {found} format, not {format}")
+    if (found or format) == "sqlite":
+        return SqlitePager(path, timeout)
+    return Pager(path, timeout)
+
+
 class Database:
     """A MiniDB database stored in the file ``path`` (``None`` keeps it in memory).
 
@@ -43,9 +69,13 @@ class Database:
     text, so executing the same SQL again skips tokenizing and parsing.
     """
 
-    def __init__(self, path: str | None = None, timeout: float = 5.0) -> None:
-        """``timeout``: seconds to wait for a lock held by another connection."""
-        self.pager = Pager(path, timeout)  # starts inside a read transaction
+    def __init__(self, path: str | None = None, timeout: float = 5.0, format: str | None = None) -> None:
+        """``timeout``: seconds to wait for a lock held by another connection.
+
+        ``format``: "minidb" (the default for new databases) or "sqlite"
+        (SQLite's own file format, see ``minidb.sqlite_pager``).  An existing
+        file is opened in the format its header says."""
+        self.pager = open_pager(path, timeout, format)  # starts inside a read transaction
         try:
             if self.pager.is_new:
                 # Creating the file: become the writer first (RESERVED before the snapshot).
@@ -276,7 +306,7 @@ class Database:
 
     def close(self) -> None:
         """Close the database; an open transaction is rolled back."""
-        if self.broken or self.pager.file.closed:
+        if self.broken or self.pager.closed:
             return
         if self.in_transaction:
             self.in_transaction = False

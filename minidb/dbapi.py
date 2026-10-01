@@ -35,9 +35,10 @@ threadsafety = 1  # threads may share the module but not connections
 paramstyle = "qmark"  # "?"; ":name", "@name", "$name" and "?NNN" work too
 
 
-def connect(database: str | os.PathLike = ":memory:", autocommit: bool = False) -> Connection:
-    """Open a connection; ``database`` is a file path or ":memory:"."""
-    return Connection(database, autocommit)
+def connect(database: str | os.PathLike = ":memory:", autocommit: bool = False, format: str | None = None) -> Connection:
+    """Open a connection; ``database`` is a file path or ":memory:".
+    ``format``: see ``Database``."""
+    return Connection(database, autocommit, format)
 
 
 class Connection:
@@ -52,9 +53,9 @@ class Connection:
     ProgrammingError = ProgrammingError
     NotSupportedError = NotSupportedError
 
-    def __init__(self, database: str | os.PathLike = ":memory:", autocommit: bool = False) -> None:
+    def __init__(self, database: str | os.PathLike = ":memory:", autocommit: bool = False, format: str | None = None) -> None:
         path = None if database == ":memory:" else os.fspath(database)
-        self._db = Database(path)
+        self._db = Database(path, format=format)
         self.autocommit = autocommit
         if not autocommit:
             self._db.execute("BEGIN")

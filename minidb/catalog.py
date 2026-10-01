@@ -14,6 +14,16 @@ namespace.
 Every UNIQUE column and every PRIMARY KEY that is not an INTEGER PRIMARY KEY
 gets an automatic unique index named ``minidb_autoindex_<table>_<n>``.
 
+In a database in SQLite's format (``minidb.sqlite_pager``) the schema table
+is SQLite's ``sqlite_schema``: automatic indexes are named
+``sqlite_autoindex_<table>_<n>`` with no SQL (SQLite numbers them in the
+order the constraints appear, which for MiniDB's column constraints is
+column order), DESC index columns are kept, ``sqlite_`` names are reserved,
+and the schema cookie changes with every schema change.  Objects whose SQL
+MiniDB cannot parse (written by SQLite) are kept as they are: using them
+raises ``NotSupportedError``, and a table with such an index or trigger
+cannot be changed (MiniDB could not keep the index up to date).
+
 ``ANALYZE`` stores planner statistics as entries of type "stat" (named after
 the table or index, sql = the numbers as text): a table's row count, and for
 an index the average number of rows per distinct value of each prefix of its
@@ -22,11 +32,11 @@ columns (like SQLite's sqlite_stat1).
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 from minidb import values
 from minidb.btree import BTree
-from minidb.errors import DatabaseError, OperationalError
+from minidb.errors import DatabaseError, NotSupportedError, OperationalError
 from minidb.pager import Pager
 from minidb.parser import ColumnDef, CreateIndex, CreateTable, CreateView, Literal, Unary, parse
 from minidb.record import decode_record, encode_record, encoded_size
@@ -35,6 +45,11 @@ from minidb.values import SQLValue, ascii_lower
 SCHEMA_ROOT = 1
 RESERVED_PREFIX = "minidb_"
 AUTO_INDEX_PREFIX = "minidb_autoindex_"
+SQLITE_RESERVED_PREFIX = "sqlite_"
+SQLITE_AUTO_INDEX_PREFIX = "sqlite_autoindex_"
+# The schema table can be read (only) as sqlite_schema or sqlite_master, as in SQLite.
+SCHEMA_TABLE_NAMES = ("sqlite_schema", "sqlite_master")
+SCHEMA_TABLE_SQL = "CREATE TABLE sqlite_master (type text, name text, tbl_name text, rootpage int, sql text)"
 
 
 def quote(name: str) -> str:
@@ -96,6 +111,8 @@ class TableInfo:
             (i for i, c in enumerate(columns) if c.primary_key and c.type == "INTEGER"), None
         )  # only the type name INTEGER itself: "INT PRIMARY KEY" is an ordinary column
         self.affinities = [values.type_affinity(c.type) for c in columns]
+        self.read_only = None  # why the table cannot be changed (SQLite files), or None
+        self.is_schema = False  # sqlite_schema / sqlite_master
         # Values of columns missing from a record (added by ALTER TABLE ADD
         # COLUMN after the row was written): their constant defaults.
         self.padding = [values.apply_affinity(constant_default(c.default), a)
@@ -143,8 +160,13 @@ def is_constant_default(expr: object) -> bool:
 
 
 class IndexInfo:
-    def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int, schema_key: int | None = None) -> None:
+    def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int,
+                 schema_key: int | None = None, auto: bool = False, descending: list[bool] | None = None) -> None:
         self.name = name
+        self.auto = auto
+        # DESC columns (kept only in SQLite-format files): the index is then
+        # maintained in that order but not used for lookups or ordering.
+        self.descending = descending if descending and any(descending) else None
         self.table = table
         self.column_names = [table.columns[table.column_index(c)].name for c in column_names]
         self.positions = [table.column_index(c) for c in column_names]
@@ -156,13 +178,19 @@ class IndexInfo:
 
     @property
     def is_auto(self) -> bool:
-        return ascii_lower(self.name).startswith(AUTO_INDEX_PREFIX)
+        return self.auto
+
+    @property
+    def ordered(self) -> bool:
+        """Whether the index tree is in the order of the keys (no DESC)."""
+        return self.descending is None
 
     def key(self, row: Sequence[SQLValue], rowid: int) -> IndexKey:
         return index_key([row[p] for p in self.positions], rowid)
 
     def sql(self) -> str:
-        columns = ", ".join(quote(c) for c in self.column_names)
+        columns = ", ".join(quote(c) + (" DESC" if self.descending and self.descending[i] else "")
+                            for i, c in enumerate(self.column_names))
         unique = "UNIQUE " if self.unique else ""
         return f"CREATE {unique}INDEX {quote(self.name)} ON {quote(self.table.name)} ({columns})"
 
@@ -183,11 +211,20 @@ class Catalog:
         self.pager = pager
         self.version = 0  # bumped by every schema change; prepared plans check it
         self.temp_views = {}  # CREATE TEMP VIEW: this connection only, never stored
-        if pager.page_count == 1:
-            tree = BTree.create(pager)
-            if tree.root != SCHEMA_ROOT:
-                raise DatabaseError("could not create the schema table")
-        self.schema = BTree(pager, SCHEMA_ROOT)
+        self.sqlite = getattr(pager, "format", None) == "sqlite"
+        if self.sqlite:
+            from minidb.sqlite_btree import SqliteTable
+
+            self.reserved_prefixes, self.auto_prefix = (SQLITE_RESERVED_PREFIX,), SQLITE_AUTO_INDEX_PREFIX
+            self.schema = SqliteTable(pager, SCHEMA_ROOT, on_change=pager.note_schema_change)
+        else:
+            # (sqlite_ as well, as SQLite reserves it)
+            self.reserved_prefixes, self.auto_prefix = (RESERVED_PREFIX, SQLITE_RESERVED_PREFIX), AUTO_INDEX_PREFIX
+            if pager.page_count == 1:
+                tree = BTree.create(pager)
+                if tree.root != SCHEMA_ROOT:
+                    raise DatabaseError("could not create the schema table")
+            self.schema = BTree(pager, SCHEMA_ROOT)
         self.load()
 
     def load(self) -> None:
@@ -196,20 +233,48 @@ class Catalog:
         self.tables = {}
         self.indexes = {}
         self.views = {}
-        entries = [decode_record(value)[0] + [key] for key, value in self.schema.scan()]
+        self.unsupported = {}  # lowered name -> why (objects only SQLite understands)
+        entries = [decode_record(value)[0][:5] + [key] for key, value in self.schema.scan()]
         for kind, name, _table_name, root, sql, key in entries:
-            if kind == "table":
-                stmt = parse(sql)
-                self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key)
-            elif kind == "view":
-                self.views[ascii_lower(name)] = ViewInfo(parse(sql), key)
+            try:
+                if kind == "table":
+                    stmt = parse(sql)
+                    self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key)
+                elif kind == "view":
+                    self.views[ascii_lower(name)] = ViewInfo(parse(sql), key)
+            except Exception as exc:  # (only SQLite files can hold such SQL)
+                if not self.sqlite:
+                    raise
+                self.unsupported[ascii_lower(name)] = f"{kind} {name}: {exc}"
         for kind, name, table_name, root, sql, key in entries:
-            if kind == "index":
-                stmt = parse(sql)
-                table = self.tables[ascii_lower(table_name)]
-                index = IndexInfo(name, table, stmt.columns, stmt.unique, root, key)
-                self.indexes[ascii_lower(name)] = index
-                table.indexes.insert(0, index)
+            if kind not in ("index", "trigger"):
+                continue
+            table = self.tables.get(ascii_lower(table_name))
+            if table is None:
+                continue  # belongs to an unsupported table
+            try:
+                if kind == "trigger":
+                    raise NotSupportedError("triggers are not supported")
+                if sql is None:  # SQLite's automatic index for a UNIQUE / PRIMARY KEY
+                    number = int(name[len(self.auto_prefix) + len(table.name) + 1:])
+                    columns, unique, descending, auto = [table.auto_index_columns()[number - 1]], True, None, True
+                else:
+                    stmt = parse(sql)
+                    columns, unique, descending = stmt.columns, stmt.unique, stmt.descending
+                    auto = ascii_lower(name).startswith(self.auto_prefix)  # (MiniDB's files store their SQL)
+                    if not self.sqlite:
+                        descending = None
+                index = IndexInfo(name, table, columns, unique, root, key, auto, descending)
+            except Exception as exc:
+                if not self.sqlite:
+                    raise
+                table.read_only = f"{kind} {name} is not supported ({exc})"
+                self.unsupported[ascii_lower(name)] = f"{kind} {name}: {exc}"
+                continue
+            self.indexes[ascii_lower(name)] = index
+            table.indexes.insert(0, index)
+        if self.sqlite:
+            self._load_sqlite_stats()
         for kind, name, _table_name, _root, sql, key in entries:
             if kind == "stat":
                 numbers = [float(n) for n in sql.split()]
@@ -224,7 +289,14 @@ class Catalog:
 
     def get_table(self, name: str) -> TableInfo:
         table = self.tables.get(ascii_lower(name))
+        if table is None and ascii_lower(name) in SCHEMA_TABLE_NAMES:
+            table = TableInfo(ascii_lower(name), parse(SCHEMA_TABLE_SQL).columns, SCHEMA_ROOT)
+            table.is_schema = True
+            table.read_only = "table sqlite_master may not be modified"
         if table is None:
+            reason = self.unsupported.get(ascii_lower(name))
+            if reason is not None:
+                raise NotSupportedError(f"MiniDB cannot use {reason}")
             raise OperationalError(f"no such table: {name}")
         return table
 
@@ -241,7 +313,15 @@ class Catalog:
         """The table an INSERT, UPDATE or DELETE changes (not a view)."""
         if self.find_view(name) is not None:
             raise OperationalError(f"cannot modify {name} because it is a view")
-        return self.get_table(name)
+        table = self.get_table(name)
+        self.check_writable(table)
+        return table
+
+    def check_writable(self, table: TableInfo, verb: str = "modified") -> None:
+        if table.is_schema:
+            raise OperationalError(f"table sqlite_master may not be {verb}")
+        if table.read_only is not None:
+            raise NotSupportedError(f"MiniDB cannot change table {table.name}: {table.read_only}")
 
     def check_index_hint(self, table: TableInfo, index_name: str | None) -> None:
         """INDEXED BY must name an index of the table."""
@@ -251,10 +331,29 @@ class Catalog:
                 raise OperationalError(f"no such index: {index_name}")
 
     def table_tree(self, table: TableInfo) -> BTree:
+        if table.is_schema and not self.sqlite:
+            return _SchemaRows(self)
+        if self.sqlite:
+            from minidb.sqlite_btree import SqliteTable
+
+            return SqliteTable(self.pager, table.root, table.affinities)
         return BTree(self.pager, table.root)
 
     def index_tree(self, index: IndexInfo) -> BTree:
+        if self.sqlite:
+            from minidb.sqlite_btree import SqliteIndex
+
+            return SqliteIndex(self.pager, index.root, index.descending,
+                               [index.table.affinities[p] for p in index.positions])
         return BTree(self.pager, index.root, IndexKeyCodec)
+
+    def _new_tree(self, index: bool) -> int:
+        """Create an empty table (or index) tree; returns its root page."""
+        if self.sqlite:
+            from minidb.sqlite_btree import IndexTree, TableTree
+
+            return (IndexTree if index else TableTree).create(self.pager)
+        return BTree.create(self.pager, IndexKeyCodec).root if index else BTree.create(self.pager).root
 
     # ---- changes ------------------------------------------------------------
 
@@ -265,7 +364,7 @@ class Catalog:
 
     def _check_new_name(self, name: str) -> None:
         lowered = ascii_lower(name)
-        if lowered.startswith(RESERVED_PREFIX):
+        if lowered.startswith(self.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {name}")
         if lowered in self.indexes:
             raise OperationalError(f"there is already an index named {name}")
@@ -274,6 +373,8 @@ class Catalog:
         """Whether a table or view called ``name`` exists (an error unless
         IF NOT EXISTS was given)."""
         lowered = ascii_lower(name)
+        if lowered in self.unsupported:
+            raise OperationalError(f"table {name} already exists")
         if lowered not in self.tables and lowered not in self.views:
             return False
         if if_not_exists:
@@ -293,13 +394,13 @@ class Catalog:
         if sum(column.primary_key for column in stmt.columns) > 1:
             raise OperationalError(f'table "{stmt.name}" has more than one primary key')
         self.version += 1
-        root = BTree.create(self.pager).root
+        root = self._new_tree(index=False)
         table = TableInfo(stmt.name, stmt.columns, root)
         table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql())
         self.tables[ascii_lower(stmt.name)] = table
         for n, column in enumerate(table.auto_index_columns(), 1):
-            name = f"{AUTO_INDEX_PREFIX}{table.name}_{n}"
-            self._create_index(name, table, [column], unique=True)
+            name = f"{self.auto_prefix}{table.name}_{n}"
+            self._create_index(name, table, [column], unique=True, auto=True)
         return table
 
     def create_view(self, stmt: CreateView) -> None:
@@ -340,14 +441,19 @@ class Catalog:
     def drop_table(self, name: str, if_exists: bool = False) -> None:
         if self.find_view(name) is not None:
             raise OperationalError(f"use DROP VIEW to delete view {name}")
+        if ascii_lower(name) in SCHEMA_TABLE_NAMES and not self.has_table(name):
+            raise OperationalError("table sqlite_master may not be dropped")
         if not self.has_table(name):
             if if_exists:
                 return
             raise OperationalError(f"no such table: {name}")
         self.version += 1
         table = self.tables[ascii_lower(name)]
+        self.check_writable(table, "dropped")
         for index in list(table.indexes):
             self._drop_index(index)
+        if self.sqlite:
+            self._delete_sqlite_stats(table.name)
         if table.stat_key is not None:
             self.schema.delete(table.stat_key)
         del self.tables[ascii_lower(name)]
@@ -363,9 +469,11 @@ class Catalog:
             raise OperationalError(f"index {stmt.name} already exists")
         if lowered in self.tables or lowered in self.views:
             raise OperationalError(f"there is already a table named {stmt.name}")
-        if lowered.startswith(RESERVED_PREFIX):
+        if lowered.startswith(self.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {stmt.name}")
         table = self.tables.get(ascii_lower(stmt.table))
+        if table is None and ascii_lower(stmt.table) in SCHEMA_TABLE_NAMES:
+            raise OperationalError("table sqlite_master may not be indexed")
         if table is None:
             if ascii_lower(stmt.table) in self.views:
                 raise OperationalError("views may not be indexed")
@@ -373,13 +481,16 @@ class Catalog:
         for column in stmt.columns:
             if table.column_index(column) is None:
                 raise OperationalError(f"no such column: {column}")
-        return self._create_index(stmt.name, table, stmt.columns, stmt.unique)
+        self.check_writable(table, "indexed")
+        descending = stmt.descending if self.sqlite else None
+        return self._create_index(stmt.name, table, stmt.columns, stmt.unique, descending=descending)
 
-    def _create_index(self, name: str, table: TableInfo, columns: list[str], unique: bool) -> IndexInfo:
+    def _create_index(self, name: str, table: TableInfo, columns: list[str], unique: bool, auto: bool = False,
+                      descending: list[bool] | None = None) -> IndexInfo:
         self.version += 1
-        root = BTree.create(self.pager, IndexKeyCodec).root
-        index = IndexInfo(name, table, columns, unique, root)
-        index.schema_key = self._add_entry("index", name, table.name, root, index.sql())
+        root = self._new_tree(index=True)
+        index = IndexInfo(name, table, columns, unique, root, None, auto, descending)
+        index.schema_key = self._add_entry("index", name, table.name, root, self.index_sql(index))
         self.indexes[ascii_lower(name)] = index
         table.indexes.insert(0, index)
         return index
@@ -398,6 +509,8 @@ class Catalog:
 
     def _drop_index(self, index: IndexInfo) -> None:
         self.version += 1
+        if self.sqlite:
+            self._delete_sqlite_stats(index.table.name, index.name)
         self.index_tree(index).destroy()
         self.schema.delete(index.schema_key)
         if index.stat_key is not None:
@@ -415,7 +528,7 @@ class Catalog:
             ["table", table.name, table.name, table.root, table.sql()]), replace=True)
         for index in table.indexes:
             self.schema.insert(index.schema_key, encode_record(
-                ["index", index.name, table.name, index.root, index.sql()]), replace=True)
+                ["index", index.name, table.name, index.root, self.index_sql(index)]), replace=True)
             if index.stat_key is not None:
                 text = " ".join(f"{n:g}" if isinstance(n, float) else str(n)
                                 for n in [table.stat_rows or 0] + index.stat_average)
@@ -432,10 +545,18 @@ class Catalog:
             return
         self.schema.insert(view.schema_key, encode_record(["view", view.name, view.name, 0, sql]), replace=True)
 
+    def index_sql(self, index: IndexInfo) -> str | None:
+        """What the schema table stores for an index: SQLite stores no SQL
+        for automatic indexes."""
+        return None if self.sqlite and index.auto else index.sql()
+
     # ---- statistics ---------------------------------------------------------
 
     def analyze(self, name: str | None = None) -> None:
         """Gather statistics for one table (or the table of an index) or all."""
+        if self.sqlite:
+            self._analyze_sqlite(name)
+            return
         if name is None:
             tables = list(self.tables.values())
         elif ascii_lower(name) in self.tables:
@@ -462,9 +583,139 @@ class Catalog:
                 self._set_stat(index, index.name, [rows] + average)
                 index.stat_average = average
 
+    # ---- statistics in SQLite's format: the table sqlite_stat1(tbl, idx, stat) ----
+
+    def _load_sqlite_stats(self) -> None:
+        stat = self.tables.get("sqlite_stat1")
+        if stat is None:
+            return
+        for _, value in self.table_tree(stat).scan():
+            row = decode_record(value)[0] + [None, None, None]
+            table, index_name, text = self.tables.get(ascii_lower(str(row[0]))), row[1], row[2]
+            numbers = []
+            for word in str(text).split():
+                try:
+                    numbers.append(float(word))
+                except ValueError:
+                    break  # SQLite allows words like "unordered" after the numbers
+            if table is None or not numbers:
+                continue
+            table.stat_rows = int(numbers[0])
+            index = self.indexes.get(ascii_lower(str(index_name))) if index_name is not None else None
+            if index is not None and index.table is table:
+                index.stat_average = numbers[1:]
+
+    def _stat_tree(self, create: bool) -> BTree | None:
+        """sqlite_stat1's tree (created as SQLite creates it, if asked)."""
+        stat = self.tables.get("sqlite_stat1")
+        if stat is None:
+            if not create:
+                return None
+            sql = "CREATE TABLE sqlite_stat1(tbl,idx,stat)"
+            root = self._new_tree(index=False)
+            stat = TableInfo("sqlite_stat1", parse(sql).columns, root)
+            stat.schema_key = self._add_entry("table", stat.name, stat.name, root, sql)
+            self.tables["sqlite_stat1"] = stat
+        return self.table_tree(stat)
+
+    def _delete_sqlite_stats(self, table: str, index: str | None = None) -> None:
+        """Remove the statistics of a table (or of one of its indexes)."""
+        tree = self._stat_tree(create=False)
+        if tree is None:
+            return
+        for rowid, value in list(tree.scan()):
+            row = decode_record(value)[0] + [None, None]
+            if ascii_lower(str(row[0])) == ascii_lower(table) and (
+                    index is None or (row[1] is not None and ascii_lower(str(row[1])) == ascii_lower(index))):
+                tree.delete(rowid)
+
+    def _analyze_sqlite(self, name: str | None) -> None:
+        """ANALYZE as SQLite does it: per index "rows avg1 avg2 ..." where
+        avgN is the rows per distinct value of the first N columns, rounded
+        up; "rows" for a table without indexes; nothing for an empty table."""
+        if name is None:
+            # (in the order SQLite's schema hash yields them: newest first,
+            # while there are fewer than 10 tables; only the row order of
+            # sqlite_stat1 depends on it)
+            targets = [(t, None) for t in reversed(self.tables.values())
+                       if not ascii_lower(t.name).startswith(SQLITE_RESERVED_PREFIX)]
+        elif ascii_lower(name) in self.tables:
+            targets = [(self.tables[ascii_lower(name)], None)]
+        elif ascii_lower(name) in self.indexes:
+            index = self.indexes[ascii_lower(name)]
+            targets = [(index.table, index)]
+        else:
+            raise OperationalError(f"no such table or index: {name}")
+        self.version += 1
+        for table, index in targets:
+            self._delete_sqlite_stats(table.name, index.name if index is not None else None)
+        tree = self._stat_tree(create=True)
+
+        def add(table_name: str, index_name: str | None, numbers: list[int]) -> None:
+            text = " ".join(str(n) for n in numbers)
+            tree.insert((tree.last_key() or 0) + 1, encode_record([table_name, index_name, text]))
+
+        for table, only in targets:
+            rows = len(self.table_tree(table))
+            table.stat_rows = rows
+            if rows == 0:
+                continue
+            if not table.indexes:
+                add(table.name, None, [rows])
+            for index in table.indexes if only is None else [only]:
+                distinct, previous = [0] * len(index.positions), None
+                for key in self.index_tree(index).keys():
+                    key = key[:-1]  # without the row id
+                    for depth in range(len(key)):
+                        if previous is None or previous[:depth + 1] != key[:depth + 1]:
+                            distinct[depth] += 1
+                    previous = key
+                averages = [(rows + d - 1) // d if d else rows for d in distinct]
+                add(table.name, index.name, [rows] + averages)
+                index.stat_average = [float(a) for a in averages]
+
     def _set_stat(self, owner: TableInfo | IndexInfo, name: str, numbers: list[int | float]) -> None:
         if owner.stat_key is not None:
             self.schema.delete(owner.stat_key)
         text = " ".join(f"{n:g}" if isinstance(n, float) else str(n) for n in numbers)
         table_name = owner.name if isinstance(owner, TableInfo) else owner.table.name
         owner.stat_key = self._add_entry("stat", name, table_name, 0, text)
+
+
+class _SchemaRows:
+    """sqlite_schema in MiniDB's own format: the schema table without the
+    statistics rows, with no SQL for automatic indexes (as SQLite shows them).
+    Read only."""
+
+    def __init__(self, catalog: Catalog) -> None:
+        self.catalog = catalog
+
+    def scan(self, start: int | None = None, end: int | None = None, start_inclusive: bool = True,
+             end_inclusive: bool = True) -> Iterator[tuple[int, bytes]]:
+        for key, value in self.catalog.schema.scan(start, end, start_inclusive, end_inclusive):
+            row = decode_record(value)[0]
+            if row[0] == "stat":
+                continue
+            if row[0] == "index" and ascii_lower(row[1]) in self.catalog.indexes \
+                    and self.catalog.indexes[ascii_lower(row[1])].is_auto:
+                row[4] = None
+            yield key, encode_record(row)
+
+    def get(self, key: int, default: bytes | None = None) -> bytes | None:
+        return next((value for k, value in self.scan(key, key)), default)
+
+    def __contains__(self, key: int) -> bool:
+        return self.get(key) is not None
+
+    def keys(self) -> list:
+        return [key for key, _ in self.scan()]
+
+    def __len__(self) -> int:
+        return len(self.keys())
+
+    def last_key(self) -> int | None:
+        keys = self.keys()
+        return keys[-1] if keys else None
+
+    def estimated_count(self) -> int:
+        return max(1, len(self))

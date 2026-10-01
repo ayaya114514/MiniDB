@@ -720,3 +720,44 @@ fuzzer 加入 TRUE / FALSE 字面量后发现的一组与 SQLite 解析/解析�
   （绝对定位布局：叶子等距排开，父节点居中于子节点之上，SVG 画父子连线和叶子兄弟链，初始滚动让根节点可见）。
 - `tests/test_playground.py` 在本机 Python 上跑 `bridge.py` 和 `app.js` 里的每个示例，避免 MiniDB 的改动悄悄弄坏 Playground。
 - 部署：`.github/workflows/pages.yml`（configure-pages / upload-pages-artifact / deploy-pages）。
+
+## D100 SQLite 文件格式：原生读写，而不是导入导出
+目标是 MiniDB 和 sqlite3 能用同一个文件——先后使用，甚至同时使用。没有走“打开时整个导入、关闭时整个导出”的
+捷径，而是给 SQLite 格式写了原生的存储层，与 MiniDB 自己的格式并列，按文件头自动选择：
+- `minidb/sqlite_format.py`：纯字节布局——varint、record（serial type；与 SQLite 写出的字节逐字节相同，有测试）、
+  100 字节文件头、B-tree 页（页头、cell 指针数组、cell 从页尾往前排）、按 SQLite 公式决定 cell 内本地 payload 多少、
+  其余进 overflow 页链、freelist 的 trunk / leaf 页。
+- `minidb/sqlite_btree.py`：表是按 rowid 的 B+ 树，索引是**真正的 B 树**（内部 cell 本身就是条目，与 MiniDB 自己的
+  B+ 树不同，所以不能逐页翻译）。平衡照 SQLite 的 balance_nonroot：过满或过空的页与最多两个兄弟（加上父页里夹在
+  它们之间的分隔 cell）一起按需要的页数重新均分，再向上修父页；根页号不变（溢出时内容下移到新子页，只剩一个子页
+  且放得下时上移）；末尾追加时照 balance_quick 只开新页，顺序插入的页因此是满的。`build()` 自底向上建树（CREATE INDEX、
+  VACUUM），按磁盘顺序复制 cell，不需要比较 key，所以连 MiniDB 解析不了的索引也能原样复制。`SqliteTable` /
+  `SqliteIndex` 提供与 `minidb.btree.BTree` 相同的接口，在边界上把 MiniDB record 与 SQLite record 互转（SQLite 把
+  整数值的 REAL 存成整数，读回时按列亲和性转回 REAL），catalog 和执行器因此几乎不用改。
+- `minidb/sqlite_pager.py`：与 `Pager` 相同的接口，但用 SQLite 的 **rollback journal** 和 **SQLite 的锁**，而不是
+  MiniDB 的 WAL：提交时先把要改的页的原内容写进 `<db>-journal`（SQLite 的头：magic、记录数、校验和种子、原页数、
+  扇区大小、页大小；记录：页号、页、每 200 字节取一个字节的校验和），fsync，再写数据库文件、fsync，最后删日志。
+  崩溃留下的“热日志”由下一个打开者回放——MiniDB 或 sqlite3 都行（多段日志、按校验和截止也照 pager.c）。锁照
+  unix VFS：SHARED 是对 510 字节区间的读锁（先读锁 PENDING 字节，让等待中的写者挡住新读者），RESERVED、PENDING、
+  EXCLUSIVE 是写锁；这些锁用 D93 的进程内登记表（按 inode 只开一次文件），数据库文件的读写也走那个共享描述符——
+  关闭任何一个描述符都会丢掉进程的所有记录锁。于是 MiniDB 与另一个进程里的 sqlite3 可以安全地同时打开同一个文件
+  （同一进程里的 sqlite3 模块则不行：记录锁属于进程）。
+- 选择：`Database(path, format="sqlite")`、`minidb.connect(..., format=)`、`python -m minidb --sqlite`；已有文件看文件头。
+- catalog：schema 表就是 `sqlite_schema`；自动索引叫 `sqlite_autoindex_<表>_<n>`、sql 为 NULL（SQLite 按约束出现
+  顺序编号，MiniDB 只有列约束，即列顺序）；`sqlite_` 名字保留；schema 变化时增加 schema cookie。DESC 索引列按降序
+  保存（MiniDB 自己的格式仍全部升序），这样的索引会被维护，但规划器不用它查找（磁盘顺序不是 MiniDB key 的顺序）。
+  ANALYZE 写 `sqlite_stat1`（与 SQLite 相同的行与数字，见测试），规划器读它；VACUUM / VACUUM INTO 也照 SQLite。
+- SQLite 写下而 MiniDB 解析不了的对象（CHECK、触发器、表达式索引、WITHOUT ROWID……）原样保留：用到它们报
+  `NotSupportedError`；有这种索引或触发器的表只读（MiniDB 没法维护它们）；VACUUM 照样复制。
+- 拒绝打开：页大小不是 4096、WAL 模式、UTF-16、auto_vacuum（报错里说明怎样用 sqlite3 转换）。大事务的脏页全在内存
+  （没有 MiniDB 格式那样的溢出）。
+
+验证：sqlite3 写的文件 MiniDB 读、MiniDB 写的文件 sqlite3 读并 `PRAGMA integrity_check`；两边轮流写同一个文件；
+在提交的每一步让 MiniDB 崩溃，分别由 sqlite3 和 MiniDB 恢复；让真实的 sqlite3 进程在事务中途死掉（cache_size=2 迫使
+脏页先写进文件），MiniDB 回放它的热日志；锁的双向互斥（另一个进程里的 sqlite3）；fuzzer 的 `--sqlite-format` 模式在
+每个种子结束时让 sqlite3 打开 MiniDB 的文件做完整性检查并逐表比较内容。
+
+## D101 sqlite_schema / sqlite_master
+两种格式都可以读 `sqlite_schema` 和 `sqlite_master`（只读；改、删、建索引、ALTER 的报错与 SQLite 逐字相同）。
+SQLite 格式里它就是第 1 页的表；MiniDB 格式里是 schema 表去掉统计行、自动索引的 sql 显示为 NULL，但自动索引的名字是
+`minidb_autoindex_...`，表的 sql 是 MiniDB 规范化重写过的，rootpage 也是 MiniDB 的页号。MiniDB 格式也保留 `sqlite_` 前缀。
