@@ -150,7 +150,7 @@ def test_threads_reading_and_writing(path):
         db.execute("CREATE TABLE account (id INTEGER PRIMARY KEY, balance INTEGER)")
         db.execute("INSERT INTO account VALUES (0, 1000), (1, 1000), (2, 1000)")
     stop = threading.Event()
-    errors, reads, longest = [], [0], [0]
+    errors, reads, generations = [], [0], set()
 
     def read():
         db = Database(path, timeout=30)
@@ -179,7 +179,7 @@ def test_threads_reading_and_writing(path):
         db.execute("UPDATE account SET balance = balance + 7 WHERE id = ?", ((i + 1) % 3,))
         db.execute("INSERT INTO t (v) VALUES (?)", ("y" * 200,))
         db.execute("COMMIT")
-        longest[0] = max(longest[0], wal_frames(path))
+        generations.add(db.pager.wal_generation)
     stop.set()
     for thread in threads:
         thread.join()
@@ -189,7 +189,10 @@ def test_threads_reading_and_writing(path):
     assert count(db) == 401
     assert db.integrity_check() == []
     db.close()
-    assert longest[0] < 700  # without restarts: about 1400 frames
+    # The log was restarted while readers kept reading.  (How short it stays
+    # depends on thread scheduling: with the GIL on a slow machine a reader
+    # may outlast the writer's wait; test_processes_... checks the bound.)
+    assert len(generations - {None}) > 1
 
 
 READER = """
