@@ -64,11 +64,14 @@ def test_presorted_range_and_multi_index_plans():
         "INSERT INTO t VALUES " + ", ".join(f"({i}, {i % 9}, 'b{i % 4}')" for i in range(1, 300)),
     ])
     db = pair.mini
-    for sql in ["SELECT * FROM t WHERE id > 250 ORDER BY id LIMIT 5",
-                "SELECT * FROM t WHERE a = 1 OR a = 2 ORDER BY id LIMIT 7",
-                "SELECT * FROM t WHERE a IN (3, 4) ORDER BY id LIMIT 7 OFFSET 2"]:
+    # (As SQLite: IN walks the index in order, so ORDER BY id needs a sort.)
+    for sql, presorted in [("SELECT * FROM t WHERE id > 250 ORDER BY id LIMIT 5", True),
+                           ("SELECT * FROM t WHERE a = 3 ORDER BY id LIMIT 7", True),
+                           ("SELECT * FROM t WHERE a IN (3, 4) ORDER BY a LIMIT 7 OFFSET 2", True),
+                           ("SELECT * FROM t WHERE a = 1 OR a = 2 ORDER BY id LIMIT 7", False),
+                           ("SELECT * FROM t WHERE a IN (3, 4) ORDER BY id LIMIT 7 OFFSET 2", False)]:
         pair.run(sql)
-        assert db.executor.prepare(db.parse(sql)[0]).compiled.presorted
+        assert db.executor.prepare(db.parse(sql)[0]).compiled.presorted == presorted, sql
     pair.close()
 
 

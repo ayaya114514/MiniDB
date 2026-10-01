@@ -42,7 +42,7 @@ def db():
         ("c = 3", "SCAN"),
         ("a + 0 = 5", "SCAN"),
         ("a != 5", "SCAN"),
-        ("a = 5 OR a = 6", "MULTI-INDEX OR (SEARCH USING INDEX t_a (a=?); SEARCH USING INDEX t_a (a=?))"),
+        ("a = 5 OR a = 6", "MULTI-INDEX IN (SEARCH USING INDEX t_a (a=?); SEARCH USING INDEX t_a (a=?))"),  # as SQLite: a IN (5, 6)
         ("b = 5", "SEARCH USING INDEX t_bc (b=?)"),
     ],
 )
