@@ -182,6 +182,9 @@ def test_each_and_tree(pair):
         "SELECT key, value, type, atom, id, parent, json FROM jsonb_tree('[1,[2,{\"c\":[]}]]')",
         "SELECT json(value), value -> '$[0]', json_array(value) FROM jsonb_each('[[1],{\"a\":2}]')",
         "SELECT * FROM jsonb_tree(jsonb('{\"a\":[1]}'), '$.a')",
+        # a subquery in the arguments that uses its own json_each() is not a reference to this one
+        "SELECT t.id, e.value FROM t, json_each(json_array(t.id, (SELECT group_concat(key) FROM json_each('[5,6]')))) e",
+        "SELECT t.id, e.key FROM t, json_tree(json_object('k', (SELECT max(value) FROM json_each(t.j)))) e",
     ])
 
 
@@ -200,6 +203,27 @@ def test_subtype_through_queries(pair):
         "SELECT x, json_array(x) FROM c",
         "SELECT json_array(x) FROM (SELECT json('[1]') x UNION ALL SELECT json('[2]'))",
         "SELECT json_array(CAST(json('[1]') AS TEXT)), json_array(json('[1]') COLLATE nocase), json_array(+json('[1]'))",
+        # JSONB with the subtype (jsonb_array, jsonb_object, jsonb_group_object, jsonb_each's containers):
+        # CAST to TEXT keeps it
+        "SELECT hex(json_array(CAST(jsonb_array(1) AS TEXT))), hex(json_array(CAST(jsonb_object('a', 1) AS TEXT)))",
+        "SELECT json_array(CAST(jsonb('[1]') AS TEXT)), json_array(CAST(jsonb_extract('[[1]]', '$[0]') AS TEXT))",
+        "SELECT hex(json_array(CAST((SELECT jsonb_group_object('a', 1)) AS TEXT))), "
+        "json_array(CAST((SELECT jsonb_group_array(1)) AS TEXT))",
+        "SELECT hex(json_array(CAST(value AS TEXT))), json_array(CAST(atom AS TEXT)) FROM jsonb_tree('{\"a\":[1],\"b\":2}')",
+        "SELECT hex(json_array(CAST(x AS TEXT))) FROM (SELECT value x FROM jsonb_each('[[1]]'))",
+        "SELECT hex(json_array(CAST(x AS TEXT))) FROM (SELECT jsonb_array(1) x)",
+        "SELECT hex(json_array(CAST(iif(1, jsonb_array(1), 0) AS TEXT))), jsonb_array(1) < x'00', jsonb_array(1) > 5",
+        "CREATE TABLE jb (b)", "INSERT INTO jb SELECT jsonb_array(1)", "SELECT json_array(CAST(b AS TEXT)) FROM jb",
+        # only a bare column of a subquery SQLite flattens keeps the subtype
+        "SELECT json_array(x), json_array(y) FROM (SELECT json('[1]') x, value y FROM json_each('[[2]]'))",
+        "SELECT json_array(x) FROM (SELECT coalesce(value, 1) x FROM json_each('[[1]]'))",
+        "SELECT json_array(x) FROM (SELECT +value x FROM json_each('[[1]]'))",
+        "SELECT json_array(x) FROM (SELECT value x, 0 y FROM json_each('[[1]]') LIMIT 5) WHERE y = 0",
+        "SELECT json_array(x) FROM (SELECT max(value) x FROM json_each('[[1]]'))",
+        "SELECT json_array(x) FROM (SELECT DISTINCT value x FROM json_each('[[1]]'))",
+        "SELECT json_array(value) FROM (SELECT * FROM json_each('[[2]]'))",
+        "SELECT json_array(x) FROM (SELECT x FROM (SELECT value x FROM json_each('[[2]]')))",
+        "WITH c AS (SELECT value v, json('[1]') w FROM json_each('[[3]]')) SELECT json_array(v), json_array(w) FROM c",
         "SELECT json_array(coalesce(json('[1]'), 1)), json_array(iif(1, json('[1]'), 2)), json_array(CASE WHEN 1 THEN json('[1]') END)",
         "SELECT json_array(max(json('[1]'))), json_array(min(json('[1]'), json('[2]'))), json_array(nullif(json('[1]'), 2))",
         "SELECT json_array(upper(json('[1]'))), json_array(json('[1]') || ''), json_array(trim(json('[1]')))",
@@ -217,3 +241,38 @@ def test_parser_round_trip():
         assert jsonb.to_text(blob) == text
         assert jsonb.parse_text(jsonb.to_text(blob))[0] == blob
         assert jsonb.validity_check(blob, 0, len(blob)) == 0
+
+
+def test_parse_cache(pair):
+    """SQLite's per-statement JSON parse cache: the text an edit function
+    returns comes back from the cache with the JSONB it was rendered from,
+    so jsonb() and json_valid() of equal text can differ (ParseCache)."""
+    run(pair, [
+        'SELECT json_valid(json_set(\'{a:0x10}\',\'$.b\',1)), json_valid(\'{"a":16,"b":1}\')',
+        'SELECT json_valid(json_set(\'{a:0x10}\',\'$.b\',1)), json_valid(json_set(\'{"a":16}\',\'$.b\',1))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), json_valid(\'{"a":16,"b":1}\')',
+        'SELECT json_valid(\'{"a":16,"b":1}\'), json_set(\'{a:0x10}\',\'$.b\',1)',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), hex(jsonb(\'{"a":16,"b":1}\')), json_valid(\'{"a":16,"b":1}\', 1), json_valid(\'{"a":16,"b":1}\', 2)',
+        'SELECT json_remove(jsonb(\'{a:0x10, b:2}\'), \'$.b\'), hex(jsonb(\'{"a":16}\'))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), hex(jsonb(\'{"a":16,"b":1}\')), hex(jsonb(\'[1]\')), hex(jsonb(\'[2]\')), hex(jsonb(\'[3]\')), hex(jsonb(\'[4]\')), hex(jsonb(\'{"a":16,"b":1}\'))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), hex(jsonb(\'{"a":16,"b":1}\')), hex(jsonb(\'[1]\')), hex(jsonb(\'[2]\')), hex(jsonb(\'[3]\')), hex(jsonb(\'{"a":16,"b":1}\'))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), hex(jsonb(\'[1]\')), hex(jsonb(\'[2]\')), hex(jsonb(\'[3]\')), hex(jsonb(\'{"a":16,"b":1}\'))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), hex(jsonb(\'[1]\')), hex(jsonb(\'[2]\')), hex(jsonb(\'[3]\')), hex(jsonb(\'[4]\')), hex(jsonb(\'{"a":16,"b":1}\'))',
+        "SELECT hex(jsonb(x)) FROM (SELECT json_set('{a:0x10}','$.b',1) x)",
+        "SELECT hex(jsonb(json_set('{a:0x10}','$.b',1))) FROM (SELECT 1 UNION ALL SELECT 2)",
+        'SELECT hex(jsonb_set(\'{"a":16,"b":1}\', \'$.c\', 1)), json_set(\'{a:0x10}\',\'$.b\',1)',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), hex(jsonb_set(\'{"a":16,"b":1}\', \'$.c\', 1))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), json_error_position(\'{"a":16,"b":1}\'), hex(jsonb_extract(\'{"a":16,"b":1}\', \'$.a\'))',
+        'CREATE TABLE t(x)',
+        'INSERT INTO t VALUES (1), (2)',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',x), hex(jsonb(\'{"a":16,"b":1}\')) FROM t',
+        'SELECT hex(jsonb(\'{"a":16,"b":1}\')), json_set(\'{a:0x10}\',\'$.b\',x) FROM t',
+        'SELECT hex(jsonb(json_patch(\'{}\', \'{a:1,b:0x10,"c":[.5,],}\')))',
+        'SELECT hex(jsonb(json_replace(\'{a:1,b:0x10,"c":[.5,],}\', \'$.a.b\', 0)))',
+        'SELECT json_patch(\'{}\', \'{a:0x10}\'), json_valid(\'{"a":16}\'), hex(jsonb(\'{"a":16}\'))',
+        "SELECT json_remove('[0x1, 2]', '$[1]'), hex(jsonb('[1]')), json_remove('[0x2]'), hex(jsonb('[2]'))",
+        "SELECT key, value FROM json_each(json_set('{a:0x10}','$.b',1))",
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1), (SELECT hex(jsonb(\'{"a":16,"b":1}\')))',
+        'SELECT json_set(\'{a:0x10}\',\'$.b\',1) FROM t WHERE hex(jsonb(\'{"a":16,"b":1}\')) LIKE \'BC%\'',
+        'SELECT hex(jsonb(\'{"a":16,"b":1}\')) FROM t WHERE json_set(\'{a:0x10}\',\'$.b\',1) IS NOT NULL',
+    ])

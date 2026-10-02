@@ -21,7 +21,7 @@ from minidb.parser import (
     AlterTable, CreateTrigger, Cte, DropTrigger, DropView, Insert, Pragma, Reindex, Rollback, TableFunction, TableRef, Update, Vacuum,
     parse_script,
 )
-from minidb import pragmas
+from minidb import jsonfuncs, pragmas
 from minidb.values import INT_MAX, INT_MIN, SQLValue, ascii_lower
 
 # Values for ?-parameters: by position, or by name.
@@ -197,6 +197,7 @@ class Database:
         pager.begin_statement()
         saved = keys.deferred, keys.deferred_immediate
         keys.extra_changes = 0
+        jsonfuncs.CACHE.clear()  # (SQLite's JSON cache lives as long as one statement's execution)
         try:
             result = self.executor.execute(stmt, parameters)
         except BaseException as exc:

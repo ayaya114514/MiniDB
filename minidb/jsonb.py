@@ -41,6 +41,15 @@ class JSONText(str):
     __slots__ = ()
 
 
+class JSONBlob(bytes):
+    """JSONB with the JSON subtype: what jsonb_array(), jsonb_object(),
+    jsonb_group_object() and a container's value in jsonb_each() return
+    (SQLite's other jsonb functions return a plain BLOB).  CAST to TEXT
+    keeps the mark (JSONText); the subtype is lost where JSONText's is."""
+
+    __slots__ = ()
+
+
 class Malformed(Exception):
     """Malformed JSON text (``position``: where, in bytes) or JSONB."""
 

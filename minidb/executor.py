@@ -50,7 +50,7 @@ from minidb.parser import (
 )
 from minidb.parser import CheckConstraint, ColumnDef, Expr, ForeignKey, KeyConstraint, Statement, parse
 from minidb.tokenizer import tokenize
-from minidb.jsonb import JSONText
+from minidb.jsonb import JSONBlob, JSONText
 from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, decode_row, encode_record
 from minidb.pager import Pager
@@ -2546,7 +2546,7 @@ class Executor:
             limit = self.compile_limit(body)
         source = RecursiveSource(cte.name, initial, names, working, compiled_parts,
                                  operators[k - 1] == "UNION", order_terms, limit)
-        source.strip = makes_json(body)
+        source.strip = tuple(range(len(names))) if carries_json(body) else ()  # (never flattened)
         return source
 
     def view_source(self, view: ViewInfo) -> DerivedSource:
@@ -2642,11 +2642,14 @@ class Executor:
         source = JsonEachSource(name)
         scope.add(source, ref.alias or name)
         me = len(scope.entries) - 1
-        depends = set()
-        for arg in args:
-            depends |= tables_referenced(arg, scope)
         compiler = Compiler(scope, executor=self)
-        compiled = [compiler.compile(arg) for arg in args]
+        saved, scope.watch = scope.watch, set()  # (the tables the references resolve to, subqueries' too)
+        try:
+            compiled = [compiler.compile(arg) for arg in args]
+        finally:
+            depends, scope.watch = scope.watch, saved
+            if saved is not None:
+                saved |= depends
         if me not in depends:
             source.args, source.depends = compiled, depends
 
@@ -3157,6 +3160,8 @@ class Executor:
             value = row[i]
             if type(value) is JSONText:
                 value = str.__str__(value)
+            elif type(value) is JSONBlob:
+                value = bytes(value)
             row[i] = values.apply_affinity(value, affinity)
         if table.rowid_column is None:
             return None
@@ -5173,7 +5178,7 @@ class DerivedSource:
     rowid_column = None
     indexes = ()
 
-    strip = False
+    strip = ()  # the columns whose JSON subtype the rows lose (lost_subtypes)
 
     def __init__(self, name: str, compiled: CompiledQuery, names: list[str] | None = None,
                  query: Any = None) -> None:
@@ -5182,7 +5187,7 @@ class DerivedSource:
         rows lose, as in SQLite)."""
         self.name = name or "subquery"
         self.compiled = compiled
-        self.strip = query is not None and makes_json(query)
+        self.strip = lost_subtypes(query, len(compiled.names)) if query is not None else ()
         if names is None:
             names = unique_names(compiled.names)
         elif len(names) != len(compiled.names):
@@ -5206,22 +5211,53 @@ class DerivedSource:
 
     def materialize(self) -> None:
         if self.strip:
-            self.rows = [plain_text(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+            self.rows = [plain_text(row, self.strip) + [i] for i, row in enumerate(self.compiled.run(), 1)]
         else:
             self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
 
 
-def makes_json(query: object) -> bool:
-    """Whether a subquery calls a function returning JSON.  SQLite does not
-    flatten such a subquery into the query using it, and its rows lose the
-    subtype on the way out (json_each()'s ``value`` keeps it: that subquery
-    is flattened)."""
-    return any(isinstance(node, Call) and node.name in jsonfuncs.SUBTYPE_FUNCTIONS for node in walk_nodes(query))
+_EACH_FUNCTIONS = frozenset({"json_each", "json_tree", "jsonb_each", "jsonb_tree"})
 
 
-def plain_text(row: Sequence) -> list:
-    """The values of a row with no JSON subtype."""
-    return [str.__str__(v) if type(v) is JSONText else v for v in row]
+def carries_json(query: object) -> bool:
+    """Whether a subquery may return values with the JSON subtype: it calls
+    a JSON function or reads json_each() / json_tree()."""
+    return any(isinstance(node, Call) and node.name in jsonfuncs.SUBTYPE_FUNCTIONS
+               or isinstance(node, (TableRef, TableFunction)) and ascii_lower(node.name) in _EACH_FUNCTIONS
+               for node in walk_nodes(query))
+
+
+def lost_subtypes(query: object, width: int) -> tuple[int, ...]:
+    """The columns of a subquery in FROM (or a view or CTE) whose values lose
+    the JSON subtype on the way out.  In SQLite only a bare column of a
+    subquery it flattens keeps it (``value`` of json_each() under a plain
+    SELECT); any other expression, and every column of a subquery it runs
+    on its own (aggregate, DISTINCT, LIMIT, ORDER BY, compound), loses it."""
+    if not carries_json(query):
+        return ()
+    flattened = (isinstance(query, Select) and not (query.distinct or query.group_by or query.order_by or query.windows)
+                 and query.having is None and query.limit is None
+                 and not any(contains_aggregate(item.expr) or contains_window(item.expr)
+                             for item in query.items if not isinstance(item.expr, Star)))
+    if not flattened:
+        return tuple(range(width))
+    if any(isinstance(item.expr, Star) for item in query.items):
+        if all(isinstance(item.expr, (Star, Column)) for item in query.items):
+            return ()
+        return tuple(range(width))  # (not worked out column by column)
+    return tuple(i for i, item in enumerate(query.items) if not isinstance(item.expr, Column))
+
+
+def plain_text(row: Sequence, positions: tuple[int, ...]) -> list:
+    """The values of a row, without the JSON subtype in the columns at ``positions``."""
+    row = list(row)
+    for i in positions:
+        value = row[i]
+        if type(value) is JSONText:
+            row[i] = str.__str__(value)
+        elif type(value) is JSONBlob:
+            row[i] = bytes(value)
+    return row
 
 
 class PragmaSource(DerivedSource):
@@ -5508,7 +5544,7 @@ class RecursiveSource(DerivedSource):
                 queue.append(row)
 
         for row in self.compiled.run():
-            push(tuple(plain_text(row) if self.strip else row))
+            push(tuple(plain_text(row, self.strip) if self.strip else row))
         out, taken = [], 0
         while (len(queue) > head) if key is None else queue:
             if end is not None and taken >= end:
@@ -5526,7 +5562,7 @@ class RecursiveSource(DerivedSource):
             self.working.rows = [list(row) + [1]]
             for part in self.parts:
                 for new in part.run():
-                    push(tuple(plain_text(new) if self.strip else new))
+                    push(tuple(plain_text(new, self.strip) if self.strip else new))
         self.rows = [list(row) + [i] for i, row in enumerate(out, 1)]
 
 
