@@ -191,6 +191,24 @@ def test_statement_journal_for_foreign_keys(pair):
         "UPDATE n SET id = CASE id WHEN 2 THEN 'x' ELSE 5 END", "SELECT * FROM n",
         "DELETE FROM p WHERE id = 1 OR id / (id - 2) > 0 OR abs(-9223372036854775807 - id)", "SELECT * FROM n",
         "COMMIT",
+        # An upsert that leaves the parent key alone needs no journal for it.
+        "CREATE TABLE pp (id INTEGER PRIMARY KEY, v)", "CREATE TABLE cc (r REFERENCES pp)", "BEGIN",
+        "INSERT INTO pp (id) VALUES (7), ('x') ON CONFLICT (id) DO UPDATE SET v = 1", "SELECT * FROM pp",
+        "INSERT INTO pp (id) VALUES (8), ('x') ON CONFLICT (id) DO UPDATE SET id = 9", "SELECT * FROM pp", "COMMIT",
+    ]:
+        pair.run(sql)
+
+
+def test_single_row_insert_into_a_parent(pair):
+    """A one-row INSERT does not look for the child rows its new parent key
+    fixes (SQLite: it cannot fix an immediate violation), so its own
+    dangling key still fails; a multi-row INSERT counts both."""
+    for sql in [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, c0 NOT NULL REFERENCES t (id) ON DELETE SET NULL)",
+        "INSERT OR REPLACE INTO t VALUES (1, 10)", "INSERT INTO t VALUES (10, -1)", "SELECT * FROM t",
+        "INSERT INTO t VALUES (10, -1), (11, 1)", "INSERT INTO t SELECT 10, -1", "SELECT * FROM t",
+        "PRAGMA foreign_key_check",
     ]:
         pair.run(sql)
 

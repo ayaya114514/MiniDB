@@ -123,6 +123,7 @@ class ForeignKeys:
         self.depth = 0  # actions within actions
         self.extra_changes = 0  # rows the actions changed (total_changes() counts them)
         self.unchecked = None  # see last_action_program
+        self.single_insert = False  # the statement is a one-row INSERT (row_inserted)
         self._version = None
         self._children = {}  # lower-case table name -> [Link] (its own foreign keys)
         self._parents = {}  # lower-case table name -> [Link] (the foreign keys naming it)
@@ -487,6 +488,8 @@ class ForeignKeys:
             if self._usable(link):
                 self.check_parent(link, row, 1, row)
         for link in self.parents_of(table):
+            if self.single_insert and not link.deferred and not self.defer_all():
+                continue  # (SQLite: one inserted row cannot fix an immediate violation)
             if self._usable(link):
                 self.scan_children(link, row, -1)
 

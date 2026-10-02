@@ -796,8 +796,11 @@ class Compiler:
     def _truth_test(self, expr: Binary) -> RowFunction | None:
         """``x IS [NOT] TRUE`` and ``x IS [NOT] FALSE`` test the truth of x
         (SQLite's TK_TRUTH / OP_IsTrue) - when TRUE / FALSE is not a column
-        name.  A NULL x IS TRUE / FALSE is 0, IS NOT TRUE / FALSE is 1."""
-        right = expr.right
+        name.  A NULL x IS TRUE / FALSE is 0, IS NOT TRUE / FALSE is 1.
+        Like SQLite (sqlite3ExprSkipCollateAndLikely), the right side may be
+        wrapped in COLLATE - not in likely(), which is unresolved (so not yet
+        marked as likely()) when SQLite looks."""
+        right = strip_collate(expr.right)
         if expr.op not in ("IS", "IS NOT") or not isinstance(right, Column) or not is_true_false(right):
             return None
         try:
@@ -1061,6 +1064,12 @@ class Compiler:
             raise OperationalError(f"wrong number of arguments to function {ascii_lower(name)}()")
         if expr.filter is not None:
             raise OperationalError(f"FILTER may not be used with non-aggregate {ascii_lower(name)}()")
+        if name == "LIKELIHOOD":
+            # SQLite wants a floating-point literal (its TK_FLOAT) from 0.0 to 1.0.
+            probability = expr.args[1]
+            if not (isinstance(probability, Literal) and type(probability.value) is float
+                    and 0.0 <= probability.value <= 1.0):
+                raise OperationalError("second argument to likelihood() must be a constant between 0.0 and 1.0")
         args = [self.compile(arg) for arg in expr.args]
         if name in values.COLLATING_FUNCTIONS:
             # The first argument with a collation decides how texts compare.
@@ -2125,6 +2134,7 @@ class Executor:
         keys = self.foreign_keys
         keys.immediate = 0
         keys.unchecked = None
+        keys.single_insert = False
         if isinstance(stmt, (Select, Compound, Values, Insert, Update, Delete)):
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
@@ -2177,7 +2187,7 @@ class Executor:
             # (a REPLACE deletes rows; an upsert updates them)
             return plan.multi_write and (keys.may_abort(plan.table, "insert") or (
                 replace_possible(plan.table, plan.conflict, True) and keys.may_abort(plan.table, "delete")) or (
-                any(u.do_update for u in plan.upserts) and keys.may_abort(plan.table, "update")))
+                any(u.do_update and keys.may_abort(plan.table, "update", u.changed_positions()) for u in plan.upserts)))
         if isinstance(stmt, Update):
             return keys.required(plan.table, plan.changed) and keys.may_abort(plan.table, "update", plan.changed)
         return keys.may_abort(plan.table, "delete")
@@ -4194,6 +4204,7 @@ class PreparedInsert:
                 table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
             multi = self.multi_write or self.returning is not None or replaces
             keys.prepare(table, "insert", single_insert=not multi)
+            keys.single_insert = not multi
             if replaces:
                 keys.prepare(table, "delete")
             steps = []
@@ -4405,6 +4416,15 @@ class PreparedUpsert:
             assignments.append((position, compiler.compile(expr)))
         self.where = compiler.compile(clause.where) if clause.where is not None else None
         self.assignments = assignments
+
+    def changed_positions(self) -> set[int]:
+        """The columns DO UPDATE sets (the row id as len(columns))."""
+        table, width = self.table, len(self.table.columns)
+        positions = set()
+        for name, _ in self.clause.assignments:
+            position = table.column_index(name)
+            positions.add(width if position is None or position == table.rowid_column else position)
+        return positions
 
     @staticmethod
     def find_constraint(table: TableInfo, clause: Upsert) -> IndexInfo | str | None:

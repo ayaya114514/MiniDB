@@ -1322,6 +1322,29 @@ def test_min_max_on_an_equal_column():
     pair.close()
 
 
+def test_truth_tests_and_likely():
+    """"x IS [NOT] TRUE / FALSE" tests truth even with a COLLATE on TRUE
+    (SQLite skips it) but not inside likely(), which SQLite has not yet
+    resolved when it looks; likely() / unlikely() / likelihood() are the
+    value itself, without its affinity or collation."""
+    pair = Pair(check_messages=True)
+    for sql in [
+        'CREATE TABLE t (a INTEGER, b TEXT COLLATE nocase, "true")',
+        "INSERT INTO t VALUES (1, 'X', 0), ('10', 'y', 5), (NULL, NULL, 1)",
+        "SELECT '10' IS NOT (TRUE COLLATE RTRIM), 0 IS (FALSE COLLATE nocase), NULL IS NOT likely(TRUE), "
+        "2 IS unlikely(true), 3 IS likelihood(false, 0.5)",
+        "SELECT a IS (TRUE COLLATE nocase), a IS NOT likely(FALSE) FROM t",
+        'SELECT a IS ("true" COLLATE nocase) FROM t', "SELECT a, a IS NOT (TRUE) FROM t WHERE a IS (TRUE COLLATE rtrim)",
+        "SELECT likely(a) = '1', unlikely(b) = 'x', likelihood(a, 0.5) = '1', typeof(likely(a)), likely(b) IN ('x'), "
+        "a = likely('1') FROM t",
+        "SELECT likelihood(1, 1)", "SELECT likelihood(1, -0.5)", "SELECT likelihood(1, 1.5)",
+        "SELECT likelihood(1, 1e0)", "SELECT likely(1, 2)", "SELECT likelihood(1)", "SELECT likelihood(5, (0.5))",
+        "SELECT a FROM t WHERE likely(a > 0) AND unlikely(b IS NOT NULL)",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_limit_zero_runs_nothing():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")
