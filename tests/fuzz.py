@@ -33,8 +33,15 @@ FUNCTIONS = [
     "substr", "replace", "trim", "ltrim", "rtrim", "instr", "round", "hex", "quote", "unicode",
     "sign", "octet_length", "char", "iif", "concat", "concat_ws", "printf", "glob", "ceil", "floor",
     "trunc", "sqrt", "ln", "exp", "mod", "pow", "atan2", "date", "datetime", "julianday", "strftime",
-    "unixepoch", "likely",
+    "unixepoch", "likely", "json", "json",
 ]
+JSON_DOCS = ['{"a":1,"b":[2,3.5,"x"],"c":{"d":null}}', '[1,[2,{"a":3}],"s",true]', '{"a":"x","x y":2,"b":-0.5e1}',
+             '{a:1,b:0x10,"c":[.5,],}', '[1e5,-0,1.50,"\\u00e9\\n"]', '"str"', '3', 'null', '[]', '{}',
+             '{"a":[{"b":1},{"b":[1,2]}],"b":false}', "['x', +1, Infinity]"]
+JSON_TEXTS = JSON_DOCS + ['[1,2', '{"a":}', '', 'x', '[1] 2', '{"a":1,}', '01']
+JSON_PATHS = ["'$'", "'$.a'", "'$.b[0]'", "'$[1]'", "'$[#-1]'", "'$.a.b'", "'$.\"x y\"'", "'$[0].a'", "'$.c.d'",
+              "'$.b[#]'", "'$.a[1].b'", "'$.z'"]
+ARROW_PATHS = ["'a'", "0", "1", "-1", "'$.b'", "'[1]'", "'x y'", "'$.a[0]'", "'b'"]
 DATE_MODIFIERS = ["'+1 day'", "'-3 months'", "'start of month'", "'weekday 2'", "'+1.5 hours'", "'unixepoch'",
                   "'floor'", "'+1-01-01'", "'subsec'"]
 PRINTF_FORMATS = ["'%d'", "'%5.2f'", "'%s|%x'", "'%.3e'", "'%-6s|'", "'%q'", "'%c'", "'%,d'", "'%g'",
@@ -307,6 +314,8 @@ class Generator:
         elif function in ("typeof", "hex", "quote", "unicode", "sign", "octet_length", "ceil",
                           "floor", "trunc", "sqrt", "ln", "exp", "length", "lower", "upper"):
             args = [sub()]
+        elif function == "json":
+            return self.json_expr(scope, depth)
         elif function == "likely":
             function = rng.choice(["likely", "unlikely", "likelihood"])
             args = [sub()] + (["0.25"] if function == "likelihood" else [])
@@ -331,6 +340,73 @@ class Generator:
         else:  # coalesce, min, max, concat, concat_ws
             args = [sub() for _ in range(rng.randint(2, 3))]
         return f"{function}({', '.join(args)})"
+
+    def json_value(self, scope, depth):
+        """An SQL value to put into JSON (no BLOB, which JSON cannot hold)."""
+        e = self.expr(scope, depth + 1, True)
+        return f"iif(typeof({e}) = 'blob', hex({e}), {e})"
+
+    def json_doc(self, scope, depth):
+        """A well-formed JSON text."""
+        rng = self.rng
+        kind = rng.random()
+        if kind < 0.4 or depth >= 3:
+            return "'" + rng.choice(JSON_DOCS).replace("'", "''") + "'"
+        if kind < 0.55:
+            return f"json_array({', '.join(self.json_value(scope, depth) for _ in range(rng.randint(0, 3)))})"
+        if kind < 0.7:
+            pairs = [f"'{rng.choice('abcz')}', {self.json_value(scope, depth)}" for _ in range(rng.randint(1, 3))]
+            return f"json_object({', '.join(pairs)})"
+        if kind < 0.8:
+            return f"json_quote({self.json_value(scope, depth)})"
+        if kind < 0.9:
+            function = rng.choice(["json_set", "json_insert", "json_replace"])
+            return (f"{function}({self.json_doc(scope, depth + 1)}, {rng.choice(JSON_PATHS)}, "
+                    f"{self.json_value(scope, depth + 1)})")
+        return f"json_patch({self.json_doc(scope, depth + 1)}, {self.json_doc(scope, depth + 1)})"
+
+    def json_expr(self, scope, depth):
+        """A JSON function call (of well-formed JSON and paths: a malformed
+        argument raises an error, and whether SQLite evaluates it for a row
+        can depend on its plan)."""
+        rng = self.rng
+        doc = lambda: self.json_doc(scope, depth + 1)  # noqa: E731
+        kind = rng.randrange(14)
+        if kind == 0:
+            return f"json({doc()})"
+        if kind == 1:
+            return f"({doc()} {rng.choice(['->', '->>'])} {rng.choice(ARROW_PATHS)})"
+        if kind == 2:
+            paths = ", ".join(rng.choice(JSON_PATHS) for _ in range(rng.randint(1, 2)))
+            return f"json_extract({doc()}, {paths})"
+        if kind == 3:
+            return f"json_type({doc()}{', ' + rng.choice(JSON_PATHS) if rng.random() < 0.6 else ''})"
+        if kind == 4:
+            text = "'" + rng.choice(JSON_TEXTS).replace("'", "''") + "'"
+            return f"json_valid({rng.choice([text, self.expr(scope, depth + 1)])}, {rng.choice([1, 2, 3, 6, 8])})"
+        if kind == 5:
+            text = "'" + rng.choice(JSON_TEXTS).replace("'", "''") + "'"
+            return f"json_error_position({rng.choice([text, self.json_value(scope, depth)])})"
+        if kind == 6:
+            return f"json_array_length({doc()}{', ' + rng.choice(JSON_PATHS) if rng.random() < 0.4 else ''})"
+        if kind == 7:
+            return f"json_remove({doc()}, {rng.choice(JSON_PATHS)})"
+        if kind == 8:
+            return f"hex(jsonb({doc()}))"
+        if kind == 9:
+            function = rng.choice(["jsonb_set", "jsonb_array", "jsonb_patch", "jsonb_extract"])
+            if function == "jsonb_array":
+                return f"json(jsonb_array({self.json_value(scope, depth)}, {doc()}))"
+            if function == "jsonb_patch":
+                return f"json(jsonb_patch({doc()}, {doc()}))"
+            if function == "jsonb_extract":
+                return f"quote(jsonb_extract({doc()}, {rng.choice(JSON_PATHS)}))"
+            return f"json(jsonb_set(jsonb({doc()}), {rng.choice(JSON_PATHS)}, {self.json_value(scope, depth)}))"
+        if kind == 10:
+            return f"json_pretty({doc()})"
+        if kind == 11:
+            return f"(SELECT group_concat(key || '=' || quote(value) || type, ';') FROM json_{rng.choice(['each', 'tree'])}({doc()}))"
+        return doc()
 
     def condition(self, scope, depth=1):
         rng = self.rng
@@ -617,6 +693,17 @@ class Generator:
             from_sql += self.join(scope, "b")
             if rng.random() < 0.25:
                 from_sql += self.join(scope, "c")
+        if rng.random() < 0.06:
+            # json_each() / json_tree() of the rows of the tables before it
+            function = rng.choice(["json_each", "json_tree", "json_each", "json_tree", "jsonb_each", "jsonb_tree"])
+            root = f", {rng.choice(JSON_PATHS)}" if rng.random() < 0.3 else ""
+            saved, self.qualify = self.qualify, True  # (an unqualified "id" would be ambiguous with j.id)
+            from_sql += f", {function}({self.json_doc(list(scope), 1)}{root}) AS j"
+            self.qualify = saved
+            each = Table("j", [(c, "", "") for c in ("key", "value", "type", "atom", "id", "parent", "fullkey",
+                                                     "path")], None)
+            each.derived = True
+            scope.append(("j", each))
         where = f" WHERE {self.condition(scope)}" if rng.random() < 0.7 else ""
         if rng.random() < 0.3:
             return self.aggregate_select(scope, from_sql, where)
@@ -651,7 +738,8 @@ class Generator:
             "group_concat({e})", "group_concat({e}, '-')", "row_number()", "rank()", "dense_rank()",
             "percent_rank()", "cume_dist()", "ntile(3)", "first_value({e})", "last_value({e})",
             "nth_value({e}, 2)", "lead({e})", "lag({e}, 2, 0)", "sum({e}) FILTER (WHERE {e})",
-        ]).replace("{e}", self.expr(scope, 2))
+            "json_group_array({j})", "json_group_object(quote({e}), {j})",
+        ]).replace("{e}", self.expr(scope, 2)).replace("{j}", self.json_value(scope, 1))
         parts = []
         if rng.random() < 0.4:
             parts.append(f"PARTITION BY {self.expr(scope, 2)}")
@@ -711,6 +799,13 @@ class Generator:
                 condition = f" WHERE {self.condition([('s', other)], 2)}" if rng.random() < 0.6 else ""
                 aggregates.append(f"(SELECT {function}({distinct}{argument}) FROM {other.name} AS s{condition})")
                 continue
+            if rng.random() < 0.08:
+                # (the order of the elements depends on the plan; their total length does not)
+                value = self.json_value(scope, 1)
+                aggregates.append(rng.choice([f"length(json_group_array({value}))",
+                                              f"json_array_length(json_group_array({distinct}{value}))",
+                                              f"length(json_group_object(quote({value}), {value}))"]))
+                continue
             aggregates.append(f"{function}({distinct}{argument})")
         sql = f"SELECT {', '.join(groups + aggregates)} FROM {from_sql}{where}"
         if groups:
@@ -759,16 +854,19 @@ class Generator:
         return self.select()
 
 
+STEP_LIMIT = 5_000_000  # (see Pair; about 0.05 s of sqlite3 time)
+
+
 def run_seed(seed, statements, path=None, verbose=False, format=None):
     """Run one fuzzing session; returns None or a failure description.
 
     With ``format="sqlite"`` MiniDB keeps the database in SQLite's file
     format; at the end sqlite3 opens that file, checks it and compares its
     content with sqlite3's own database."""
-    from sqlcompare import Pair  # only here: the generator itself (metamorphic.py) needs no sqlite3
+    from sqlcompare import SKIPPED, Pair  # only here: the generator itself (metamorphic.py) needs no sqlite3
 
     generator = Generator(seed)
-    pair = Pair(path, loose_numbers=True, format=format)
+    pair = Pair(path, loose_numbers=True, format=format, step_limit=STEP_LIMIT)
     snapshots = SnapshotReader(pair.mini, path, seed) if path is not None and format != "sqlite" else None
     history = []
     try:
@@ -779,7 +877,8 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
             history.append(sql if parameters is None else f"{sql}  -- parameters: {parameters!r}")
             if verbose:
                 print(history[-1])
-            pair.run(sql, parameters=parameters)
+            if pair.run(sql, parameters=parameters) == SKIPPED:
+                history[-1] += "  -- skipped: sqlite3 interrupted it (step limit)"
             if snapshots is not None:
                 snapshots.step(history)
         if snapshots is not None:
