@@ -919,11 +919,19 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   时保存恢复）。伪表的列有排序规则、没有亲和性（TK_TRIGGER），但 INTEGER PRIMARY KEY 列是 rowid，有 INTEGER 亲和性；
   只能用限定名访问，视图上的没有 rowid。
 - **编译时机与顺序**：SQLite 在编译语句时就编译它可能运行的程序，所以错误（no such column、外键 mismatch……）在任何行
-  改变之前报出，且报的是最先遇到的那个。MiniDB 在构造计划时按 SQLite 的代码生成顺序做这些事：BEFORE 程序；约束检查
-  会用到的（upsert 的 UPDATE 及其触发器和外键、REPLACE 的 DELETE——只在 recursive_triggers 开着且真的可能冲突时编译
-  DELETE 触发器）；语句自己的外键；AFTER 程序；外键动作语句的子表触发器。`PRAGMA foreign_keys` /
-  `defer_foreign_keys` / `recursive_triggers` 改变时让已编译的计划失效（SQLite 让语句过期）。触发器程序内的、以及有
-  INSERT 触发器的单行 INSERT 都算多行写入（外键的“单行插入不必找子行”优化只在顶层且无触发器时成立）。
+  改变之前报出，且报的是最先遇到的那个。MiniDB 在构造计划时按 SQLite 的代码生成顺序做这些事——INSERT：BEFORE 程序；
+  约束检查会用到的（upsert 的 UPDATE、REPLACE 的 DELETE——只在 recursive_triggers 开着且真的可能冲突时编译 DELETE
+  触发器）；新行的外键；AFTER 程序。UPDATE / DELETE（`Executor.compile_update` / `compile_delete`）：先按触发器链表
+  顺序（新的在前）编译全部 BEFORE 和 AFTER 程序（SQLite 的 sqlite3TriggerColmask 为算列掩码而提前编译），再 REPLACE
+  的 DELETE、外键检查、外键动作。外键动作语句编译时同样编译子表的触发器。`PRAGMA foreign_keys` /
+  `defer_foreign_keys` / `recursive_triggers` 改变时让已编译的计划失效（SQLite 让语句过期）。
+- **程序清单**：语句编译过的程序（触发器程序、外键动作）按顺序记在 `Executor.program_log`，每个只记一次；缓存下来的
+  程序在别的语句里被用到时，回放它当初编译时请求过的程序。这样 isSetNullAction（编码新行外键检查时，若最后编译的程序是
+  该外键的 SET NULL 动作就跳过检查）看到的“最后一个”与 SQLite 相同——包括 BEFORE 触发器里的 UPDATE 编译出的动作。
+- **多行写入与语句日志**：有 SELECT、多行、RETURNING、INSERT 触发器、在触发器程序里、或者 upsert 的 UPDATE / REPLACE
+  的 DELETE 有触发器或外键工作时，语句是多行写入（外键的“单行插入不必找子行”优化随之失效）。语句日志只给可能中止的
+  多行写入（SQLite 的 mayAbort：按 ABORT 处理的约束、函数调用、RAISE(ABORT)、程序里这样的语句——upsert 的 UPDATE
+  触发器按 OR ABORT 编译）；没有日志时，事务里中途失败的语句保留已做的修改。DELETE 也照此（以前总当作有日志）。
 - **触发**：同一事件的触发器新建的先触发。BEFORE INSERT 的 NEW 是做过亲和性转换的值，rowid 未知时为 -1；BEFORE
   UPDATE / DELETE 之后再看一次这一行——被删了就跳过，被改了则 UPDATE 没有赋值的列取新值（SQLite trigger1-18.0），
   OLD 保持原样；AFTER 触发器在外键动作之后。REPLACE 删除的行只在 recursive_triggers 开着时触发 DELETE 触发器，且
@@ -934,12 +942,17 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   影响最近的那一层）；ABORT / FAIL / ROLLBACK 是相应处理方式的约束错误，消息是求值后的文本（NULL 为空串）。
 - **计数**：`changes()` 只算外层语句的行；程序完成时其改动计入 `total_changes()`（失败的程序不计）；
   `last_insert_rowid()` 在程序里可见、程序结束后恢复。
-- **INSTEAD OF**：视图上有匹配的 INSTEAD OF 触发器时，INSERT 的每一行（不做亲和性转换，缺的列为 NULL，rowid 列被接受
-  但忽略）、UPDATE / DELETE 先找出视图里匹配 WHERE 的行（NEW 是 OLD 加上 SET 的值，按视图列的亲和性转换）去触发它们；
-  `changes()` 为 0。带 RETURNING 时只要视图有任何触发器就可写（SQLite 自己的 RETURNING 触发器让它检查的列表非空）。
+- **INSTEAD OF**：视图上有匹配的 INSTEAD OF 触发器时，INSERT 的每一行（不做亲和性转换，缺的列为 NULL；rowid 列被接受，
+  构造 NEW 时检查是不是整数，然后忽略）、UPDATE / DELETE 先找出视图里匹配 WHERE 的行（NEW 是 OLD 加上 SET 的值，有
+  INSTEAD OF 触发器时按视图列的亲和性转换）去触发它们；`changes()` 为 0。带 RETURNING 时只要视图有任何触发器就可写
+  （SQLite 自己的 RETURNING 触发器让它检查的列表非空），此时只输出 RETURNING。
 - **存储与 ALTER**：触发器存在 `sqlite_schema`（两种格式），文本照 SQLite 保存（"CREATE TRIGGER " 加上从名字到 END
   的原文，去掉 IF NOT EXISTS 和 schema 前缀），有自己的命名空间。RENAME TO 改它的 ON 表名和程序里的表名（总是加引号）；
   RENAME COLUMN 改 UPDATE OF、NEW/OLD 的列、目标表的 INSERT 列名 / SET 列名，以及（编译程序时用列钩子收集的）解析到
   该表的列引用；DROP COLUMN 时若某个触发器的程序会因此找不到列就报错（报文本里第一个，按原写法带限定名）。
 - 不支持：TEMP 触发器（阶段 25 才有 temp schema）；程序里的 `UPDATE ... FROM`（MiniDB 本来就不支持），SQLite 文件里
   带这种触发器的表只读。
+
+顺带修正（触发器 fuzz 找到，与触发器无直接关系）：NOT NULL 分两遍检查（先按列序：有默认值的 REPLACE 列取默认值、其余列
+检查；再查仍为 NULL 的 REPLACE 列，按 ABORT）；`x IN (列表)` 的每一项像 `=` 一样用左边的亲和性比较（TEXT 只在一边是文本时
+转换，SQLite 的 OP_Eq）；查询有窗口函数时，子查询里属于它的聚合是误用（SQLite 先把它挪进子查询）。
