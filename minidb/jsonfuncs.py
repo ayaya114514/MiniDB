@@ -13,7 +13,7 @@ from minidb import jsonb, values
 from minidb.errors import OperationalError
 from minidb.jsonb import (
     ARRAY, EDIT_DEL, EDIT_INS, EDIT_REPL, EDIT_SET, FALSE, FLOAT, FLOAT5, INT, INT5, LOOKUP_ERROR, LOOKUP_NOTFOUND,
-    LOOKUP_PATHERROR, NULL, OBJECT, TEXT, TEXT5, TEXTJ, TEXTRAW, TRUE, JSONText, Malformed, payload_size,
+    LOOKUP_PATHERROR, NULL, OBJECT, TEXT, TEXT5, TEXTJ, TEXTRAW, TRUE, JSONBlob, JSONText, Malformed, payload_size,
 )
 from minidb.values import SQLValue
 
@@ -49,27 +49,71 @@ def bad_path(path: object) -> OperationalError:
 
 # ---- arguments ---------------------------------------------------------------------------
 
-def parse_arg(value: SQLValue, keep_error: bool = False) -> tuple[bytes, bool] | None:
+class ParseCache:
+    """SQLite's JSON parse cache (json.c's JsonCache), one per statement: the
+    last four JSON texts its function calls parsed, with their JSONB, and the
+    text results of the edit functions with the JSONB they rendered.  A text
+    found here is not parsed again, and its JSONB may differ from parsing it
+    anew: json_set('{a:0x10}', ...) returns '{"a":16,...}', whose cached JSONB
+    keeps 0x10 (and its JSON5 mark), as jsonb() and json_valid() then show."""
+
+    SIZE = 4
+
+    def __init__(self) -> None:
+        self.entries = []  # (text, JSONB, uses JSON5), least recently used first
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+    def search(self, text: str) -> tuple[bytes, bool] | None:
+        """jsonCacheSearch: the first entry with this text (compared byte by
+        byte), which becomes the most recently used."""
+        for i, entry in enumerate(self.entries):
+            if entry[0] == text:
+                if i < len(self.entries) - 1:
+                    del self.entries[i]
+                    self.entries.append(entry)
+                return entry[1], entry[2]
+        return None
+
+    def insert(self, text: str, blob: bytes, nonstandard: bool) -> None:
+        if len(self.entries) >= self.SIZE:
+            del self.entries[0]
+        self.entries.append((text, blob, nonstandard))
+
+
+CACHE = ParseCache()  # (Database clears it before each statement)
+
+
+def parse_arg(value: SQLValue, keep_error: bool = False, cache: bool = True) -> tuple[bytes, bool] | None:
     """The JSONB of a JSON argument and whether it used JSON5 (SQLite's
     jsonParseFuncArg): None for NULL.  A BLOB is JSONB if it looks like it,
-    else its bytes are taken as text.  Raises "malformed JSON" (``keep_error``:
-    raises Malformed instead)."""
+    else its bytes are taken as text.  Text is looked up in and added to the
+    statement's ParseCache (``cache``).  Raises "malformed JSON"
+    (``keep_error``: raises Malformed instead)."""
     if value is None:
         return None
     if isinstance(value, bytes):
         if jsonb.is_jsonb(value):
             return value, False
-        data = value
+        text = values.to_text(value)
     else:
-        data = _bytes(values.to_text(value))
+        text = values.to_text(value)
+        if cache and isinstance(value, str):
+            found = CACHE.search(text)
+            if found is not None:
+                return found
     try:
-        if not data:
+        if not text:
             raise Malformed(0)
-        return jsonb.parse_text(data)
+        parsed = jsonb.parse_text(_bytes(text))
     except Malformed:
         if keep_error:
             raise
         raise malformed() from None
+    if cache:
+        CACHE.insert(str.__str__(text), *parsed)
+    return parsed
 
 
 def might_be_binary(value: SQLValue) -> bool:
@@ -154,9 +198,16 @@ def render(blob: bytes | bytearray, i: int = 0) -> JSONText:
         raise malformed() from None
 
 
-def result_parse(blob: bytes | bytearray, binary: bool) -> SQLValue:
-    """SQLite's jsonReturnParse: the JSONB, or its text with the JSON subtype."""
-    return bytes(blob) if binary else render(blob)
+def result_parse(blob: bytes | bytearray, binary: bool, nonstandard: bool | None = None) -> SQLValue:
+    """SQLite's jsonReturnParse: the JSONB, or its text with the JSON subtype.
+    The text of an edited JSONB (``nonstandard``: whether the JSON it came
+    from used JSON5) goes into the statement's ParseCache."""
+    if binary:
+        return bytes(blob)
+    text = render(blob)
+    if nonstandard is not None:
+        CACHE.insert(str.__str__(text), bytes(blob), nonstandard)
+    return text
 
 
 def from_blob(blob: bytes | bytearray, i: int, text_only: bool = False, binary: bool = False) -> SQLValue:
@@ -273,8 +324,8 @@ def json_array(*args: SQLValue) -> JSONText:
     return _json(out)
 
 
-def jsonb_array(*args: SQLValue) -> bytes:
-    return _text_to_blob(json_array(*args))
+def jsonb_array(*args: SQLValue) -> JSONBlob:
+    return JSONBlob(_text_to_blob(json_array(*args)))
 
 
 def json_object(*args: SQLValue) -> JSONText:
@@ -294,8 +345,8 @@ def json_object(*args: SQLValue) -> JSONText:
     return _json(out)
 
 
-def jsonb_object(*args: SQLValue) -> bytes:
-    return _text_to_blob(json_object(*args))
+def jsonb_object(*args: SQLValue) -> JSONBlob:
+    return JSONBlob(_text_to_blob(json_object(*args)))
 
 
 def _text_to_blob(text: str) -> bytes:
@@ -492,7 +543,7 @@ def edit(value: SQLValue, args: tuple, how: int, name: str, binary: bool) -> SQL
             if rc == LOOKUP_ERROR:
                 raise malformed()
             raise bad_path(path)
-    return result_parse(editor.blob, binary)
+    return result_parse(editor.blob, binary, parsed[1])
 
 
 def json_remove(value: SQLValue, *paths: SQLValue, binary: bool = False) -> SQLValue:
@@ -516,7 +567,7 @@ def json_remove(value: SQLValue, *paths: SQLValue, binary: bool = False) -> SQLV
             if rc == LOOKUP_PATHERROR:
                 raise bad_path(path)
             raise malformed()
-    return result_parse(editor.blob, binary)
+    return result_parse(editor.blob, binary, parsed[1] if paths else None)  # (without paths: json())
 
 
 def json_patch(target: SQLValue, patch: SQLValue, binary: bool = False) -> SQLValue:
@@ -531,7 +582,7 @@ def json_patch(target: SQLValue, patch: SQLValue, binary: bool = False) -> SQLVa
         jsonb.merge_patch(editor, 0, patched[0], 0)
     except (jsonb.BadPatch, IndexError):
         raise malformed() from None
-    return result_parse(editor.blob, binary)
+    return result_parse(editor.blob, binary, parsed[1])
 
 
 def json_pretty(value: SQLValue, indent: SQLValue = None) -> SQLValue:
@@ -575,10 +626,11 @@ SCALAR_FUNCTIONS = {
 }
 
 
-# The functions whose results have the JSON subtype (when they are text).
+# The functions whose results may have the JSON subtype (JSONText, JSONBlob).
 SUBTYPE_FUNCTIONS = frozenset({
     "JSON", "JSON_ARRAY", "JSON_OBJECT", "JSON_QUOTE", "JSON_EXTRACT", "->", "JSON_INSERT", "JSON_REPLACE",
     "JSON_SET", "JSON_REMOVE", "JSON_PATCH", "JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT",
+    "JSONB_ARRAY", "JSONB_OBJECT", "JSONB_GROUP_OBJECT",
 })
 
 
@@ -630,7 +682,7 @@ class GroupObject(GroupArray):
     def result(self) -> SQLValue:
         text = self.text + b"}" if self.text is not None else bytearray(b"{}")
         if self.binary:
-            return _text_to_blob(_text(text))
+            return JSONBlob(_text_to_blob(_text(text)))  # (unlike jsonb_group_array(), with the subtype)
         return _json(text)
 
     value = result
@@ -698,7 +750,7 @@ def each_rows(value: SQLValue, root: SQLValue, recursive: bool, with_root: bool,
     JsonEachCursor, step by step (key, value, type, atom, id, parent,
     fullkey, path, json, root); ``binary`` for jsonb_each / jsonb_tree,
     whose container values are JSONB."""
-    parsed = parse_arg(value)
+    parsed = parse_arg(value, cache=False)  # (SQLite's json_each() has no function context: no cache)
     if parsed is None:
         return
     blob = parsed[0]
@@ -813,7 +865,7 @@ class EachCursor:
         element = blob[i] & 0x0F
         if element >= ARRAY and self.binary:
             n, sz = payload_size(blob, i)
-            value = bytes(blob[i:i + n + sz])
+            value = JSONBlob(blob[i:i + n + sz])
         else:
             value = from_blob(blob, i, text_only=True)
             if element >= ARRAY and isinstance(value, str):

@@ -970,15 +970,28 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 - **JSON subtype**：SQLite 给 JSON 函数的文本结果打 subtype，别的 JSON 函数拿到它会当 JSON 嵌入而不是当字符串引起来。
   MiniDB 用 `str` 的子类 `JSONText` 表示：它在表达式、标量子查询、CASE / coalesce / iif / min / max / likely 之间原样
   传递（这些都直接返回参数对象），字符串运算（`||`、upper、trim…）产生普通 `str`，自然丢掉 subtype——和 SQLite 一致。
-  丢失点按 SQLite 实测：存进表（`prepare_row` 统一转回 `str`；内存格式不序列化记录，不转就会留在索引键里）、FROM 里
-  调用了 JSON 函数的子查询 / 视图 / CTE（SQLite 不展平这种子查询，行出来时丢掉 subtype；`json_each` 的 `value` 所在
-  子查询会被展平，保留）。比较、排序把它当普通文本（`values.compare` 等处对子类放宽）。
+  丢失点按 SQLite 实测：存进表（`prepare_row` 统一转回 `str`；内存格式不序列化记录，不转就会留在索引键里）、经过 FROM
+  里的子查询 / 视图 / CTE——只有 SQLite 展平的简单子查询里的**裸列**（`SELECT value FROM json_each(...)`）保留，
+  `coalesce(value, 1)`、`+value`、`json('[1]')` 这类表达式列，以及聚合 / DISTINCT / LIMIT / ORDER BY / 复合查询 / 递归
+  CTE 的所有列都丢掉（`lost_subtypes`，只对可能产生 JSON 的子查询按列处理）。比较、排序把它当普通文本。
+- **带 subtype 的 JSONB**：`jsonb_array` / `jsonb_object` / `jsonb_group_object` 和 `jsonb_each` 的容器 `value` 返回
+  带 subtype 的 BLOB（`jsonb()`、`jsonb_extract`、`jsonb_group_array` 不带——都是实测），`CAST(... AS TEXT)` 后成为带
+  subtype 的文本，被别的 JSON 函数原样嵌入。用 `bytes` 的子类 `JSONBlob` 表示，丢失点同 `JSONText`。
+- **解析缓存**：SQLite 每条语句有一个 4 项的 JSON 解析缓存（json.c 的 JsonCache，auxdata），文本参数先按内容查缓存，
+  `json_set` / `json_insert` / `json_replace` / `json_remove` / `json_patch` 把结果文本连同编辑后的 JSONB 放进去。
+  这是看得见的语义：`json_set('{a:0x10}', '$.b', 1)` 返回 `{"a":16,"b":1}`，同一语句里这段文本的 `jsonb()` 保留
+  `0x10` 的 INT5 节点，`json_valid()` 也因为 JSON5 标记返回 0。MiniDB 照搬（`ParseCache`：按内容找第一个、命中移到
+  最近、满了丢最旧），每条语句开始时清空；`json_each` 在 SQLite 里没有函数上下文，不用缓存。
 - **json_each / json_tree**：FROM 里的虚表，列声明无类型（BLOB 亲和性：和 TEXT 列比较时不转换，两列比较的规则），
   有 rowid（从 0 开始），隐藏列 `json` / `root`。参数可以引用前面的表：每行外层重新计算（`JsonEachScan`），连接重排
   把它放在依赖的表之后。参数在它自己加入作用域之后解析：引用到它自己的列（例如子查询里裸写的 `rowid`）时 SQLite 的
   xBestIndex 拿不到参数，结果为空，MiniDB 照此。没有参数也是空表。
+  `jsonb_each` / `jsonb_tree` 只有一处不同：容器的 `value` 是 JSONB 子结构的字节（BLOB）。
 - **聚合**：`json_group_array` / `json_group_object`（及 jsonb 版本）也可作窗口函数，xInverse 照 SQLite 从文本开头切掉
   第一个元素。`DISTINCT` 聚合放过一个 NULL（SQLite 的去重表把 NULL 当相等值；以前 MiniDB 跳过 NULL，对忽略 NULL 的
   内置聚合没有区别，对 `json_group_array(DISTINCT x)` 有）。
 - **运算符**：`->` / `->>` 与 `||` 同一优先级；右边按 SQLite 的缩写规则变成路径（整数 → `[N]`、负数 → `[#N]`，
   字母数字 → `.key`，`[..]` 原样，其余 `."key"`）。`->` 返回 JSON 文本，`->>` 返回 SQL 值。
+- **fuzz 的步数上限**：随机触发器偶尔级联出上千万次改动（种子 240 的一条 INSERT 在 SQLite 里改了 3600 万行，24 秒），
+  MiniDB 要跑几个小时。对照层给 sqlite3 设 progress handler，约 500 万 VM 步后中断语句，MiniDB 跳过这一句（显式事务里
+  被中断的写语句 SQLite 会回滚整个事务，MiniDB 照做 ROLLBACK）。种子 0–59 里没有一句被跳过，所以它不削弱覆盖。

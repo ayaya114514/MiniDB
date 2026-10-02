@@ -15,6 +15,7 @@ from functools import lru_cache
 
 from minidb.errors import OperationalError
 from minidb.fp import atof
+from minidb.jsonb import JSONBlob, JSONText
 from minidb.fp import format_real as fp_format_real
 
 _TO_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
@@ -353,7 +354,7 @@ def compare(a: int | float | str | bytes, b: int | float | str | bytes) -> int:
         if not (a.isascii() and b.isascii()):
             a, b = _text_key(a), _text_key(b)
         return (a > b) - (a < b)
-    a_blob, b_blob = type(a) is bytes, type(b) is bytes
+    a_blob, b_blob = isinstance(a, bytes), isinstance(b, bytes)
     if a_text == b_text and a_blob == b_blob:
         return (a > b) - (a < b)  # two numbers or two BLOBs
     return 1 if (a_blob or a_text and not b_blob) else -1
@@ -859,7 +860,8 @@ def cast(value: SQLValue, target: str) -> SQLValue:
     if target == "REAL":
         return float(to_number(value))
     if target == "TEXT":
-        return to_text(value)
+        text = to_text(value)
+        return JSONText(text) if type(value) is JSONBlob else text  # (SQLite keeps the JSON subtype)
     if target == "BLOB":
         return to_blob(value)
     # NUMERIC: text is read by its numeric prefix; integral REALs read from
