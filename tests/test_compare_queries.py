@@ -1368,6 +1368,24 @@ def test_group_by_through_an_ordering_index():
     pair.close()
 
 
+def test_outer_aggregates_and_window_functions():
+    """An aggregate of the outer query inside a subquery is a misuse when that
+    query has window functions (SQLite moves it into a subquery first)."""
+    pair = Pair(check_messages=True)
+    for sql in [
+        "CREATE TABLE t0 (a)", "CREATE TABLE t2 (c3)", "INSERT INTO t2 VALUES (1), (2)", "INSERT INTO t0 VALUES (5)",
+        "SELECT (SELECT avg(c3) FROM t0 AS s), dense_rank() OVER () FROM t2",
+        "SELECT (SELECT avg(c3) FROM t0 AS s), row_number() OVER (ORDER BY c3) FROM t2",
+        "SELECT (SELECT avg(c3) FROM t0 AS s) FROM t2", "SELECT avg(c3), row_number() OVER () FROM t2",
+        "SELECT (SELECT avg(c3) FROM t0 AS s) FROM t2 ORDER BY row_number() OVER ()",
+        "SELECT avg(c3), (SELECT max(c3) FROM t0), row_number() OVER () FROM t2",
+        "SELECT avg(c3), (SELECT max(t0.a) FROM t0), row_number() OVER () FROM t2",
+        "SELECT (SELECT max(c3) FROM t0) w FROM t2 WINDOW x AS ()",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_limit_zero_runs_nothing():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")

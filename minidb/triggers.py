@@ -189,6 +189,18 @@ class Triggers:
             found.append(trigger)
         return found
 
+    def prepare_listed(self, name: str, event: str, changed: list[str] | None, orconf: str | None) -> None:
+        """Compile the BEFORE and AFTER programs of an UPDATE or DELETE in
+        the order of the table's trigger list (newest first), as SQLite's
+        sqlite3TriggerColmask does before the rest of the statement."""
+        executor = self.executor
+        if not executor.catalog.triggers or self.disabled:
+            return
+        for trigger in executor.catalog.triggers_on(name):
+            if trigger.event == event and trigger.timing in ("BEFORE", "AFTER") and trigger in self.matching(
+                    name, trigger.timing, event, changed):
+                self.program(trigger, orconf, compiling=True)
+
     def may_abort(self, name: str, event: str, changed: list[str] | None, orconf: str | None) -> bool:
         """Whether a program the statement may run may abort it (compiled already by prepare())."""
         return any(getattr(self.program(trigger, orconf), "may_abort", False)
