@@ -172,7 +172,7 @@ class Scope:
         self.phase = None  # the clause of the query being compiled: "outputs", "where", "group", ...
         self.in_aggregate = False  # compiling the arguments of one of its aggregate calls
         self.watch = None  # a set to collect the indexes of the tables references resolve to
-        self.has_windows = False  # its query has window functions
+        self.has_windows = lambda: False  # whether its query has window functions
 
     def add(self, table: Source, alias: str | None = None) -> None:
         name = ascii_lower(alias if alias is not None else table.name)
@@ -1127,7 +1127,7 @@ class Compiler:
         owner = self.scope.ancestor(depth)
         if owner.phase == "group":
             raise OperationalError("aggregate functions are not allowed in the GROUP BY clause")
-        if owner.has_windows:
+        if owner.has_windows():
             # (SQLite moves a query with window functions into a subquery, which the aggregate cannot reach)
             raise OperationalError(f"misuse of aggregate: {name}()")
         if owner.aggregates is None:
@@ -2404,7 +2404,7 @@ class Executor:
         self.once_caches = []
         if isinstance(stmt, (Select, Compound, Values)):
             plan = PreparedSelect(self.compile_query(stmt))
-            plan.aborts = calls_function(stmt)  # (in a trigger program)
+            plan.aborts = bool(self.compiling_trigger) and calls_function(stmt)  # (see Program.may_abort)
         else:
             with self.cte_scope(stmt.ctes or []):
                 view = self.catalog.find_view(stmt.table)
@@ -4099,8 +4099,9 @@ class CompiledSelect:
             raise OperationalError("HAVING clause on a non-aggregate query")
         self.aggregates = scope.aggregates = AggregateCollector(scope.width) if self.is_aggregate else None
         self.windows = WindowCollector(stmt.windows)
-        scope.has_windows = any(isinstance(node, Call) and node.over is not None
-                                for e in [*self.exprs, *(item.expr for item in stmt.order_by)] for node in walk(e))
+        exprs = [*self.exprs, *(item.expr for item in stmt.order_by)]
+        scope.has_windows = lambda: any(isinstance(node, Call) and node.over is not None  # (asked for rarely)
+                                        for e in exprs for node in walk(e))
         compiler = Compiler(scope, self.aggregates, misuse="misuse of aggregate: {name}()",
                             executor=executor, allow_aggregates=True, windows=self.windows)
         scope.phase = "outputs"
@@ -4510,7 +4511,9 @@ class PreparedInsert:
         # several rows, triggers) that may abort: a constraint checked as
         # ABORT, a function call, a trigger program that may abort.
         triggers = executor.triggers
-        self.aborts = self.may_abort() or calls_function(stmt) or triggers.may_abort(
+        multi = multi_write or bool(executor.catalog.triggers and triggers.exist(table.name, "INSERT"))
+        # (Only a multi-row write needs it, or a statement of a trigger program: Program.may_abort.)
+        self.aborts = (multi or bool(executor.compiling_trigger)) and (self.may_abort() or calls_function(stmt) or triggers.may_abort(
             table.name, "INSERT", None, self.conflict) or any(
             # (an upsert's UPDATE runs its triggers' programs as OR ABORT)
             upsert.assignments and triggers.may_abort(table.name, "UPDATE", [
@@ -4518,8 +4521,8 @@ class PreparedInsert:
             for upsert in self.upserts) or (
             bool(executor.settings["recursive_triggers"]) and replace_possible(
                 table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
-            and triggers.may_abort(table.name, "DELETE", None, "REPLACE"))
-        self.statement_journal = (multi_write or triggers.exist(table.name, "INSERT")) and self.aborts
+            and triggers.may_abort(table.name, "DELETE", None, "REPLACE")))
+        self.statement_journal = multi and self.aborts
 
     def prepare_programs(self) -> None:
         """What SQLite compiles with the statement, in its order (so the
@@ -4529,6 +4532,10 @@ class PreparedInsert:
         the AFTER triggers."""
         executor, table = self.executor, self.table
         triggers, keys = executor.triggers, executor.foreign_keys
+        self.unchecked = None
+        if not executor.catalog.triggers and not keys.enabled:
+            self.fk_multi = True  # (nothing to compile; used only with foreign keys)
+            return
         triggers.prepare(table.name, "INSERT", None, self.conflict, ("BEFORE",))
         # A statement is a multi-row write (sqlite3MultiWrite) with a SELECT,
         # RETURNING or INSERT triggers, in a trigger program, and when an
@@ -4550,7 +4557,6 @@ class PreparedInsert:
             executor.compile_delete(table, "REPLACE", recursive)
             multi = multi or keys.involved(table) or (recursive and triggers.exist(table.name, "DELETE"))
         self.fk_multi = multi
-        self.unchecked = None
         if keys.enabled:
             keys.prepare(table, "insert", single_insert=not self.fk_multi)
             self.unchecked = executor.set_null_link(table)
@@ -4758,13 +4764,14 @@ class PreparedDelete(PreparedSingleTable):
         self.delete_all = stmt.where is None and self.returning is None
         executor.compile_delete(self.table, None)  # (what SQLite compiles with it, in its order)
         keys = executor.foreign_keys
-        self.aborts = calls_function(stmt) or executor.triggers.may_abort(self.table.name, "DELETE", None, None) or (
-            keys.enabled and keys.involved(self.table) and keys.may_abort(self.table, "delete"))
         # (SQLite: a statement journal for a multi-row write - triggers, foreign
         # keys, RETURNING - that may abort; a plain DELETE cannot fail half way.)
-        self.statement_journal = self.aborts and (
-            executor.triggers.exist(self.table.name, "DELETE") or keys.involved(self.table)
-            or self.returning is not None)
+        multi = executor.triggers.exist(self.table.name, "DELETE") or keys.involved(self.table) or (
+            self.returning is not None)
+        self.aborts = (multi or bool(executor.compiling_trigger)) and (
+            calls_function(stmt) or executor.triggers.may_abort(self.table.name, "DELETE", None, None) or (
+                keys.enabled and keys.involved(self.table) and keys.may_abort(self.table, "delete")))
+        self.statement_journal = multi and self.aborts
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
