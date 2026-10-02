@@ -150,7 +150,7 @@ class Program:
                 for cache in plan.once_caches:
                     cache.clear()  # (each run of a program evaluates its subqueries anew)
                 result = plan.run()
-                if changes:
+                if changes:  # (SQLite's OP_ResetCount after each statement adds them to total_changes())
                     self.changes += max(result.rowcount, 0)
         finally:
             cell[0] = saved
@@ -272,13 +272,10 @@ class Triggers:
             outer_changes, program.changes = program.changes, 0
             try:
                 program.run(new, old)
-            except TriggerIgnore:
-                executor.foreign_keys.extra_changes += program.changes
-                raise
-            else:
-                # (SQLite counts a program's changes in total_changes() when it completes)
-                executor.foreign_keys.extra_changes += program.changes
             finally:
+                # (the statements a program completed count in total_changes(), even when
+                # a later one fails and the statement is undone)
+                executor.foreign_keys.extra_changes += program.changes
                 program.changes = outer_changes
                 executor.last_insert_rowid = saved_rowid
                 self.active.pop()
