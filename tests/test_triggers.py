@@ -1,0 +1,241 @@
+"""Triggers, compared with SQLite (both file formats)."""
+
+import sqlite3
+from contextlib import closing
+
+import pytest
+
+from minidb.database import Database
+from sqlcompare import Pair
+
+SCHEMA = "SELECT type, name, tbl_name, rootpage, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name"
+
+
+@pytest.fixture(params=[None, "sqlite"])
+def pair(request, tmp_path):
+    path = str(tmp_path / "db") if request.param else None
+    return Pair(path, check_messages=True, format=request.param)
+
+
+def run(pair, script):
+    for sql in script:
+        pair.run(sql)
+
+
+def test_firing_order_and_new_values(pair):
+    """Newest trigger first; BEFORE INSERT sees the values with their
+    affinities and row id -1 when unknown; UPDATE OF, WHEN; changes()."""
+    run(pair, [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a REAL, b TEXT COLLATE nocase, c)", "CREATE TABLE log (x)",
+        "CREATE TRIGGER t1 BEFORE INSERT ON t BEGIN INSERT INTO log VALUES ('t1:' || typeof(new.a) || ':' "
+        "|| new.rowid || ':' || quote(new.id) || ':' || quote(new.a) || ':' || quote(new.b)); END",
+        "CREATE TRIGGER t2 BEFORE INSERT ON t BEGIN INSERT INTO log VALUES ('t2'); END",
+        "CREATE TRIGGER t3 AFTER INSERT ON t BEGIN INSERT INTO log VALUES ('t3:' || new.rowid || ':' "
+        "|| last_insert_rowid() || ':' || changes()); END",
+        "CREATE TRIGGER t4 AFTER INSERT ON t FOR EACH ROW WHEN new.b = 'X' BEGIN INSERT INTO log VALUES ('t4'); END",
+        "INSERT INTO t (a, b, c) VALUES ('5', 7, 1)", "INSERT INTO t VALUES (10, '1.0', 'x', NULL), (NULL, 2, 'y', 3)",
+        "SELECT * FROM log", "SELECT changes(), total_changes(), last_insert_rowid()",
+        "CREATE TRIGGER u1 AFTER UPDATE OF b, c ON t WHEN new.a > 3 BEGIN INSERT INTO log VALUES "
+        "(old.a || '>' || new.a || ',' || quote(old.b) || '>' || quote(new.b) || ' ' || (new.b = 'Y')); END",
+        "CREATE TRIGGER u2 BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('u2 ' || quote(new.a) || quote(new.id)); END",
+        "UPDATE t SET a = a + 10", "UPDATE t SET b = upper(b), id = id + 100 WHERE id > 1", "SELECT * FROM log",
+        "SELECT changes(), total_changes()", "SELECT * FROM t",
+        "CREATE TRIGGER d1 AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('d1 ' || old.id || ' ' || old.b); END",
+        "DELETE FROM t WHERE a > 11", "DELETE FROM t", "SELECT * FROM log", "SELECT changes(), total_changes()",
+        SCHEMA,
+    ])
+
+
+def test_recursion_and_depth(pair):
+    run(pair, [
+        "CREATE TABLE t (a)", "CREATE TRIGGER r AFTER INSERT ON t WHEN new.a < 5 BEGIN INSERT INTO t VALUES (new.a + 1); END",
+        "INSERT INTO t VALUES (1)", "SELECT * FROM t", "PRAGMA recursive_triggers = 1", "INSERT INTO t VALUES (1)",
+        "SELECT * FROM t", "SELECT total_changes()",
+        "CREATE TABLE u (a)", "CREATE TRIGGER r2 AFTER INSERT ON u BEGIN INSERT INTO u VALUES (new.a + 1); END",
+        "INSERT INTO u VALUES (1)", "SELECT count(*) FROM u",
+        # Two triggers firing each other: off, each runs once per chain.
+        "PRAGMA recursive_triggers = 0", "CREATE TABLE p (a)", "CREATE TABLE q (a)",
+        "CREATE TRIGGER pq AFTER INSERT ON p WHEN new.a < 6 BEGIN INSERT INTO q VALUES (new.a + 1); END",
+        "CREATE TRIGGER qp AFTER INSERT ON q WHEN new.a < 6 BEGIN INSERT INTO p VALUES (new.a + 1); END",
+        "INSERT INTO p VALUES (1)", "SELECT * FROM p", "SELECT * FROM q",
+    ])
+
+
+def test_raise(pair):
+    run(pair, [
+        "CREATE TABLE t (a)", "CREATE TABLE log (x)",
+        "CREATE TRIGGER b BEFORE INSERT ON t BEGIN SELECT RAISE(IGNORE) WHERE new.a = 2; "
+        "SELECT RAISE(ABORT, 'no threes ' || new.a) WHERE new.a = 3; SELECT RAISE(FAIL, 'fail4') WHERE new.a = 4; "
+        "SELECT RAISE(ROLLBACK, 'rb5') WHERE new.a = 5; SELECT RAISE(ABORT, NULL) WHERE new.a = 6; "
+        "SELECT RAISE(FAIL, 7.5) WHERE new.a = 7; END",
+        "INSERT INTO t VALUES (1), (2), (1)", "SELECT * FROM t", "SELECT changes()",
+        "INSERT INTO t VALUES (1), (3)", "SELECT * FROM t", "INSERT INTO t VALUES (8), (4), (8)", "SELECT * FROM t",
+        "INSERT INTO t VALUES (6)", "INSERT INTO t VALUES (7)",
+        "BEGIN", "INSERT INTO t VALUES (9)", "INSERT INTO t VALUES (5)", "SELECT * FROM t", "COMMIT",
+        "SELECT RAISE(ABORT, 'x')", "SELECT RAISE(IGNORE) FROM t WHERE 0",
+        # RAISE(IGNORE) in a nested trigger abandons only that one (and its row).
+        "CREATE TABLE u (x)",
+        "CREATE TRIGGER n1 AFTER INSERT ON u BEGIN INSERT INTO log VALUES ('u ' || new.x); "
+        "SELECT RAISE(IGNORE) WHERE new.x = 2; INSERT INTO log VALUES ('after ' || new.x); END",
+        "CREATE TRIGGER n0 AFTER INSERT ON t WHEN new.a > 10 BEGIN INSERT INTO u VALUES (1), (2), (3); "
+        "INSERT INTO log VALUES ('t done'); END",
+        "INSERT INTO t VALUES (11)", "SELECT * FROM log", "SELECT * FROM u", "SELECT changes(), total_changes()",
+        "UPDATE t SET a = RAISE(IGNORE)",
+    ])
+
+
+def test_errors(pair):
+    run(pair, [
+        "CREATE TABLE t (a, b)", "CREATE VIEW v AS SELECT * FROM t", "CREATE TABLE u (x)", "CREATE INDEX ui ON u (x)",
+        "CREATE TRIGGER x INSTEAD OF INSERT ON t BEGIN SELECT 1; END",
+        "CREATE TRIGGER x BEFORE INSERT ON v BEGIN SELECT 1; END", "CREATE TRIGGER x AFTER DELETE ON v BEGIN SELECT 1; END",
+        "CREATE TRIGGER x AFTER INSERT ON nosuch BEGIN SELECT 1; END",
+        "CREATE TRIGGER x AFTER INSERT ON sqlite_master BEGIN SELECT 1; END",
+        "CREATE TRIGGER sqlite_x AFTER INSERT ON t BEGIN SELECT 1; END",
+        "CREATE TRIGGER x AFTER INSERT ON t BEGIN INSERT INTO main.u VALUES (1); END",
+        "CREATE TRIGGER x AFTER INSERT ON t BEGIN UPDATE u INDEXED BY ui SET x = 1; END",
+        "CREATE TRIGGER x AFTER INSERT ON t BEGIN DELETE FROM u NOT INDEXED; END",
+        "CREATE TRIGGER x AFTER INSERT ON t BEGIN INSERT INTO u VALUES (1) RETURNING x; END",
+        "CREATE TRIGGER x AFTER INSERT ON t WHEN ? BEGIN SELECT 1; END",
+        "CREATE TRIGGER x AFTER INSERT ON t BEGIN SELECT ?; END",
+        "CREATE TRIGGER x AFTER INSERT ON t BEGIN INSERT INTO nosuch VALUES (1); END",
+        "INSERT INTO t VALUES (1, 2)", "DROP TRIGGER x", "DROP TRIGGER x", "DROP TRIGGER IF EXISTS x",
+        "CREATE TRIGGER y AFTER INSERT ON t BEGIN SELECT nosuchcol FROM t; END", "INSERT INTO t VALUES (1, 2)",
+        "CREATE TRIGGER IF NOT EXISTS y AFTER INSERT ON t BEGIN SELECT 1; END",
+        "CREATE TRIGGER y AFTER INSERT ON t BEGIN SELECT 1; END", "DROP TRIGGER main.y",
+        "CREATE TRIGGER z1 AFTER INSERT ON t BEGIN SELECT old.a; END", "INSERT INTO t VALUES (1, 2)", "DROP TRIGGER z1",
+        "CREATE TRIGGER z2 AFTER DELETE ON t BEGIN SELECT new.a; END", "DELETE FROM t", "DROP TRIGGER z2",
+        "CREATE TRIGGER z3 AFTER INSERT ON t WHEN a > 0 BEGIN SELECT 1; END", "INSERT INTO t VALUES (1, 2)",
+        "DROP TRIGGER z3", "CREATE TRIGGER z4 AFTER INSERT ON t BEGIN SELECT new.nosuch; END",
+        "INSERT INTO t VALUES (1, 2)", "DROP TRIGGER z4",
+        # Triggers have a namespace of their own.
+        "CREATE TRIGGER t AFTER INSERT ON t BEGIN SELECT 1; END", "CREATE TRIGGER ui AFTER INSERT ON t BEGIN SELECT 1; END",
+        "CREATE TABLE ui2 (a)", "CREATE TRIGGER \"x 13\" AFTER DELETE ON \"t\" BEGIN SELECT 1 ; END ;",
+        "CREATE  TRIGGER IF NOT EXISTS  main.x3 AFTER INSERT ON main.t FOR EACH ROW BEGIN SELECT 1; END",
+        SCHEMA, "DROP TABLE t", SCHEMA, "SELECT name FROM sqlite_master ORDER BY name",
+    ])
+
+
+def test_before_triggers_change_the_row(pair):
+    """After BEFORE UPDATE / DELETE triggers SQLite looks at the row again:
+    gone, it is skipped; changed, the columns the UPDATE does not set take
+    the new values (SQLite's trigger1-18.0); OLD stays what it was."""
+    run(pair, [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a, b)", "CREATE TABLE log (x)",
+        "INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3)",
+        "CREATE TRIGGER bu BEFORE UPDATE ON t BEGIN UPDATE t SET b = b * 10 WHERE id = new.id; "
+        "DELETE FROM t WHERE id = 3 AND new.id = 2; END",
+        "CREATE TRIGGER au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (old.b || '>' || new.b || ' ' || new.a); END",
+        "UPDATE t SET a = a + 100", "SELECT * FROM t", "SELECT * FROM log", "SELECT changes()",
+        "CREATE TRIGGER bd BEFORE DELETE ON t BEGIN DELETE FROM t WHERE id = old.id + 1; END",
+        "CREATE TRIGGER ad AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('gone ' || old.id); END",
+        "INSERT INTO t VALUES (5, 5, 5), (6, 6, 6), (7, 7, 7)", "DELETE FROM t WHERE id >= 5", "SELECT * FROM t",
+        "SELECT * FROM log", "SELECT changes(), total_changes()",
+    ])
+
+
+def test_interplay(pair):
+    """Triggers with foreign key actions, REPLACE (delete triggers only with
+    recursive_triggers), upserts (UPDATE triggers), and the outer statement's
+    OR clause, which overrides the trigger's own."""
+    run(pair, [
+        "PRAGMA foreign_keys = ON", "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, r REFERENCES p ON DELETE CASCADE ON UPDATE SET NULL)",
+        "CREATE TABLE log (x)",
+        "CREATE TRIGGER cd AFTER DELETE ON c BEGIN INSERT INTO log VALUES ('c del ' || old.id); END",
+        "CREATE TRIGGER cu AFTER UPDATE ON c BEGIN INSERT INTO log VALUES ('c upd ' || quote(new.r)); END",
+        "INSERT INTO p VALUES (1), (2)", "INSERT INTO c VALUES (10, 1), (11, 1), (12, 2)",
+        "DELETE FROM p WHERE id = 1", "UPDATE p SET id = 3", "SELECT * FROM log", "SELECT changes(), total_changes()",
+        "CREATE TABLE k (a PRIMARY KEY, b)",
+        "CREATE TRIGGER kd AFTER DELETE ON k BEGIN INSERT INTO log VALUES ('k del ' || old.a || old.b); END",
+        "CREATE TRIGGER ku AFTER UPDATE ON k BEGIN INSERT INTO log VALUES ('k upd ' || new.b); END",
+        "CREATE TRIGGER ki BEFORE INSERT ON k BEGIN INSERT INTO log VALUES ('k ins ' || new.b); END",
+        "INSERT INTO k VALUES (1, 'a')", "REPLACE INTO k VALUES (1, 'b')", "PRAGMA recursive_triggers = 1",
+        "REPLACE INTO k VALUES (1, 'c')", "INSERT INTO k VALUES (1, 'd') ON CONFLICT (a) DO UPDATE SET b = 'e'",
+        "INSERT INTO k VALUES (1, 'f') ON CONFLICT DO NOTHING", "SELECT * FROM log", "SELECT * FROM k",
+        "CREATE TABLE o (a UNIQUE)", "CREATE TABLE src (a)",
+        "CREATE TRIGGER so AFTER INSERT ON src BEGIN INSERT INTO o VALUES (new.a); INSERT INTO log VALUES ('so ' || new.a); END",
+        "INSERT INTO src VALUES (1)", "INSERT INTO src VALUES (1)", "INSERT OR IGNORE INTO src VALUES (1)",
+        "INSERT OR REPLACE INTO src VALUES (1)", "SELECT * FROM o", "SELECT count(*) FROM src",
+        "SELECT * FROM log ORDER BY rowid DESC LIMIT 3",
+    ])
+
+
+def test_instead_of_triggers(pair):
+    run(pair, [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a REAL, b TEXT)", "CREATE TABLE log (x)",
+        "INSERT INTO t VALUES (1, 1.5, 'x'), (2, 2.5, 'y'), (3, 3.5, 'z')",
+        "CREATE VIEW v AS SELECT id, a * 2 AS dbl, b FROM t", "CREATE VIEW w (p, q) AS SELECT a, b FROM t",
+        "CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO log VALUES ('ins ' || quote(new.id) || ',' "
+        "|| quote(new.dbl) || ',' || quote(new.b)); END",
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN INSERT INTO log VALUES ('upd ' || old.id || ':' "
+        "|| quote(old.dbl) || '->' || quote(new.dbl) || ' b ' || old.b || '->' || quote(new.b)); END",
+        "CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN INSERT INTO log VALUES ('del ' || old.id); END",
+        "INSERT INTO v VALUES (7, '8', 9)", "SELECT changes(), total_changes()", "INSERT INTO v (b) VALUES ('q')",
+        "INSERT INTO v SELECT * FROM v WHERE id < 3", "UPDATE v SET dbl = dbl + 1 WHERE id >= 2", "UPDATE v SET b = 'B'",
+        "UPDATE OR IGNORE v SET b = 'C' WHERE b = 'x'", "DELETE FROM v WHERE dbl > 4", "SELECT changes()",
+        "DELETE FROM v", "SELECT * FROM log", "INSERT INTO w VALUES (1, 2)", "UPDATE w SET p = 1", "DELETE FROM w",
+        "CREATE TRIGGER wi INSTEAD OF INSERT ON w BEGIN SELECT RAISE(IGNORE) WHERE new.p = 0; "
+        "INSERT INTO t (a, b) VALUES (new.p, new.q); END",
+        "INSERT INTO w VALUES (0, 'zero'), (5, 'five')", "SELECT changes(), last_insert_rowid()", "SELECT * FROM t",
+        "INSERT INTO v VALUES (1) RETURNING *", "UPDATE v SET nosuch = 1", "UPDATE v SET b = 1 WHERE nosuch",
+        "INSERT INTO v (nosuch) VALUES (1)", "INSERT INTO v VALUES (1, 2)", "INSERT OR REPLACE INTO v VALUES (1, 2, 3)",
+        "CREATE TRIGGER wr INSTEAD OF INSERT ON w BEGIN SELECT new.rowid; END", "INSERT INTO w VALUES (1, 1)",
+        "DROP TRIGGER wr", "INSERT INTO v VALUES (1, 2, 3) RETURNING id", "UPDATE v SET b = 2 RETURNING *",
+        "DELETE FROM v RETURNING b", "UPDATE v SET id = id + 100 WHERE id = 1",
+        "SELECT * FROM log ORDER BY rowid DESC LIMIT 3", "DROP VIEW v", "SELECT name FROM sqlite_master ORDER BY name",
+    ])
+
+
+def test_alter_table_edits_triggers(pair):
+    run(pair, [
+        "CREATE TABLE t (a, b)", "CREATE TABLE log (x, y)", "CREATE TABLE other (p)",
+        "CREATE TRIGGER tr1 AFTER UPDATE OF a ON t WHEN new.a > old.a BEGIN INSERT INTO log (x, y) "
+        "SELECT new.a, t.b FROM t WHERE a = new.a; UPDATE other SET p = new.b; END",
+        "CREATE TRIGGER tr2 AFTER INSERT ON other BEGIN DELETE FROM t WHERE a = new.p; "
+        "INSERT INTO log VALUES ((SELECT count(*) FROM t), 0); UPDATE t SET a = 1, b = 2 WHERE b = new.p; END",
+        "ALTER TABLE t RENAME TO \"T 2\"", SCHEMA, "ALTER TABLE \"T 2\" RENAME COLUMN a TO aa", SCHEMA,
+        "ALTER TABLE \"T 2\" RENAME COLUMN b TO \"b b\"", SCHEMA, "ALTER TABLE log RENAME COLUMN x TO xx", SCHEMA,
+        "ALTER TABLE other RENAME TO o2", SCHEMA, "ALTER TABLE \"T 2\" DROP COLUMN aa",
+        "ALTER TABLE \"T 2\" DROP COLUMN \"b b\"",
+        "ALTER TABLE \"T 2\" ADD COLUMN c", SCHEMA, "INSERT INTO o2 VALUES (1)", "UPDATE \"T 2\" SET aa = 5",
+        "SELECT * FROM log",
+        "CREATE TABLE q (m, n)", "CREATE TRIGGER tq AFTER INSERT ON q BEGIN SELECT new.n; END", "ALTER TABLE q DROP COLUMN n",
+        "ALTER TABLE log DROP COLUMN y", "DROP TABLE log", SCHEMA, "INSERT INTO o2 VALUES (1)",
+    ])
+
+
+def test_triggers_survive_reopening(tmp_path):
+    for fmt in (None, "sqlite"):
+        path = str(tmp_path / f"db{fmt}")
+        with Database(path, format=fmt) as db:
+            db.execute("CREATE TABLE t (a)")
+            db.execute("CREATE TABLE log (x)")
+            db.execute("CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO log VALUES (new.a * 2); END")
+            db.execute("CREATE TRIGGER gone AFTER INSERT ON t BEGIN SELECT 1; END")
+            db.execute("BEGIN")
+            db.execute("DROP TRIGGER gone")
+            db.execute("ROLLBACK")
+        with Database(path) as db:
+            db.execute("INSERT INTO t VALUES (21)")
+            assert db.execute("SELECT * FROM log") == [(42,)]
+            assert [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")] == ["tr", "gone"]
+
+
+def test_sqlite_runs_minidb_triggers_and_back(tmp_path):
+    path = str(tmp_path / "db")
+    with Database(path, format="sqlite") as db:
+        db.execute("CREATE TABLE t (a)")
+        db.execute("CREATE TABLE log (x)")
+        db.execute("CREATE TRIGGER tr BEFORE INSERT ON t WHEN new.a > 0 BEGIN INSERT INTO log VALUES ('mini ' || new.a); END")
+    with closing(sqlite3.connect(path)) as lite:
+        lite.execute("INSERT INTO t VALUES (1)")
+        lite.execute("CREATE TRIGGER tr2 AFTER DELETE ON t BEGIN INSERT INTO log VALUES ('lite ' || old.a); END")
+        lite.commit()
+        assert lite.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    with Database(path) as db:
+        db.execute("INSERT INTO t VALUES (2)")
+        db.execute("DELETE FROM t WHERE a = 1")
+        assert db.execute("SELECT * FROM log") == [("mini 1",), ("mini 2",), ("lite 1",)]
+    with closing(sqlite3.connect(path)) as lite:
+        assert lite.execute("PRAGMA integrity_check").fetchall() == [("ok",)]

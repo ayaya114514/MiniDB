@@ -120,7 +120,6 @@ class ForeignKeys:
         self.immediate = 0  # the statement's violations of immediate constraints
         self.deferred = 0  # the transaction's violations of deferred constraints
         self.deferred_immediate = 0  # violations of immediate ones while PRAGMA defer_foreign_keys is on
-        self.depth = 0  # actions within actions
         self.extra_changes = 0  # rows the actions changed (total_changes() counts them)
         self.unchecked = None  # see last_action_program
         self.single_insert = False  # the statement is a one-row INSERT (row_inserted)
@@ -535,16 +534,16 @@ class ForeignKeys:
                 continue
             if action == "RESTRICT":
                 raise IntegrityError("FOREIGN KEY constraint failed")
-            self.depth += 1
+            self.executor.frame_depth += 1
             try:
-                if self.depth > MAX_ACTION_DEPTH:
+                if self.executor.frame_depth > MAX_ACTION_DEPTH:
                     raise OperationalError("too many levels of trigger recursion")
                 # (SQLite counts an action's changes in total_changes() once it
                 # completes, even if the statement fails afterwards)
                 changes = self._act(link, action, children, new)  # (nested actions count first)
                 self.extra_changes += changes
             finally:
-                self.depth -= 1
+                self.executor.frame_depth -= 1
 
     def _act(self, link: Link, action: str, children: list[tuple[int, list]], new: list | None) -> int:
         """Run an action on the child rows; returns how many it changed."""
@@ -558,8 +557,8 @@ class ForeignKeys:
                 continue  # (an earlier action removed it)
             row = executor.load_row(child, rowid, tree.get(rowid))
             if action == "CASCADE" and new is None:
-                executor.delete_row(child, tree, rowid)
-                changes += 1
+                if executor.delete_row(child, tree, rowid, orconf="ABORT") is not None:
+                    changes += 1
                 continue
             updated = list(row)
             changed = set()

@@ -32,16 +32,18 @@ from typing import Any, Protocol, Union
 
 from minidb import dates, functions, pragmas, values, window
 from minidb.foreign_keys import ForeignKeys
+from minidb.triggers import Program, TriggerIgnore, Triggers, raise_error
 from minidb.btree import BTree, IntKey
 from minidb.catalog import (
-    HIGH, Catalog, IndexInfo, IndexKeyCodec, TableInfo, ViewInfo,
+    HIGH, Catalog, IndexInfo, IndexKeyCodec, TableInfo, TriggerInfo, ViewInfo,
     constant_default,
     is_constant_default, quote,
 )
 from minidb.errors import Error, IntegrityError, NotSupportedError, OperationalError
 from minidb.parser import (
     AlterTable, Analyze, Between, Binary, Call, Case, Cast, Collate, Column, Compound, CreateIndex, CreateTable,
-    CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropView, Exists, Explain, InList,
+    CreateTrigger, CreateView, Cte, Delete, DerivedTable, DropIndex, DropTable, DropTrigger, DropView, Exists,
+    Explain, InList, Raise,
     InSelect, Insert, Join, Like, Literal, Parameter, Pragma, Reindex, Select, SelectItem, Star, Subquery,
     TableFunction, TableRef, Unary, Update, Upsert, Vacuum, Values, Frame, WindowDef,
 )
@@ -759,6 +761,8 @@ class Compiler:
             if expr.defer_affinity:
                 return self.call(expr), self.compile_with_affinity(expr.args[0])[1]
             return self.call(expr), None
+        if isinstance(expr, Raise):
+            return self._raise(expr), None
         if isinstance(expr, Star):
             raise OperationalError("* is only allowed in a select list or COUNT(*)")
         raise OperationalError(f"cannot evaluate {expr!r}")
@@ -1042,6 +1046,21 @@ class Compiler:
                 return found
             return None if has_null else missing
         return in_select
+
+    def _raise(self, expr: Raise) -> RowFunction:
+        if self.executor is None or not self.executor.compiling_trigger:
+            raise OperationalError("RAISE() may only be used within a trigger-program")
+        kind = expr.kind
+        if kind == "IGNORE":
+            def ignore(row):
+                raise TriggerIgnore()
+            return ignore
+        message = self.compile(expr.message)
+
+        def raise_(row):
+            text = message(row)
+            raise raise_error(kind, "" if text is None else values.to_text(text))
+        return raise_
 
     def call(self, expr: Call) -> RowFunction:
         name = expr.name
@@ -2151,6 +2170,10 @@ class Executor:
         self.column_hook = None  # called with (Column, table) for each column reference compiled
         self.statement_journal = True  # see PreparedInsert.statement_journal
         self.ran = False  # see execute
+        self.triggers = Triggers(self)
+        self.outer_scope = None  # the NEW / OLD scope while a trigger's statements are compiled
+        self.compiling_trigger = 0  # > 0: RAISE() is allowed
+        self.frame_depth = 0  # trigger programs and foreign key actions running (SQLite's nFrame)
         self.changes = 0  # changes() and total_changes(), kept up to date by Database
         self.total_changes = 0
         # PRAGMA settings of the connection (see minidb.pragmas).
@@ -2178,7 +2201,8 @@ class Executor:
                 cache.clear()
             self.ran = True
             self.statement_journal = getattr(plan, "statement_journal", True)
-            if keys.enabled and isinstance(stmt, (Insert, Update, Delete)) and keys.involved(plan.table):
+            if keys.enabled and isinstance(stmt, (Insert, Update, Delete)) and getattr(plan, "view", None) is None \
+                    and keys.involved(plan.table):
                 self.statement_journal = self.statement_journal or self.foreign_keys_may_abort(stmt, plan)
             result = plan.run()
             self.check_foreign_keys()
@@ -2210,6 +2234,12 @@ class Executor:
             return self.explain(stmt.statement)
         if isinstance(stmt, Analyze):
             self.catalog.analyze(stmt.name)
+            return Result()
+        if isinstance(stmt, CreateTrigger):
+            self.catalog.create_trigger(stmt)
+            return Result()
+        if isinstance(stmt, DropTrigger):
+            self.catalog.drop_trigger(stmt.name, stmt.if_exists)
             return Result()
         if isinstance(stmt, Pragma):
             self.ran = True
@@ -2251,7 +2281,7 @@ class Executor:
                 tree = self.catalog.table_tree(table)
                 for rowid in list(tree.keys()):
                     if rowid in tree:
-                        self.delete_row(table, tree, rowid)
+                        self.delete_row(table, tree, rowid, fire=False)  # (SQLite disables its triggers)
                         keys.extra_changes += 1  # (total_changes() counts them, as in SQLite)
                 if not keys.defer_all() and keys.statement_failed():
                     raise self.constraint_error("FOREIGN KEY constraint failed", "ABORT")
@@ -2306,7 +2336,13 @@ class Executor:
             plan = PreparedSelect(self.compile_query(stmt))
         else:
             with self.cte_scope(stmt.ctes or []):
-                if isinstance(stmt, Insert):
+                view = self.catalog.find_view(stmt.table)
+                event = "INSERT" if isinstance(stmt, Insert) else "UPDATE" if isinstance(stmt, Update) else "DELETE"
+                names = [name for name, _ in stmt.assignments] if isinstance(stmt, Update) else None
+                if view is not None and self.triggers.matching(view.name, "INSTEAD OF", event, names):
+                    plan = (PreparedViewInsert(self, stmt, view) if isinstance(stmt, Insert)
+                            else PreparedViewChange(self, stmt, view))
+                elif isinstance(stmt, Insert):
                     plan = PreparedInsert(self, stmt)
                 elif isinstance(stmt, Update):
                     plan = PreparedUpdate(self, stmt)
@@ -2331,6 +2367,8 @@ class Executor:
     def compile_query(self, stmt: Select | Compound | Values, parent: Scope | None = None) -> CompiledQuery:
         """Compile a SELECT, VALUES or compound SELECT (``parent``: the
         enclosing query's scope when this is a subquery), with its WITH clause."""
+        if parent is None:
+            parent = self.outer_scope  # (a trigger's NEW / OLD)
         if stmt.ctes:
             with self.cte_scope(stmt.ctes):
                 return self._compile_query(stmt, parent)
@@ -2437,6 +2475,7 @@ class Executor:
             raise OperationalError(f"view {view.name} is circularly defined")
         self.expanding.append(view)
         saved, self.cte_scopes = self.cte_scopes, []  # a view sees no CTE of the query using it
+        outer, self.outer_scope = self.outer_scope, None  # (nor a trigger's NEW / OLD)
         try:
             compiled = self.compile_query(view.query)
         except OperationalError as exc:
@@ -2446,6 +2485,7 @@ class Executor:
                 raise OperationalError(message.replace(": ", ": main.", 1)) from None
             raise
         finally:
+            self.outer_scope = outer
             self.expanding.pop()
             self.cte_scopes = saved
         return DerivedSource(view.name, compiled, view.columns)
@@ -3105,18 +3145,41 @@ class Executor:
     def unique_error(table: TableInfo, index: IndexInfo) -> str:
         return "UNIQUE constraint failed: " + ", ".join(f"{table.name}.{c}" for c in index.column_names)
 
-    def delete_row(self, table: TableInfo, tree: BTree, rowid: int) -> Row:
-        """Delete a row and its index entries; returns it (with its row id).
-        With foreign keys on: their checks before, their actions after."""
+    def delete_row(self, table: TableInfo, tree: BTree, rowid: int, replace: bool = False,
+                   orconf: str | None = None, fire: bool = True) -> Row | None:
+        """Delete a row and its index entries; returns it (with its row id),
+        or None if a BEFORE trigger's RAISE(IGNORE) kept it or the trigger
+        deleted it.  With foreign keys on: their checks before, their
+        actions after.  ``replace``: deleted by REPLACE, which fires DELETE
+        triggers only with PRAGMA recursive_triggers (as in SQLite);
+        ``fire``: False for DROP TABLE's implicit DELETE."""
         row = self.load_row(table, rowid, tree.get(rowid))
+        triggers = self.triggers
+        fire = fire and (not replace or self.settings["recursive_triggers"])
+        if replace:
+            orconf = "REPLACE"
+        current = row
+        if fire and triggers.matching(table.name, "BEFORE", "DELETE"):
+            try:
+                triggers.fire(table.name, "BEFORE", "DELETE", row, None, None, orconf)
+            except TriggerIgnore:
+                return None
+            if rowid not in tree:
+                return None
+            current = self.load_row(table, rowid, tree.get(rowid))
         keys = self.foreign_keys
         involved = keys.involved(table)
         if involved:
             keys.row_removing(table, row)
-        self.remove_index_entries(table, row, rowid)
+        self.remove_index_entries(table, current, rowid)
         tree.delete(rowid)
         if involved:
             keys.actions(table, row)
+        if fire and triggers.matching(table.name, "AFTER", "DELETE"):
+            try:
+                triggers.fire(table.name, "AFTER", "DELETE", row, None, None, orconf)
+            except TriggerIgnore:
+                pass
         return row
 
     def check_unique(self, table: TableInfo, row: Row, rowid: int) -> None:
@@ -3178,6 +3241,16 @@ class Executor:
             rowid = values.apply_affinity(given, values.INTEGER)
             if not isinstance(rowid, int):
                 raise IntegrityError("datatype mismatch")
+        triggers = self.triggers
+        if triggers.matching(table.name, "BEFORE", "INSERT"):
+            # NEW has the values with their affinities, and row id -1 when it is not known yet.
+            new = row + [-1 if rowid is None else rowid]
+            if table.rowid_column is not None:
+                new[table.rowid_column] = new[-1]
+            try:
+                triggers.fire(table.name, "BEFORE", "INSERT", None, new, None, conflict)
+            except TriggerIgnore:
+                return None
         if sequence is not None and rowid is not None:
             sequence[0] = max(sequence[0], rowid)
         violation = self.not_null_violation(table, row, conflict, raw)
@@ -3229,7 +3302,7 @@ class Executor:
             if how == "IGNORE":
                 return None
             if how == "REPLACE":
-                self.delete_row(table, tree, other)
+                self.delete_row(table, tree, other, replace=True)
                 continue
             message = self.rowid_conflict(table).args[0] if constraint == "rowid" else self.unique_error(table, constraint)
             raise self.constraint_error(message, how)
@@ -3239,6 +3312,12 @@ class Executor:
             self.foreign_keys.row_inserted(table, row + [rowid])
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
+        if triggers.matching(table.name, "AFTER", "INSERT"):
+            self.last_insert_rowid = rowid  # (the trigger sees it)
+            try:
+                triggers.fire(table.name, "AFTER", "INSERT", None, row + [rowid], None, conflict)
+            except TriggerIgnore:
+                pass
         return "insert", row + [rowid]
 
     def update_row(self, table: TableInfo, tree: BTree, rowid: int, old: Row, new: Row, conflict: str | None = None,
@@ -3258,6 +3337,22 @@ class Executor:
             new_rowid = self.prepare_row(table, row)
             if new_rowid is None:
                 raise IntegrityError("datatype mismatch")
+        triggers = self.triggers
+        names = None if changed is None else [table.columns[p].name if p < width else "rowid" for p in changed]
+        current = old
+        if triggers.matching(table.name, "BEFORE", "UPDATE", names):
+            try:
+                triggers.fire(table.name, "BEFORE", "UPDATE", old, row + [new_rowid], names, conflict)
+            except TriggerIgnore:
+                return None
+            if rowid not in tree:
+                return None  # (the trigger deleted it)
+            # The trigger may have changed the row: the columns the UPDATE does
+            # not set take their values from it now (SQLite's trigger1-18.0).
+            current = self.load_row(table, rowid, tree.get(rowid))
+            for i in range(width):
+                if (changed is None or i not in changed) and i != table.rowid_column:
+                    row[i] = current[i]
         violation = self.not_null_violation(table, row, conflict)
         if violation is not None:
             if violation[1] == "IGNORE":
@@ -3293,12 +3388,12 @@ class Executor:
                 message = (self.rowid_conflict(table).args[0] if constraint == "rowid"
                            else self.unique_error(table, constraint))
                 raise self.constraint_error(message, how)
-            self.delete_row(table, tree, other)
+            self.delete_row(table, tree, other, replace=True)
         keys = self.foreign_keys
         involved = keys.involved(table) and keys.required(table, changed)
         if involved:
             keys.row_removing(table, old, changed)
-        self.remove_index_entries(table, old, rowid)
+        self.remove_index_entries(table, current, rowid)
         if new_rowid != rowid:
             tree.delete(rowid)
         if involved:
@@ -3307,6 +3402,11 @@ class Executor:
         self.add_index_entries(table, row, new_rowid)
         if involved:
             keys.actions(table, old, row + [new_rowid], changed)
+        if triggers.matching(table.name, "AFTER", "UPDATE", names):
+            try:
+                triggers.fire(table.name, "AFTER", "UPDATE", old, row + [new_rowid], names, conflict)
+            except TriggerIgnore:
+                pass
         return row + [new_rowid]
 
     def compile_returning(self, items: list[SelectItem] | None, scope: Scope) -> tuple[list[RowFunction], list[str]] | None:
@@ -3409,6 +3509,31 @@ class Executor:
             self.cte_scopes = saved
         return found
 
+    def _trigger_references(self, trigger: TriggerInfo, table: TableInfo) -> list[Column] | None:
+        """The column references of a trigger's program that resolve to
+        ``table`` (None if the program does not compile)."""
+        found = []
+        source = self.catalog.tables.get(ascii_lower(trigger.table_name))
+        if source is None:
+            view = self.catalog.find_view(trigger.table_name)
+            if view is None:
+                return None
+        self.column_hook = lambda expr, owner: found.append(expr) if owner is table else None
+        self.triggers.disabled += 1  # (not the programs of the triggers its statements fire)
+        try:
+            Program(self, trigger, source if source is not None else self.view_source(view), None)
+        except Error:
+            return None
+        finally:
+            self.column_hook = None
+            self.triggers.disabled -= 1
+        return found
+
+    @staticmethod
+    def _trigger_nodes(trigger: TriggerInfo) -> Iterator[object]:
+        yield from walk_nodes(trigger.stmt.body)
+        yield from walk_nodes(trigger.stmt.when)
+
     def _referencing_tables(self, table: TableInfo) -> list[tuple[TableInfo, CreateTable]]:
         """The tables (``table`` too) with a foreign key to ``table``, and their parsed SQL."""
         found = []
@@ -3434,6 +3559,23 @@ class Executor:
                       and ascii_lower(node.table) == ascii_lower(old) and node.table_pos >= 0]
             if edits:
                 catalog.rewrite_view(view, apply_edits(view.sql, edits))
+        # Triggers: their table, and the table in their statements (as alter.c does).
+        for trigger in list(catalog.triggers.values()):
+            changes, target = [], trigger.table_name
+            if ascii_lower(trigger.table_name) == ascii_lower(old):
+                changes.append((trigger.stmt.table_pos, quote(new)))
+                target = new
+            for node in self._trigger_nodes(trigger):
+                if isinstance(node, TableRef) and ascii_lower(node.name) == ascii_lower(old) and node.pos >= 0:
+                    changes.append((node.pos, quote(new)))
+                elif (isinstance(node, (Insert, Update, Delete)) and ascii_lower(node.table) == ascii_lower(old)
+                      and node.table_pos >= 0):
+                    changes.append((node.table_pos, quote(new)))
+                elif (isinstance(node, Column) and node.table is not None
+                      and ascii_lower(node.table) == ascii_lower(old) and node.table_pos >= 0):
+                    changes.append((node.table_pos, quote(new)))
+            if changes:
+                catalog.rewrite_trigger(trigger, apply_edits(trigger.sql, changes), target)
         # The foreign keys naming it (its own too), and its own name.
         edits = {table: [(parse(table.sql).name_pos, quote(new))]}
         for other, stmt in self._referencing_tables(table):
@@ -3480,6 +3622,26 @@ class Executor:
                      if node.pos >= 0 and ascii_lower(node.name) == old]
             if edits:
                 catalog.rewrite_view(view, apply_edits(view.sql, edits))
+        for trigger in list(catalog.triggers.values()):
+            on_table = ascii_lower(trigger.table_name) == ascii_lower(table.name)
+            stmt, positions = trigger.stmt, []
+            if on_table and stmt.columns:
+                positions += [p for name, p in zip(stmt.columns, stmt.column_pos) if ascii_lower(name) == old]
+            for node in self._trigger_nodes(trigger):
+                if (on_table and isinstance(node, Column) and node.table is not None
+                        and ascii_lower(node.table) in ("new", "old") and ascii_lower(node.name) == old):
+                    positions.append(node.pos)
+                elif isinstance(node, Insert) and ascii_lower(node.table) == ascii_lower(table.name) and node.columns:
+                    positions += [p for name, p in zip(node.columns, node.column_pos) if ascii_lower(name) == old]
+                elif isinstance(node, Update) and ascii_lower(node.table) == ascii_lower(table.name):
+                    positions += [p for (name, _), p in zip(node.assignments, node.assignment_pos)
+                                  if ascii_lower(name) == old]
+            positions += [node.pos for node in self._trigger_references(trigger, table) or ()
+                          if ascii_lower(node.name) == old]
+            positions = sorted({p for p in positions if p >= 0})
+            if positions:
+                catalog.rewrite_trigger(trigger, apply_edits(trigger.sql, [(p, renamed(trigger.sql, p))
+                                                                           for p in positions]), trigger.table_name)
         own = parse(table.sql)
         edits = {table: [c.pos for c in own.columns if ascii_lower(c.name) == old]}
         for check in [c for c in all_constraints(own) if isinstance(c, CheckConstraint)]:
@@ -3572,6 +3734,18 @@ class Executor:
             if any(ascii_lower(node.name) == ascii_lower(column.name) for node in references or ()):
                 raise OperationalError(
                     f"error in view {view.name} after drop column: no such column: {column.name}")
+        for trigger in self.catalog.triggers.values():
+            dropped_name = ascii_lower(column.name)
+            used = [node for node in self._trigger_references(trigger, table) or ()
+                    if ascii_lower(node.name) == dropped_name]
+            if ascii_lower(trigger.table_name) == ascii_lower(table.name):
+                used += [node for node in self._trigger_nodes(trigger) if isinstance(node, Column)
+                         and node.table is not None and ascii_lower(node.table) in ("new", "old")
+                         and ascii_lower(node.name) == dropped_name]
+            if used:
+                first = min(used, key=lambda node: node.pos)  # (SQLite reports the first, as written)
+                name = first.name if first.table is None else f"{first.table}.{first.name}"
+                raise OperationalError(f"error in trigger {trigger.name} after drop column: no such column: {name}")
         tree = self.catalog.table_tree(table)
         rows = [(rowid, self.load_row(table, rowid, record)) for rowid, record in tree.scan()]
         alias = dropped.rowid_column
@@ -4195,7 +4369,7 @@ class PreparedInsert:
                     position = width if table.rowid_column is None else table.rowid_column
                 self.positions.append(position)
         self.rowid_given = (width if table.rowid_column is None else table.rowid_column) in self.positions
-        compiler = Compiler(Scope(), executor=executor)
+        compiler = Compiler(Scope(executor.outer_scope), executor=executor)
         self.defaults = [(p, compiler.compile(c.default)) for p, c in enumerate(table.columns)
                          if p not in self.positions and c.default is not None]
         self.conflict = stmt.conflict
@@ -4221,6 +4395,9 @@ class PreparedInsert:
         self.tree = executor.catalog.table_tree(table)
         multi_write = self.multi_write = self.query is not None or len(self.rows) > 1
         self.statement_journal = multi_write and (self.may_abort() or calls_function(stmt))
+        executor.triggers.prepare(table.name, "INSERT", None, self.conflict)
+        if executor.triggers.exist(table.name, "INSERT"):
+            self.statement_journal = True  # (SQLite: a multi-row write, and the programs may abort)
 
     def may_abort(self) -> bool:
         """Whether a constraint check could abort the statement.
@@ -4344,7 +4521,7 @@ class PreparedSingleTable:
         self.table = executor.catalog.table_to_modify(table_name)
         executor.catalog.check_index_hint(self.table, indexed_by)
         self.tree = executor.catalog.table_tree(self.table)
-        self.scope = Scope()
+        self.scope = Scope(executor.outer_scope)
         ref = TableRef(self.table.name, indexed_by=indexed_by, not_indexed=not_indexed)
         joins, _ = executor.build_from([Join(ref)], self.scope)
         self.levels, self.constants = executor.plan_joins(self.scope, joins, where)
@@ -4397,6 +4574,10 @@ class PreparedUpdate(PreparedSingleTable):
                  for index in table.indexes)
         # Whether a REPLACE may delete a row the statement has yet to update.
         self.may_replace = "REPLACE" in (conflict, table.rowid_conflict(), *(i.conflict for i in table.indexes))
+        self.names = [table.columns[p].name if p < width else "rowid" for p in changed]
+        executor.triggers.prepare(table.name, "UPDATE", self.names, conflict)
+        if executor.triggers.exist(table.name, "UPDATE", self.names):
+            self.statement_journal = True
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
@@ -4410,11 +4591,15 @@ class PreparedUpdate(PreparedSingleTable):
                 keys.unchecked = keys.last_action_program(table, [("delete", None)])
         changed = []
         try:
-            two_pass = self.may_replace or self.rowid_changed or self.returning is not None or (
+            triggered = executor.triggers.exist(table.name, "UPDATE", self.names)
+            two_pass = self.may_replace or self.rowid_changed or self.returning is not None or triggered or (
                 keys.enabled and keys.required(table, self.changed))
             for rowid, old in self.matching_rows(two_pass):
-                if (self.may_replace or keys.enabled) and rowid not in tree:
-                    continue  # an earlier row's REPLACE (or a foreign key action) deleted it
+                if self.may_replace or keys.enabled or triggered:
+                    if rowid not in tree:
+                        continue  # an earlier row's REPLACE (or a foreign key action, a trigger) deleted it
+                    if triggered or keys.enabled:
+                        old = executor.load_row(table, rowid, tree.get(rowid))  # (as it is now)
                 new = list(old)
                 for position, function in self.assignments:
                     new[position] = function(old)
@@ -4432,6 +4617,7 @@ class PreparedDelete(PreparedSingleTable):
         super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         self.delete_all = stmt.where is None and self.returning is None
+        executor.triggers.prepare(self.table.name, "DELETE", None, None)
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
@@ -4439,6 +4625,7 @@ class PreparedDelete(PreparedSingleTable):
         involved = keys.involved(table)
         if involved:
             keys.prepare(table, "delete")
+        involved = involved or executor.triggers.exist(table.name, "DELETE")
         if self.delete_all and not involved:
             count = len(tree)
             tree.clear()
@@ -4455,12 +4642,138 @@ class PreparedDelete(PreparedSingleTable):
         try:
             for rowid, row in matches:
                 if rowid not in tree:
-                    continue  # (a foreign key action deleted it)
-                deleted.append(executor.delete_row(table, tree, rowid))
+                    continue  # (a foreign key action or a trigger deleted it)
+                row = executor.delete_row(table, tree, rowid)
+                if row is not None:
+                    deleted.append(row)
         except Error as exc:
             exc.changes = len(deleted)
             raise
         return returning_result(self.returning, deleted)
+
+
+class PreparedViewInsert:
+    """INSERT into a view with INSTEAD OF INSERT triggers: each row, as NEW
+    (the values as given, without affinities), fires them instead."""
+
+    def __init__(self, executor: Executor, stmt: Insert, view: ViewInfo) -> None:
+        self.executor = executor
+        self.view = view
+        if stmt.upsert:
+            raise OperationalError("cannot UPSERT a view")
+        source = self.source = executor.view_source(view)
+        width = len(source.columns)
+        if stmt.columns is None:
+            self.positions = list(range(width))
+        else:
+            self.positions = []
+            for name in stmt.columns:
+                position = source.column_index(name)
+                if position is None:
+                    raise OperationalError(f"table {view.name} has no column named {name}")
+                self.positions.append(position)
+        compiler = Compiler(Scope(executor.outer_scope), executor=executor)
+        self.query = None
+        self.rows = []
+        if stmt.query is not None:
+            self.query = executor.compile_query(stmt.query)
+            self.check_count(stmt, len(self.query.names))
+        for exprs in stmt.rows:
+            self.check_count(stmt, len(exprs))
+            self.rows.append([compiler.compile(e) for e in exprs])
+        scope = Scope(executor.outer_scope)
+        scope.add(source)
+        self.returning = executor.compile_returning(stmt.returning, scope)
+        self.conflict = stmt.conflict
+        executor.triggers.prepare(view.name, "INSERT", None, self.conflict)
+        self.statement_journal = True
+
+    def check_count(self, stmt: Insert, count: int) -> None:
+        if count != len(self.positions):
+            if stmt.columns is None:
+                raise OperationalError(f"table {self.view.name} has {len(self.source.columns)} columns "
+                                       f"but {count} values were supplied")
+            raise OperationalError(f"{count} values for {len(self.positions)} columns")
+
+    def run(self) -> Result:
+        executor, width = self.executor, len(self.source.columns)
+        if self.query is not None:
+            sources = self.query.run()
+        else:
+            sources = [[f([]) for f in functions] for functions in self.rows]
+        done = []
+        for values_ in sources:
+            new = [None] * (width + 1)
+            for position, value in zip(self.positions, values_):
+                new[position] = value
+            try:
+                executor.triggers.fire(self.view.name, "INSTEAD OF", "INSERT", None, new, None, self.conflict)
+            except TriggerIgnore:
+                continue
+            done.append(new)
+        return view_result(self.returning, done)
+
+
+class PreparedViewChange:
+    """UPDATE or DELETE of a view with INSTEAD OF triggers: the view's rows
+    that match WHERE are found first; each fires the triggers, as OLD (and
+    NEW: OLD with the SET values, converted by the columns' affinities)."""
+
+    def __init__(self, executor: Executor, stmt: Update | Delete, view: ViewInfo) -> None:
+        self.executor = executor
+        self.view = view
+        self.scope = scope = Scope(executor.outer_scope)
+        joins, self.derived = executor.build_from([Join(TableRef(view.name))], scope)
+        self.source = source = scope.entries[0].table
+        self.levels, self.constants = executor.plan_joins(scope, joins, stmt.where)
+        compiler = Compiler(scope, executor=executor)
+        self.assignments = []
+        self.names = None
+        self.event = "DELETE"
+        self.conflict = None
+        if isinstance(stmt, Update):
+            self.event = "UPDATE"
+            self.conflict = stmt.conflict
+            self.names = []
+            for name, expr in stmt.assignments:
+                position = source.column_index(name)
+                if position is None:
+                    raise OperationalError(f"no such column: {name}")
+                self.assignments.append((position, compiler.compile(expr)))
+                self.names.append(name)
+        self.returning = executor.compile_returning(stmt.returning, scope)
+        executor.triggers.prepare(view.name, self.event, self.names, self.conflict)
+        self.statement_journal = True
+
+    def run(self) -> Result:
+        executor, source = self.executor, self.source
+        width = len(source.columns)
+        if not passes_constants(self.constants, self.scope):
+            rows = []
+        else:
+            for derived in self.derived:
+                derived.materialize()
+            rows = [list(row[:width]) + [None] for row in executor.join_rows(self.scope, self.levels)]
+        done = []
+        for old in rows:
+            new = None
+            if self.event == "UPDATE":
+                new = list(old)
+                for position, function in self.assignments:
+                    new[position] = values.apply_affinity(function(old), source.affinities[position])
+            try:
+                executor.triggers.fire(self.view.name, "INSTEAD OF", self.event, old, new, self.names, self.conflict)
+            except TriggerIgnore:
+                continue
+            done.append(new if new is not None else old)
+        return view_result(self.returning, done)
+
+
+def view_result(returning: tuple[list[RowFunction], list[str]] | None, rows: list[Row]) -> Result:
+    """The result of a change of a view: no rows changed (changes() is 0), its RETURNING rows."""
+    result = returning_result(returning, rows)
+    result.rowcount = 0
+    return result
 
 
 class PreparedUpsert:
@@ -4483,7 +4796,7 @@ class PreparedUpsert:
             return
         table, clause = self.table, self.clause
         # SET and WHERE see the existing row (by the table's name) and "excluded".
-        self.scope = Scope()
+        self.scope = Scope(self.executor.outer_scope)
         self.scope.add(table)
         self.scope.add(ExcludedSource(table))
         # An unqualified name is the existing row's column; excluded.x must be qualified.

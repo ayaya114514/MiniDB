@@ -107,6 +107,14 @@ class Collate:
 
 
 @dataclass(frozen=True)
+class Raise:
+    """``RAISE(IGNORE)`` or ``RAISE(ROLLBACK | ABORT | FAIL, message)``, for trigger programs."""
+
+    kind: str  # IGNORE, ROLLBACK, ABORT or FAIL
+    message: object = None  # an expression (None for IGNORE)
+
+
+@dataclass(frozen=True)
 class Case:
     """``CASE [base] WHEN a THEN b ... [ELSE c] END``."""
 
@@ -328,6 +336,9 @@ class Insert:
     upsert: list = field(default_factory=list)  # Upsert clauses, in order
     returning: list | None = None  # SelectItems of RETURNING
     ctes: list | None = None  # WITH ...
+    # Where the table name and the column names are in the SQL text (for ALTER TABLE in triggers).
+    table_pos: int = field(default=-1, compare=False)
+    column_pos: list | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -456,6 +467,8 @@ class Update:
     indexed_by: str | None = None
     ctes: list | None = None
     not_indexed: bool = False
+    table_pos: int = field(default=-1, compare=False)
+    assignment_pos: list | None = field(default=None, compare=False)  # of the names SET assigns
 
 
 @dataclass
@@ -466,6 +479,7 @@ class Delete:
     indexed_by: str | None = None
     ctes: list | None = None
     not_indexed: bool = False
+    table_pos: int = field(default=-1, compare=False)
 
 
 @dataclass
@@ -494,6 +508,30 @@ class TableFunction:
 
 
 @dataclass
+class CreateTrigger:
+    """``CREATE TRIGGER name [BEFORE | AFTER | INSTEAD OF] event ON table
+    [FOR EACH ROW] [WHEN expr] BEGIN statement; ... END``."""
+
+    name: str
+    table: str
+    timing: str  # BEFORE, AFTER or INSTEAD OF
+    event: str  # INSERT, UPDATE or DELETE
+    columns: list | None  # UPDATE OF columns
+    when: object
+    body: list  # INSERT / UPDATE / DELETE / SELECT statements
+    if_not_exists: bool = False
+    sql: str = ""  # as SQLite stores it: "CREATE TRIGGER " and the text from the name to END
+    table_pos: int = field(default=-1, compare=False)  # of the table name in ``sql``
+    column_pos: list | None = field(default=None, compare=False)  # of the UPDATE OF columns, in ``sql``
+
+
+@dataclass
+class DropTrigger:
+    name: str
+    if_exists: bool = False
+
+
+@dataclass
 class Vacuum:
     """``VACUUM [schema] [INTO <file name>]``."""
 
@@ -508,7 +546,7 @@ Expr = Union[
 ]
 Statement = Union[
     CreateTable, CreateIndex, CreateView, DropTable, DropIndex, DropView, Reindex, Vacuum, Values, AlterTable, Insert, Select, Compound, Update, Delete,
-    Begin, Commit, Rollback, Analyze, Explain, Pragma,
+    Begin, Commit, Rollback, Analyze, Explain, Pragma, CreateTrigger, DropTrigger,
 ]
 
 
@@ -544,6 +582,7 @@ class Parser:
         self.tokens = tokenize(text)
         self.i = 0
         self.seen_with = False
+        self.in_trigger = False  # parsing a trigger program (its statements have restrictions)
         self.tok = self.tokens[0]  # the current token (only advance() moves on)
 
     # ---- token helpers ------------------------------------------------
@@ -736,6 +775,10 @@ class Parser:
             self.advance()
         if self.at_word("VIEW"):
             return self.create_view(create.pos, temp)
+        if self.at_word("TRIGGER"):
+            if temp:
+                raise NotSupportedError("temporary triggers are not supported")
+            return self.create_trigger()
         if temp:
             raise NotSupportedError("temporary tables are not supported")
         self.expect_keyword("TABLE")
@@ -973,6 +1016,104 @@ class Parser:
         sql = self.text[start:last.pos + len(last.text)]
         return CreateView(name, columns, query, if_not_exists, sql, temp)
 
+    def create_trigger(self) -> CreateTrigger:
+        self.advance()  # TRIGGER
+        if_not_exists = self.if_not_exists()
+        name_pos = self.tok.pos
+        name = self.identifier("trigger name")
+        if self.accept_op("."):
+            self.check_schema(name)
+            name_pos = self.tok.pos
+            name = self.identifier("trigger name")
+        timing = "BEFORE"  # (SQLite's default)
+        column_pos = None
+        if self.at_word("BEFORE", "AFTER"):
+            timing = ascii_upper(self.advance().text)
+        elif self.at_word("INSTEAD"):
+            self.advance()
+            self.expect_word("OF")
+            timing = "INSTEAD OF"
+        columns = None
+        if self.accept_keyword("DELETE"):
+            event = "DELETE"
+        elif self.accept_keyword("INSERT"):
+            event = "INSERT"
+        elif self.accept_keyword("UPDATE"):
+            event = "UPDATE"
+            if self.at_word("OF"):
+                self.advance()
+                column_pos = [self.tok.pos]
+                columns = [self.identifier("column name")]
+                while self.accept_op(","):
+                    column_pos.append(self.tok.pos)
+                    columns.append(self.identifier("column name"))
+        else:
+            raise self.error("DELETE, INSERT or UPDATE")
+        self.expect_keyword("ON")
+        table_pos = self.tok.pos
+        table = self.identifier("table name")
+        if self.accept_op("."):
+            self.check_schema(table)
+            table_pos = self.tok.pos
+            table = self.identifier("table name")
+        if self.at_word("FOR"):
+            self.advance()
+            self.expect_word("EACH")
+            self.expect_word("ROW")
+        parameters = self.param_count
+        when = self.expr() if self.accept_keyword("WHEN") else None
+        self.expect_keyword("BEGIN")
+        body = []
+        self.in_trigger = True
+        try:
+            while True:
+                body.append(self.trigger_statement())
+                self.expect_op(";")
+                if self.at_keyword("END"):
+                    break
+        finally:
+            self.in_trigger = False
+        end = self.advance()
+        if self.param_count != parameters:
+            raise OperationalError("trigger cannot use variables")
+        # (SQLite keeps the text from the trigger's name on, without IF NOT EXISTS or a schema.)
+        sql = "CREATE TRIGGER " + self.text[name_pos:end.pos + len(end.text)]
+        shift = len("CREATE TRIGGER ") - name_pos
+        return CreateTrigger(name, table, timing, event, columns, when, body, if_not_exists, sql, table_pos + shift,
+                             None if column_pos is None else [p + shift for p in column_pos])
+
+    def trigger_statement(self) -> Statement:
+        """One statement of a trigger program, with SQLite's restrictions."""
+        if self.at_keyword("INSERT") or self.at_word("REPLACE"):
+            stmt = self.insert()
+        elif self.at_keyword("UPDATE"):
+            stmt = self.update()
+        elif self.at_keyword("DELETE"):
+            stmt = self.delete()
+        elif self.at_query() or self.at_word("WITH"):
+            return self.query()
+        else:
+            raise self.error("INSERT, UPDATE, DELETE or SELECT")
+        if stmt.returning is not None:
+            raise OperationalError("cannot use RETURNING in a trigger")
+        if isinstance(stmt, (Update, Delete)) and (stmt.indexed_by is not None or stmt.not_indexed):
+            clause = "INDEXED BY" if stmt.indexed_by is not None else "NOT INDEXED"
+            raise OperationalError(f"the {clause} clause is not allowed on UPDATE or DELETE statements within triggers")
+        return stmt
+
+    def check_schema(self, name: str) -> None:
+        if ascii_lower(name) not in ("main", "temp"):
+            raise OperationalError(f"unknown database {name}")
+
+    def target_table(self) -> str:
+        """The table an INSERT, UPDATE or DELETE writes (its position: self.target_pos)."""
+        self.target_pos = self.tok.pos
+        name = self.identifier("table name")
+        if self.in_trigger and self.at_op("."):
+            raise OperationalError(
+                "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers")
+        return name
+
     def create_index(self) -> CreateIndex:
         unique = bool(self.accept_keyword("UNIQUE"))
         self.expect_keyword("INDEX")
@@ -1104,6 +1245,17 @@ class Parser:
 
     def drop(self) -> DropTable | DropIndex | DropView:
         self.expect_keyword("DROP")
+        if self.at_word("TRIGGER"):
+            self.advance()
+            if_exists = False
+            if self.accept_keyword("IF"):
+                self.expect_keyword("EXISTS")
+                if_exists = True
+            name = self.identifier("trigger name")
+            if self.accept_op("."):
+                self.check_schema(name)
+                name = self.identifier("trigger name")
+            return DropTrigger(name, if_exists)
         if self.accept_keyword("INDEX"):
             kind = DropIndex
         elif self.at_word("VIEW"):
@@ -1180,14 +1332,18 @@ class Parser:
             self.expect_keyword("INSERT")
             conflict = self.conflict_clause()
         self.expect_keyword("INTO")
-        table = self.identifier("table name")
+        table = self.target_table()
+        table_pos = self.target_pos
         columns = None
+        column_pos = None
         if self.accept_op("("):
+            column_pos = [self.tok.pos]
             columns = [self.identifier("column name")]
             while self.accept_op(","):
+                column_pos.append(self.tok.pos)
                 columns.append(self.identifier("column name"))
             self.expect_op(")")
-        if self.at_word("DEFAULT"):
+        if self.at_word("DEFAULT") and not self.in_trigger:
             self.advance()
             self.expect_keyword("VALUES")
             stmt = Insert(table, [], [[]], None, conflict)
@@ -1198,6 +1354,7 @@ class Parser:
             stmt = Insert(table, columns, self.value_rows(), None, conflict)
         stmt.upsert = self.upsert_clauses()
         stmt.returning = self.returning()
+        stmt.table_pos, stmt.column_pos = table_pos, column_pos
         return stmt
 
     def value_rows(self) -> list[list[Expr]]:
@@ -1579,14 +1736,18 @@ class Parser:
     def update(self) -> Update:
         self.expect_keyword("UPDATE")
         conflict = self.conflict_clause()
-        table = self.identifier("table name")
+        table = self.target_table()
+        table_pos = self.target_pos
         indexed_by, not_indexed = self.index_hint()
         self.expect_keyword("SET")
+        assignment_pos = [self.tok.pos]
         assignments = [self.assignment()]
         while self.accept_op(","):
+            assignment_pos.append(self.tok.pos)
             assignments.append(self.assignment())
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Update(table, assignments, where, conflict, self.returning(), indexed_by, not_indexed=not_indexed)
+        return Update(table, assignments, where, conflict, self.returning(), indexed_by, not_indexed=not_indexed,
+                      table_pos=table_pos, assignment_pos=assignment_pos)
 
     def assignment(self) -> tuple[str, Expr]:
         name = self.identifier("column name")
@@ -1596,10 +1757,11 @@ class Parser:
     def delete(self) -> Delete:
         self.expect_keyword("DELETE")
         self.expect_keyword("FROM")
-        table = self.identifier("table name")
+        table = self.target_table()
+        table_pos = self.target_pos
         indexed_by, not_indexed = self.index_hint()
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Delete(table, where, self.returning(), indexed_by, not_indexed=not_indexed)
+        return Delete(table, where, self.returning(), indexed_by, not_indexed=not_indexed, table_pos=table_pos)
 
     # ---- expressions --------------------------------------------------
 
@@ -1791,6 +1953,8 @@ class Parser:
             self.advance()  # the functions like() and if() are spelled like keywords
             self.advance()
             return self.call(token.value)
+        if token.kind == "IDENT" and ascii_upper(token.text) == "RAISE" and self.tokens[self.i + 1].text == "(":
+            return self.raise_()
         if token.kind == "IDENT":
             self.advance()
             if self.accept_op("("):
@@ -1802,6 +1966,22 @@ class Parser:
                 return Column(self.identifier("column name"), token.value, pos, token.pos)
             return Column(token.value, None, token.pos)
         raise self.error("expression")
+
+    def raise_(self) -> Raise:
+        self.advance()  # RAISE
+        self.advance()  # (
+        if self.accept_keyword("ROLLBACK"):
+            kind = "ROLLBACK"
+        elif self.at_word("IGNORE", "ABORT", "FAIL"):
+            kind = ascii_upper(self.advance().text)
+        else:
+            raise self.error("IGNORE, ROLLBACK, ABORT or FAIL")
+        message = None
+        if kind != "IGNORE":
+            self.expect_op(",")
+            message = self.expr()
+        self.expect_op(")")
+        return Raise(kind, message)
 
     def case(self) -> Case:
         base = None if self.at_keyword("WHEN") else self.expr()
