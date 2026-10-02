@@ -9,7 +9,8 @@
 全部带类型注解。
 
 **Playground**：<https://ayaya114514.github.io/MiniDB/> —— 浏览器里（Pyodide）运行 MiniDB，
-每条查询显示计划，并画出所选表或索引的 B+ 树；数据只在本机内存里，不上传。
+每条查询显示计划，并画出所选表或索引的 B+ 树；也能打开（选择或拖入）本地的 SQLite 文件，查询、修改后导出，
+看它真实的页面：每一页属于谁、一页里的页头、单元格指针、单元格、空闲块和碎片。数据只在本机内存里，不上传。
 
 ## 功能
 
@@ -127,6 +128,9 @@ python -m minidb --sqlite app.sqlite                 # 新建的文件用 SQLite
 db = minidb.Database("app.sqlite", format="sqlite")   # 或 minidb.connect("app.sqlite", format="sqlite")
 ```
 
+和 Python 的 sqlite3 一样有 `serialize()` / `deserialize(data)`：把 SQLite 格式的库取成文件字节（含未提交的改动），
+或让连接换成一个从这些字节开始的内存库（原来的文件不动）。
+
 用的是 SQLite 的 rollback journal（`-journal`，崩溃后 sqlite3 和 MiniDB 都能回放对方留下的日志）和 SQLite 的文件锁，
 所以另一个进程里的 sqlite3 可以同时打开同一个文件。ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。只支持 4096 字节
 的页、UTF-8、非 WAL 模式、无 auto_vacuum（其他文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的
@@ -178,7 +182,8 @@ SQL 文本
 
 `playground/` 是一个静态页面：`worker.js` 在 Web Worker（ES module）里加载 Pyodide 314（CDN），
 解压 `minidb.zip`（`minidb` 包 + `bridge.py`），之后页面通过 `bridge.py` 的 `run` / `objects` / `tree`
-拿 JSON 结果。本地构建与预览：
+拿 JSON 结果；打开的 SQLite 文件经 `deserialize()` 成为内存库，`file_map` / `page` 从页面的原始字节画出文件和单页的布局，
+`export` 用 `serialize()` 交回文件。本地构建与预览：
 
 ```sh
 python tools/build_playground.py && python -m http.server -d site    # http://localhost:8000

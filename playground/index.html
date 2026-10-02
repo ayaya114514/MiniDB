@@ -13,29 +13,42 @@
     <div class="brand">
       <img src="favicon.svg" alt="" width="28" height="28">
       <h1>MiniDB</h1>
-      <p>纯 Python 写的 SQLite 式数据库，在你的浏览器里运行（Pyodide），数据不离开本机。</p>
+      <p>纯 Python 写的 SQLite 式数据库，在浏览器里运行（Pyodide），也能打开本地的 SQLite 文件；数据不离开本机。</p>
     </div>
     <div class="workspace">
       <section class="left">
         <div class="bar">
           <button id="run" disabled>运行</button>
           <select id="examples" aria-label="示例"></select>
+          <button id="open" disabled>打开文件</button>
+          <button id="export" disabled title="下载为 SQLite 文件">导出</button>
           <button id="reset" class="quiet" disabled>清空数据库</button>
-          <span id="status" role="status">正在加载 Python 运行时…</span>
+          <input id="file" type="file" accept=".sqlite,.sqlite3,.db,.db3,.s3db,application/vnd.sqlite3,application/x-sqlite3" hidden>
         </div>
+        <div class="dbline"><span id="dbinfo">内存数据库（MiniDB 格式）</span><span id="status" role="status">正在加载 Python 运行时…</span></div>
         <textarea id="sql" spellcheck="false" autocapitalize="off" autocomplete="off" aria-label="SQL"></textarea>
         <div id="output"></div>
       </section>
       <section class="right">
         <div class="bar">
-          <span class="label">B+ 树</span>
+          <span class="label" id="treelabel">B+ 树</span>
           <select id="object" aria-label="表或索引"></select>
           <span id="treeinfo"></span>
         </div>
         <div id="tree"><p class="empty">运行 SQL 之后，这里画出所选表或索引的 B+ 树。</p></div>
+        <div id="pagearea" hidden>
+          <div class="bar"><span class="label">文件</span><span id="mapinfo" class="info"></span></div>
+          <div id="filemap" aria-hidden="true"></div>
+          <div class="bar"><span class="label" id="pagetitle">页</span><span id="pageinfo" class="info"></span></div>
+          <div id="pagebar"></div>
+          <div id="pagescale"><span>0</span><span>1024</span><span>2048</span><span>3072</span><span>4096</span></div>
+          <div id="legend"></div>
+          <div id="cells"></div>
+        </div>
       </section>
     </div>
   </main>
+  <div id="drop" hidden>松开以打开这个 SQLite 文件（只在浏览器里读取，不上传）</div>
   <script src="app.js?v=__BUILD__"></script>
 </body>
 </html>
