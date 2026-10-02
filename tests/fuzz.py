@@ -886,6 +886,8 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
             snapshots.finish()
         if format == "sqlite" and path is not None:
             check_sqlite_file(pair, path)
+        if format == "sqlite":
+            check_images(pair)
         problems = pair.mini.integrity_check()
         if problems:
             raise AssertionError(f"integrity check failed: {problems}")
@@ -927,6 +929,43 @@ def check_sqlite_file(pair, path):
                                      f"  sqlite3's: {expected[:5]}\n  MiniDB's file: {found[:5]}")
     finally:
         other.close()
+
+
+def check_images(pair):
+    """serialize() / deserialize() both ways: sqlite3 opens MiniDB's image
+    of the database, MiniDB opens sqlite3's; both hold sqlite3's rows."""
+    import sqlite3
+
+    from minidb.database import Database
+
+    if pair.mini.in_transaction:
+        pair.run("COMMIT")
+    if pair.mini.in_transaction:
+        pair.run("ROLLBACK")
+    tables = [row[0] for row in pair.lite.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    other = sqlite3.connect(":memory:")
+    other.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
+    other.deserialize(pair.mini.serialize())
+    copy = Database()
+    copy.deserialize(pair.lite.serialize())
+    try:
+        result = other.execute("PRAGMA integrity_check").fetchall()
+        if result != [("ok",)]:
+            raise AssertionError(f"sqlite3's integrity_check on MiniDB's serialize(): {result[:5]}")
+        problems = copy.integrity_check()
+        if problems:
+            raise AssertionError(f"MiniDB's integrity_check after deserialize() of sqlite3's image: {problems[:5]}")
+        for name in tables:
+            query = f'SELECT rowid, * FROM "{name}" ORDER BY rowid'
+            expected = [sqlcompare_loose(r) for r in pair.lite.execute(query).fetchall()]
+            for who, rows in (("sqlite3 reading MiniDB's image", other.execute(query).fetchall()),
+                              ("MiniDB reading sqlite3's image", list(copy.execute(query)))):
+                if [sqlcompare_loose(r) for r in rows] != expected:
+                    raise AssertionError(f"table {name} differs, {who}:\n  expected: {expected[:5]}\n  found: {rows[:5]}")
+    finally:
+        other.close()
+        copy.close()
 
 
 def sqlcompare_loose(row):
