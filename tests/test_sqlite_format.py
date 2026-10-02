@@ -385,6 +385,8 @@ def test_objects_minidb_cannot_parse(tmp_path):
             CREATE TABLE checked (a CHECK (a > 0));
             CREATE TABLE logged (a);
             CREATE TRIGGER log AFTER INSERT ON logged BEGIN INSERT INTO plain VALUES (new.a, 'trigger'); END;
+            CREATE TABLE odd (a);
+            CREATE TRIGGER odd_one AFTER DELETE ON odd BEGIN UPDATE plain SET b = 'z' FROM checked; END;
             CREATE TABLE expressed (a);
             CREATE INDEX lower_a ON expressed (lower(a));
             INSERT INTO plain VALUES (1, 'x');
@@ -397,8 +399,9 @@ def test_objects_minidb_cannot_parse(tmp_path):
         with pytest.raises(IntegrityError, match="CHECK constraint failed: a > 0"):
             db.execute("INSERT INTO checked VALUES (0)")  # (CHECK is supported now)
         assert db.execute("SELECT * FROM logged") == []
-        with pytest.raises(NotSupportedError, match="trigger"):
-            db.execute("INSERT INTO logged VALUES (1)")  # (the trigger would not run)
+        db.execute("INSERT INTO logged VALUES (1)")  # (triggers are supported now)
+        with pytest.raises(NotSupportedError, match="odd_one"):
+            db.execute("DELETE FROM odd")  # (MiniDB cannot parse UPDATE ... FROM: the trigger would not run)
         assert db.execute("SELECT * FROM expressed") == [("A",)]
         with pytest.raises(NotSupportedError, match="lower_a"):
             db.execute("DELETE FROM expressed")  # (the index could not be kept up to date)
@@ -406,8 +409,8 @@ def test_objects_minidb_cannot_parse(tmp_path):
     with closing(lite(path)) as connection:
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         connection.execute("INSERT INTO logged VALUES (7)")
-        assert connection.execute("SELECT * FROM plain ORDER BY a").fetchall() == [
-            (1, "x"), (2, "y"), (7, "trigger")]
+        assert connection.execute("SELECT * FROM plain ORDER BY a, b").fetchall() == [
+            (1, "trigger"), (1, "x"), (2, "y"), (7, "trigger")]
 
 
 def test_choosing_the_format(tmp_path):

@@ -5,11 +5,11 @@ The schema lives in the database file itself, in a B+ tree rooted at page 1
 
     (type, name, table name, root page, sql)
 
-where ``type`` is "table", "index" or "view" and ``sql`` is the CREATE
-statement (canonical for tables and indexes, as written for views); on open
-the statements are parsed again to rebuild the in-memory ``TableInfo``,
-``IndexInfo`` and ``ViewInfo`` objects.  Tables, views and indexes share one
-namespace.
+where ``type`` is "table", "index", "view" or "trigger" and ``sql`` is the
+CREATE statement (as written; a trigger's as SQLite keeps it); on open the
+statements are parsed again to rebuild the in-memory ``TableInfo``,
+``IndexInfo``, ``ViewInfo`` and ``TriggerInfo`` objects.  Tables, views and
+indexes share one namespace, triggers have their own.
 
 Every UNIQUE column and every PRIMARY KEY that is not an INTEGER PRIMARY KEY
 gets an automatic unique index named ``minidb_autoindex_<table>_<n>``.
@@ -40,8 +40,8 @@ from minidb.btree import BTree
 from minidb.errors import DatabaseError, NotSupportedError, OperationalError
 from minidb.pager import Pager
 from minidb.parser import (
-    CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateView, ForeignKey, KeyConstraint, Literal, Unary,
-    parse,
+    CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateTrigger, CreateView, ForeignKey, KeyConstraint,
+    Literal, Unary, parse,
 )
 from minidb.record import decode_record, encode_record, encoded_size
 from minidb.values import SQLValue, ascii_lower
@@ -341,6 +341,23 @@ class ViewInfo:
         self.schema_key = schema_key
 
 
+class TriggerInfo:
+    """A trigger: when it fires and its program (compiled by minidb.triggers)."""
+
+    def __init__(self, stmt: CreateTrigger, schema_key: int | None = None) -> None:
+        self.name = stmt.name
+        self.table_name = stmt.table
+        self.timing = stmt.timing  # BEFORE, AFTER or INSTEAD OF
+        self.event = stmt.event  # INSERT, UPDATE or DELETE
+        self.columns = None if stmt.columns is None else [ascii_lower(c) for c in stmt.columns]
+        self.when = stmt.when
+        self.body = stmt.body
+        self.sql = stmt.sql
+        self.stmt = stmt  # parsed from ``sql`` (positions in it, for ALTER TABLE)
+        self.schema_key = schema_key
+        self.programs = {}  # (catalog version, ...) -> compiled program (see minidb.triggers)
+
+
 class Catalog:
     def __init__(self, pager: Pager) -> None:
         self.pager = pager
@@ -368,6 +385,7 @@ class Catalog:
         self.tables = {}
         self.indexes = {}
         self.views = {}
+        self.triggers = {}  # lowered name -> TriggerInfo (a namespace of their own)
         self.unsupported = {}  # lowered name -> why (objects only SQLite understands)
         entries = [decode_record(value)[0][:5] + [key] for key, value in self.schema.scan()]
         for kind, name, _table_name, root, sql, key in entries:
@@ -385,11 +403,20 @@ class Catalog:
             if kind not in ("index", "trigger"):
                 continue
             table = self.tables.get(ascii_lower(table_name))
+            if table is None and kind == "trigger" and ascii_lower(table_name) in self.views:
+                try:
+                    self.triggers[ascii_lower(name)] = TriggerInfo(parse(sql), key)
+                except Exception as exc:
+                    if not self.sqlite:
+                        raise
+                    self.unsupported[ascii_lower(name)] = f"{kind} {name}: {exc}"
+                continue
             if table is None:
                 continue  # belongs to an unsupported table
             try:
                 if kind == "trigger":
-                    raise NotSupportedError("triggers are not supported")
+                    self.triggers[ascii_lower(name)] = TriggerInfo(parse(sql), key)
+                    continue
                 if ascii_lower(name).startswith(self.auto_prefix):
                     # The automatic index of a UNIQUE / PRIMARY KEY (no SQL;
                     # MiniDB's files once stored some, for column constraints)
@@ -428,6 +455,13 @@ class Catalog:
                     table.stat_rows, table.stat_key = int(numbers[0]), key
 
     # ---- lookups ----------------------------------------------------------
+
+    def triggers_on(self, name: str) -> list[TriggerInfo]:
+        """The triggers of a table or view, newest first (the order SQLite fires them in)."""
+        lowered = ascii_lower(name)
+        found = [t for t in self.triggers.values() if ascii_lower(t.table_name) == lowered]
+        found.sort(key=lambda t: t.schema_key, reverse=True)
+        return found
 
     def get_table(self, name: str) -> TableInfo:
         table = self.tables.get(ascii_lower(name))
@@ -575,6 +609,52 @@ class Catalog:
         view.schema_key = self._add_entry("view", stmt.name, stmt.name, 0, stmt.sql)
         self.views[ascii_lower(stmt.name)] = view
 
+    def create_trigger(self, stmt: CreateTrigger) -> None:
+        """Store a trigger, with SQLite's checks (sqlite3BeginTrigger) in its
+        order.  Like SQLite, its program is not checked until it first runs."""
+        table = self.tables.get(ascii_lower(stmt.table))
+        view = self.views.get(ascii_lower(stmt.table))
+        if table is None and view is None:
+            if ascii_lower(stmt.table) in SCHEMA_TABLE_NAMES:
+                raise OperationalError("cannot create trigger on system table")
+            reason = self.unsupported.get(ascii_lower(stmt.table))
+            if reason is not None:
+                raise NotSupportedError(f"MiniDB cannot use {reason}")
+            raise OperationalError(f"no such table: main.{stmt.table}")
+        target = table.name if table is not None else view.name
+        if ascii_lower(stmt.name).startswith(self.reserved_prefixes):
+            raise OperationalError(f"object name reserved for internal use: {stmt.name}")
+        if ascii_lower(stmt.name) in self.triggers:
+            if stmt.if_not_exists:
+                return
+            raise OperationalError(f"trigger {stmt.name} already exists")
+        if ascii_lower(target).startswith(SQLITE_RESERVED_PREFIX):
+            raise OperationalError("cannot create trigger on system table")
+        if view is not None and stmt.timing != "INSTEAD OF":
+            raise OperationalError(f"cannot create {stmt.timing} trigger on view: {view.name}")
+        if table is not None and stmt.timing == "INSTEAD OF":
+            raise OperationalError(f"cannot create INSTEAD OF trigger on table: {table.name}")
+        if table is not None:
+            self.check_writable(table)
+        self.version += 1
+        trigger = TriggerInfo(parse(stmt.sql))  # (positions in its own text, for ALTER TABLE)
+        trigger.table_name = target
+        trigger.schema_key = self._add_entry("trigger", stmt.name, target, 0, stmt.sql)
+        self.triggers[ascii_lower(stmt.name)] = trigger
+
+    def drop_trigger(self, name: str, if_exists: bool = False) -> None:
+        trigger = self.triggers.get(ascii_lower(name))
+        if trigger is None:
+            if if_exists:
+                return
+            raise OperationalError(f"no such trigger: {name}")
+        self._drop_trigger(trigger)
+
+    def _drop_trigger(self, trigger: TriggerInfo) -> None:
+        self.version += 1
+        self.schema.delete(trigger.schema_key)
+        del self.triggers[ascii_lower(trigger.name)]
+
     def drop_view(self, name: str, if_exists: bool = False) -> None:
         if ascii_lower(name) in self.temp_views:
             self.version += 1
@@ -588,6 +668,8 @@ class Catalog:
                 return
             raise OperationalError(f"no such view: {name}")
         self.version += 1
+        for trigger in self.triggers_on(view.name):
+            self._drop_trigger(trigger)
         self.schema.delete(view.schema_key)
         del self.views[ascii_lower(name)]
 
@@ -605,6 +687,8 @@ class Catalog:
             raise OperationalError("table sqlite_sequence may not be dropped")
         self.version += 1
         self.check_writable(table, "dropped")
+        for trigger in self.triggers_on(table.name):
+            self._drop_trigger(trigger)
         for index in list(table.indexes):
             self._drop_index(index)
         if self.sqlite:
@@ -706,6 +790,11 @@ class Catalog:
         if table.stat_key is not None:
             self.schema.insert(table.stat_key, encode_record(
                 ["stat", table.name, table.name, 0, str(table.stat_rows)]), replace=True)
+
+    def rewrite_trigger(self, trigger: TriggerInfo, sql: str, table_name: str) -> None:
+        self.version += 1
+        self.schema.insert(trigger.schema_key, encode_record(["trigger", trigger.name, table_name, 0, sql]),
+                           replace=True)
 
     def rewrite_view(self, view: ViewInfo, sql: str) -> None:
         self.version += 1

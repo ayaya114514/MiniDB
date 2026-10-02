@@ -18,7 +18,7 @@ from minidb.sqlite_format import MAGIC as SQLITE_MAGIC
 from minidb.sqlite_pager import SqlitePager
 from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, CreateView, Delete, DropIndex, DropTable,
-    AlterTable, Cte, DropView, Insert, Pragma, Reindex, Rollback, TableFunction, TableRef, Update, Vacuum,
+    AlterTable, CreateTrigger, Cte, DropTrigger, DropView, Insert, Pragma, Reindex, Rollback, TableFunction, TableRef, Update, Vacuum,
     parse_script,
 )
 from minidb import pragmas
@@ -32,7 +32,7 @@ SPILL_PAGES = 1000  # dirty pages a transaction may hold before they go to the l
 CACHE_PAGES_AFTER_SPILL = 2000
 WRITE_STATEMENTS = (
     Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex, CreateView, DropView,
-    Analyze, Reindex, AlterTable,
+    Analyze, Reindex, AlterTable, CreateTrigger, DropTrigger,
 )
 
 
