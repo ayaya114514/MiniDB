@@ -442,3 +442,81 @@
 - TEMP 触发器不支持（阶段 25 才有 temp schema）；触发器程序里的 `UPDATE ... FROM` 不支持（MiniDB 本来就不支持），SQLite
   文件里带这种触发器的表只读。
 - 逐条字面量 INSERT 的编译比阶段 21 慢约 6%。
+
+## 阶段 23：JSON 函数（完成，2026-10-02）
+- **JSON 函数**（D111，`minidb/jsonb.py`、`minidb/jsonfuncs.py`）：照 json.c 在 SQLite 的二进制格式 JSONB 上实现——
+  `json`、`jsonb`、`json_valid`（含 flags）、`json_type`、`json_extract` 与 `->` / `->>`、`json_array` / `json_object`、
+  `json_insert` / `json_replace` / `json_set` / `json_array_insert` / `json_remove` / `json_patch`、`json_quote`、
+  `json_array_length`、`json_pretty`、`json_error_position`，聚合 `json_group_array` / `json_group_object`（也可作窗口
+  函数），表值函数 `json_each` / `json_tree`（参数可引用前面的表）。**jsonb 系列全部实现**（`jsonb_*` 编辑函数、
+  `jsonb_array` / `jsonb_object`、`jsonb_group_*`、`jsonb_each` / `jsonb_tree`），JSONB 字节与 SQLite 相同；参考 SQLite
+  3.53.4 的 `pragma_function_list` 里 30 个 json 函数全部存在。支持 JSON5 输入。
+- 与 SQLite 逐值对照的细节：结果文本逐字节相同（数字保留原文、`0x1F` → `31`、REAL 写法）、错误信息（malformed、
+  `bad JSON path: '...'`、`not an array element`、`JSON path too deep`、`JSON nested too deep`、参数个数）、
+  `json_error_position`、`json_each` 的 `id`（JSONB 偏移）、1000 层的嵌套上限（解析、路径查找、为不存在的路径造子
+  结构、compact / pretty 渲染、json_patch 各自的条件）。
+- **JSON subtype**：`JSONText`（str 子类）/ `JSONBlob`（bytes 子类）在表达式、CASE / coalesce / 标量子查询之间传递，
+  在 SQLite 丢掉它的地方丢掉——存进表、FROM 子查询 / 视图 / CTE（只有被展平的简单子查询里的裸列保留，按列判断）。
+- **解析缓存**：每条语句 4 项的 JsonCache 照搬（同一语句里 `json_set` 的结果文本带着编辑后的 JSONB，`jsonb()` /
+  `json_valid()` 看得出来），连“结果还在 JsonString 的 100 字节静态区时不进缓存”的条件也照搬。
+- `DISTINCT` 聚合放过一个 NULL（`json_group_array(DISTINCT x)` 看得出，以前 MiniDB 跳过 NULL）。
+- fuzzer：随机 JSON 文档 / 路径 / 函数（文本与 JSONB）、JSON 聚合与窗口、`json_each` / `json_tree` 与前面的表连接；
+  对照层给 sqlite3 设步数上限（约 500 万 VM 步，随机触发器偶尔级联出上千万次改动，MiniDB 跳过这一句）。
+- fuzz 在阶段内找到并修复（JSON 让随机流整个换了一遍，所以也找出不少与 JSON 无关的问题，D112）：subtype 按列丢失、
+  JSONB 带 subtype、解析缓存及其静态区条件（种子 1822）；rowid / INTEGER PRIMARY KEY 与 upsert 的 `excluded.x` 没有排序
+  规则、展平子查询的裸列就是该列；UPDATE 的 REPLACE 删除冲突行并运行 DELETE 触发器时固定当前行（`constraint failed`）、
+  REPLACE 之后的唯一约束复查（拿第一遍最后找到的 rowid 比较）、外键子表扫描就地改写 OLD 的亲和性（阶段 22 记下的种子
+  4181 / 6037 随之修好）、upsert 的 isSetNullAction 编译顺序、`total_changes()` 在出错的触发器程序之后、触发器跳过
+  upsert、NEW / OLD 读 REAL 列、mayAbort 的更多来源。自己检查边界时另外发现：998 层的 JSON 就抛 Python
+  `RecursionError`（递归上限，现在处理大 JSON 前按需提高）；`json_array_insert`（3.53 新增）原先缺失。
+- 测试：`tests/test_json.py` 13 组对照（含嵌套上限、array_insert、解析缓存、subtype 经过各种查询），另在
+  test_triggers / test_constraints / test_foreign_keys 里补了 D112 的用例。
+
+**benchmark**（10 万行；“前”是阶段 22 末 5472a37，与“后”同一次运行里测；“后”测于 b6ed109，之后的 f8dccfc 只改了
+JSON 代码）：
+
+| 操作 | MiniDB 格式 前 | MiniDB 格式 后 | SQLite 格式 前 | SQLite 格式 后 | sqlite3 |
+|---|---:|---:|---:|---:|---:|
+| 逐条 INSERT，一个事务 | 3.23 s | 3.18 s | 5.11 s | 5.10 s | 0.20 s |
+| 逐条 INSERT，`?` 参数 | 1.15 s | 1.16 s | 2.71 s | 2.77 s | 0.07 s |
+| 每条 INSERT 1000 行 | 2.50 s | 2.54 s | 4.06 s | 4.03 s | 0.07 s |
+| 1 万次主键点查 | 0.937 s | 0.949 s | 1.016 s | 0.996 s | 0.059 s |
+| 1 万次主键点查，`?` 参数 | 0.154 s | 0.154 s | 0.146 s | 0.150 s | 0.041 s |
+| GROUP BY 3 个聚合 | 0.110 s | 0.106 s | 0.121 s | 0.117 s | 0.031 s |
+| 索引嵌套循环连接 | 0.173 s | 0.176 s | 0.201 s | 0.202 s | 0.006 s |
+
+持平（差别在噪声内；SQLite 格式的全表 `SELECT *` 一次测出 0.069 → 0.108 s，复测基线也是 0.106 s）。
+
+**JSON 微基准**（1 万个文档，内存库，结果与 sqlite3 逐条相同；脚本不入库）：
+
+| 操作 | MiniDB | sqlite3 | 倍数 |
+|---|---:|---:|---:|
+| `json_extract` 嵌套字段作过滤条件 | 0.153 s | 0.003 s | 54x |
+| `->>` 后 GROUP BY | 0.152 s | 0.004 s | 34x |
+| 每行 `json_set` 两个路径 | 0.297 s | 0.006 s | 51x |
+| `json_each` 展开数组 | 0.193 s | 0.002 s | 79x |
+| `json_tree` 遍历每个文档 | 0.539 s | 0.003 s | 156x |
+| `json_group_array` 1 万个对象 | 0.196 s | 0.005 s | 39x |
+| `jsonb()` 再转回文本 | 0.196 s | 0.004 s | 45x |
+| `json_valid` | 0.113 s | 0.002 s | 47x |
+
+JSON 是逐字节照搬 json.c 的纯 Python 解析 / 渲染，比 sqlite3 慢 34–156 倍，本阶段没有做优化。
+
+**验证**：测试 1428 个全部通过；fuzz（最终代码 f8dccfc）：MiniDB 格式内存 4000 种子 × 400 语句（0–1999、4000–5999）、
+SQLite 格式文件模式 2400 种子（2000–3199、6000–7199）、MiniDB 格式文件模式 300 种子（5000–5299）——只有 5 个种子不同，
+都依赖查询计划、已归类（见下）；变形测试文件模式 300 × 300 0 失败；sqllogictest 全量（`--jobs 8`，20 分钟）5,939,875 / 5,939,879，与阶段 22 相同（剩 4 条是已知的 `sum` / `total` 精度和整数溢出）。
+
+**已知问题 / 做得不扎实的地方**：
+- 依赖查询计划的 fuzz 种子（与 JSON 无关，都缩成了最小用例，差别只在 SQLite 选的计划决定的行序或代表行）：248（DESC 索引上相等键的
+  先后）、1961（ANALYZE 之后 GROUP BY 在 NOCASE 下相等的组取哪一行作代表）、2789 / 6728 / 7119（索引扫描顺序决定
+  并列行的先后）。同类的还有阶段 20 的种子 25（有统计信息时 `sum(DISTINCT)` 的溢出取决于累加顺序）。
+- subtype 经过 FROM 子查询时，SQLite 是否展平还取决于外层查询（例如外层有 LIMIT），MiniDB 只看子查询本身来近似。
+- 视图 INSERT 的 RETURNING 里 `typeof()` 的参数不经 OP_RealAffinity，MiniDB 不区分：`INSERT INTO v VALUES (1)
+  RETURNING a, typeof(a)`（a 是 REAL 列）SQLite 返回 `1.0, 'integer'`，MiniDB 返回 `1.0, 'real'`。
+- `json_each` / `json_tree` 的参数不能引用 FROM 里排在它后面的表：`FROM json_each(t.j), t` 在 SQLite 可以（规划器
+  把它挪到后面），MiniDB 报 `no such column: t.j`。
+- 编辑函数为不存在的路径造子结构时，json.c 会多减一次 `iDepth`，之后渲染时的 1000 层上限因此偏移；只有用编辑拼出
+  超过 1000 层的值才看得出，MiniDB 不模拟。
+- 没有 `pragma_function_list`。
+- JSON 性能见上表，没有优化。
+- fuzz 的步数上限会跳过级联改动过多的语句（种子 0–59 里没有一句被跳过）。
