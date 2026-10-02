@@ -384,3 +384,61 @@
 - 外键动作语句是否需要语句日志是保守估计（动作碰到任何约束就算）；`defer_foreign_keys` 的“读文件”判断里 CTE 名
   不分作用域。
 - `WITHOUT ROWID`、`STRICT`、生成列、表达式 / 部分索引仍不支持（SQLite 写的含这些对象的表只读）。
+
+## 阶段 22：触发器（完成，2026-10-02）
+- **触发器**（D110，`minidb/triggers.py`）：`CREATE [IF NOT EXISTS] TRIGGER` / `DROP TRIGGER [IF EXISTS]`，`BEFORE` / `AFTER` /
+  `INSTEAD OF`（视图上），`INSERT` / `UPDATE [OF 列]` / `DELETE`，`FOR EACH ROW`、`WHEN`、`NEW` / `OLD`，
+  `RAISE(IGNORE / ROLLBACK / ABORT / FAIL)`，`PRAGMA recursive_triggers`（最多 1000 层，含外键动作）。触发器存进
+  `sqlite_schema`（两种格式，文本照 SQLite 保存）；SQLite 格式里带触发器的表可写，sqlite3 和 MiniDB 互相执行对方建的
+  触发器；ALTER TABLE 照 alter.c 改写触发器文本（RENAME TO / RENAME COLUMN），DROP COLUMN 检查触发器。
+- 与 SQLite 逐语句对照的行为：触发顺序（新的先）、BEFORE INSERT 的 NEW（亲和性、rowid -1）、BEFORE 触发器改动或删除
+  当前行后的重读、外键动作与触发器的先后、REPLACE 删除的行只在 recursive_triggers 开着时触发且之后重查唯一约束、
+  upsert 触发 UPDATE 触发器、外层 `OR ...` 覆盖程序里的冲突子句、`changes()` / `total_changes()` /
+  `last_insert_rowid()`、INSTEAD OF 的各种细节（rowid 列、亲和性只在有触发器时转换、带 RETURNING 时的可写性）。
+- **编译期语义**：SQLite 在编译语句时编译它可能运行的程序，所以 MiniDB 在构造计划时按 SQLite 的代码生成顺序编译触发器
+  程序和外键动作，并记录“编译过的程序清单”——外键 mismatch、程序里的 no such column 等错误报得一样早、报的是同一个；
+  isSetNullAction 怪癖经由触发器程序时也一致；多行写入与语句日志（mayAbort）的判断照 SQLite。
+- sqllogictest：剩下的 23 条 TRIGGER 记录通过，全量 5,939,875 / 5,939,879（剩 4 条是已知的 `sum` / `total`
+  精度和整数溢出），CI 的基线随之提高。
+- fuzzer：随机触发器（表上 BEFORE / AFTER、视图上 INSTEAD OF；程序里 INSERT / UPDATE / DELETE / RAISE，用 NEW / OLD）、
+  DROP TRIGGER、写视图、`PRAGMA recursive_triggers`。它在阶段内找到并修复（都与 SQLite 对过，大多与触发器交织）：编译顺序
+  （BEFORE、约束检查、外键、AFTER；UPDATE / DELETE 为算列掩码先编译全部触发器）、单行 INSERT 的外键优化在触发器程序里
+  及有 INSERT 触发器时失效、递归按触发器判断、NEW 的 INTEGER PRIMARY KEY 有 INTEGER 亲和性、语句日志的 mayAbort
+  （DELETE 也不再总有日志）、NOT NULL 分两遍检查、`x IN (列表)` 按 OP_Eq 的亲和性规则比较、有窗口函数的查询里属于它的
+  聚合出现在子查询中是误用。
+- 测试：`tests/test_triggers.py`（两种格式，各 13 组对照，含重开文件、sqlite3 与 MiniDB 互相执行对方的触发器）。
+
+**benchmark**（10 万行；“前”是阶段 21 末 7bc00af）：
+
+| 操作 | MiniDB 格式 前 | MiniDB 格式 后 | SQLite 格式 前 | SQLite 格式 后 | sqlite3 |
+|---|---:|---:|---:|---:|---:|
+| 逐条 INSERT，一个事务 | 3.04 s | 3.40 s | 4.95 s | 5.46 s | 0.21 s |
+| 逐条 INSERT，`?` 参数 | 1.14 s | 1.14 s | 2.74 s | 2.76 s | 0.07 s |
+| 每条 INSERT 1000 行 | 2.51 s | 2.54 s | 4.07 s | 4.10 s | 0.07 s |
+| 1 万次主键点查 | 0.923 s | 0.934 s | 0.972 s | 1.016 s | 0.059 s |
+| 1 万次主键点查，`?` 参数 | 0.153 s | 0.153 s | 0.151 s | 0.155 s | 0.041 s |
+| GROUP BY 3 个聚合 | 0.109 s | 0.106 s | 0.118 s | 0.114 s | 0.032 s |
+| 索引嵌套循环连接 | 0.175 s | 0.189 s | 0.208 s | 0.206 s | 0.006 s |
+
+第一次跑“后”时，从字面量 SQL 编译的语句慢了约 20%（每条 INSERT / SELECT / DELETE 都为 mayAbort 遍历一次语法树）；
+改成只在多行写入和触发器程序里计算、窗口检查改为按需、没有触发器且外键关闭时跳过编译期的程序准备后，逐条字面量 INSERT
+仍慢约 6%（剖析：每条 INSERT 编译多约 5 µs），用 `?` 参数的路径不变。上表是修正后的数字（“前”的 SQLite 格式数字是同一
+次运行里测的）。
+
+**验证**：测试 1373 个全部通过；fuzz（最终代码）：MiniDB 格式内存 4000 种子 × 400 语句（0–1999、4000–5999）、SQLite 格式
+文件模式 2400 种子（2000–3199、6000–7199）、MiniDB 格式文件模式 300 种子（5000–5299）——只有 3 个种子不同，都已归类
+（见下）；变形测试文件模式 300 × 300 0 失败；sqllogictest 全量见上。第一次全量 sqllogictest（`--jobs 8`）在 1 小时的
+后台时限被停掉，原因没有查清（按目录分别跑全部通过、每个文件耗时与阶段 21 相同）；重跑 `--jobs 8` 用了 21 分钟、结果如上。
+
+**已知问题 / 做得不扎实的地方**：
+- fuzz 种子 4181、6037：外键子表扫描用索引查找时，SQLite 把子表列的亲和性就地作用在被删除行的寄存器上，于是 DELETE 的
+  RETURNING 看到 `127` 而不是 `'127.0'`（寄存器复用的副作用），MiniDB 不模拟。
+- fuzz 种子 6647：ANALYZE 之后 SQLite 选覆盖索引全扫描，ORDER BY 在 NOCASE 下相等的 'b' / 'B' 先后不同（依赖统计信息的
+  计划，同阶段 21 的种子 2266）。
+- 带 BEFORE INSERT 触发器时 SQLite 对单行 VALUES 的表达式求值两次（NEW 一次、存储一次），只在 `random()` 之类上看得出，
+  MiniDB 只求一次。
+- 程序清单的回放：缓存的程序记录的是它编译时请求过的程序，在别的语句里回放时去重规则与 SQLite 不完全相同（极端组合下
+  isSetNullAction 可能不同）。外键动作在运行时才第一次编译的子表触发器，其错误报得比 SQLite 晚。
+- TEMP 触发器不支持（阶段 25 才有 temp schema）；触发器程序里的 `UPDATE ... FROM` 不支持（MiniDB 本来就不支持），SQLite
+  文件里带这种触发器的表只读。
+- 逐条字面量 INSERT 的编译比阶段 21 慢约 6%。
