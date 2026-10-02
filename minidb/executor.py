@@ -23,6 +23,7 @@ import contextlib
 import dataclasses
 import heapq
 import itertools
+import math
 import os
 import random
 import re
@@ -30,7 +31,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from operator import itemgetter
 from typing import Any, Protocol, Union
 
-from minidb import dates, functions, pragmas, values, window
+from minidb import dates, functions, jsonfuncs, pragmas, values, window
 from minidb.foreign_keys import ForeignKeys, Link
 from minidb.triggers import Program, TriggerIgnore, Triggers, raise_error
 from minidb.btree import BTree, IntKey
@@ -49,6 +50,7 @@ from minidb.parser import (
 )
 from minidb.parser import CheckConstraint, ColumnDef, Expr, ForeignKey, KeyConstraint, Statement, parse
 from minidb.tokenizer import tokenize
+from minidb.jsonb import JSONText
 from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_record, decode_row, encode_record
 from minidb.pager import Pager
@@ -454,16 +456,16 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
         numeric = values.numeric_affinity
 
         def order(a, b):
-            if type(a) is str:
+            if isinstance(a, str):
                 a = numeric(a)
-            if type(b) is str:
+            if isinstance(b, str):
                 b = numeric(b)
             return compare(a, b)
     elif affinity == values.TEXT:
         text = values.text_affinity
 
         def order(a, b):
-            if type(a) is str or type(b) is str:
+            if isinstance(a, str) or isinstance(b, str):
                 return compare(text(a), text(b))
             return compare(a, b)
     else:
@@ -1421,7 +1423,8 @@ class AggregateCollector:
                 env[f"_distinct{i}"] = values.collation_sort_key(self.collations[i])
                 lines.append(f"{indent}_a = _arg{i}_0(row)")
                 lines.append(f"{indent}_seen = state[{i}][1]")
-                lines.append(f"{indent}if _a is not None and (_key := _distinct{i}(_a)) not in _seen:")
+                # (one NULL passes too: json_group_array() records it, the others skip it)
+                lines.append(f"{indent}if (_key := _distinct{i}(_a)) not in _seen:")
                 lines.append(f"{indent}    _seen.add(_key)")
                 indent += "    "
                 call = f"state[{i}][0].step(_a)"
@@ -2116,6 +2119,8 @@ def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr
     table = scope.entries[index].table
     if bound is None:
         bound = set(range(index))
+    if isinstance(table, JsonEachSource):
+        return JsonEachScan(table)
     if isinstance(table, DerivedSource):
         scan = DerivedScan(table)
         if type(table) in (DerivedSource, PragmaSource):  # (not a CTE's working table, which changes)
@@ -2507,7 +2512,7 @@ class Executor:
         if not any(recursive):
             compiled = self.compile_query(body, parent)
             check_cte_columns(cte, compiled.names)
-            return DerivedSource(cte.name, compiled, cte.columns)
+            return DerivedSource(cte.name, compiled, cte.columns, body)
         k = next(i for i, count in enumerate(recursive) if count)
         if k == 0 or operators[k - 1] not in ("UNION", "UNION ALL"):
             raise OperationalError(f"circular reference: {cte.name}")
@@ -2539,8 +2544,10 @@ class Executor:
             if body.order_by:
                 order_terms = self.compound_order_terms(body, [initial] + compiled_parts)
             limit = self.compile_limit(body)
-        return RecursiveSource(cte.name, initial, names, working, compiled_parts,
-                               operators[k - 1] == "UNION", order_terms, limit)
+        source = RecursiveSource(cte.name, initial, names, working, compiled_parts,
+                                 operators[k - 1] == "UNION", order_terms, limit)
+        source.strip = makes_json(body)
+        return source
 
     def view_source(self, view: ViewInfo) -> DerivedSource:
         """A view used in FROM: its SELECT, compiled as a subquery that sees
@@ -2562,7 +2569,7 @@ class Executor:
             self.outer_scope = outer
             self.expanding.pop()
             self.cte_scopes = saved
-        return DerivedSource(view.name, compiled, view.columns)
+        return DerivedSource(view.name, compiled, view.columns, view.query)
 
     def build_from(self, joins: list[Join], scope: Scope) -> tuple[list[Join], list[DerivedSource]]:
         """Add the FROM clause's tables to ``scope``.
@@ -2580,9 +2587,13 @@ class Executor:
                 compiled = self.compile_query(ref.query, parent=scope.parent)
                 if compiled.correlated:
                     scope.uses_outer = True
-                source = DerivedSource(ref.alias or "", compiled)
+                source = DerivedSource(ref.alias or "", compiled, query=ref.query)
                 derived.append(source)
                 scope.add(source, ref.alias or "")
+            elif ascii_lower(ref.name) in ("json_each", "json_tree", "jsonb_each", "jsonb_tree") and (
+                    isinstance(ref, TableFunction) or self.find_cte(ref.name) is None
+                    and not self.catalog.has_table(ref.name) and self.catalog.find_view(ref.name) is None):
+                self.json_each_source(ref, scope)
             elif isinstance(ref, TableFunction) or (
                     pragmas.function_spec(ref.name) is not None and self.find_cte(ref.name) is None
                     and not self.catalog.has_table(ref.name) and self.catalog.find_view(ref.name) is None):
@@ -2619,6 +2630,25 @@ class Executor:
                 join = self.using_condition(scope, index, join)
             normalized.append(join)
         return normalized, derived
+
+    def json_each_source(self, ref: TableFunction | TableRef, scope: Scope) -> None:
+        """Add json_each() / json_tree() to ``scope``.  Its arguments see it
+        too, as in SQLite: one that uses its own columns (or row id) leaves
+        SQLite's virtual table without its argument, and it has no rows."""
+        name = ascii_lower(ref.name)
+        args = ref.args if isinstance(ref, TableFunction) else []
+        if len(args) > 2:
+            raise OperationalError(f"too many arguments on {name}() - max 2")
+        source = JsonEachSource(name)
+        scope.add(source, ref.alias or name)
+        me = len(scope.entries) - 1
+        depends = set()
+        for arg in args:
+            depends |= tables_referenced(arg, scope)
+        compiler = Compiler(scope, executor=self)
+        compiled = [compiler.compile(arg) for arg in args]
+        if me not in depends:
+            source.args, source.depends = compiled, depends
 
     def table_function_source(self, ref: TableFunction, scope: Scope) -> tuple[PragmaSource, Expr | None]:
         """The source of ``pragma_<name>(arg, schema)`` in FROM, and an
@@ -2827,6 +2857,8 @@ class Executor:
 
         def access(table, bound):
             key = (table, bound)
+            if not getattr(scope.entries[table].table, "depends", set()) <= bound:
+                return math.inf, math.inf  # (json_each() after the tables its arguments use)
             if key not in accesses:
                 plan = plan_access(scope, table, self.catalog, pool, compiler, bound=set(bound))
                 rows, cost = plan.estimate()
@@ -3119,9 +3151,13 @@ class Executor:
     # ---- INSERT --------------------------------------------------------------
 
     def prepare_row(self, table: TableInfo, row: Row) -> int | None:
-        """Apply column affinities; returns the requested row id."""
+        """Apply column affinities (and drop the JSON subtype: a stored
+        value has none); returns the requested row id."""
         for i, affinity in enumerate(table.affinities):
-            row[i] = values.apply_affinity(row[i], affinity)
+            value = row[i]
+            if type(value) is JSONText:
+                value = str.__str__(value)
+            row[i] = values.apply_affinity(value, affinity)
         if table.rowid_column is None:
             return None
         rowid = row[table.rowid_column]
@@ -5121,10 +5157,16 @@ class DerivedSource:
     rowid_column = None
     indexes = ()
 
-    def __init__(self, name: str, compiled: CompiledQuery, names: list[str] | None = None) -> None:
-        """``names``: the column names a view declares, if any."""
+    strip = False
+
+    def __init__(self, name: str, compiled: CompiledQuery, names: list[str] | None = None,
+                 query: Any = None) -> None:
+        """``names``: the column names a view declares, if any.  ``query``:
+        the subquery, to see whether it may return JSON (whose subtype the
+        rows lose, as in SQLite)."""
         self.name = name or "subquery"
         self.compiled = compiled
+        self.strip = query is not None and makes_json(query)
         if names is None:
             names = unique_names(compiled.names)
         elif len(names) != len(compiled.names):
@@ -5147,7 +5189,23 @@ class DerivedSource:
         return self.compiled.correlated
 
     def materialize(self) -> None:
-        self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+        if self.strip:
+            self.rows = [plain_text(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+        else:
+            self.rows = [list(row) + [i] for i, row in enumerate(self.compiled.run(), 1)]
+
+
+def makes_json(query: object) -> bool:
+    """Whether a subquery calls a function returning JSON.  SQLite does not
+    flatten such a subquery into the query using it, and its rows lose the
+    subtype on the way out (json_each()'s ``value`` keeps it: that subquery
+    is flattened)."""
+    return any(isinstance(node, Call) and node.name in jsonfuncs.SUBTYPE_FUNCTIONS for node in walk_nodes(query))
+
+
+def plain_text(row: Sequence) -> list:
+    """The values of a row with no JSON subtype."""
+    return [str.__str__(v) if type(v) is JSONText else v for v in row]
 
 
 class PragmaSource(DerivedSource):
@@ -5194,6 +5252,65 @@ class PragmaSource(DerivedSource):
             for result in spec.rows(executor, argument):
                 rows.append(list(result) + ([argument] if spec.arg is not None else []) + [schema])
         self.rows = [row + [i] for i, row in enumerate(rows, 1)]
+
+
+class JsonEachSource(DerivedSource):
+    """``json_each(json[, root])`` / ``json_tree(...)`` in FROM: SQLite's
+    JSON virtual tables, with the hidden columns ``json`` and ``root``.  The
+    arguments may use tables before it in the FROM clause: its rows are
+    computed for each row of those (JsonEachScan)."""
+
+    has_rowid = True
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.args = []  # (none: no rows)
+        self.depends = set()  # the FROM clause's tables the arguments use
+        self.recursive = name.endswith("tree")
+        self.binary = name.startswith("jsonb")  # (jsonb_each: a container value is JSONB)
+        names = jsonfuncs.EACH_COLUMNS
+        self.columns = [ColumnName(n) for n in names]
+        self.hidden_columns = {"json", "root"}
+        self.affinities = [values.BLOB] * len(names)  # (columns declared without a type)
+        self.collations = [None] * len(names)
+        self.positions = {n: i for i, n in enumerate(names)}
+        self.rows = []
+
+    @property
+    def correlated(self) -> bool:
+        return False  # (its arguments read the enclosing query's row through scope.cell)
+
+    def materialize(self) -> None:
+        pass  # (JsonEachScan computes the rows)
+
+    def rows_for(self, row: Row) -> Iterator[tuple[int, list]]:
+        if not self.args:
+            return  # (SQLite's xFilter without the json argument: no rows)
+        args = [arg(row) for arg in self.args]
+        rows = jsonfuncs.each_rows(args[0], args[1] if len(args) > 1 else None, self.recursive, len(args) > 1,
+                                   self.binary)
+        for rowid, values_ in enumerate(rows):
+            values_.append(rowid)
+            yield rowid, values_
+
+
+class JsonEachScan:
+    """The rows of json_each() / json_tree() for the current row of the join."""
+
+    def __init__(self, source: JsonEachSource) -> None:
+        self.source = source
+
+    def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
+        return self.source.rows_for(row)
+
+    def order(self) -> tuple[list[int], set[int]] | None:
+        return None
+
+    def estimate(self) -> tuple[float, float]:
+        return 25, 25
+
+    def describe(self) -> str:
+        return f"SCAN {self.source.name} VIRTUAL TABLE INDEX 0:"
 
 
 class CteInfo:
@@ -5375,7 +5492,7 @@ class RecursiveSource(DerivedSource):
                 queue.append(row)
 
         for row in self.compiled.run():
-            push(tuple(row))
+            push(tuple(plain_text(row) if self.strip else row))
         out, taken = [], 0
         while (len(queue) > head) if key is None else queue:
             if end is not None and taken >= end:
@@ -5393,7 +5510,7 @@ class RecursiveSource(DerivedSource):
             self.working.rows = [list(row) + [1]]
             for part in self.parts:
                 for new in part.run():
-                    push(tuple(new))
+                    push(tuple(plain_text(new) if self.strip else new))
         self.rows = [list(row) + [i] for i, row in enumerate(out, 1)]
 
 

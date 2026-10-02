@@ -20,6 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from minidb import jsonfuncs
 from minidb.errors import OperationalError
 from minidb.values import (
     INT_MAX, INT_MIN, SQLValue, SumAccumulator, add, collation_compare, collation_sort_key, compare,
@@ -481,6 +482,8 @@ class WindowFunction:
                     else WindowMinMax(want, self.compare))
         if name in ("GROUP_CONCAT", "STRING_AGG"):
             return WindowGroupConcat()
+        if name in jsonfuncs.AGGREGATES:
+            return jsonfuncs.WindowJsonGroup(jsonfuncs.AGGREGATES[name][0])
         if name == "ROW_NUMBER":
             return RowNumber()
         if name == "DENSE_RANK":

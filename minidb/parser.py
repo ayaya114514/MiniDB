@@ -1892,9 +1892,12 @@ class Parser:
         return left
 
     def concat(self) -> Expr:
+        """``||`` and the JSON operators ``->`` / ``->>`` (one precedence level, as in SQLite)."""
         left = self.collate()
-        while self.accept_op("||"):
-            left = Binary("||", left, self.collate())
+        while self.at_op("||", "->", "->>"):
+            op = self.advance().value
+            right = self.collate()
+            left = Binary("||", left, right) if op == "||" else Call(op, (left, right))
         return left
 
     def collate(self) -> Expr:

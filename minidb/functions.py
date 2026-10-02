@@ -15,7 +15,7 @@ import re
 from collections.abc import Callable
 from functools import lru_cache
 
-from minidb import values
+from minidb import jsonfuncs, values
 from minidb.errors import OperationalError
 from minidb.dates import DATE_FUNCTIONS
 from minidb.fp import atof
@@ -584,6 +584,7 @@ def _printf(*args: SQLValue) -> str | None:
 # name -> (function, minimum argument count, maximum argument count or None)
 SCALAR_FUNCTIONS = {
     **values.SCALAR_FUNCTIONS,
+    **jsonfuncs.SCALAR_FUNCTIONS,
     **MATH_FUNCTIONS,
     **DATE_FUNCTIONS,
     "CHAR": (char, 0, None),
