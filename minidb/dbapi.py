@@ -102,6 +102,23 @@ class Connection:
             db.execute(sql)
         db.execute("BEGIN")
 
+    def serialize(self) -> bytes:
+        """The database as the bytes of an SQLite file (see Database.serialize)."""
+        return self.database.serialize()
+
+    def deserialize(self, data: bytes) -> None:
+        """Replace the database with an in-memory copy of the SQLite file
+        ``data``.  Not with uncommitted changes (as in sqlite3, "database is
+        locked"); the transaction this connection keeps open starts again."""
+        db = self.database
+        if not self.autocommit and db.in_transaction:
+            if db.pager.dirty:
+                raise OperationalError("database is locked")
+            db.execute("ROLLBACK")
+        db.deserialize(data)
+        if not self.autocommit:
+            db.execute("BEGIN")
+
     def close(self) -> None:
         """Close the connection; an uncommitted transaction is rolled back."""
         if self._db is not None:

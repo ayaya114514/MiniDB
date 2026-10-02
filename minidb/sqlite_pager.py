@@ -158,8 +158,8 @@ class SqliteLocks:
 class _MemoryFile:
     """A database file kept in memory (the same calls as ``_LockFile``)."""
 
-    def __init__(self) -> None:
-        self.data = io.BytesIO()
+    def __init__(self, image: bytes = b"") -> None:
+        self.data = io.BytesIO(image)
 
     def read(self, offset: int, size: int) -> bytes:
         self.data.seek(offset)
@@ -180,14 +180,15 @@ class _MemoryFile:
 
 
 class SqlitePager(PageCache):
-    """Pages of an SQLite-format database file (``path``; None: in memory).
-    The new pager is inside a read transaction, like ``Pager``."""
+    """Pages of an SQLite-format database file (``path``; None: in memory,
+    starting from the file contents ``image``).  The new pager is inside a
+    read transaction, like ``Pager``."""
 
     format = "sqlite"
     committed = 0  # no log: Database's checkpoint condition never fires
     checkpoint_frames = 1 << 62
 
-    def __init__(self, path: str | None = None, timeout: float = 5.0) -> None:
+    def __init__(self, path: str | None = None, timeout: float = 5.0, image: bytes = b"") -> None:
         self.path = path
         self.journal_path = None if path is None else path + "-journal"
         self.crash_hook = None
@@ -202,7 +203,7 @@ class SqlitePager(PageCache):
         self.read_counter = None  # the change counter when the cache was last validated
         if path is None:
             self.locks = None
-            self.io = _MemoryFile()
+            self.io = _MemoryFile(image)
         else:
             created = not os.path.exists(path)
             self.locks = SqliteLocks(path, timeout)
@@ -424,6 +425,17 @@ class SqlitePager(PageCache):
         self.read_counter = header.change_counter
         if self.locks is not None:
             self.locks.downgrade()
+
+    def serialize(self) -> bytes:
+        """The database file as this connection sees it, uncommitted changes
+        included (sqlite3_serialize)."""
+        size = self.header.page_count * PAGE_SIZE
+        image = bytearray(self.io.read(0, size).ljust(size, b"\x00"))
+        for pgno in self.dirty - {0}:
+            if pgno <= self.header.page_count:
+                image[(pgno - 1) * PAGE_SIZE:pgno * PAGE_SIZE] = self.cache[pgno].to_bytes()
+        image[:HEADER_SIZE] = self.header.to_bytes()
+        return bytes(image)
 
     def _write_journal(self, pgnos: list[int]) -> None:
         seed = int.from_bytes(os.urandom(4), "big")
