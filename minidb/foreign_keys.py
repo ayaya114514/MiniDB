@@ -122,7 +122,6 @@ class ForeignKeys:
         self.deferred_immediate = 0  # violations of immediate ones while PRAGMA defer_foreign_keys is on
         self.extra_changes = 0  # rows the actions changed (total_changes() counts them)
         self.unchecked = None  # see last_action_program
-        self.single_insert = False  # the statement is a one-row INSERT (row_inserted)
         self._version = None
         self._children = {}  # lower-case table name -> [Link] (its own foreign keys)
         self._parents = {}  # lower-case table name -> [Link] (the foreign keys naming it)
@@ -228,12 +227,18 @@ class ForeignKeys:
                 continue
             seen.add((id(link), kind))
             child = link.child
+            triggers = self.executor.triggers
             if action == "CASCADE" and kind == "delete":
+                triggers.prepare(child.name, "DELETE", None, "ABORT", ("BEFORE",))
                 self.prepare(child, "delete", seen=seen)
+                triggers.prepare(child.name, "DELETE", None, "ABORT", ("AFTER",))
             else:
                 width = len(child.columns)
                 positions = {width if p == child.rowid_column else p for p in link.child_positions}
+                names = [child.columns[p].name if p < width else "rowid" for p in positions]
+                triggers.prepare(child.name, "UPDATE", names, "ABORT", ("BEFORE",))
                 self.prepare(child, "update", positions, seen=seen)
+                triggers.prepare(child.name, "UPDATE", names, "ABORT", ("AFTER",))
 
     def required(self, table: TableInfo, changed: set[int] | None) -> bool:
         """Whether an UPDATE setting ``changed`` needs foreign key work (sqlite3FkRequired)."""
@@ -481,13 +486,13 @@ class ForeignKeys:
 
     # ---- the steps of a change ------------------------------------------------------
 
-    def row_inserted(self, table: TableInfo, row: list) -> None:
-        """Before ``row`` (values and row id) is stored."""
+    def row_inserted(self, table: TableInfo, row: list, single: bool = False) -> None:
+        """Before ``row`` (values and row id) is stored (``single``: by a one-row INSERT)."""
         for link in self.children_of(table):
             if self._usable(link):
                 self.check_parent(link, row, 1, row)
         for link in self.parents_of(table):
-            if self.single_insert and not link.deferred and not self.defer_all():
+            if single and not link.deferred and not self.defer_all():
                 continue  # (SQLite: one inserted row cannot fix an immediate violation)
             if self._usable(link):
                 self.scan_children(link, row, -1)

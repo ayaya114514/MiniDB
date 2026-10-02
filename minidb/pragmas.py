@@ -270,10 +270,15 @@ def _setting(name: str) -> Callable[[Executor], object]:
     return lambda executor: executor.settings[name]
 
 
+PLAN_SETTINGS = frozenset(("foreign_keys", "defer_foreign_keys", "recursive_triggers"))
+
+
 def _set_flag(name: str) -> Callable[[Executor, object], None]:
     def write(executor: Executor, value: object) -> None:
         if name == "foreign_keys" and executor.in_transaction():
             return  # (SQLite ignores it inside a transaction)
+        if executor.settings[name] != boolean(value) and name in PLAN_SETTINGS:
+            executor.catalog.version += 1  # (compiled plans depend on it: SQLite expires its statements)
         executor.settings[name] = boolean(value)
     return write
 
