@@ -49,7 +49,7 @@ class _Tree:
     @classmethod
     def create(cls, pager: Any) -> int:
         """A new empty tree; returns its root page."""
-        return pager.allocate(BtreePage, TABLE_LEAF if cls.table else INDEX_LEAF).pgno
+        return pager.allocate_root(TABLE_LEAF if cls.table else INDEX_LEAF).pgno
 
     def page(self, pgno: int) -> BtreePage:
         return self.pager.get(pgno, BtreePage)
@@ -251,8 +251,11 @@ class _Tree:
                 page, used = [], 0
             page.append(cell)
             used += size
-        if not page and level:  # the last entry went up: bring it back down
+        if not page and level:
+            # The last entry went up: it comes back down as the last leaf, and
+            # the previous leaf sends its own last entry up in its place.
             page = [dividers.pop()]
+            dividers.append(level[-1].pop())
         level.append(page)
         children = [tree._new_page(leaf_kind, cells, 0) for cells in level]
         if cls.table:

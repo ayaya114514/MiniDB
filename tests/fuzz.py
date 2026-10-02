@@ -846,6 +846,8 @@ class Generator:
             return self.add_column()
         if roll < 0.1:
             if self.page_sizes and rng.random() < 0.4:
+                if rng.random() < 0.5:
+                    return f"PRAGMA auto_vacuum = {rng.choice(['NONE', 'FULL', 'INCREMENTAL'])}"
                 return f"PRAGMA page_size = {rng.choice(PAGE_SIZES)}"  # (the next VACUUM uses it)
             return "VACUUM"
         if roll < 0.11:
@@ -877,8 +879,9 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
     history = []
     try:
         setup = [("PRAGMA foreign_keys = ON", None)] if seed % 2 else []
-        if format == "sqlite":  # (a new database: both take the page size at once)
+        if format == "sqlite":  # (a new database: both take the page size and auto_vacuum at once)
             setup.insert(0, (f"PRAGMA page_size = {PAGE_SIZES[seed % len(PAGE_SIZES)]}", None))
+            setup.insert(1, (f"PRAGMA auto_vacuum = {seed // 7 % 3}", None))
         setup += [(generator.create_table(), None) for _ in range(2)]
         setup.append((generator.create_index(), None))
         for sql, parameters in setup + [generator.statement_with_parameters() for _ in range(statements)]:

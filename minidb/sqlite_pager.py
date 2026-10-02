@@ -25,8 +25,13 @@ after the other, and (on POSIX) even at the same time:
   MiniDB's own header is); free pages on SQLite's freelist of trunk and
   leaf pages.
 
-Not supported (refused when opening): WAL mode, UTF-16, auto-vacuum,
-reserved bytes at the end of pages.  Large transactions keep every changed page in memory (no
+* auto_vacuum (FULL or INCREMENTAL): pointer map pages say what each page
+  is and which page points to it; root pages stay at the front of the
+  file; a FULL database moves pages from the end into free pages and
+  shrinks at every commit, an INCREMENTAL one on PRAGMA incremental_vacuum.
+
+Not supported (refused when opening): WAL mode, UTF-16, reserved bytes at
+the end of pages.  Large transactions keep every changed page in memory (no
 spilling, unlike MiniDB's own format).
 """
 
@@ -41,8 +46,9 @@ from minidb.errors import DatabaseError
 from minidb.locking import LockTimeout, _LockFile, fsync_directory
 from minidb.pager import PageCache
 from minidb.sqlite_format import (
-    DEFAULT_PAGE_SIZE, HEADER_SIZE, PENDING_BYTE, TABLE_LEAF, BtreePage, DbHeader, FreePage, Geometry,
-    OverflowPage, TrunkPage, corrupt, valid_page_size,
+    DEFAULT_PAGE_SIZE, HEADER_SIZE, PENDING_BYTE, PTRMAP_BTREE, PTRMAP_FREEPAGE, PTRMAP_OVERFLOW1,
+    PTRMAP_OVERFLOW2, PTRMAP_ROOTPAGE, TABLE_LEAF, BtreePage, DbHeader, FreePage, Geometry, OverflowPage,
+    PtrmapPage, TrunkPage, corrupt, valid_page_size,
 )
 
 PENDING, RESERVED, SHARED = 0, 1, 2  # lock numbers (see SPANS)
@@ -209,6 +215,7 @@ class SqlitePager(PageCache):
         self.next_page_size = None  # PRAGMA page_size on an existing database: for the next VACUUM
         self.fresh = False  # this connection created the database and nothing was written since
         self.resized_from = None  # the geometry before this transaction changed the page size
+        self.next_auto_vacuum = None  # PRAGMA auto_vacuum on an existing database: for the next VACUUM
         if path is None:
             self.locks = None
             self.io = _MemoryFile(image)
@@ -285,13 +292,283 @@ class SqlitePager(PageCache):
                 header.freelist_trunk = trunk.next_trunk
             header.freelist_count -= 1
         else:
-            pgno = header.page_count + 1
-            if pgno == self.geometry.lock_page:  # never used (SQLite's locks live there)
-                pgno += 1
-            header.page_count = pgno
+            pgno = self._grow()
         page = page_class(pgno, *args, geometry=self.geometry)
         self.write(page)
         return page
+
+    def _grow(self) -> int:
+        """A new page at the end of the file (as SQLite's allocateBtreePage):
+        not the lock page, and with auto_vacuum not a pointer map page - that
+        one is added, empty, before it."""
+        header, geometry = self.header, self.geometry
+        self.write(header)  # (before changing it: a statement rollback must undo this)
+        pgno = header.page_count + 1
+        if pgno == geometry.lock_page:  # never used (SQLite's locks live there)
+            pgno += 1
+        if self.auto_vacuum and geometry.is_ptrmap(pgno):
+            self.write(PtrmapPage(pgno, geometry=geometry))
+            pgno += 1
+            if pgno == geometry.lock_page:
+                pgno += 1
+        header.page_count = pgno
+        return pgno
+
+    # ---- auto_vacuum ---------------------------------------------------------------------
+
+    @property
+    def auto_vacuum(self) -> int:
+        """0 (NONE), 1 (FULL) or 2 (INCREMENTAL), as the header says."""
+        header = self.header
+        if not header.autovacuum_root:
+            return 0
+        return 2 if header.incremental_vacuum else 1
+
+    def set_auto_vacuum(self, mode: int) -> None:
+        """PRAGMA auto_vacuum = ``mode``: between FULL and INCREMENTAL at once;
+        on or off only for a new database (for an existing one at the next
+        VACUUM), as SQLite."""
+        self.next_auto_vacuum = mode
+        current = self.auto_vacuum
+        if mode == current:
+            return
+        header = self.header
+        if current and mode:
+            self.write(header)
+            header.incremental_vacuum = int(mode == 2)
+        elif self.fresh and header.page_count == 1:
+            self.write(header)
+            header.autovacuum_root = 1 if mode else 0
+            header.incremental_vacuum = int(mode == 2)
+
+    def allocate_root(self, kind: int) -> BtreePage:
+        """A new root page: with auto_vacuum the page after the largest root
+        (SQLite's btreeCreateTable), moving the page that is there."""
+        if not self.auto_vacuum:
+            return self.allocate(BtreePage, kind)
+        self.sync_ptrmap()
+        header, geometry = self.header, self.geometry
+        target = header.autovacuum_root + 1
+        while geometry.is_ptrmap(target) or target == geometry.lock_page:
+            target += 1
+        if header.page_count < target:  # (the file grows up to it; pages before it become free)
+            while header.page_count < target:
+                pgno = self._grow()
+                if pgno != target:
+                    self.free(pgno)
+        else:
+            free = self.free_list()
+            if target in free:
+                free.remove(target)
+                self.set_free_list(free)
+            else:
+                kind_there, parent = self.ptrmap_get(target)
+                if kind_there in (PTRMAP_ROOTPAGE, PTRMAP_FREEPAGE) or not kind_there:
+                    raise corrupt(f"page {target}: bad pointer map entry where a new root page goes")
+                destination = self.allocate(FreePage).pgno  # (any page; its content comes from target)
+                self.relocate(target, destination, kind_there, parent)
+        page = BtreePage(target, kind, geometry=geometry)
+        self.write(page)
+        self.write(header)
+        header.autovacuum_root = target
+        self.ptrmap_set(target, PTRMAP_ROOTPAGE, 0)  # (a page write: a statement rollback undoes it too)
+        return page
+
+    def release_root(self, root: int) -> tuple[int, int] | None:
+        """After the tree at ``root`` was freed (DROP): with auto_vacuum the
+        largest root moves into its place (SQLite's btreeDropTable).  Returns
+        (old, new) root page of the tree that moved, if one did."""
+        if not self.auto_vacuum:
+            return None
+        self.sync_ptrmap()
+        header, geometry = self.header, self.geometry
+        largest = header.autovacuum_root
+        moved = None
+        if root != largest:
+            free = self.free_list()
+            free.remove(root)
+            self.set_free_list(free)
+            self.relocate(largest, root, PTRMAP_ROOTPAGE, 0)
+            self.free(largest)
+            moved = (largest, root)
+        largest -= 1
+        while largest == geometry.lock_page or geometry.is_ptrmap(largest):
+            largest -= 1
+        self.write(header)
+        header.autovacuum_root = largest
+        return moved
+
+    def ptrmap_get(self, pgno: int) -> tuple[int, int]:
+        page = self.get(self.geometry.ptrmap_page(pgno), PtrmapPage)
+        return page.entry(pgno)
+
+    def ptrmap_set(self, pgno: int, kind: int, parent: int) -> None:
+        if pgno < 3 or self.geometry.is_ptrmap(pgno):
+            return
+        map_pgno = self.geometry.ptrmap_page(pgno)
+        if map_pgno > self.header.page_count:
+            return
+        page = self.get(map_pgno, PtrmapPage)
+        if page.entry(pgno) != (kind, parent):
+            self.write(page)
+            page.set_entry(pgno, kind, parent)
+
+    def set_child_ptrmaps(self, page: Any) -> None:
+        """The pointer map entries of what ``page`` points to (SQLite's setChildPtrmaps)."""
+        pgno = page.pgno
+        if isinstance(page, BtreePage):
+            leaf = page.is_leaf
+            for cell in page.cells:
+                if not leaf:
+                    self.ptrmap_set(cell.child, PTRMAP_BTREE, pgno)
+                if cell.overflow:
+                    self.ptrmap_set(cell.overflow, PTRMAP_OVERFLOW1, pgno)
+            if not leaf:
+                self.ptrmap_set(page.right, PTRMAP_BTREE, pgno)
+        elif isinstance(page, OverflowPage):
+            if page.next_page:
+                self.ptrmap_set(page.next_page, PTRMAP_OVERFLOW2, pgno)
+        elif isinstance(page, TrunkPage):
+            self.ptrmap_set(pgno, PTRMAP_FREEPAGE, 0)
+            for leaf_pgno in page.leaves:
+                self.ptrmap_set(leaf_pgno, PTRMAP_FREEPAGE, 0)
+        elif isinstance(page, FreePage):
+            self.ptrmap_set(pgno, PTRMAP_FREEPAGE, 0)
+
+    def sync_ptrmap(self) -> None:
+        """Bring the pointer map up to date with this transaction's changes:
+        a changed parent-child link always has a changed page on its parent
+        side, so the changed pages say it all."""
+        if not self.auto_vacuum:
+            return
+        for pgno in sorted(self.dirty - {0}):
+            page = self.cache.get(pgno)
+            if page is not None and pgno <= self.header.page_count:
+                self.set_child_ptrmaps(page)
+
+    def relocate(self, source: int, target: int, kind: int, parent: int) -> None:
+        """Move page ``source`` (of pointer map ``kind``, pointed to from
+        ``parent``) to page ``target`` (SQLite's relocatePage)."""
+        page_class = BtreePage if kind in (PTRMAP_ROOTPAGE, PTRMAP_BTREE) else OverflowPage
+        moved = self.get(source, page_class).copy()
+        moved.pgno = target
+        self.write(moved)
+        self.set_child_ptrmaps(moved)
+        if kind == PTRMAP_BTREE:
+            owner = self.get(parent, BtreePage)
+            self.write(owner)
+            if owner.right == source:
+                owner.right = target
+            else:
+                for i, cell in enumerate(owner.cells):
+                    if cell.child == source:
+                        owner.cells[i] = cell = cell.copy()
+                        cell.child = target
+                        break
+        elif kind == PTRMAP_OVERFLOW1:
+            owner = self.get(parent, BtreePage)
+            self.write(owner)
+            for i, cell in enumerate(owner.cells):
+                if cell.overflow == source:
+                    owner.cells[i] = cell = cell.copy()
+                    cell.overflow = target
+                    break
+        elif kind == PTRMAP_OVERFLOW2:
+            owner = self.get(parent, OverflowPage)
+            self.write(owner)
+            owner.next_page = target
+        self.ptrmap_set(target, kind, parent)
+
+    def free_list(self) -> list[int]:
+        """Every free page, trunks first in chain order."""
+        pages, trunk = [], self.header.freelist_trunk
+        while trunk:
+            page = self.get(trunk, TrunkPage)
+            pages.append(trunk)
+            pages.extend(page.leaves)
+            trunk = page.next_trunk
+        return pages
+
+    def set_free_list(self, pages: list[int]) -> None:
+        """Rewrite the freelist to hold ``pages``."""
+        header, geometry = self.header, self.geometry
+        self.write(header)
+        header.freelist_count = len(pages)
+        header.freelist_trunk = 0
+        per_trunk = geometry.max_leaves + 1
+        chunks = [pages[i:i + per_trunk] for i in range(0, len(pages), per_trunk)]
+        for chunk in reversed(chunks):
+            trunk, leaves = chunk[0], chunk[1:]
+            self.write(TrunkPage(trunk, header.freelist_trunk, list(leaves), geometry=geometry))
+            for leaf in leaves:
+                self.write(FreePage(leaf, geometry=geometry))
+            header.freelist_trunk = trunk
+
+    def final_size(self, original: int, free: int) -> int:
+        """The page count once ``free`` pages are gone (SQLite's finalDbSize)."""
+        geometry = self.geometry
+        entries = geometry.usable // 5
+        maps = (free - original + geometry.ptrmap_page(original) + entries) // entries
+        final = original - free - maps
+        if original > geometry.lock_page and final < geometry.lock_page:
+            final -= 1
+        while geometry.is_ptrmap(final) or final == geometry.lock_page:
+            final -= 1
+        return final
+
+    def vacuum_pages(self, limit: int | None = None) -> int:
+        """Give free pages back by moving pages from the end of the file into
+        them: all of them (a FULL database's commit, SQLite's
+        autoVacuumCommit), or ``limit`` steps (PRAGMA incremental_vacuum,
+        SQLite's incrVacuumStep: each takes the last page off the file).
+        Returns the number of steps taken (with ``limit``)."""
+        self.sync_ptrmap()
+        header, geometry = self.header, self.geometry
+        free = self.free_list()
+        if not free:
+            return 0
+        self.write(header)
+        original, steps = header.page_count, 0
+        if limit is None:  # (everything, at once)
+            final = self.final_size(original, len(free))
+            available = sorted(p for p in free if p <= final)
+            for last in range(original, final, -1):
+                if geometry.is_ptrmap(last) or last == geometry.lock_page or last in free:
+                    continue
+                kind, parent = self.ptrmap_get(last)
+                if kind == PTRMAP_ROOTPAGE:
+                    raise corrupt(f"root page {last} at the end of an auto_vacuum database")
+                self.relocate(last, available.pop(0), kind, parent)
+            free = []
+        else:
+            final = original
+            for _ in range(limit):
+                if not free:
+                    break
+                steps += 1
+                final = self.final_size(header.page_count, len(free))
+                last = header.page_count
+                if last in free:
+                    free.remove(last)
+                else:
+                    kind, parent = self.ptrmap_get(last)
+                    if kind == PTRMAP_ROOTPAGE:
+                        raise corrupt(f"root page {last} at the end of an auto_vacuum database")
+                    target = max((p for p in free if p <= final), default=min(free))
+                    free.remove(target)
+                    self.relocate(last, target, kind, parent)
+                last -= 1
+                while last == geometry.lock_page or geometry.is_ptrmap(last):
+                    last -= 1
+                header.page_count = last
+                final = last
+        self.write(header)
+        header.page_count = final
+        for pgno in [p for p in self.cache if p > final]:
+            del self.cache[pgno]
+            self.dirty.discard(pgno)
+        self.set_free_list(free)
+        return steps
 
     def free(self, pgno: int) -> None:
         header = self.header
@@ -316,37 +593,55 @@ class SqlitePager(PageCache):
     def check_pages(self, roots: list[int]) -> list[str]:
         """Every page must belong to exactly one B-tree (rooted at one of
         ``roots``), overflow chain or the freelist, as sqlite3's
-        integrity_check demands ("never used", "2nd reference")."""
-        from minidb.sqlite_btree import TableTree
-
+        integrity_check demands ("never used", "2nd reference"); with
+        auto_vacuum the pointer map must say so ("Bad ptr map entry")."""
+        self.sync_ptrmap()  # (inside a transaction: what its commit would write)
         owner = {}
         problems = []
+        expected = {}  # page -> its pointer map entry (auto_vacuum)
 
-        def claim(pgno: int, what: str) -> bool:
+        def claim(pgno: int, what: str, entry: tuple[int, int]) -> bool:
             if pgno in owner:
                 problems.append(f"page {pgno}: used by {owner[pgno]} and by {what}")
                 return False
             owner[pgno] = what
+            expected[pgno] = entry
             return True
 
         for root in roots:
-            for page in TableTree(self, root)._pages():
-                claim(page.pgno, f"the tree at page {root}")
+            stack = [(root, (PTRMAP_ROOTPAGE, 0))]
+            while stack:
+                pgno, entry = stack.pop()
+                if not claim(pgno, f"the tree at page {root}", entry):
+                    continue
+                page = self.get(pgno, BtreePage)
                 for cell in page.cells:
-                    pgno = cell.overflow
-                    while pgno and claim(pgno, f"an overflow chain of the tree at page {root}"):
-                        pgno = self.get(pgno, OverflowPage).next_page
+                    chain, link = cell.overflow, (PTRMAP_OVERFLOW1, pgno)
+                    while chain and claim(chain, f"an overflow chain of the tree at page {root}", link):
+                        link = (PTRMAP_OVERFLOW2, chain)
+                        chain = self.get(chain, OverflowPage).next_page
+                if not page.is_leaf:
+                    stack.extend((child, (PTRMAP_BTREE, pgno)) for child in [c.child for c in page.cells] + [page.right])
         pgno, count = self.header.freelist_trunk, 0
-        while pgno and claim(pgno, "the freelist"):
+        while pgno and claim(pgno, "the freelist", (PTRMAP_FREEPAGE, 0)):
             trunk = self.get(pgno, TrunkPage)
             for leaf in trunk.leaves:
-                claim(leaf, "the freelist")
+                claim(leaf, "the freelist", (PTRMAP_FREEPAGE, 0))
             count += 1 + len(trunk.leaves)
             pgno = trunk.next_trunk
         if count != self.header.freelist_count:
             problems.append(f"freelist: {count} pages, the header says {self.header.freelist_count}")
-        lock_page = self.geometry.lock_page
-        unused = [p for p in range(1, self.header.page_count + 1) if p not in owner and p != lock_page]
+        geometry = self.geometry
+        if self.auto_vacuum:
+            for pgno in range(2, self.header.page_count + 1):
+                if geometry.is_ptrmap(pgno):
+                    claim(pgno, "the pointer map", None)
+            for pgno, entry in sorted(expected.items()):
+                if entry is not None and pgno > 2 and self.ptrmap_get(pgno) != entry:
+                    found = self.ptrmap_get(pgno)
+                    problems.append(f"Bad ptr map entry key={pgno} expected=({entry[0]},{entry[1]}) "
+                                    f"got=({found[0]},{found[1]})")
+        unused = [p for p in range(1, self.header.page_count + 1) if p not in owner and p != geometry.lock_page]
         if unused:
             problems.append(f"pages never used: {unused[:10]}")
         return problems
@@ -430,6 +725,9 @@ class SqlitePager(PageCache):
         if not self.dirty:
             return
         header = self.header
+        if self.auto_vacuum == 1 and header.freelist_count:
+            self.vacuum_pages()  # (SQLite's autoVacuumCommit)
+        self.sync_ptrmap()
         if self.locks is not None:
             self.locks.reserve()
             self.locks.lock_exclusive()
@@ -444,7 +742,12 @@ class SqlitePager(PageCache):
                 old = self.resized_from
                 self._write_journal([p for p in range(1, self.original_pages + 1) if p != old.lock_page], old)
             else:
-                self._write_journal([p for p in pages if p <= self.original_pages], self.geometry)
+                # The changed pages, and the pages the file loses (SQLite's CommitPhaseOne
+                # journals those too: a rollback must bring them back).
+                kept = set(p for p in pages if p <= self.original_pages)
+                kept.update(range(header.page_count + 1, self.original_pages + 1))
+                kept.discard(self.geometry.lock_page)
+                self._write_journal(sorted(kept), self.geometry)
         size = self.geometry.page_size
         for i, pgno in enumerate(pages):
             self._crash_point("db_page", i)

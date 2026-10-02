@@ -1061,3 +1061,25 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   日志头的页大小写回并截断，崩溃后恢复成旧页大小（测试在写日志、写库的各个崩溃点上让 sqlite3 回放）。回滚时恢复旧
   Geometry 并清空页缓存。一个 sqlite3 的细节：`PRAGMA page_size` 不加锁，在热日志回放之前问，返回的是打开时读到的
   （崩溃后的）文件头。
+
+## D115 auto_vacuum：指针图从脏页推出来，根页照 SQLite 放在前部
+
+- **读写不破坏的前提**（都按 sqlite3.c 读过再实现）：指针图页（第 2 页起每 usable/5 + 1 页一个）记录每页的类型和
+  指向它的页；所有根页集中在“最大根页号”（文件头第 52 字节）以内——FULL 模式提交时、incremental_vacuum 时，SQLite
+  只搬文件末尾的非根页，遇到根页就报损坏，所以新建的树必须照 btreeCreateTable 放在最大根页号 + 1（占着的页搬走），
+  DROP 必须照 btreeDropTable 把最大的根页搬进空出的位置并改 `sqlite_schema` 的 rootpage（多棵树时从大到小删，同
+  destroyTable）。VACUUM 先按 SQLite 的顺序为表、再为索引建根页（`sqlite_sequence` 跟着第一个 AUTOINCREMENT 表），
+  再批量构建后 adopt 进去。
+- **指针图不在 B 树代码里逐处维护**：父子关系变了，父的那一侧一定是本事务改过的页，所以提交前（以及搬页、检查之前）
+  遍历脏页，按每页的子指针 / 溢出指针 / 空闲列表写条目（SQLite 的 setChildPtrmaps），B 树的分裂合并代码一行不用改。
+  根页的条目在分配时直接写（作为一次页写入，语句回滚能撤销；起初用一个集合记“新根页”，语句回滚撤不掉，fuzz 第一轮
+  就暴露了）。
+- **搬页**（relocatePage）：复制页内容到新页号，改父页里的指针（子页指针、单元格的溢出指针、上一个溢出页的 next），
+  再改它自己的子页的条目。FULL 模式提交时照 autoVacuumCommit 把末尾的页搬进前面的空闲页并截断；`PRAGMA
+  incremental_vacuum(N)` 照 incrVacuumStep 每步拿掉最后一页，每步返回一个空行（SQLite 的 ResultRow 0 列）。
+- `PRAGMA auto_vacuum`：新库立即生效（同 page_size 的“新库”），FULL 与 INCREMENTAL 之间随时切换，已有内容的库开关要等
+  VACUUM；`'full'`、`2` 等写法与非法值（当作 0）照 getAutoVacuum。
+- **顺带修好的两个老问题**（都由新 fuzz 找到）：(1) 提交使文件变小时，被截掉的原页也要进回滚日志（SQLite 的
+  CommitPhaseOne 这样做），否则崩溃回滚后它们是零——以前 VACUUM 缩小文件时就有这个风险，只是没有在“截断之后、sync
+  之前”的崩溃点测过；(2) SQLite 格式批量建索引时，最后一个条目恰好放不下而上升为分隔键、又被放回去单独成叶时，少了一个
+  分隔键，前一个叶子丢失（与页大小无关，512 字节页上更容易碰到；种子 2184）。

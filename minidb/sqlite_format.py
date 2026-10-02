@@ -36,6 +36,9 @@ SQLITE_VERSION_NUMBER = 3053004  # written as "last writer" (the format version 
 # B-tree page kinds (the first byte of the page header)
 INDEX_INTERIOR, TABLE_INTERIOR, INDEX_LEAF, TABLE_LEAF = 2, 5, 10, 13
 
+# Pointer map entry types (auto_vacuum): what a page is and what points to it
+PTRMAP_ROOTPAGE, PTRMAP_FREEPAGE, PTRMAP_OVERFLOW1, PTRMAP_OVERFLOW2, PTRMAP_BTREE = 1, 2, 3, 4, 5
+
 _u16 = struct.Struct(">H")
 _u32 = struct.Struct(">I")
 _double = struct.Struct(">d")
@@ -230,8 +233,6 @@ class DbHeader:
             raise DatabaseError("SQLite databases with reserved bytes per page are not supported")
         if self.encoding not in (0, 1):
             raise DatabaseError("SQLite databases in UTF-16 are not supported")
-        if self.autovacuum_root:
-            raise DatabaseError("SQLite databases with auto_vacuum are not supported")
         if not 1 <= self.schema_format <= 4:
             raise DatabaseError("unsupported schema format")
         if self.version_valid_for != self.change_counter or self.page_count == 0:
@@ -272,6 +273,17 @@ class Geometry:
         self.lock_page = PENDING_BYTE // page_size + 1
         self.max_leaves = usable // 4 - 8  # leaves SQLite writes on a freelist trunk
         self.read_leaves = usable // 4 - 2  # leaves it accepts there
+        self.ptrmap_span = usable // 5 + 1  # a pointer map page and the pages it maps
+
+    def ptrmap_page(self, pgno: int) -> int:
+        """The pointer map page holding the entry of page ``pgno`` (SQLite's
+        ptrmapPageno): page 2, then one every ptrmap_span pages."""
+        span = self.ptrmap_span
+        page = (pgno - 2) // span * span + 2
+        return page + 1 if page == self.lock_page else page
+
+    def is_ptrmap(self, pgno: int) -> bool:
+        return pgno >= 2 and self.ptrmap_page(pgno) == pgno
 
     def local_size(self, payload: int, table: bool) -> int:
         """How much of a payload of ``payload`` bytes is stored in the cell."""
@@ -507,3 +519,32 @@ class FreePage:
 
     def copy(self) -> FreePage:
         return FreePage(self.pgno, geometry=self.geometry)
+
+
+class PtrmapPage:
+    """A pointer map page (auto_vacuum): for each page it maps, 5 bytes - the
+    page's type and the page that points to it (0 for roots and free pages)."""
+
+    def __init__(self, pgno: int, data: bytes | None = None, *, geometry: Geometry) -> None:
+        self.pgno = pgno
+        self.data = bytearray(data if data is not None else geometry.page_size)
+        self.geometry = geometry
+
+    @classmethod
+    def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry) -> PtrmapPage:
+        return cls(pgno, data, geometry=geometry)
+
+    def entry(self, pgno: int) -> tuple[int, int]:
+        offset = 5 * (pgno - self.pgno - 1)
+        return self.data[offset], _u32.unpack_from(self.data, offset + 1)[0]
+
+    def set_entry(self, pgno: int, kind: int, parent: int) -> None:
+        offset = 5 * (pgno - self.pgno - 1)
+        self.data[offset] = kind
+        _u32.pack_into(self.data, offset + 1, parent)
+
+    def to_bytes(self) -> bytes:
+        return bytes(self.data)
+
+    def copy(self) -> PtrmapPage:
+        return PtrmapPage(self.pgno, self.data, geometry=self.geometry)
