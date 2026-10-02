@@ -429,3 +429,54 @@ def test_replace_pins_the_updated_row(pair):
         "UPDATE OR REPLACE t SET b = 'k' WHERE a = 11",
         'SELECT * FROM t',
     ])
+
+
+def test_new_and_old_of_a_real_column_are_real(pair):
+    """SQLite reads NEW.x / OLD.x of a REAL column with OP_RealAffinity: an
+    integer in a view's row (which has no affinities applied) becomes a
+    REAL, in the trigger and in the INSERT's RETURNING."""
+    run(pair, [
+        "CREATE TABLE t1 (c0, c1 FLOAT, c2 INTEGER)", "CREATE TABLE log (a, b)",
+        "CREATE VIEW w AS SELECT c1 AS x, c2 AS z FROM t1", "INSERT INTO w VALUES (3, 4) RETURNING *",
+        "CREATE TRIGGER tw INSTEAD OF INSERT ON w BEGIN INSERT INTO log VALUES (new.x, new.x || ''); END",
+        "INSERT INTO w VALUES (3, 4) RETURNING *", "INSERT INTO w VALUES ('3', 4.0) RETURNING *, typeof(z)",
+        "CREATE TRIGGER bt BEFORE INSERT ON t1 BEGIN INSERT INTO log VALUES (new.c1, typeof(new.c1)); END",
+        "INSERT INTO t1 VALUES (1, 5, 6)",
+        "CREATE TRIGGER wu INSTEAD OF UPDATE ON w BEGIN INSERT INTO log VALUES (old.x || '>' || new.x, "
+        "typeof(old.x) || typeof(new.x)); END",
+        "UPDATE w SET x = 9 RETURNING x, typeof(x)",
+        "CREATE VIEW w2 AS SELECT x + 0 AS s, CAST(x AS REAL) AS r FROM w",
+        "CREATE TRIGGER w2t INSTEAD OF INSERT ON w2 BEGIN INSERT INTO log VALUES (new.r, typeof(new.r)); END",
+        "INSERT INTO w2 VALUES (1, 2) RETURNING r", "SELECT * FROM log",
+    ])
+
+
+def test_foreign_key_check_in_a_program_may_abort(pair):
+    """An INSERT into a child table in a trigger program may abort (fkey.c's
+    sqlite3MayAbort) whatever its OR clause, so a DELETE whose own foreign
+    keys cannot abort (CASCADE) still gets a statement journal."""
+    run(pair, [
+        "PRAGMA foreign_keys = ON", "CREATE TABLE t0 (id INTEGER PRIMARY KEY, c0)",
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, c0 REFERENCES t0 ON DELETE CASCADE)",
+        "INSERT INTO t0 VALUES (1, 'a'), (2, 'b'), (3, 'c')", "INSERT INTO t1 VALUES (5, 1)",
+        "CREATE TRIGGER tr0 BEFORE DELETE ON t0 WHEN old.id = 2 BEGIN "
+        "INSERT OR IGNORE INTO t1 (id) VALUES (old.id || 'abc'); END",
+        "BEGIN", "DELETE FROM t0 WHERE id >= 1", "SELECT * FROM t0", "SELECT * FROM t1", "ROLLBACK",
+        "DROP TRIGGER tr0",
+        "CREATE TRIGGER tr0 BEFORE DELETE ON t0 WHEN old.id = 2 BEGIN UPDATE OR IGNORE t1 SET id = 'x' || old.id; END",
+        "BEGIN", "DELETE FROM t0 WHERE id >= 1", "SELECT * FROM t0", "ROLLBACK",
+    ])
+
+
+def test_function_in_when_may_abort(pair):
+    """A function call (LIKE too) in a trigger's WHEN may abort, so a multi-row
+    INSERT OR ROLLBACK firing it gets a statement journal: a later datatype
+    mismatch undoes the rows it wrote."""
+    run(pair, [
+        "CREATE TABLE t0 (id INTEGER PRIMARY KEY, c0)", "CREATE TABLE log (x)",
+        "CREATE TRIGGER tr AFTER INSERT ON t0 WHEN new.c0 NOT LIKE 'q%' BEGIN INSERT INTO log VALUES (1); END",
+        "BEGIN", "INSERT OR ROLLBACK INTO t0 VALUES (1, 10), ('x', 2)", "SELECT * FROM t0", "ROLLBACK",
+        "DROP TRIGGER tr",
+        "CREATE TRIGGER tr AFTER INSERT ON t0 WHEN new.c0 > 5 BEGIN INSERT INTO log VALUES (1); END",
+        "BEGIN", "INSERT OR ROLLBACK INTO t0 VALUES (1, 10), ('x', 2)", "SELECT * FROM t0", "ROLLBACK",
+    ])

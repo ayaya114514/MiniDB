@@ -337,3 +337,20 @@ def test_child_index_converts_the_old_parent_key(pair, child, index, value, pare
         "SELECT * FROM log", "SELECT * FROM c",
     ]:
         pair.run(sql)
+
+
+def test_replace_with_foreign_keys_may_abort(pair):
+    """With foreign keys on, a REPLACE is followed by SQLite's uniqueness
+    recheck, which halts as ABORT: a multi-row REPLACE then has a statement
+    journal, and a later datatype mismatch undoes its rows."""
+    for sql in [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE p (id INTEGER PRIMARY KEY, u UNIQUE, v)",
+        "CREATE TABLE c (x REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        "BEGIN", "REPLACE INTO p VALUES (1, 1, 1), (-3.75, 2, 2)", "SELECT * FROM p", "ROLLBACK",
+        "CREATE TABLE q (id INTEGER PRIMARY KEY, v)",
+        "CREATE TABLE d (x REFERENCES q(id) DEFERRABLE INITIALLY DEFERRED)",
+        "BEGIN", "REPLACE INTO q VALUES (1, 1), (-3.75, 2)", "SELECT * FROM q", "ROLLBACK",
+        "BEGIN", "INSERT OR ROLLBACK INTO q VALUES (1, 1), (-3.75, 2)", "SELECT * FROM q", "ROLLBACK",
+    ]:
+        pair.run(sql)

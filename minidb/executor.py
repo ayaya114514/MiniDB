@@ -612,7 +612,8 @@ class Compiler:
         if position == getattr(entry.table, "rowid_column", None):
             return None  # (an INTEGER PRIMARY KEY is the row id)
         collation = entry.table.collations[position]
-        if collation is None and position in getattr(entry.table, "bare", ()):
+        if collation is None and (position in getattr(entry.table, "bare", ())
+                                  or getattr(entry.table, "uncollated", False)):
             return None  # (a flattened subquery's row id: SQLite puts the column itself in its place)
         return collation or "BINARY"
 
@@ -2326,9 +2327,7 @@ class Executor:
         keys = self.foreign_keys
         if isinstance(stmt, Insert):
             # (a REPLACE deletes rows; an upsert updates them)
-            return plan.multi_write and (keys.may_abort(plan.table, "insert") or (
-                replace_possible(plan.table, plan.conflict, True) and keys.may_abort(plan.table, "delete")) or (
-                any(u.do_update and keys.may_abort(plan.table, "update", u.changed_positions()) for u in plan.upserts)))
+            return plan.multi_write and plan.foreign_keys_abort()
         if isinstance(stmt, Update):
             return keys.required(plan.table, plan.changed) and keys.may_abort(plan.table, "update", plan.changed)
         return keys.may_abort(plan.table, "delete")
@@ -3164,10 +3163,8 @@ class Executor:
         value has none); returns the requested row id."""
         for i, affinity in enumerate(table.affinities):
             value = row[i]
-            if type(value) is JSONText:
-                value = str.__str__(value)
-            elif type(value) is JSONBlob:
-                value = bytes(value)
+            if type(value) in SUBTYPED:
+                value = str.__str__(value) if type(value) is JSONText else bytes(value)
             row[i] = values.apply_affinity(value, affinity)
         if table.rowid_column is None:
             return None
@@ -4631,7 +4628,7 @@ class PreparedInsert:
             for upsert in self.upserts) or (
             bool(executor.settings["recursive_triggers"]) and replace_possible(
                 table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
-            and triggers.may_abort(table.name, "DELETE", None, "REPLACE")))
+            and triggers.may_abort(table.name, "DELETE", None, "REPLACE")) or self.foreign_keys_abort())
         self.statement_journal = multi and self.aborts
 
     def prepare_programs(self) -> None:
@@ -4672,6 +4669,15 @@ class PreparedInsert:
             self.unchecked = executor.set_null_link(table)
         triggers.prepare(table.name, "INSERT", None, self.conflict, ("AFTER",))
 
+    def foreign_keys_abort(self) -> bool:
+        """Whether its foreign key code may abort (fkey.c's sqlite3MayAbort,
+        whatever the statement's OR clause): a child row checked, a REPLACE's
+        delete, an upsert's update."""
+        keys, table = self.executor.foreign_keys, self.table
+        return keys.enabled and (keys.may_abort(table, "insert") or (
+            replace_possible(table, self.conflict, True) and keys.may_abort(table, "delete")) or any(
+            u.do_update and keys.may_abort(table, "update", u.changed_positions()) for u in self.upserts))
+
     def may_abort(self) -> bool:
         """Whether a constraint check could abort the statement.
 
@@ -4683,6 +4689,9 @@ class PreparedInsert:
         as a datatype mismatch) undo the rows the statement already wrote.
         Otherwise they stay (see Database.execute_statement)."""
         table, conflict = self.table, self.conflict
+        if self.executor.replace_rechecks(table) and replace_possible(
+                table, conflict, self.rowid_given, handled=[u.constraint for u in self.upserts]):
+            return True  # (the recheck after a REPLACE halts as ABORT: Executor.recheck_unique)
         if any(c.not_null and (conflict or c.not_null_conflict or "ABORT") in ("ABORT", "REPLACE")
                for c in table.columns):
             return True  # REPLACE fixes NOT NULL with a default value; MiniDB has none
@@ -4983,6 +4992,10 @@ class PreparedViewInsert:
                 exc.changes = 0  # (a view's changes() is 0, also after RAISE(FAIL))
                 raise
             done.append(new)
+        if self.returning is not None:
+            # (SQLite reads a REAL column of the new rows with OP_RealAffinity - not in typeof())
+            real = [i for i, a in enumerate(self.source.affinities) if a == values.REAL]
+            done = [[float(v) if i in real and type(v) is int else v for i, v in enumerate(row)] for row in done]
         return view_result(self.returning, done)
 
 
@@ -5216,17 +5229,19 @@ def row_key(collations: list[str | None]) -> Callable[[tuple], tuple]:
 class ExcludedSource:
     """The ``excluded`` row of an upsert: the table's columns without
     affinities (as in SQLite; its values may not be converted either, see
-    Executor.insert_row)."""
+    Executor.insert_row) and without collations (the other operand's
+    decides a comparison)."""
 
     has_rowid = True
     indexes = ()
+    uncollated = True
 
     def __init__(self, table: TableInfo) -> None:
         self.name = "excluded"
         self.columns = table.columns
         self.rowid_column = table.rowid_column
         self.affinities = [None] * len(table.columns)
-        self.collations = table.collations
+        self.collations = [None] * len(table.columns)
         self.column_index = table.column_index
 
 
@@ -5286,6 +5301,7 @@ class DerivedSource:
 
 
 _EACH_FUNCTIONS = frozenset({"json_each", "json_tree", "jsonb_each", "jsonb_tree"})
+SUBTYPED = (JSONText, JSONBlob)  # the types of values with the JSON subtype
 
 
 def carries_json(query: object) -> bool:
