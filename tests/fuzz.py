@@ -81,7 +81,9 @@ class Generator:
         self.index_info = {}  # name -> (table, columns, unique)
         self.parameters = []  # values for the "?" placeholders of the current statement
         self.views = []  # Tables describing the views (columns x and y)
-        self.no_parameters = False  # views may not contain parameters
+        self.no_parameters = False  # views and triggers may not contain parameters
+        self.qualify = False  # always qualify column names (NEW.x / OLD.x in triggers)
+        self.triggers = []  # names of the triggers created
 
     # ---- schema -------------------------------------------------------------
 
@@ -225,7 +227,7 @@ class Generator:
         alias, table = self.rng.choice(scope)
         rowid = ["rowid"] if table.rowid_alias is None and not table.derived else []
         name = self.rng.choice(table.column_names() + rowid)
-        return f"{alias}.{name}" if len(scope) > 1 else name
+        return f"{alias}.{name}" if len(scope) > 1 or self.qualify else name
 
     def subquery(self, scope, depth, text_safe):
         """A scalar, IN or EXISTS subquery, correlated with ``scope`` half the time.
@@ -377,9 +379,17 @@ class Generator:
         where = f" WHERE {self.expr(scope, 2)}" if rng.random() < 0.3 else ""
         return f" ON CONFLICT {target}DO UPDATE SET {', '.join(assignments)}{where}"
 
+    def target(self):
+        """The table an INSERT / UPDATE / DELETE changes: now and then a view
+        (an error unless it has an INSTEAD OF trigger)."""
+        rng = self.rng
+        if self.views and rng.random() < 0.05:
+            return rng.choice(self.views)
+        return rng.choice(self.tables)
+
     def insert(self):
         rng = self.rng
-        table = rng.choice(self.tables)
+        table = self.target()
         if rng.random() < 0.15:
             return self.insert_select(table)
         rows = []
@@ -429,7 +439,7 @@ class Generator:
 
     def update(self):
         rng = self.rng
-        table = rng.choice(self.tables)
+        table = self.target()
         scope = [(table.name, table)]
         names = [c for c in table.column_names() if c != table.rowid_alias]
         assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in rng.sample(names, rng.randint(1, len(names)))]
@@ -451,7 +461,7 @@ class Generator:
         return f"UPDATE {conflict}{table.name} SET {', '.join(assignments)} WHERE {where}{self.returning(table)}"
 
     def delete(self):
-        table = self.rng.choice(self.tables)
+        table = self.target()
         where = self.condition([(table.name, table)])
         return f"DELETE FROM {table.name} WHERE {where}{self.returning(table)}"
 
@@ -477,6 +487,64 @@ class Generator:
         table.name = f"v{len(self.views) + 1}"
         self.views.append(table)
         return f"CREATE VIEW {table.name} AS {sql[1:-1]}"
+
+    def create_trigger(self):
+        """A trigger on a table (or, INSTEAD OF, on a view) whose program
+        changes tables using NEW / OLD, or RAISEs."""
+        rng = self.rng
+        on_view = bool(self.views) and rng.random() < 0.15
+        table = rng.choice(self.views) if on_view else rng.choice([t for t in self.tables if not t.derived])
+        event = rng.choice(["INSERT", "UPDATE", "DELETE"])
+        timing = "INSTEAD OF" if on_view else rng.choice(["BEFORE", "AFTER", "AFTER", ""])
+        of = ""
+        if event == "UPDATE" and rng.random() < 0.3:
+            names = table.column_names()
+            of = " OF " + ", ".join(rng.sample(names, rng.randint(1, min(2, len(names)))))
+        rows = ([("new", table)] if event != "DELETE" else []) + ([("old", table)] if event != "INSERT" else [])
+        self.no_parameters, self.qualify = True, True
+        try:
+            when = f" WHEN {self.condition(rows, 2)}" if rng.random() < 0.4 else ""
+            body = [self.trigger_step(rows) for _ in range(rng.randint(1, 3))]
+        finally:
+            self.no_parameters, self.qualify = False, False
+        name = f"tr{len(self.triggers)}"
+        self.triggers.append(name)
+        return f"CREATE TRIGGER {name} {timing} {event}{of} ON {table.name}{when} BEGIN {'; '.join(body)}; END"
+
+    def trigger_step(self, rows):
+        rng = self.rng
+        kind = rng.random()
+        target = rng.choice([t for t in self.tables if not t.derived])
+        if kind < 0.45:
+            columns = rng.sample(target.column_names(), rng.randint(1, len(target.columns)))
+            values = [no_max_rowid(self.expr(rows, 2, True)) if c == target.rowid_alias else self.expr(rows, 2, True)
+                      for c in columns]
+            return f"INSERT {self.conflict()}INTO {target.name} ({', '.join(columns)}) VALUES ({', '.join(values)})"
+        if kind < 0.65:
+            scope = [(target.name, target)] + rows
+            names = [c for c in target.column_names() if c != target.rowid_alias]
+            chosen = rng.sample(names, rng.randint(1, min(2, len(names))))
+            assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in chosen]
+            where = self.condition(scope)
+            conflict = self.conflict()
+            if conflict or any(c in target.unique_columns for c in chosen) or any("(SELECT" in a for a in assignments):
+                where = f"{target.name}.rowid = {rng.randint(1, 40)}"  # (one row: the order cannot matter)
+            return f"UPDATE {conflict}{target.name} SET {', '.join(assignments)} WHERE {where}"
+        if kind < 0.8:
+            return f"DELETE FROM {target.name} WHERE {self.condition([(target.name, target)] + rows)}"
+        if kind < 0.92 and rows:
+            how = rng.choice(["IGNORE", "ABORT", "FAIL", "ROLLBACK", "ABORT", "IGNORE"])
+            # (hex(): Python's sqlite3 cannot decode an error message that is not UTF-8)
+            message = "" if how == "IGNORE" else f", 'raised ' || hex({self.expr(rows, 2, True)})"
+            return f"SELECT RAISE({how}{message}) WHERE {self.condition(rows, 2)}"
+        return f"SELECT {self.expr(rows, 1, True) if rows else 1}"
+
+    def drop_trigger(self):
+        if not self.triggers or self.rng.random() < 0.1:
+            return "DROP TRIGGER IF EXISTS tr99"
+        name = self.rng.choice(self.triggers)
+        self.triggers.remove(name)
+        return f"DROP TRIGGER {name}"
 
     def drop_view(self):
         if not self.views:
@@ -670,7 +738,8 @@ class Generator:
             return rng.choice(["BEGIN", "COMMIT", "ROLLBACK"])
         if roll < 0.082:
             return rng.choice(["PRAGMA foreign_keys = ON", "PRAGMA foreign_keys = OFF", "PRAGMA foreign_key_check",
-                               "PRAGMA defer_foreign_keys = ON", "PRAGMA integrity_check"])
+                               "PRAGMA defer_foreign_keys = ON", "PRAGMA integrity_check",
+                               "PRAGMA recursive_triggers = ON", "PRAGMA recursive_triggers = OFF"])
         if roll < 0.085:
             return "ANALYZE"  # statistics change later plans, never results
         if roll < 0.095:
@@ -679,6 +748,8 @@ class Generator:
             return self.add_column()
         if roll < 0.1:
             return "VACUUM"
+        if roll < 0.11:
+            return self.create_trigger() if rng.random() < 0.8 else self.drop_trigger()
         if roll < 0.40:
             return self.insert()
         if roll < 0.50:

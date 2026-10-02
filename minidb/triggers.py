@@ -54,8 +54,8 @@ def raise_error(kind: str, message: str) -> IntegrityError:
 
 class PseudoSource:
     """``NEW`` or ``OLD`` in a trigger program: the table's (or view's)
-    columns with their collations, without affinities.  Reachable only by
-    qualified names."""
+    columns with their collations, without affinities - except the INTEGER
+    PRIMARY KEY, which is the row id.  Reachable only by qualified names."""
 
     indexes = ()
 
@@ -65,6 +65,8 @@ class PseudoSource:
         self.columns = source.columns
         self.rowid_column = getattr(source, "rowid_column", None)
         self.affinities = [None] * len(source.columns)
+        if self.rowid_column is not None:
+            self.affinities[self.rowid_column] = values.INTEGER  # (it is the row id, as in SQLite)
         self.collations = source.collations
         self.column_index = source.column_index
 
@@ -182,10 +184,11 @@ class Triggers:
                 raise
         return program
 
-    def prepare(self, name: str, event: str, changed: list[str] | None, orconf: str | None) -> None:
+    def prepare(self, name: str, event: str, changed: list[str] | None, orconf: str | None,
+                timings: tuple[str, ...] = ("BEFORE", "AFTER", "INSTEAD OF")) -> None:
         """Compile the programs a statement may run, as SQLite does when it
         compiles the statement (so their errors come first)."""
-        for timing in ("BEFORE", "AFTER", "INSTEAD OF"):
+        for timing in timings:
             for trigger in self.matching(name, timing, event, changed):
                 self.program(trigger, orconf)
 
@@ -199,8 +202,8 @@ class Triggers:
         recursive = executor.settings["recursive_triggers"]
         for trigger in triggers:
             program = self.program(trigger, orconf)
-            if not recursive and program in self.active:
-                continue
+            if not recursive and any(p.trigger is trigger for p in self.active):
+                continue  # (SQLite's check is by trigger, whatever the program's conflict resolution)
             if executor.frame_depth >= MAX_DEPTH:
                 raise OperationalError("too many levels of trigger recursion")
             executor.frame_depth += 1

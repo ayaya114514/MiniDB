@@ -2194,7 +2194,6 @@ class Executor:
         keys = self.foreign_keys
         keys.immediate = 0
         keys.unchecked = None
-        keys.single_insert = False
         if isinstance(stmt, (Select, Compound, Values, Insert, Update, Delete)):
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
@@ -2339,7 +2338,10 @@ class Executor:
                 view = self.catalog.find_view(stmt.table)
                 event = "INSERT" if isinstance(stmt, Insert) else "UPDATE" if isinstance(stmt, Update) else "DELETE"
                 names = [name for name, _ in stmt.assignments] if isinstance(stmt, Update) else None
-                if view is not None and self.triggers.matching(view.name, "INSTEAD OF", event, names):
+                # (With RETURNING any trigger on the view will do: SQLite's own
+                # RETURNING trigger makes the list it checks non-empty.)
+                if view is not None and (self.triggers.matching(view.name, "INSTEAD OF", event, names) or (
+                        stmt.returning is not None and self.catalog.triggers_on(view.name))):
                     plan = (PreparedViewInsert(self, stmt, view) if isinstance(stmt, Insert)
                             else PreparedViewChange(self, stmt, view))
                 elif isinstance(stmt, Insert):
@@ -3145,6 +3147,20 @@ class Executor:
     def unique_error(table: TableInfo, index: IndexInfo) -> str:
         return "UNIQUE constraint failed: " + ", ".join(f"{table.name}.{c}" for c in index.column_names)
 
+    def replace_fires(self, table: TableInfo) -> bool:
+        """Whether a REPLACE's delete of a row of ``table`` runs triggers."""
+        return bool(self.settings["recursive_triggers"]) and self.triggers.exist(table.name, "DELETE")
+
+    def recheck_unique(self, table: TableInfo, tree: BTree, row: Row, rowid: int, own: int | None) -> None:
+        """After REPLACE ran DELETE triggers, SQLite checks the uniqueness
+        constraints again, as ABORT (the triggers may have kept a row - RAISE
+        (IGNORE) - or added one).  ``own``: the row id of the row being updated."""
+        for index in table.indexes:
+            if index.unique and self.find_conflict(index, row, own) is not None:
+                raise self.constraint_error(self.unique_error(table, index), "ABORT")
+        if rowid != own and rowid in tree:
+            raise self.constraint_error(self.rowid_conflict(table).args[0], "ABORT")
+
     def delete_row(self, table: TableInfo, tree: BTree, rowid: int, replace: bool = False,
                    orconf: str | None = None, fire: bool = True) -> Row | None:
         """Delete a row and its index entries; returns it (with its row id),
@@ -3216,7 +3232,8 @@ class Executor:
 
     def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str | None = None,
                    upserts: Sequence[PreparedUpsert] = (), rowid: SQLValue = None,
-                   defaults: DefaultRegisters | None = None, sequence: list[int] | None = None) -> tuple[str, Row] | None:
+                   defaults: DefaultRegisters | None = None, sequence: list[int] | None = None,
+                   single: bool = False) -> tuple[str, Row] | None:
         """Insert ``row`` under a conflict resolution (INSERT OR ...; None:
         each constraint's ON CONFLICT, else ABORT) and the statement's ON
         CONFLICT clauses.  Returns ("insert", row + [rowid]), ("update",
@@ -3285,6 +3302,7 @@ class Executor:
         # "excluded" row shows them converted only if the conflict was found
         # after that.
         converted = bool(table.checks) and not self.settings["ignore_check_constraints"]
+        replaced = False  # a REPLACE deleted a row and its DELETE triggers ran
         for constraint in constraints:
             if constraint == "rowid":
                 other = rowid if not fresh and rowid in tree else None
@@ -3303,13 +3321,16 @@ class Executor:
                 return None
             if how == "REPLACE":
                 self.delete_row(table, tree, other, replace=True)
+                replaced = replaced or self.replace_fires(table)
                 continue
             message = self.rowid_conflict(table).args[0] if constraint == "rowid" else self.unique_error(table, constraint)
             raise self.constraint_error(message, how)
+        if replaced:
+            self.recheck_unique(table, tree, row, rowid, None)
         if defaults is not None:
             defaults.converted = True  # (OP_MakeRecord converts in place too)
         if self.foreign_keys.involved(table):
-            self.foreign_keys.row_inserted(table, row + [rowid])
+            self.foreign_keys.row_inserted(table, row + [rowid], single)
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
         if triggers.matching(table.name, "AFTER", "INSERT"):
@@ -3372,6 +3393,7 @@ class Executor:
             constraints.append("rowid")
         else:
             constraints.insert(0, "rowid")
+        replaced = False  # a REPLACE deleted a row and its DELETE triggers ran
         for constraint in constraints:
             if constraint == "rowid":
                 if new_rowid == rowid or new_rowid not in tree:
@@ -3389,6 +3411,9 @@ class Executor:
                            else self.unique_error(table, constraint))
                 raise self.constraint_error(message, how)
             self.delete_row(table, tree, other, replace=True)
+            replaced = replaced or self.replace_fires(table)
+        if replaced:
+            self.recheck_unique(table, tree, row, new_rowid, rowid)
         keys = self.foreign_keys
         involved = keys.involved(table) and keys.required(table, changed)
         if involved:
@@ -4395,9 +4420,43 @@ class PreparedInsert:
         self.tree = executor.catalog.table_tree(table)
         multi_write = self.multi_write = self.query is not None or len(self.rows) > 1
         self.statement_journal = multi_write and (self.may_abort() or calls_function(stmt))
-        executor.triggers.prepare(table.name, "INSERT", None, self.conflict)
+        self.prepare_programs()
         if executor.triggers.exist(table.name, "INSERT"):
             self.statement_journal = True  # (SQLite: a multi-row write, and the programs may abort)
+
+    def prepare_programs(self) -> None:
+        """What SQLite compiles with the statement, in its order (so the
+        first error is the one SQLite reports): the BEFORE triggers; the
+        constraint checks' work - an upsert's UPDATE, REPLACE's DELETE (with
+        their triggers and foreign keys); the foreign keys of the INSERT; the
+        AFTER triggers."""
+        executor, table = self.executor, self.table
+        triggers, keys = executor.triggers, executor.foreign_keys
+        triggers.prepare(table.name, "INSERT", None, self.conflict, ("BEFORE",))
+        replaces = replace_possible(table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
+        self.fk_steps = []
+        for upsert in self.upserts:
+            if upsert.assignments:
+                positions = {position for position, _ in upsert.assignments}
+                names = [table.columns[p].name if p < len(table.columns) else "rowid" for p in positions]
+                triggers.prepare(table.name, "UPDATE", names, "ABORT")
+                if keys.enabled:
+                    keys.prepare(table, "update", positions)
+                    self.fk_steps.append(("update", positions))
+        if replaces and executor.settings["recursive_triggers"]:
+            triggers.prepare(table.name, "DELETE", None, "REPLACE")
+        replaces = replaces and keys.involved(table)
+        if replaces:
+            keys.prepare(table, "delete")
+            self.fk_steps.append(("delete", None))
+        # (A REPLACE that may delete rows, RETURNING, a SELECT and INSERT
+        # triggers make the statement a multi-row write; so does being part
+        # of a trigger program.)
+        self.fk_multi = (self.multi_write or self.returning is not None or replaces or bool(executor.compiling_trigger)
+                         or triggers.exist(table.name, "INSERT"))
+        if keys.enabled:
+            keys.prepare(table, "insert", single_insert=not self.fk_multi)
+        triggers.prepare(table.name, "INSERT", None, self.conflict, ("AFTER",))
 
     def may_abort(self) -> bool:
         """Whether a constraint check could abort the statement.
@@ -4457,25 +4516,8 @@ class PreparedInsert:
                 row[position] = default([])
             rows.append(row)
         keys = executor.foreign_keys
-        if keys.enabled:
-            # As SQLite compiles it: a REPLACE that may delete rows codes the
-            # foreign key work of a delete; it, RETURNING and a SELECT make
-            # the statement a multi-row write; DO UPDATE is an UPDATE.
-            replaces = keys.involved(table) and replace_possible(
-                table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
-            multi = self.multi_write or self.returning is not None or replaces
-            keys.prepare(table, "insert", single_insert=not multi)
-            keys.single_insert = not multi
-            if replaces:
-                keys.prepare(table, "delete")
-            steps = []
-            for upsert in self.upserts:
-                if upsert.assignments:
-                    keys.prepare(table, "update", {position for position, _ in upsert.assignments})
-                    steps.append(("update", {position for position, _ in upsert.assignments}))
-            if replaces:
-                steps.append(("delete", None))
-            keys.unchecked = keys.last_action_program(table, steps) if steps else None
+        if keys.enabled:  # (prepare_programs did the foreign keys' compile-time work)
+            keys.unchecked = keys.last_action_program(table, self.fk_steps) if self.fk_steps else None
         changed = []  # rows inserted or updated by an upsert, with their row ids
         defaults = DefaultRegisters([position for position, _ in self.defaults])
         sequence = None
@@ -4486,7 +4528,7 @@ class PreparedInsert:
             for row in rows:
                 rowid = row.pop()
                 outcome = executor.insert_row(table, self.tree, row, self.conflict, self.upserts, rowid, defaults,
-                                              sequence)
+                                              sequence, not self.fk_multi)
                 if outcome is not None:
                     kind, stored = outcome
                     if kind == "insert":
@@ -4575,20 +4617,27 @@ class PreparedUpdate(PreparedSingleTable):
         # Whether a REPLACE may delete a row the statement has yet to update.
         self.may_replace = "REPLACE" in (conflict, table.rowid_conflict(), *(i.conflict for i in table.indexes))
         self.names = [table.columns[p].name if p < width else "rowid" for p in changed]
-        executor.triggers.prepare(table.name, "UPDATE", self.names, conflict)
-        if executor.triggers.exist(table.name, "UPDATE", self.names):
+        # What SQLite compiles with the statement, in its order: BEFORE
+        # triggers, the foreign keys, REPLACE's DELETE, AFTER triggers.
+        triggers, keys = executor.triggers, executor.foreign_keys
+        triggers.prepare(table.name, "UPDATE", self.names, conflict, ("BEFORE",))
+        self.fk_replace = False
+        if keys.enabled:
+            keys.prepare(table, "update", self.changed)
+            self.fk_replace = keys.involved(table) and replace_possible(table, conflict, rowid_changed, self.changed)
+            if self.fk_replace:
+                keys.prepare(table, "delete")
+        if executor.settings["recursive_triggers"] and replace_possible(table, conflict, rowid_changed, self.changed):
+            triggers.prepare(table.name, "DELETE", None, "REPLACE")
+        triggers.prepare(table.name, "UPDATE", self.names, conflict, ("AFTER",))
+        if triggers.exist(table.name, "UPDATE", self.names):
             self.statement_journal = True
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
         keys = executor.foreign_keys
         if keys.enabled:
-            keys.prepare(table, "update", self.changed)
-            keys.unchecked = None
-            if keys.involved(table) and replace_possible(table, self.conflict, bool(
-                    self.changed & {len(table.columns), table.rowid_column}), self.changed):
-                keys.prepare(table, "delete")
-                keys.unchecked = keys.last_action_program(table, [("delete", None)])
+            keys.unchecked = keys.last_action_program(table, [("delete", None)]) if self.fk_replace else None
         changed = []
         try:
             triggered = executor.triggers.exist(table.name, "UPDATE", self.names)
@@ -4617,15 +4666,17 @@ class PreparedDelete(PreparedSingleTable):
         super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         self.delete_all = stmt.where is None and self.returning is None
-        executor.triggers.prepare(self.table.name, "DELETE", None, None)
+        # What SQLite compiles with it, in its order: BEFORE triggers, the foreign keys, AFTER triggers.
+        triggers, keys = executor.triggers, executor.foreign_keys
+        triggers.prepare(self.table.name, "DELETE", None, None, ("BEFORE",))
+        if keys.involved(self.table):
+            keys.prepare(self.table, "delete")
+        triggers.prepare(self.table.name, "DELETE", None, None, ("AFTER",))
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
         keys = executor.foreign_keys
-        involved = keys.involved(table)
-        if involved:
-            keys.prepare(table, "delete")
-        involved = involved or executor.triggers.exist(table.name, "DELETE")
+        involved = keys.involved(table) or executor.triggers.exist(table.name, "DELETE")
         if self.delete_all and not involved:
             count = len(tree)
             tree.clear()
@@ -4670,7 +4721,9 @@ class PreparedViewInsert:
             for name in stmt.columns:
                 position = source.column_index(name)
                 if position is None:
-                    raise OperationalError(f"table {view.name} has no column named {name}")
+                    if ascii_lower(name) not in ROWID_NAMES:
+                        raise OperationalError(f"table {view.name} has no column named {name}")
+                    position = width  # (SQLite accepts a row id for a view, and ignores it)
                 self.positions.append(position)
         compiler = Compiler(Scope(executor.outer_scope), executor=executor)
         self.query = None
@@ -4706,6 +4759,7 @@ class PreparedViewInsert:
             new = [None] * (width + 1)
             for position, value in zip(self.positions, values_):
                 new[position] = value
+            new[width] = None
             try:
                 executor.triggers.fire(self.view.name, "INSTEAD OF", "INSERT", None, new, None, self.conflict)
             except TriggerIgnore:
