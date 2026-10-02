@@ -76,3 +76,113 @@ def test_build(tmp_path):
     for name in ("index.html", "app.js", "worker.js"):
         text = (tmp_path / name).read_text(encoding="utf-8")
         assert "__BUILD__" not in text and version in text
+
+
+def sqlite_file(path):
+    """An SQLite file written by sqlite3 with what real files have: free
+    blocks and fragments (deleted rows, shorter updates), overflow pages,
+    freelist pages (a dropped table), an index."""
+    import sqlite3
+
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, data BLOB);
+        CREATE INDEX t_name ON t (name);
+        CREATE TABLE gone (x);
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1500)
+        INSERT INTO t (name, data) SELECT printf('name %05d %.*c', i, i % 40, 'x'), randomblob(CASE WHEN i % 100 = 0 THEN 9000 ELSE i % 50 END) FROM n;
+        INSERT INTO gone SELECT randomblob(500) FROM t;
+        DELETE FROM t WHERE id % 3 = 0;
+        UPDATE t SET name = substr(name, 1, 10) WHERE id % 7 = 0;
+        DROP TABLE gone;
+    """)
+    connection.commit()
+    connection.close()
+    with open(path, "rb") as f:
+        return f.read()
+
+
+def test_sqlite_files_pages_and_export(tmp_path):
+    import sqlite3
+
+    image = sqlite_file(tmp_path / "f.sqlite")
+    info = json.loads(bridge.open_file(image, "f.sqlite"))
+    assert info == {"name": "f.sqlite", "format": "sqlite", "pages": len(image) // 4096, "bytes": len(image)}
+    names = [o["name"] for o in json.loads(bridge.objects())]
+    assert names == ["sqlite_schema", "t", "t_name"]
+    reference = sqlite3.connect(tmp_path / "f.sqlite")
+
+    # Every page is accounted for, the freelist as SQLite counts it.
+    pages = json.loads(bridge.file_map())["pages"]
+    kinds = [kind for kind, _ in pages]
+    assert "unknown" not in kinds and len(pages) == info["pages"]
+    free = kinds.count("freelist-trunk") + kinds.count("freelist-leaf")
+    assert free == reference.execute("PRAGMA freelist_count").fetchone()[0] > 0
+    assert kinds.count("overflow") == 10 * 2  # (the 10 rows left with a 9000-byte blob: 2 pages each)
+
+    # Each B-tree page: the regions cover its bytes exactly once, the
+    # fragments add up to what its header says.
+    fragments_seen = freeblocks_seen = 0
+    for pgno, kind in enumerate(kinds, 1):
+        if kind not in ("table-leaf", "table-interior", "index-leaf", "index-interior"):
+            continue
+        layout = json.loads(bridge.page(pgno))
+        assert layout["kind"] == kind
+        position = 0
+        for region in layout["regions"]:
+            assert region["start"] == position, (pgno, region)
+            position = region["end"]
+        assert position == 4096
+        fragments = sum(r["end"] - r["start"] for r in layout["regions"] if r["kind"] == "fragment")
+        assert fragments == layout["fragmented"], pgno
+        fragments_seen += fragments
+        freeblocks_seen += sum(r["kind"] == "freeblock" for r in layout["regions"])
+    assert fragments_seen and freeblocks_seen  # (the file has both)
+
+    # The table's leaves, in tree order, hold sqlite3's row ids.
+    tree = json.loads(bridge.tree("t"))
+    assert tree["keys"] == reference.execute("SELECT count(*) FROM t").fetchone()[0]
+    leaves = []
+
+    def walk(pgno):
+        layout = json.loads(bridge.page(pgno))
+        if layout["kind"] == "table-leaf":
+            leaves.extend(int(cell["key"]) for cell in layout["listed"])
+        else:
+            for cell in layout["listed"]:
+                walk(cell["child"])
+            walk(layout["right"])
+    walk(tree["root"])
+    assert leaves == [r[0] for r in reference.execute("SELECT id FROM t ORDER BY id")]
+    index = json.loads(bridge.tree("t_name"))
+    assert index["keys"] == tree["keys"]
+
+    # Change it, export it: sqlite3 finds the changes and a sound file.
+    results = json.loads(bridge.run("DELETE FROM t WHERE id < 100; UPDATE t SET name = upper(name) WHERE id % 5 = 0; "
+                                    "CREATE TABLE u (v); INSERT INTO u VALUES (zeroblob(20000))"))
+    assert all("error" not in r for r in results), results
+    exported = bridge.export()
+    check = sqlite3.connect(":memory:")
+    check.deserialize(exported)
+    assert check.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    reference.executescript("DELETE FROM t WHERE id < 100; UPDATE t SET name = upper(name) WHERE id % 5 = 0;")
+    assert check.execute("SELECT * FROM t ORDER BY id").fetchall() == reference.execute("SELECT * FROM t ORDER BY id").fetchall()
+    assert check.execute("SELECT length(v) FROM u").fetchall() == [(20000,)]
+    assert json.loads(bridge.info())["pages"] == len(exported) // 4096
+
+
+def test_files_the_playground_refuses(tmp_path):
+    import sqlite3
+
+    bridge.reset()
+    with pytest.raises(ValueError, match="不是 SQLite 数据库文件"):
+        bridge.open_file(b"MiniDB or anything else", "x.db")
+    small = tmp_path / "small.sqlite"
+    connection = sqlite3.connect(small)
+    connection.executescript("PRAGMA page_size = 1024; CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+    connection.close()
+    with pytest.raises(Exception, match="page size of 1024"):
+        bridge.open_file(small.read_bytes(), "small.sqlite")
+    assert json.loads(bridge.info())["format"] == "minidb"  # (still the database it had)
+    with pytest.raises(Exception, match="SQLite's file format"):
+        bridge.export()

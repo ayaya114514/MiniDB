@@ -1030,3 +1030,21 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   读成 REAL；RETURNING 里 `typeof()` 的参数绕过这一步，MiniDB 不区分（见 PROGRESS 的已知问题）。
 - **排序规则**：rowid / INTEGER PRIMARY KEY 没有排序规则（多参数 max/min 取下一个参数的）；被展平的子查询里裸列就是
   该列本身，其他表达式带隐式 COLLATE（substExpr）；upsert 的 `excluded.x` 没有排序规则。
+
+## D113 Playground 打开本地 SQLite 文件：serialize / deserialize，布局取自原始字节
+
+- **文件进内存，不进文件系统**：页面把文件读成字节交给 worker，MiniDB 用新加的 `deserialize()` 把它变成内存里的
+  SQLite 格式库（`SqlitePager` 的内存文件以这些字节开始），导出用 `serialize()`。没有写进 Pyodide 的 MEMFS 再按路径
+  打开，因为那样要经过文件锁和 `-journal`（Pyodide 里的文件锁没有验证过），内存库一样都不需要。API 照
+  Python sqlite3 的 `Connection.serialize` / `deserialize`，语义也按它实测：镜像含本连接未提交的改动；事务中
+  deserialize 报 `database is locked`；文件连接 deserialize 后成为内存库，原文件不变；DB-API 连接（总有一个打开的事务）
+  没有改动时重开事务，有改动时报错。不是数据库的字节在 deserialize 时就报错（sqlite3 拖到第一次使用），并且连接保持原样。
+- **布局取自原始字节**：`BtreePage` 解码后不保留单元格指针、空闲块、碎片，而“真实页面布局”要的正是这些，所以 bridge 直接
+  解析页面字节（页头、指针数组、每个单元格按 cellSizePtr 算大小、空闲块链、剩下 1–3 字节的碎片）；本事务改过的页用
+  MiniDB 将写出的字节。整个文件的页面归属从 B 树根、溢出链和空闲列表走出来。测试用 sqlite3 写出带空闲块、碎片、溢出页、
+  空闲列表的文件，检查每页的区域恰好覆盖 4096 字节、碎片数等于页头记录、叶子 rowid 与 sqlite3 一致、空闲页数等于
+  `PRAGMA freelist_count`（参考 SQLite 按默认选项编译，没有 dbstat，所以不直接对照 dbstat）。
+- **缓存**：Pyodide 里遍历 24 MB 的 Northwind（6031 页）要 1.5 秒，而大多数语句不改文件；树和页面图按文件头的 change
+  counter 缓存，有未提交改动时不缓存。
+- 只能打开 MiniDB 现在支持的 SQLite 文件（4096 字节页、非 WAL……），其余给出 MiniDB 的报错原文；阶段 25 补页大小等。
+  MiniDB 自己格式的文件不接受（内存版 `Pager` 没有文件镜像），页面仍以 MiniDB 格式的内存库开始。

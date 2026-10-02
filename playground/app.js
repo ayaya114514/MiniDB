@@ -78,6 +78,9 @@ const MAX_ROWS = 500;
 const $ = (id) => document.getElementById(id);
 const editor = $("sql"), output = $("output"), statusLine = $("status");
 const runButton = $("run"), resetButton = $("reset"), examples = $("examples"), objectSelect = $("object");
+const openButton = $("open"), exportButton = $("export"), fileInput = $("file");
+let database = { name: null, format: "minidb" };  // what bridge.info() says
+let shownPage = null, shownFor = null;  // the page whose layout is shown, and the tree it was shown with
 
 // ---- the worker ---------------------------------------------------------------
 
@@ -106,12 +109,15 @@ function save(key, value) {
   try { localStorage.setItem(key, value); } catch { /* private mode: fine */ }
 }
 
+const placeholder = new Option("示例", "");
+placeholder.disabled = true;
+examples.add(placeholder);  // (shown when the editor holds something else)
 for (const [name] of EXAMPLES) examples.add(new Option(name, name));
 const saved = load(STORAGE_KEY);
 editor.value = saved !== null && saved.trim() ? saved : EXAMPLES[0][1];
 const matching = EXAMPLES.find(([, text]) => text === editor.value);
 if (matching) examples.value = matching[0];
-else examples.selectedIndex = -1;
+else examples.value = "";
 
 examples.addEventListener("change", () => {
   const example = EXAMPLES.find(([name]) => name === examples.value);
@@ -121,7 +127,7 @@ examples.addEventListener("change", () => {
 });
 editor.addEventListener("input", () => {
   save(STORAGE_KEY, editor.value);
-  if (!EXAMPLES.some(([, text]) => text === editor.value)) examples.selectedIndex = -1;
+  if (!EXAMPLES.some(([, text]) => text === editor.value)) examples.value = "";
 });
 editor.addEventListener("keydown", (event) => {
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
@@ -137,11 +143,117 @@ runButton.addEventListener("click", run);
 resetButton.addEventListener("click", async () => {
   await call("reset");
   output.replaceChildren();
+  shownPage = null;
+  await refreshInfo();
   statusLine.textContent = "数据库已清空";
   await refreshTree();
 });
 objectSelect.addEventListener("change", refreshTree);
 runButton.title = /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘ + Enter" : "Ctrl + Enter";
+
+// ---- opening and exporting SQLite files ------------------------------------------
+
+const SCHEMA_QUERY = "SELECT type, name, tbl_name, rootpage FROM sqlite_schema;\n";
+
+openButton.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => {
+  if (fileInput.files.length) openFile(fileInput.files[0]);
+  fileInput.value = "";
+});
+let dragDepth = 0;
+const dropHint = $("drop");
+const carriesFiles = (event) => event.dataTransfer && [...event.dataTransfer.types].includes("Files");
+document.addEventListener("dragenter", (event) => {
+  if (!carriesFiles(event) || openButton.disabled) return;
+  dragDepth++;
+  dropHint.hidden = false;
+});
+document.addEventListener("dragleave", () => {
+  if (dragDepth && --dragDepth === 0) dropHint.hidden = true;
+});
+document.addEventListener("dragover", (event) => {
+  if (carriesFiles(event)) event.preventDefault();
+});
+document.addEventListener("drop", (event) => {
+  if (!carriesFiles(event)) return;
+  event.preventDefault();
+  dragDepth = 0;
+  dropHint.hidden = true;
+  if (event.dataTransfer.files.length && !openButton.disabled) openFile(event.dataTransfer.files[0]);
+});
+
+async function openFile(file) {
+  if (running) return;
+  running = true;
+  setBusy(true);
+  statusLine.classList.remove("error");
+  statusLine.textContent = `正在打开 ${file.name}…`;
+  try {
+    const data = new Uint8Array(await file.arrayBuffer());
+    await call("open_file", data, file.name);
+    shownPage = null;
+    await refreshInfo();
+    output.replaceChildren();
+    statusLine.textContent = `已打开 ${file.name}`;
+    // An example (or nothing of the user's) in the editor: show the schema instead.
+    if (!editor.value.trim() || EXAMPLES.some(([, text]) => text === editor.value)) {
+      editor.value = SCHEMA_QUERY;
+      examples.value = "";
+      save(STORAGE_KEY, editor.value);
+    }
+  } catch (error) {
+    statusLine.classList.add("error");
+    statusLine.textContent = `打不开 ${file.name}：${error.message}`;
+    return;
+  } finally {
+    running = false;
+    setBusy(false);
+  }
+  if (editor.value === SCHEMA_QUERY) await run();
+  else await refreshTree();
+}
+
+exportButton.addEventListener("click", async () => {
+  try {
+    const data = await call("export");
+    const url = URL.createObjectURL(new Blob([data], { type: "application/vnd.sqlite3" }));
+    const link = element("a");
+    link.href = url;
+    link.download = database.name || "minidb.sqlite";
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 10_000);
+    statusLine.classList.remove("error");
+    statusLine.textContent = `已导出 ${link.download}（${formatBytes(data.length)}）`;
+  } catch (error) {
+    statusLine.classList.add("error");
+    statusLine.textContent = `导出失败：${error.message}`;
+  }
+});
+
+async function refreshInfo() {
+  database = JSON.parse(await call("info"));
+  const sqlite = database.format === "sqlite";
+  $("dbinfo").textContent = sqlite
+    ? `${database.name || "SQLite 数据库"} · SQLite 格式 · ${database.pages} 页 · ${formatBytes(database.bytes)}`
+    : "内存数据库（MiniDB 格式）";
+  exportButton.disabled = !sqlite;
+  $("pagearea").hidden = !sqlite;
+  // (SQLite's tables are B+ trees, its indexes B-trees with entries on every level)
+  $("treelabel").textContent = sqlite ? "B 树" : "B+ 树";
+}
+
+function formatBytes(n) {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10240 ? 1 : 0)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function setBusy(busy) {
+  for (const button of [runButton, openButton, resetButton]) button.disabled = busy;
+  exportButton.disabled = busy || database.format !== "sqlite";
+}
 
 // ---- running SQL --------------------------------------------------------------
 
@@ -149,7 +261,7 @@ let running = false;
 async function run() {
   if (running || runButton.disabled) return;
   running = true;
-  runButton.disabled = true;
+  setBusy(true);
   statusLine.classList.remove("error");
   statusLine.textContent = "运行中…";
   const started = performance.now();
@@ -158,13 +270,14 @@ async function run() {
     output.replaceChildren(...results.map(renderResult));
     const failed = results.some((r) => r.error !== undefined);
     statusLine.textContent = `${results.length} 条语句${failed ? "，出错停止" : ""} · ${Math.round(performance.now() - started)} ms`;
+    await refreshInfo();
     await refreshTree();
   } catch (error) {
     statusLine.classList.add("error");
     statusLine.textContent = String(error.message || error);
   } finally {
     running = false;
-    runButton.disabled = false;
+    setBusy(false);
   }
 }
 
@@ -220,9 +333,13 @@ function renderTable(columns, rows) {
 
 // ---- the B+ tree ------------------------------------------------------------------
 
+let treeGeneration = 0;  // a newer refresh makes an older one stop
+
 async function refreshTree() {
-  const objects = JSON.parse(await call("objects"));
+  const generation = ++treeGeneration;
   const current = objectSelect.value;
+  const objects = JSON.parse(await call("objects"));
+  if (generation !== treeGeneration) return;
   objectSelect.replaceChildren(...objects.map((o) =>
     new Option(o.kind === "index" ? `索引 ${o.name}（${o.table}）` : `表 ${o.name}`, o.name)));
   const tree = $("tree");
@@ -231,9 +348,19 @@ async function refreshTree() {
     tree.replaceChildren(element("p", "empty", "还没有表。"));
     return;
   }
-  objectSelect.value = objects.some((o) => o.name === current) ? current : objects[0].name;
-  const data = JSON.parse(await call("tree", objectSelect.value));
+  const name = objects.some((o) => o.name === current) ? current : objects[0].name;
+  objectSelect.value = name;
+  const data = JSON.parse(await call("tree", name));
+  if (generation !== treeGeneration) return;
   drawTree(tree, data);
+  if (database.format === "sqlite") {
+    const map = JSON.parse(await call("file_map"));
+    if (generation !== treeGeneration) return;
+    drawFileMap(map, name);
+    const keep = shownPage && shownPage <= database.pages && shownFor === name;
+    shownFor = name;
+    await showPage(keep ? shownPage : data.root);
+  }
 }
 
 function drawTree(container, data) {
@@ -252,6 +379,7 @@ function drawTree(container, data) {
     }
   }
   const pages = levels.reduce((n, level) => n + level.length, 0);
+  const sqlite = database.format === "sqlite";
   $("treeinfo").textContent =
     `${data.depth} 层 · ${data.keys} 个 key · 显示 ${pages} 页${data.hidden ? `（另有 ${data.hidden} 页未画出）` : ""}`;
 
@@ -265,7 +393,13 @@ function drawTree(container, data) {
       box.style.left = `${x.get(node.page)}px`;
       box.style.width = `${WIDTH}px`;
       box.style.maxWidth = "none";
-      box.title = `第 ${node.page} 页 · ${node.leaf ? "叶子" : "内部节点"} · ${node.count} 个 key · 填充 ${Math.round(node.fill * 100)}%`;
+      box.title = `第 ${node.page} 页 · ${node.leaf ? "叶子" : "内部节点"} · ${node.count} 个 key · 填充 ${Math.round(node.fill * 100)}%`
+        + (sqlite ? " · 点击查看页面布局" : "");
+      box.dataset.page = node.page;
+      if (sqlite) {
+        box.classList.add("clickable");
+        box.addEventListener("click", () => showPage(node.page));
+      }
       box.append(element("div", "head", `p${node.page} · ${node.count} key${node.leaf ? "" : " · 内部"}`));
       const keys = node.keys.slice();
       keys.forEach((key, i) => {
@@ -336,10 +470,124 @@ function drawTree(container, data) {
 
 call("ready").then(async () => {
   statusLine.textContent = "就绪 · Ctrl/⌘ + Enter 运行";
-  runButton.disabled = false;
-  resetButton.disabled = false;
+  setBusy(false);
   if (EXAMPLES.some(([, text]) => text === editor.value)) await run();
 }, (error) => {
   statusLine.classList.add("error");
   statusLine.textContent = `加载失败：${error.message}`;
+});
+
+// ---- SQLite's format: the file's pages and one page's layout -------------------------
+
+const PAGE_KINDS = {
+  "table-leaf": "表叶子页", "table-interior": "表内部页", "index-leaf": "索引叶子页",
+  "index-interior": "索引内部页", "overflow": "溢出页", "freelist-trunk": "空闲列表主干页",
+  "freelist-leaf": "空闲页", "lock-byte": "锁字节页", "unknown": "未识别",
+};
+const REGION_KINDS = {
+  "file-header": "文件头", "page-header": "页头", "pointers": "单元格指针", "unallocated": "未分配",
+  "cell": "单元格", "freeblock": "空闲块", "fragment": "碎片",
+};
+const BTREE_KINDS = new Set(["table-leaf", "table-interior", "index-leaf", "index-interior"]);
+let fileMap = null;
+
+function drawFileMap(data, selected) {
+  fileMap = data;
+  const map = $("filemap");
+  const owner = fileMap.owners.indexOf(selected);
+  const counts = {};
+  const squares = fileMap.pages.map(([kind, who], i) => {
+    counts[kind] = (counts[kind] || 0) + 1;
+    const square = element("i", `p-${kind}${who === owner ? " mine" : ""}`);
+    square.dataset.page = i + 1;
+    square.title = `第 ${i + 1} 页 · ${PAGE_KINDS[kind]}${who >= 0 ? ` · ${fileMap.owners[who]}` : ""}`;
+    return square;
+  });
+  map.replaceChildren(...squares);
+  map.classList.toggle("dense", fileMap.pages.length > 2000);
+  $("mapinfo").textContent = `${fileMap.pages.length} 页，每格一页；高亮的是 ${selected} 的页 · `
+    + Object.entries(counts).map(([kind, n]) => `${PAGE_KINDS[kind]} ${n}`).join(" · ");
+}
+
+$("filemap").addEventListener("click", (event) => {
+  const page = Number(event.target.dataset && event.target.dataset.page);
+  if (page) showPage(page);
+});
+
+async function showPage(pgno) {
+  shownPage = pgno;
+  for (const node of document.querySelectorAll(".node.current, #filemap i.current")) node.classList.remove("current");
+  for (const node of document.querySelectorAll(`.node[data-page="${pgno}"], #filemap i[data-page="${pgno}"]`)) {
+    node.classList.add("current");
+  }
+  const kind = fileMap ? fileMap.pages[pgno - 1][0] : "unknown";
+  $("pagetitle").textContent = `第 ${pgno} 页`;
+  const bar = $("pagebar"), cells = $("cells"), legend = $("legend");
+  if (!BTREE_KINDS.has(kind)) {
+    $("pageinfo").textContent = `${PAGE_KINDS[kind]}（只画 B 树页的布局）`;
+    bar.replaceChildren();
+    legend.replaceChildren();
+    cells.replaceChildren();
+    return;
+  }
+  const layout = JSON.parse(await call("page", pgno));
+  if (pgno !== shownPage) return;  // (another page was asked for meanwhile)
+  if (layout.error) {
+    $("pageinfo").textContent = layout.error;
+    return;
+  }
+  const unallocated = layout.regions.find((r) => r.kind === "unallocated");
+  const freeblocks = layout.regions.filter((r) => r.kind === "freeblock").reduce((n, r) => n + r.end - r.start, 0);
+  $("pageinfo").textContent = `${PAGE_KINDS[layout.kind]} · ${layout.cells} 个单元格 · 内容区从 ${layout.content_start} 开始 · `
+    + `空闲 ${layout.free} 字节（未分配 ${unallocated.end - unallocated.start}，空闲块 ${freeblocks}，碎片 ${layout.fragmented}）`
+    + (layout.right ? ` · 最右子页 ${layout.right}` : "");
+  bar.replaceChildren(...layout.regions.filter((r) => r.end > r.start).map((r) => {
+    const part = element("i", `r-${r.kind}${r.kind === "cell" && r.cell % 2 ? " odd" : ""}`);
+    part.style.left = `${(r.start / layout.size) * 100}%`;
+    part.style.width = `${((r.end - r.start) / layout.size) * 100}%`;
+    const what = r.kind === "cell" ? `单元格 #${r.cell}` : REGION_KINDS[r.kind];
+    part.title = `${what} · 字节 ${r.start}–${r.end - 1} · ${r.end - r.start} 字节`;
+    if (r.kind === "cell") part.dataset.cell = r.cell;
+    return part;
+  }));
+  const present = new Set(layout.regions.map((r) => r.kind));
+  legend.replaceChildren(...Object.entries(REGION_KINDS).filter(([kind]) => present.has(kind)).map(([kind, name]) => {
+    const item = element("span");
+    item.append(element("i", `r-${kind}`), name);
+    return item;
+  }));
+  const table = element("table");
+  const head = table.createTHead().insertRow();
+  const leafTable = layout.kind === "table-leaf", interior = layout.kind.endsWith("interior");
+  const columns = ["#", "偏移", "字节", leafTable ? "rowid" : layout.kind === "table-interior" ? "rowid 上界" : "索引项 | rowid"];
+  if (layout.kind !== "table-interior") columns.push("负载");
+  if (interior) columns.push("左子页");
+  columns.push("溢出页");
+  for (const name of columns) head.append(element("th", "", name));
+  const body = table.createTBody();
+  for (const cell of layout.listed) {
+    const row = body.insertRow();
+    row.dataset.cell = cell.index;
+    const values = [cell.index, cell.offset, cell.size, cell.key];
+    if (layout.kind !== "table-interior") values.push(cell.payload);
+    if (interior) values.push(cell.child);
+    values.push(cell.overflow ? `${cell.overflow[0]}（共 ${cell.overflow[1]} 页）` : "");
+    values.forEach((value, i) => row.append(element("td", i < 3 || typeof value === "number" ? "num" : "", String(value))));
+  }
+  const wrap = element("div", "table-wrap");
+  wrap.append(table);
+  cells.replaceChildren(wrap);
+  if (layout.listed.length < layout.cells) {
+    cells.append(element("div", "note", `只列出前 ${layout.listed.length} 个单元格（共 ${layout.cells} 个）`));
+  }
+}
+
+$("pagebar").addEventListener("click", (event) => {
+  const cell = event.target.dataset && event.target.dataset.cell;
+  if (cell === undefined) return;
+  const row = document.querySelector(`#cells tr[data-cell="${cell}"]`);
+  if (!row) return;
+  for (const other of document.querySelectorAll("#cells tr.current")) other.classList.remove("current");
+  row.classList.add("current");
+  row.scrollIntoView({ block: "nearest" });
 });
