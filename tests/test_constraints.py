@@ -377,3 +377,35 @@ def test_sqlite_checks_collated_indexes_minidb_wrote(tmp_path):
         assert connection.execute("SELECT a, b, c FROM t ORDER BY a").fetchall() == rows
         assert connection.execute("SELECT a FROM t INDEXED BY sqlite_autoindex_t_1 WHERE a = 'zeta'").fetchall() == [
             ("Zeta",)]
+
+
+def test_row_id_and_flattened_subqueries_have_no_collation(pair):
+    """A row id (an INTEGER PRIMARY KEY too) has no collation, so the next
+    argument of a multi-argument max() / min() picks it; a bare column of a
+    subquery SQLite flattens is that column, any other expression of it has
+    BINARY (SQLite's substExpr)."""
+    for sql in [
+        'CREATE TABLE t0 (id INTEGER PRIMARY KEY, c1, c2 COLLATE NOCASE)',
+        "INSERT INTO t0 VALUES (1, 'x', 'AbC'), (2, 'y', 'ab%'), (3, 'abc', 'B')",
+        "SELECT max(id, CASE WHEN 0x7f THEN 'ab%' WHEN 5 THEN c1 END, c2) FROM t0",
+        "SELECT max(id, 'ab%', c2), max(rowid, 'ab%', c2), max(c1, 'ab%', c2) FROM t0",
+        "SELECT min(id, 'ab%', c2), min(t0.rowid, c2, 'ab%') FROM t0",
+        "SELECT max(a.id, 'ab%', b.c2) FROM t0 a JOIN t0 b USING (id)",
+        "SELECT max(id, 'ab%', c2) FROM t0 a NATURAL JOIN t0 b",
+        "SELECT max(x, 'ab%', y) FROM (SELECT id x, c2 y FROM t0)",
+        "SELECT max(x, 'ab%', y) FROM (SELECT rowid x, c2 y FROM t0)",
+        "SELECT max(x, 'ab%', y) FROM (SELECT +id x, c2 y FROM t0)",
+        "SELECT max(x, 'ab%', y) FROM (SELECT * FROM (SELECT id x, c2 y FROM t0))",
+        'CREATE VIEW v AS SELECT id, c2 FROM t0',
+        "SELECT max(id, 'ab%', c2) FROM v",
+        "SELECT x, y FROM (SELECT c1 || '' x, c2 y FROM t0) WHERE x = y",
+        "SELECT x, y FROM (SELECT 'abc' x, c2 y FROM t0) WHERE x = y",
+        "SELECT x FROM (SELECT 'abc' x, c2 y FROM t0) WHERE x IN (SELECT c2 FROM t0)",
+        'SELECT x, y FROM (SELECT c1 x, c2 y FROM t0) WHERE x = y',
+        'SELECT a.x FROM (SELECT upper(c1) x FROM t0) a JOIN t0 b ON a.x = b.c2',
+        'SELECT b.c2 FROM t0 a LEFT JOIN (SELECT upper(c1) x, c2 FROM t0) b ON b.x = a.c2',
+        'WITH c AS (SELECT upper(c1) x FROM t0) SELECT x FROM c, t0 WHERE x = c2',
+        'SELECT x, count(*) FROM (SELECT lower(c1) x FROM t0) a JOIN t0 ON x = c2 GROUP BY 1',
+        "SELECT x FROM (SELECT id x FROM t0) WHERE x = '1'",
+    ]:
+        pair.run(sql)
