@@ -3185,7 +3185,8 @@ class Executor:
             if violation[1] == "IGNORE":
                 return None
             raise self.constraint_error(*violation)
-        if rowid is None:
+        fresh = rowid is None  # (a new row id is never taken)
+        if fresh:
             rowid = self.new_rowid(tree, sequence)
         if table.rowid_column is not None:
             row[table.rowid_column] = raw[table.rowid_column] = rowid
@@ -3213,7 +3214,7 @@ class Executor:
         converted = bool(table.checks) and not self.settings["ignore_check_constraints"]
         for constraint in constraints:
             if constraint == "rowid":
-                other = rowid if rowid in tree else None
+                other = rowid if not fresh and rowid in tree else None
             else:
                 converted = True
                 if defaults is not None:

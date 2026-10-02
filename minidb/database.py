@@ -237,7 +237,8 @@ class Database:
                 pager.end_transaction()
             elif not self.in_transaction:
                 pager.end_transaction()
-                if self.executor.ran and (writes or self._reads_file(stmt)):
+                if self.executor.ran and (writes or (self.executor.settings["defer_foreign_keys"]
+                                                     and self._reads_file(stmt))):
                     self._transaction_ended()  # (SQLite's sqlite3RollbackAll, once the program ran)
             if exc is not sys.exc_info()[1]:
                 raise exc from None
@@ -248,7 +249,8 @@ class Database:
         if result.rowcount > 0:
             self.total_changes += result.rowcount
         self.total_changes += keys.extra_changes  # (rows foreign key actions changed)
-        if not self.in_transaction and (writes or self._reads_file(stmt)):
+        if not self.in_transaction and (writes or (self.executor.settings["defer_foreign_keys"]
+                                                   and self._reads_file(stmt))):
             self._transaction_ended()
         if isinstance(stmt, (Insert, Update, Delete)):
             self.executor.changes = max(result.rowcount, 0)
