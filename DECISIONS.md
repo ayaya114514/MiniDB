@@ -910,3 +910,36 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 1404：RTRIM 下的 'b' 与 'b '）。MiniDB 在第一张表没有别的访问路径（全表扫描）时照此选索引：能排好的项多的优先，
 再覆盖的优先，再窄的优先；全部排好时各组按索引顺序输出（不再按键排序）。带统计信息时 SQLite 按代价决定（种子 2266
 里它在 `GROUP BY c3, c0` 上仍选了只排好 c0 的索引），这一点不模拟，记为已知差异。
+
+## D110 触发器：每个触发器一份按冲突处理方式编译的程序，NEW / OLD 是父作用域
+`minidb/triggers.py`。照 SQLite 的 trigger.c：
+- **程序**：每个触发器按（catalog 版本，外层语句的冲突处理方式 orconf）编译一份 `Program`——外层语句写了 `OR ...` 时，
+  它覆盖程序里 INSERT / UPDATE 自己的冲突子句（SQLite 的 eOrconf），所以程序语句是语法树的深拷贝。程序的语句以一个只含
+  `new` / `old` 伪表的作用域为父作用域编译，NEW / OLD 的引用就像相关子查询的外层列一样读 `cell`（运行前设好，嵌套运行
+  时保存恢复）。伪表的列有排序规则、没有亲和性（TK_TRIGGER），但 INTEGER PRIMARY KEY 列是 rowid，有 INTEGER 亲和性；
+  只能用限定名访问，视图上的没有 rowid。
+- **编译时机与顺序**：SQLite 在编译语句时就编译它可能运行的程序，所以错误（no such column、外键 mismatch……）在任何行
+  改变之前报出，且报的是最先遇到的那个。MiniDB 在构造计划时按 SQLite 的代码生成顺序做这些事：BEFORE 程序；约束检查
+  会用到的（upsert 的 UPDATE 及其触发器和外键、REPLACE 的 DELETE——只在 recursive_triggers 开着且真的可能冲突时编译
+  DELETE 触发器）；语句自己的外键；AFTER 程序；外键动作语句的子表触发器。`PRAGMA foreign_keys` /
+  `defer_foreign_keys` / `recursive_triggers` 改变时让已编译的计划失效（SQLite 让语句过期）。触发器程序内的、以及有
+  INSERT 触发器的单行 INSERT 都算多行写入（外键的“单行插入不必找子行”优化只在顶层且无触发器时成立）。
+- **触发**：同一事件的触发器新建的先触发。BEFORE INSERT 的 NEW 是做过亲和性转换的值，rowid 未知时为 -1；BEFORE
+  UPDATE / DELETE 之后再看一次这一行——被删了就跳过，被改了则 UPDATE 没有赋值的列取新值（SQLite trigger1-18.0），
+  OLD 保持原样；AFTER 触发器在外键动作之后。REPLACE 删除的行只在 recursive_triggers 开着时触发 DELETE 触发器，且
+  触发过之后要以 ABORT 重新检查唯一约束（触发器可能 RAISE(IGNORE) 留下了行，或插入了冲突的行）。upsert 的 DO UPDATE
+  触发 UPDATE 触发器；DROP TABLE 隐式的 DELETE 不触发。递归按触发器（不是按程序变体）判断；程序和外键动作合计最多
+  嵌套 1000 层（Python 递归上限随之提高）。
+- **RAISE**：只能出现在触发器程序里（否则编译报错）；IGNORE 放弃当前程序和触发它的那一行（语句继续下一行；嵌套时只
+  影响最近的那一层）；ABORT / FAIL / ROLLBACK 是相应处理方式的约束错误，消息是求值后的文本（NULL 为空串）。
+- **计数**：`changes()` 只算外层语句的行；程序完成时其改动计入 `total_changes()`（失败的程序不计）；
+  `last_insert_rowid()` 在程序里可见、程序结束后恢复。
+- **INSTEAD OF**：视图上有匹配的 INSTEAD OF 触发器时，INSERT 的每一行（不做亲和性转换，缺的列为 NULL，rowid 列被接受
+  但忽略）、UPDATE / DELETE 先找出视图里匹配 WHERE 的行（NEW 是 OLD 加上 SET 的值，按视图列的亲和性转换）去触发它们；
+  `changes()` 为 0。带 RETURNING 时只要视图有任何触发器就可写（SQLite 自己的 RETURNING 触发器让它检查的列表非空）。
+- **存储与 ALTER**：触发器存在 `sqlite_schema`（两种格式），文本照 SQLite 保存（"CREATE TRIGGER " 加上从名字到 END
+  的原文，去掉 IF NOT EXISTS 和 schema 前缀），有自己的命名空间。RENAME TO 改它的 ON 表名和程序里的表名（总是加引号）；
+  RENAME COLUMN 改 UPDATE OF、NEW/OLD 的列、目标表的 INSERT 列名 / SET 列名，以及（编译程序时用列钩子收集的）解析到
+  该表的列引用；DROP COLUMN 时若某个触发器的程序会因此找不到列就报错（报文本里第一个，按原写法带限定名）。
+- 不支持：TEMP 触发器（阶段 25 才有 temp schema）；程序里的 `UPDATE ... FROM`（MiniDB 本来就不支持），SQLite 文件里
+  带这种触发器的表只读。

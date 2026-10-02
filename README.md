@@ -5,7 +5,7 @@
 用 Python 从零实现的小型关系数据库，行为以 SQLite 为标准答案：解析并执行 SQL，数据按 4 KB
 页存在单个文件里，表和索引都是 B+ 树，提交通过预写日志（WAL）保证原子性和崩溃恢复。
 
-只依赖 Python 标准库（3.11–3.14），测试用 pytest。约 9,300 行实现代码（不含空行和注释），
+只依赖 Python 标准库（3.11–3.14），测试用 pytest。约 1.5 万行实现代码（不含空行、注释和文档字符串），
 全部带类型注解。
 
 **Playground**：<https://ayaya114514.github.io/MiniDB/> —— 浏览器里（Pyodide）运行 MiniDB，
@@ -16,8 +16,17 @@
 **SQL**
 
 - `CREATE TABLE [IF NOT EXISTS]`、`DROP TABLE [IF EXISTS]`；任意类型名，按 SQLite 规则得到
-  INTEGER / REAL / NUMERIC / TEXT / BLOB 亲和性；约束 `PRIMARY KEY`、`NOT NULL`、`UNIQUE`、
-  `DEFAULT`。`INTEGER PRIMARY KEY` 是 rowid 的别名；其他表有隐藏的 `rowid`（也可写 `oid`、`_rowid_`）。
+  INTEGER / REAL / NUMERIC / TEXT / BLOB 亲和性；约束 `PRIMARY KEY`、`NOT NULL`、`UNIQUE`、`CHECK`、
+  `DEFAULT`、`COLLATE`（列级和表级，带 `ON CONFLICT`）、`AUTOINCREMENT`。`INTEGER PRIMARY KEY` 是 rowid
+  的别名；其他表有隐藏的 `rowid`（也可写 `oid`、`_rowid_`）。
+- 外键：`REFERENCES` / `FOREIGN KEY`、`PRAGMA foreign_keys`、`ON DELETE / ON UPDATE`（CASCADE / SET NULL /
+  SET DEFAULT / RESTRICT）、`DEFERRABLE INITIALLY DEFERRED`、`PRAGMA defer_foreign_keys`。
+- 触发器：`CREATE TRIGGER` / `DROP TRIGGER`，`BEFORE` / `AFTER` / `INSTEAD OF`（视图上）、
+  `INSERT` / `UPDATE [OF ...]` / `DELETE`、`WHEN`、`NEW` / `OLD`、`RAISE(...)`、`PRAGMA recursive_triggers`。
+- 排序规则 BINARY / NOCASE / RTRIM：比较、`ORDER BY`、`GROUP BY` / `DISTINCT`、索引。
+- PRAGMA：`table_info` / `table_xinfo`、`index_list` / `index_info` / `index_xinfo`、`foreign_key_list`、
+  `foreign_key_check`、`integrity_check` / `quick_check`、`user_version`、`application_id`、`schema_version`、
+  `page_size` / `page_count` / `freelist_count`、`journal_mode` 等，以及表值函数形式 `pragma_xxx(...)`。
 - `ALTER TABLE ... RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN`（视图里的引用一并改写）；
   `CREATE [TEMP] VIEW` / `DROP VIEW`；`REINDEX`；`VACUUM`（重写紧凑文件、收缩文件）与 `VACUUM INTO 'file'`。
 - `INSERT`（多行 `VALUES`、`DEFAULT VALUES`、`INSERT ... SELECT`、`(rowid, ...)` 列）、`UPDATE`、`DELETE`；
@@ -117,7 +126,7 @@ db = minidb.Database("app.sqlite", format="sqlite")   # 或 minidb.connect("app.
 用的是 SQLite 的 rollback journal（`-journal`，崩溃后 sqlite3 和 MiniDB 都能回放对方留下的日志）和 SQLite 的文件锁，
 所以另一个进程里的 sqlite3 可以同时打开同一个文件。ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。只支持 4096 字节
 的页、UTF-8、非 WAL 模式、无 auto_vacuum（其他文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的
-对象（CHECK、触发器、表达式索引等）原样保留，用到时报 `NotSupportedError`。设计见 DECISIONS.md 的 D100。
+对象（表达式索引、部分索引、`WITHOUT ROWID` 表等）原样保留，用到时报 `NotSupportedError`。设计见 DECISIONS.md 的 D100。
 SQLite 格式下查询与 MiniDB 格式相差 10–45%，逐行插入慢 1.6–2.4 倍（benchmark 见 PROGRESS.md 阶段 20）。
 
 ## 架构
@@ -239,8 +248,8 @@ Python 源码编译执行，见 DECISIONS.md D90）。
 
 ## 已知限制
 
-- 不支持触发器、`CHECK` 约束、`COLLATE`（只有 BINARY 比较）、临时表、外键、虚表 / 表值函数、
-  `WITHOUT ROWID`、生成列；`localtime` 修饰符只在一个时区的机器上对照过。
+- 不支持临时表和 TEMP 触发器、虚表（表值函数只有 `pragma_xxx()`）、`WITHOUT ROWID`、`STRICT`、生成列、
+  表达式索引和部分索引、`UPDATE ... FROM`；`localtime` 修饰符只在一个时区的机器上对照过。
 - 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
   多行 UPDATE 先处理哪一行导致 UNIQUE 冲突、聚合查询里裸列取自哪一行、常量传播 / 常量折叠

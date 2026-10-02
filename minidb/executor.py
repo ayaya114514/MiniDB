@@ -31,7 +31,7 @@ from operator import itemgetter
 from typing import Any, Protocol, Union
 
 from minidb import dates, functions, pragmas, values, window
-from minidb.foreign_keys import ForeignKeys
+from minidb.foreign_keys import ForeignKeys, Link
 from minidb.triggers import Program, TriggerIgnore, Triggers, raise_error
 from minidb.btree import BTree, IntKey
 from minidb.catalog import (
@@ -2174,6 +2174,10 @@ class Executor:
         self.outer_scope = None  # the NEW / OLD scope while a trigger's statements are compiled
         self.compiling_trigger = 0  # > 0: RAISE() is allowed
         self.frame_depth = 0  # trigger programs and foreign key actions running (SQLite's nFrame)
+        self.compile_depth = 0  # prepare() calls in progress
+        self.program_log = []  # the programs the statement being compiled compiled, in order (log_program)
+        self.program_seen = set()
+        self.program_stack = []  # for each trigger program being compiled: the programs it asks for
         self.changes = 0  # changes() and total_changes(), kept up to date by Database
         self.total_changes = 0
         # PRAGMA settings of the connection (see minidb.pragmas).
@@ -2245,6 +2249,62 @@ class Executor:
             rows, columns = pragmas.run(self, stmt.name, stmt.value, stmt.schema)
             return Result(rows, columns)
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
+
+    # ---- what SQLite compiles with a statement ------------------------------------
+
+    def log_program(self, key: tuple, entry: tuple) -> bool:
+        """Note that the statement being compiled compiles a trigger program
+        or a foreign key action (SQLite's list pParse->pTriggerPrg, newest
+        last); False if it already did (SQLite compiles each once)."""
+        for requested in self.program_stack:
+            requested.append((key, entry))
+        if key in self.program_seen:
+            return False
+        self.program_seen.add(key)
+        self.program_log.append(entry)
+        return True
+
+    def set_null_link(self, table: TableInfo) -> Link | None:
+        """A SQLite quirk (isSetNullAction): where it codes the check of a new
+        row's foreign keys, it leaves out foreign key F if the program it
+        compiled last is F's ON DELETE / ON UPDATE SET NULL action."""
+        if self.program_log:
+            entry = self.program_log[-1]
+            if entry[0] == "action" and entry[1].child is table and entry[3] == "SET NULL":
+                return entry[1]
+        return None
+
+    def compile_delete(self, table: TableInfo, orconf: str | None, triggers: bool = True) -> None:
+        """What SQLite compiles to delete a row of ``table`` (sqlite3GenerateRowDelete):
+        BEFORE triggers, the foreign keys of the row, their actions, AFTER triggers."""
+        if triggers:
+            self.triggers.prepare(table.name, "DELETE", None, orconf, ("BEFORE",))
+        keys = self.foreign_keys
+        if keys.involved(table):
+            keys.prepare(table, "delete")
+        if triggers:
+            self.triggers.prepare(table.name, "DELETE", None, orconf, ("AFTER",))
+
+    def compile_update(self, table: TableInfo, changed: set[int], orconf: str | None,
+                       replace: bool = False, rowid_changed: bool = False) -> Link | None:
+        """What SQLite compiles to update rows of ``table`` setting ``changed``
+        (sqlite3Update): BEFORE triggers; the constraint checks (REPLACE's
+        DELETE); the foreign keys of the old and the new row; their actions;
+        AFTER triggers.  Returns the foreign key whose new-row check it leaves out."""
+        width = len(table.columns)
+        names = [table.columns[p].name if p < width else "rowid" for p in changed]
+        triggers, keys = self.triggers, self.foreign_keys
+        triggers.prepare(table.name, "UPDATE", names, orconf, ("BEFORE",))
+        if replace and replace_possible(table, orconf, rowid_changed, changed):
+            self.compile_delete(table, "REPLACE", bool(self.settings["recursive_triggers"]))
+        unchecked = None
+        if keys.enabled:
+            keys.prepare(table, "update", changed, actions=False)
+            unchecked = self.set_null_link(table)
+            if keys.required(table, changed):
+                keys.prepare_actions(table, "update", changed)
+        triggers.prepare(table.name, "UPDATE", names, orconf, ("AFTER",))
+        return unchecked
 
     def foreign_keys_may_abort(self, stmt: Insert | Update | Delete, plan: Any) -> bool:
         """Whether SQLite gives a statement on a table with foreign keys a
@@ -2330,9 +2390,19 @@ class Executor:
         cached = getattr(stmt, "_plan", None)
         if cached is not None and cached[0] == self.catalog.version:
             return cached[1]
+        if self.compile_depth == 0:
+            self.program_log, self.program_seen = [], set()
+        self.compile_depth += 1
+        try:
+            return self._prepare(stmt)
+        finally:
+            self.compile_depth -= 1
+
+    def _prepare(self, stmt: Select | Compound | Insert | Update | Delete) -> PreparedStatement:
         self.once_caches = []
         if isinstance(stmt, (Select, Compound, Values)):
             plan = PreparedSelect(self.compile_query(stmt))
+            plan.aborts = calls_function(stmt)  # (in a trigger program)
         else:
             with self.cte_scope(stmt.ctes or []):
                 view = self.catalog.find_view(stmt.table)
@@ -3063,18 +3133,30 @@ class Executor:
         resolve it (IGNORE, ABORT, FAIL or ROLLBACK).  Under REPLACE a NULL
         becomes the column's default first, if that is not NULL (also in
         ``raw``, the values before affinities, which upserts may see)."""
+        # As SQLite, in two passes: in column order, a REPLACE column with a
+        # default gets it, the others are checked; then the REPLACE columns
+        # that are still NULL fail as ABORT.
+        replaced = []
         for i, column in enumerate(table.columns):
-            if column.not_null and row[i] is None and i != table.rowid_column:  # (a NULL there: a new row id)
-                how = conflict or column.not_null_conflict or "ABORT"
-                if how == "REPLACE" and column.default is not None:
-                    value = Compiler(Scope(), executor=self).compile(column.default)([])
-                    row[i] = values.apply_affinity(value, table.affinities[i])
-                    if raw is not None:
-                        real = table.affinities[i] == values.REAL and type(value) is int
-                        raw[i] = float(value) if real else value
-                    if row[i] is not None:
-                        continue
+            if not column.not_null or i == table.rowid_column:  # (a NULL there: a new row id)
+                continue
+            how = conflict or column.not_null_conflict or "ABORT"
+            if how == "REPLACE":
+                if column.default is not None:
+                    if row[i] is None:
+                        value = Compiler(Scope(), executor=self).compile(column.default)([])
+                        row[i] = values.apply_affinity(value, table.affinities[i])
+                        if raw is not None:
+                            real = table.affinities[i] == values.REAL and type(value) is int
+                            raw[i] = float(value) if real else value
+                    replaced.append(i)
+                    continue
+                how = "ABORT"
+            if row[i] is None:
                 return f"NOT NULL constraint failed: {table.name}.{column.name}", how
+        for i in replaced:
+            if row[i] is None:
+                return f"NOT NULL constraint failed: {table.name}.{table.columns[i].name}", "ABORT"
         return None
 
     def check_violation(self, table: TableInfo, row: Row, conflict: str | None,
@@ -4419,43 +4501,48 @@ class PreparedInsert:
             self.rows.append([compiler.compile(e) for e in exprs])
         self.tree = executor.catalog.table_tree(table)
         multi_write = self.multi_write = self.query is not None or len(self.rows) > 1
-        self.statement_journal = multi_write and (self.may_abort() or calls_function(stmt))
         self.prepare_programs()
-        if executor.triggers.exist(table.name, "INSERT"):
-            self.statement_journal = True  # (SQLite: a multi-row write, and the programs may abort)
+        # SQLite keeps a statement journal for a multi-row write (a SELECT,
+        # several rows, triggers) that may abort: a constraint checked as
+        # ABORT, a function call, a trigger program that may abort.
+        triggers = executor.triggers
+        self.aborts = self.may_abort() or calls_function(stmt) or triggers.may_abort(
+            table.name, "INSERT", None, self.conflict)
+        self.statement_journal = (multi_write or triggers.exist(table.name, "INSERT")) and self.aborts
 
     def prepare_programs(self) -> None:
         """What SQLite compiles with the statement, in its order (so the
         first error is the one SQLite reports): the BEFORE triggers; the
         constraint checks' work - an upsert's UPDATE, REPLACE's DELETE (with
-        their triggers and foreign keys); the foreign keys of the INSERT; the
-        AFTER triggers."""
+        their triggers and foreign keys); the foreign keys of the new row;
+        the AFTER triggers."""
         executor, table = self.executor, self.table
         triggers, keys = executor.triggers, executor.foreign_keys
         triggers.prepare(table.name, "INSERT", None, self.conflict, ("BEFORE",))
-        replaces = replace_possible(table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
-        self.fk_steps = []
+        # A statement is a multi-row write (sqlite3MultiWrite) with a SELECT,
+        # RETURNING or INSERT triggers, in a trigger program, and when an
+        # upsert's UPDATE or a REPLACE's DELETE (coded within it) has triggers
+        # or foreign key work.
+        multi = (self.multi_write or self.returning is not None or bool(executor.compiling_trigger)
+                 or triggers.exist(table.name, "INSERT"))
+        width = len(table.columns)
         for upsert in self.upserts:
             if upsert.assignments:
                 positions = {position for position, _ in upsert.assignments}
-                names = [table.columns[p].name if p < len(table.columns) else "rowid" for p in positions]
-                triggers.prepare(table.name, "UPDATE", names, "ABORT")
-                if keys.enabled:
-                    keys.prepare(table, "update", positions)
-                    self.fk_steps.append(("update", positions))
-        if replaces and executor.settings["recursive_triggers"]:
-            triggers.prepare(table.name, "DELETE", None, "REPLACE")
-        replaces = replaces and keys.involved(table)
+                executor.compile_update(table, positions, "ABORT")
+                names = [table.columns[p].name if p < width else "rowid" for p in positions]
+                multi = multi or triggers.exist(table.name, "UPDATE", names) or (
+                    keys.enabled and keys.required(table, positions))
+        replaces = replace_possible(table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
         if replaces:
-            keys.prepare(table, "delete")
-            self.fk_steps.append(("delete", None))
-        # (A REPLACE that may delete rows, RETURNING, a SELECT and INSERT
-        # triggers make the statement a multi-row write; so does being part
-        # of a trigger program.)
-        self.fk_multi = (self.multi_write or self.returning is not None or replaces or bool(executor.compiling_trigger)
-                         or triggers.exist(table.name, "INSERT"))
+            recursive = bool(executor.settings["recursive_triggers"])
+            executor.compile_delete(table, "REPLACE", recursive)
+            multi = multi or keys.involved(table) or (recursive and triggers.exist(table.name, "DELETE"))
+        self.fk_multi = multi
+        self.unchecked = None
         if keys.enabled:
             keys.prepare(table, "insert", single_insert=not self.fk_multi)
+            self.unchecked = executor.set_null_link(table)
         triggers.prepare(table.name, "INSERT", None, self.conflict, ("AFTER",))
 
     def may_abort(self) -> bool:
@@ -4516,8 +4603,7 @@ class PreparedInsert:
                 row[position] = default([])
             rows.append(row)
         keys = executor.foreign_keys
-        if keys.enabled:  # (prepare_programs did the foreign keys' compile-time work)
-            keys.unchecked = keys.last_action_program(table, self.fk_steps) if self.fk_steps else None
+        saved_unchecked, keys.unchecked = keys.unchecked, self.unchecked  # (prepare_programs did the compiling)
         changed = []  # rows inserted or updated by an upsert, with their row ids
         defaults = DefaultRegisters([position for position, _ in self.defaults])
         sequence = None
@@ -4537,6 +4623,8 @@ class PreparedInsert:
         except Error as exc:
             exc.changes = len(changed)  # the rows that FAIL (or no statement journal) keeps
             raise
+        finally:
+            keys.unchecked = saved_unchecked
         if sequence is not None and sequence[0] != start:
             executor.set_sequence_value(table, sequence[0])
         return returning_result(self.returning, changed)
@@ -4617,27 +4705,16 @@ class PreparedUpdate(PreparedSingleTable):
         # Whether a REPLACE may delete a row the statement has yet to update.
         self.may_replace = "REPLACE" in (conflict, table.rowid_conflict(), *(i.conflict for i in table.indexes))
         self.names = [table.columns[p].name if p < width else "rowid" for p in changed]
-        # What SQLite compiles with the statement, in its order: BEFORE
-        # triggers, the foreign keys, REPLACE's DELETE, AFTER triggers.
-        triggers, keys = executor.triggers, executor.foreign_keys
-        triggers.prepare(table.name, "UPDATE", self.names, conflict, ("BEFORE",))
-        self.fk_replace = False
-        if keys.enabled:
-            keys.prepare(table, "update", self.changed)
-            self.fk_replace = keys.involved(table) and replace_possible(table, conflict, rowid_changed, self.changed)
-            if self.fk_replace:
-                keys.prepare(table, "delete")
-        if executor.settings["recursive_triggers"] and replace_possible(table, conflict, rowid_changed, self.changed):
-            triggers.prepare(table.name, "DELETE", None, "REPLACE")
-        triggers.prepare(table.name, "UPDATE", self.names, conflict, ("AFTER",))
-        if triggers.exist(table.name, "UPDATE", self.names):
-            self.statement_journal = True
+        # What SQLite compiles with the statement, in its order (Executor.compile_update).
+        self.unchecked = executor.compile_update(table, self.changed, conflict, True, rowid_changed)
+        self.aborts = self.statement_journal or executor.triggers.may_abort(table.name, "UPDATE", self.names, conflict)
+        if executor.triggers.exist(table.name, "UPDATE", self.names):
+            self.statement_journal = self.aborts  # (triggers make it a multi-row write)
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
         keys = executor.foreign_keys
-        if keys.enabled:
-            keys.unchecked = keys.last_action_program(table, [("delete", None)]) if self.fk_replace else None
+        saved_unchecked, keys.unchecked = keys.unchecked, self.unchecked
         changed = []
         try:
             triggered = executor.triggers.exist(table.name, "UPDATE", self.names)
@@ -4658,6 +4735,8 @@ class PreparedUpdate(PreparedSingleTable):
         except Error as exc:
             exc.changes = len(changed)
             raise
+        finally:
+            keys.unchecked = saved_unchecked
         return returning_result(self.returning, changed)
 
 
@@ -4666,12 +4745,10 @@ class PreparedDelete(PreparedSingleTable):
         super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         self.delete_all = stmt.where is None and self.returning is None
-        # What SQLite compiles with it, in its order: BEFORE triggers, the foreign keys, AFTER triggers.
-        triggers, keys = executor.triggers, executor.foreign_keys
-        triggers.prepare(self.table.name, "DELETE", None, None, ("BEFORE",))
-        if keys.involved(self.table):
-            keys.prepare(self.table, "delete")
-        triggers.prepare(self.table.name, "DELETE", None, None, ("AFTER",))
+        executor.compile_delete(self.table, None)  # (what SQLite compiles with it, in its order)
+        keys = executor.foreign_keys
+        self.aborts = calls_function(stmt) or executor.triggers.may_abort(self.table.name, "DELETE", None, None) or (
+            keys.enabled and keys.involved(self.table) and keys.may_abort(self.table, "delete"))
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
@@ -4739,7 +4816,8 @@ class PreparedViewInsert:
         self.returning = executor.compile_returning(stmt.returning, scope)
         self.conflict = stmt.conflict
         executor.triggers.prepare(view.name, "INSERT", None, self.conflict)
-        self.statement_journal = True
+        self.aborts = calls_function(stmt) or executor.triggers.may_abort(view.name, "INSERT", None, self.conflict)
+        self.statement_journal = self.aborts
 
     def check_count(self, stmt: Insert, count: int) -> None:
         if count != len(self.positions):
@@ -4759,6 +4837,8 @@ class PreparedViewInsert:
             new = [None] * (width + 1)
             for position, value in zip(self.positions, values_):
                 new[position] = value
+            if new[width] is not None and not isinstance(values.apply_affinity(new[width], values.INTEGER), int):
+                raise IntegrityError("datatype mismatch")  # (SQLite checks the row id it then ignores)
             new[width] = None
             try:
                 executor.triggers.fire(self.view.name, "INSTEAD OF", "INSERT", None, new, None, self.conflict)
@@ -4771,7 +4851,8 @@ class PreparedViewInsert:
 class PreparedViewChange:
     """UPDATE or DELETE of a view with INSTEAD OF triggers: the view's rows
     that match WHERE are found first; each fires the triggers, as OLD (and
-    NEW: OLD with the SET values, converted by the columns' affinities)."""
+    NEW: OLD with the SET values, converted by the columns' affinities when
+    an INSTEAD OF trigger fires)."""
 
     def __init__(self, executor: Executor, stmt: Update | Delete, view: ViewInfo) -> None:
         self.executor = executor
@@ -4797,7 +4878,11 @@ class PreparedViewChange:
                 self.names.append(name)
         self.returning = executor.compile_returning(stmt.returning, scope)
         executor.triggers.prepare(view.name, self.event, self.names, self.conflict)
-        self.statement_journal = True
+        # (SQLite converts NEW only for INSTEAD OF triggers - its BEFORE ones - not for RETURNING alone.)
+        self.convert = bool(executor.triggers.matching(view.name, "INSTEAD OF", self.event, self.names))
+        self.aborts = calls_function(stmt) or executor.triggers.may_abort(view.name, self.event, self.names,
+                                                                          self.conflict)
+        self.statement_journal = self.aborts
 
     def run(self) -> Result:
         executor, source = self.executor, self.source
@@ -4814,7 +4899,8 @@ class PreparedViewChange:
             if self.event == "UPDATE":
                 new = list(old)
                 for position, function in self.assignments:
-                    new[position] = values.apply_affinity(function(old), source.affinities[position])
+                    value = function(old)
+                    new[position] = values.apply_affinity(value, source.affinities[position]) if self.convert else value
             try:
                 executor.triggers.fire(self.view.name, "INSTEAD OF", self.event, old, new, self.names, self.conflict)
             except TriggerIgnore:

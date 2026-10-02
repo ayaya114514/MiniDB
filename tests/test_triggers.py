@@ -239,3 +239,76 @@ def test_sqlite_runs_minidb_triggers_and_back(tmp_path):
         assert db.execute("SELECT * FROM log") == [("mini 1",), ("mini 2",), ("lite 1",)]
     with closing(sqlite3.connect(path)) as lite:
         assert lite.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
+def test_found_by_the_fuzzer(pair):
+    """Corners SQLite's code generation decides, each found by tests/fuzz.py."""
+    run(pair, [
+        # Recursion is checked per trigger, whatever OR clause its program was compiled for.
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, c0 TEXT, c2 REAL NOT NULL)", "CREATE TABLE log (x)",
+        "CREATE TRIGGER tr1 INSERT ON t1 BEGIN INSERT INTO log VALUES (quote(new.c0)); "
+        "INSERT OR REPLACE INTO t1 (c0, id, c2) VALUES (NULL, 10, (-4 >> new.c0)); END",
+        "INSERT INTO t1 VALUES (0, 3, 0)", "SELECT * FROM t1", "SELECT * FROM log",
+        # NEW.x of an INTEGER PRIMARY KEY is the row id: INTEGER affinity.
+        "CREATE TABLE t2 (id INTEGER PRIMARY KEY, c0 REAL, c1 TEXT)",
+        "CREATE TRIGGER tr2 AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES ((new.c1 BETWEEN new.c1 AND new.id) "
+        "|| (new.c1 <= new.id) || (new.c0 = '1')); END",
+        "INSERT INTO t2 VALUES (2, 1, 0)", "SELECT * FROM log",
+        # After REPLACE ran DELETE triggers, uniqueness is checked again (one kept the row).
+        "PRAGMA recursive_triggers = ON", "CREATE TABLE t3 (id INTEGER PRIMARY KEY, a UNIQUE)",
+        "CREATE TRIGGER tr3 BEFORE DELETE ON t3 BEGIN SELECT RAISE(IGNORE) WHERE old.a = 'keep'; END",
+        "INSERT INTO t3 VALUES (1, 'keep'), (2, 'go')", "REPLACE INTO t3 VALUES (1, 'x')",
+        "REPLACE INTO t3 VALUES (5, 'go')", "SELECT * FROM t3", "PRAGMA recursive_triggers = OFF",
+    ])
+
+
+def test_foreign_keys_through_triggers(pair):
+    run(pair, [
+        "PRAGMA foreign_keys = ON",
+        # isSetNullAction: the SET NULL action a BEFORE trigger's UPDATE compiled is the
+        # last program before the INSERT's own check of t2's key, which is left out.
+        "CREATE TABLE t0 (id INTEGER PRIMARY KEY, c0 FLOAT UNIQUE, c2 BLOB)",
+        "CREATE TABLE t2 (c0 VARCHAR(5) NOT NULL REFERENCES t0(c0) ON UPDATE SET NULL, c1 TEXT)",
+        "CREATE TRIGGER tr0 INSERT ON t2 WHEN 0 BEGIN UPDATE t0 SET c2 = 0, c0 = NULL WHERE t0.rowid = 21; END",
+        "REPLACE INTO t2 VALUES (7, 1)", "SELECT * FROM t2",
+        # An upsert whose UPDATE has triggers makes the INSERT a multi-row write:
+        # its foreign keys look for t0's children, and find the mismatch.
+        "CREATE TABLE p (c0, c2 REAL, c1 REAL)", "CREATE TABLE c (id INTEGER PRIMARY KEY, r REFERENCES p(c0))",
+        "CREATE UNIQUE INDEX pi ON p (c0, c2)", "CREATE TRIGGER pu AFTER UPDATE ON p BEGIN SELECT 1; END",
+        "INSERT INTO p (c2, c1, c0) VALUES (1, 2, 3) ON CONFLICT DO UPDATE SET c1 = 5",
+        # Inside a trigger program a one-row INSERT into a parent looks for its children too.
+        "CREATE TABLE q (a)", "CREATE TRIGGER qi AFTER INSERT ON q BEGIN INSERT INTO p (c0) VALUES (1); END",
+        "INSERT INTO q VALUES (1)",
+    ])
+
+
+def test_statement_journal_with_triggers(pair):
+    """With triggers a statement is a multi-row write; SQLite keeps a
+    statement journal only if something in it may abort - else rows an
+    error leaves (here a datatype mismatch, in a transaction) stay."""
+    run(pair, [
+        "CREATE TABLE t0 (id INTEGER PRIMARY KEY, c1)", "CREATE TABLE t1 (a)", "INSERT INTO t1 VALUES (1), (2)",
+        "CREATE TRIGGER tr BEFORE INSERT ON t0 BEGIN DELETE FROM t1 WHERE t1.a = new.c1; END",
+        "BEGIN", "INSERT OR IGNORE INTO t0 VALUES (1, 1), ('x', 2)", "SELECT * FROM t1", "SELECT * FROM t0",
+        "CREATE TRIGGER tr2 BEFORE INSERT ON t0 BEGIN SELECT RAISE(ABORT, 'no') WHERE new.c1 = 99; END",
+        "INSERT OR IGNORE INTO t0 VALUES (2, 2), ('y', 3)", "SELECT * FROM t1", "SELECT * FROM t0", "COMMIT",
+    ])
+
+
+def test_views_corners(pair):
+    run(pair, [
+        "CREATE TABLE t (a INTEGER, b TEXT)", "INSERT INTO t VALUES (1, 'x')", "CREATE TABLE log (x)",
+        "CREATE VIEW v AS SELECT a, b, rowid AS r FROM t",
+        "CREATE TRIGGER vd INSTEAD OF DELETE ON v BEGIN SELECT 1; END",
+        # RETURNING with any trigger on the view: writable; NEW converted only with an INSTEAD OF trigger.
+        "UPDATE v SET a = '5', b = 6, r = '7' RETURNING typeof(a), typeof(b), typeof(r)",
+        "INSERT INTO v VALUES ('5', 6, '7') RETURNING typeof(a), typeof(b), typeof(r)",
+        "UPDATE v SET a = 1", "INSERT INTO v VALUES (1, 2, 3)",
+        "CREATE TRIGGER vu INSTEAD OF UPDATE ON v BEGIN INSERT INTO log VALUES (typeof(new.a) || typeof(new.r)); END",
+        "CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO log VALUES (typeof(new.a) || typeof(new.r)); END",
+        "UPDATE v SET a = '5', b = 6, r = '7' RETURNING typeof(a), typeof(b), typeof(r)",
+        "INSERT INTO v VALUES ('5', 6, '7') RETURNING typeof(a), typeof(b), typeof(r)", "SELECT * FROM log",
+        # A row id for a view is checked and ignored.
+        "INSERT INTO v (rowid, a) VALUES (3, 1)", "INSERT INTO v (rowid, a) VALUES ('x', 1)",
+        "INSERT INTO v (oid, a) VALUES (NULL, 1)", "SELECT * FROM log",
+    ])

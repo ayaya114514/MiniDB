@@ -169,6 +169,19 @@ def test_not_null_rowid_alias(pair):
         pair.run(sql)
 
 
+def test_not_null_in_two_passes(pair):
+    """SQLite checks NOT NULL in two passes: in column order, a REPLACE
+    column with a default gets it and the others are checked; then a REPLACE
+    column still NULL fails, as ABORT."""
+    for sql in ["CREATE TABLE t (a NOT NULL ON CONFLICT REPLACE DEFAULT NULL, b NOT NULL ON CONFLICT ROLLBACK, "
+                "c NOT NULL ON CONFLICT REPLACE DEFAULT 5, d NOT NULL)", "BEGIN",
+                "INSERT INTO t VALUES (NULL, 1, NULL, 1)", "INSERT INTO t VALUES (1, 1, NULL, NULL)",
+                "INSERT INTO t VALUES (NULL, NULL, NULL, 1)", "SELECT * FROM t", "BEGIN",
+                "INSERT OR FAIL INTO t VALUES (NULL, NULL, 1, 1)", "INSERT INTO t VALUES (1, 2, NULL, 3)",
+                "SELECT * FROM t"]:
+        pair.run(sql)
+
+
 def test_autoincrement(pair):
     run_all(pair, """
         CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v);
