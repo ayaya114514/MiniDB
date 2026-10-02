@@ -308,7 +308,9 @@ def test_views_corners(pair):
         "CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO log VALUES (typeof(new.a) || typeof(new.r)); END",
         "UPDATE v SET a = '5', b = 6, r = '7' RETURNING typeof(a), typeof(b), typeof(r)",
         "INSERT INTO v VALUES ('5', 6, '7') RETURNING typeof(a), typeof(b), typeof(r)", "SELECT * FROM log",
-        # A row id for a view is checked and ignored.
+        # A row id for a view is checked (for NEW, so only with an INSTEAD OF INSERT trigger) and ignored.
+        "CREATE VIEW w AS SELECT a FROM t", "CREATE TRIGGER wd INSTEAD OF DELETE ON w BEGIN SELECT 1; END",
+        "INSERT INTO w (rowid, a) VALUES ('x', 1) RETURNING *",
         "INSERT INTO v (rowid, a) VALUES (3, 1)", "INSERT INTO v (rowid, a) VALUES ('x', 1)",
         "INSERT INTO v (oid, a) VALUES (NULL, 1)", "SELECT * FROM log",
     ])
