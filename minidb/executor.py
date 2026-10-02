@@ -1554,6 +1554,7 @@ class IndexScan:
 
     def __init__(self, index: IndexInfo, index_tree: BTree, table_tree: BTree, equal: list[RowFunction], lower: Bound, upper: Bound, table_rows: int) -> None:
         self.index = index
+        self.grouping = None  # see grouping_index_scan
         self.index_tree = index_tree
         self.table_tree = table_tree
         self.equal = equal  # key functions for the leading columns
@@ -2049,6 +2050,40 @@ def covering_index_scan(scope: Scope, index: int, catalog: Catalog, scan: FullSc
     return best
 
 
+def grouping_index_scan(scope: Scope, index: int, catalog: Catalog, scan: FullScan,
+                        group: list[tuple[int, str]]) -> IndexScan | None:
+    """A full scan through an index that orders the groups, as SQLite takes
+    one (without statistics) to save sorting them: its first columns are all
+    the GROUP BY columns in any order (``grouping`` "all": the groups then
+    come out in index order), or the first GROUP BY terms in their written
+    order (a partial order).  So each group's rows come in index order, which
+    decides its bare columns.  Ordering more terms wins, then a covering
+    index, then the narrower one."""
+    table = scope.entries[index].table
+    wanted = set(group)
+    best = best_rank = None
+    for info in scope.entries[index].indexes():
+        if not info.ordered:
+            continue
+        columns = list(zip(info.positions, info.collations))
+        if len(columns) >= len(group) and set(columns[:len(group)]) == wanted:
+            satisfied = len(group)
+        else:
+            satisfied = 0
+            while satisfied < min(len(group), len(columns)) and columns[satisfied] == group[satisfied]:
+                satisfied += 1
+        if not satisfied:
+            continue
+        candidate = IndexScan(info, catalog.index_tree(info), scan.tree, [], None, None, scan.rows)
+        candidate.cover_if_possible(scope, index)
+        size = sum(size_estimate(table.columns[p].type) for p in info.positions)
+        rank = (-satisfied, not candidate.covering, size)
+        if best is None or rank < best_rank:
+            best, best_rank = candidate, rank
+            candidate.grouping = "all" if satisfied == len(group) else "partial"
+    return best
+
+
 def plan_access(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, order_hint: int | None = None, bound: set[int] | frozenset[int] | None = None) -> AccessPath:
     """Choose the cheapest way to read table ``index`` of ``scope``.
 
@@ -2115,6 +2150,7 @@ class Executor:
         self.cte_scopes = []  # the WITH clauses in effect: dicts of lower-case name -> CteInfo
         self.column_hook = None  # called with (Column, table) for each column reference compiled
         self.statement_journal = True  # see PreparedInsert.statement_journal
+        self.ran = False  # see execute
         self.changes = 0  # changes() and total_changes(), kept up to date by Database
         self.total_changes = 0
         # PRAGMA settings of the connection (see minidb.pragmas).
@@ -2130,6 +2166,7 @@ class Executor:
         indexed by parameter number - 1)."""
         self.parameters[:] = parameters
         self.statement_journal = True
+        self.ran = False  # whether the statement got past compiling (Database: what an error ends)
         dates.statement_time[0] = None  # 'now' is fixed for the length of a statement
         keys = self.foreign_keys
         keys.immediate = 0
@@ -2139,6 +2176,7 @@ class Executor:
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
                 cache.clear()
+            self.ran = True
             self.statement_journal = getattr(plan, "statement_journal", True)
             if keys.enabled and isinstance(stmt, (Insert, Update, Delete)) and keys.involved(plan.table):
                 self.statement_journal = self.statement_journal or self.foreign_keys_may_abort(stmt, plan)
@@ -2174,6 +2212,7 @@ class Executor:
             self.catalog.analyze(stmt.name)
             return Result()
         if isinstance(stmt, Pragma):
+            self.ran = True
             rows, columns = pragmas.run(self, stmt.name, stmt.value, stmt.schema)
             return Result(rows, columns)
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
@@ -2557,7 +2596,7 @@ class Executor:
             return Compiler(scope, misuse="misuse of aggregate: {name}()", executor=self, allow_aggregates=True)
         return Compiler(scope, executor=self)
 
-    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False, aggregate: bool = False) -> tuple[list[JoinLevel], list[RowFunction]]:
+    def plan_joins(self, scope: Scope, joins: list[Join], where: Expr | None, order_hint: int | None = None, covering: bool = False, aggregate: bool = False, group_hint: list[tuple[int, str]] | None = None) -> tuple[list[JoinLevel], list[RowFunction]]:
         """Plan a nested loop over ``joins``; returns (levels, constants).
 
         WHERE conjuncts and the ON conditions of inner joins form one pool of
@@ -2640,6 +2679,8 @@ class Executor:
             hint = order_hint if level == 0 and index == 0 and not rights else None
             access = plan_access(scope, index, self.catalog, usable, compiler, hint,
                                  bound=set(order[:level]))
+            if group_hint and type(access) is FullScan and level == 0 and index == 0 and not rights:
+                access = grouping_index_scan(scope, index, self.catalog, access, group_hint) or access
             if covering and isinstance(access, IndexScan):
                 access.cover_if_possible(scope, index)
             elif covering and type(access) is FullScan:
@@ -2915,15 +2956,16 @@ class Executor:
 
     @staticmethod
     def group_rows(rows: Iterable[Row], scope: Scope, group_functions: list[RowFunction], aggregates: AggregateCollector,
-                   group_keys: list[Callable[[SQLValue], tuple]] | None = None) -> Iterator[Row]:
+                   group_keys: list[Callable[[SQLValue], tuple]] | None = None, in_order: bool = False) -> Iterator[Row]:
         """Aggregate ``rows`` into groups; yield each group's representative row
-        followed by its aggregate results, ordered by group key."""
+        followed by its aggregate results, ordered by group key (``in_order``:
+        as the groups came, when an index scan delivered them in order)."""
         groups = {}
         keys = group_keys if group_keys is not None else [values.sort_key] * len(group_functions)
         aggregates.grouping_loop(group_functions, keys)(rows, groups, aggregates.new_state)
         if not groups and not group_functions:
             groups[()] = [[None] * scope.width, aggregates.new_state()]
-        for key in sorted(groups):
+        for key in (groups if in_order else sorted(groups)):
             representative, state = groups[key]
             yield representative + aggregates.results(state)
 
@@ -3787,7 +3829,8 @@ class CompiledSelect:
         if stmt.source:
             hint = order_columns[0] if order_columns and stmt.limit is not None else None
             self.levels, self.constants = executor.plan_joins(
-                scope, joins, stmt.where, hint, covering=True, aggregate=self.is_aggregate
+                scope, joins, stmt.where, hint, covering=True, aggregate=self.is_aggregate,
+                group_hint=self.group_columns(stmt)
             )
         elif stmt.where is not None:
             self.constants = [executor.where_compiler(scope, self.is_aggregate).compile(stmt.where)]
@@ -3799,6 +3842,11 @@ class CompiledSelect:
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
         self.first_row_only = self.is_aggregate and self.min_max_on_equal_column(stmt)
+        # An index scan that orders every GROUP BY column delivers the groups in its order.
+        self.groups_in_order = bool(
+            self.levels and self.levels[0].offset == scope.entries[0].offset
+            and getattr(self.levels[0].access, "grouping", None) == "all"
+        )
         # True when the first table's access path already yields ORDER BY order.
         self.presorted = bool(
             self.levels and order_columns and not self.is_aggregate and self.windows is None
@@ -3901,6 +3949,31 @@ class CompiledSelect:
         joins = [dataclasses.replace(join, on=substitute_columns(fold_and(join.on), restricted)) for join in joins]
         return stmt, joins
 
+    def group_columns(self, stmt: Select) -> list[tuple[int, str]] | None:
+        """GROUP BY as a list of (position, collation) of the first table's
+        columns, or None unless every term is a plain column of it (not the
+        row id, not a result column number)."""
+        if not stmt.group_by or not self.scope.entries or isinstance(self.scope.entries[0].table, DerivedSource):
+            return None
+        entry = self.scope.entries[0]
+        compiler = Compiler(self.scope, executor=self.executor)
+        columns = []
+        for term in stmt.group_by:
+            expr = strip_collate(term)
+            if not isinstance(expr, Column):
+                return None  # (an alias was substituted already)
+            try:
+                slot, _, table_index, depth = self.scope.resolve(expr)
+            except (AliasReference, OperationalError):
+                return None
+            position = slot - entry.offset
+            if depth or table_index != 0 or slot == self.scope.rowid_slot(0) or position == entry.table.rowid_column:
+                return None
+            column = (position, compiler.collation(term) or "BINARY")
+            if column not in columns:
+                columns.append(column)
+        return columns
+
     def order_columns(self, stmt: Select) -> list[int] | None:
         """ORDER BY as positions of the first table's columns (ROWID for the row
         id), or None unless every term is an ascending, NULLS FIRST plain
@@ -3962,7 +4035,7 @@ class CompiledSelect:
             rows = (
                 group_row
                 for group_row in self.executor.group_rows(
-                    rows, self.scope, self.group_functions, self.aggregates, self.group_keys
+                    rows, self.scope, self.group_functions, self.aggregates, self.group_keys, self.groups_in_order
                 )
                 if having is None or truth(having(group_row))
             )

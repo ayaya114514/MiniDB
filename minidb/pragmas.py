@@ -398,6 +398,31 @@ def run(executor: Executor, name: str, value: object, schema: str | None) -> tup
     return spec.rows(executor, value), spec.columns
 
 
+# The pragmas whose SQLite program always reads the database file (it has an
+# OP_Transaction): outside a transaction, running one ends an implicit one.
+READS_FILE = frozenset((
+    "integrity_check", "quick_check", "table_list", "user_version", "application_id", "schema_version",
+    "page_count", "freelist_count", "journal_mode", "data_version",
+))
+
+
+def reads_file(executor: Executor, name: str, value: object) -> bool:
+    """Whether SQLite's program for ``PRAGMA name [= value]`` reads the
+    database file: the ones above, and the reports on a table or index
+    that exists (table_info on any name)."""
+    if name in READS_FILE:
+        return True
+    if value is None:
+        return False
+    if name in ("table_info", "table_xinfo"):
+        return True
+    if name == "index_list":
+        return ascii_lower(str(value)) in executor.catalog.tables
+    if name in ("index_info", "index_xinfo"):
+        return ascii_lower(str(value)) in executor.catalog.indexes
+    return False
+
+
 def is_write(name: str, value: object) -> bool:
     spec = PRAGMAS.get(name)
     return spec is not None and spec.writes and value is not None

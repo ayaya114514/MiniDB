@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
@@ -17,10 +18,11 @@ from minidb.sqlite_format import MAGIC as SQLITE_MAGIC
 from minidb.sqlite_pager import SqlitePager
 from minidb.parser import (
     Analyze, Begin, Commit, CreateIndex, CreateTable, CreateView, Delete, DropIndex, DropTable,
-    AlterTable, DropView, Insert, Pragma, Reindex, Rollback, Update, Vacuum, parse_script,
+    AlterTable, Cte, DropView, Insert, Pragma, Reindex, Rollback, TableFunction, TableRef, Update, Vacuum,
+    parse_script,
 )
 from minidb import pragmas
-from minidb.values import INT_MAX, INT_MIN, SQLValue
+from minidb.values import INT_MAX, INT_MIN, SQLValue, ascii_lower
 
 # Values for ?-parameters: by position, or by name.
 Parameters = Sequence[object] | Mapping[str, object]
@@ -223,6 +225,8 @@ class Database:
                 resolution = "FAIL"
             if resolution == "FAIL":
                 self._end_statement()
+                if not self.in_transaction:
+                    self._transaction_ended()
                 raise
             keys.deferred, keys.deferred_immediate = saved  # (SQLite's statement journal keeps them too)
             pager.rollback_statement()
@@ -233,6 +237,8 @@ class Database:
                 pager.end_transaction()
             elif not self.in_transaction:
                 pager.end_transaction()
+                if self.executor.ran and (writes or self._reads_file(stmt)):
+                    self._transaction_ended()  # (SQLite's sqlite3RollbackAll, once the program ran)
             if exc is not sys.exc_info()[1]:
                 raise exc from None
             raise
@@ -242,7 +248,7 @@ class Database:
         if result.rowcount > 0:
             self.total_changes += result.rowcount
         self.total_changes += keys.extra_changes  # (rows foreign key actions changed)
-        if writes and not self.in_transaction:
+        if not self.in_transaction and (writes or self._reads_file(stmt)):
             self._transaction_ended()
         if isinstance(stmt, (Insert, Update, Delete)):
             self.executor.changes = max(result.rowcount, 0)
@@ -293,6 +299,30 @@ class Database:
         self.pager.rollback()
         self.catalog.load()
         self._transaction_ended()
+
+    def _reads_file(self, stmt: object) -> bool:
+        """Whether SQLite's program for a statement that changes nothing reads
+        the database file (a table, sqlite_schema, a pragma that does): only
+        then does it end an implicit transaction (and PRAGMA defer_foreign_keys).
+        Names of WITH tables don't count (approximately: anywhere in it)."""
+        if isinstance(stmt, Pragma):
+            return pragmas.reads_file(self.executor, stmt.name, stmt.value)
+        nodes, ctes, refs = [stmt], set(), []
+        while nodes:
+            node = nodes.pop()
+            if isinstance(node, (list, tuple)):
+                nodes.extend(node)
+            elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+                if isinstance(node, Cte):
+                    ctes.add(ascii_lower(node.name))
+                elif isinstance(node, TableRef):
+                    refs.append(ascii_lower(node.name))
+                elif isinstance(node, TableFunction):
+                    spec_name = ascii_lower(node.name)[7:] if ascii_lower(node.name).startswith("pragma_") else ""
+                    if spec_name in pragmas.READS_FILE or spec_name in ("table_info", "table_xinfo"):
+                        return True
+                nodes.extend(getattr(node, f.name) for f in dataclasses.fields(node))
+        return any(name not in ctes for name in refs)
 
     def _transaction_ended(self) -> None:
         """Deferred foreign key violations and PRAGMA defer_foreign_keys end with the transaction."""
