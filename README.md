@@ -44,13 +44,17 @@
 - 窗口函数：`row_number`、`rank`、`dense_rank`、`percent_rank`、`cume_dist`、`ntile`、`lag`、`lead`、
   `first_value`、`last_value`、`nth_value`，以及全部聚合函数 `OVER (PARTITION BY ... ORDER BY ...
   {ROWS | RANGE | GROUPS} BETWEEN ... [EXCLUDE ...])`、`WINDOW` 子句；聚合的 `FILTER (WHERE ...)`。
-- 表达式：比较、`AND`/`OR`/`NOT`（三值逻辑）、`+ - * / %`、`||`、位运算 `& | ~ << >>`、`IS [NOT]`、
+- 表达式：比较、`AND`/`OR`/`NOT`（三值逻辑）、`+ - * / %`、`||`、`->` / `->>`、位运算 `& | ~ << >>`、`IS [NOT]`、
   `[NOT] IN (...)`、`[NOT] BETWEEN`、`[NOT] LIKE / GLOB ... [ESCAPE]`、`CASE`、`CAST(x AS type)`、
   BLOB 字面量 `x'..'`、十六进制整数、参数 `?` / `?NNN` / `:name`。
 - 函数：SQLite 的核心标量函数（`substr`、`replace`、`trim`、`instr`、`printf`/`format`、`round`、
   `hex`/`unhex`、`quote`、`char`/`unicode`、`concat`、`iif` ……）、数学函数、日期时间函数
   （`date`、`time`、`datetime`、`julianday`、`unixepoch`、`strftime`、`timediff`，全部修饰符）；
   聚合 `count`、`sum`、`avg`、`min`、`max`、`total`、`group_concat`、`string_agg`（支持 `DISTINCT`）。
+- JSON：`json`、`json_valid`、`json_type`、`json_extract` 与 `->` / `->>`、`json_array` / `json_object`、
+  `json_insert` / `json_replace` / `json_set` / `json_remove` / `json_patch`、`json_quote`、`json_array_length`、
+  `json_pretty`、`json_error_position`，对应的 `jsonb_*` 二进制版本（与 SQLite 的 JSONB 字节相同），聚合
+  `json_group_array` / `json_group_object`（也可作窗口函数），表值函数 `json_each` / `json_tree`；支持 JSON5 输入。
 - 索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`，UNIQUE 列自动建索引；
   执行器对“索引列前缀等值 + 下一列范围”使用索引，也用于连接的内层表。
   `EXPLAIN [QUERY PLAN]` 显示每张表的访问路径。
@@ -140,6 +144,8 @@ SQL 文本
   │  executor.py    名字解析、表达式编译成闭包、访问路径规划、嵌套循环连接、
   │                 聚合/排序/限制、INSERT/UPDATE/DELETE 与约束检查
   │  values.py      SQL 值语义：亲和性、比较、算术、文本转换、标量和聚合函数
+  │  jsonb.py       JSON 文本 ⇄ JSONB 的解析、渲染与路径编辑（照 SQLite 的 json.c）
+  │  jsonfuncs.py   JSON 标量/聚合函数与 json_each / json_tree
   │  catalog.py     schema（表、索引）存在第 1 页的 B+ 树里，打开时重建
   ▼
   │  btree.py       B+ 树：按字节大小分裂/合并/借位，叶子兄弟链，范围扫描，overflow 页
@@ -248,7 +254,7 @@ Python 源码编译执行，见 DECISIONS.md D90）。
 
 ## 已知限制
 
-- 不支持临时表和 TEMP 触发器、虚表（表值函数只有 `pragma_xxx()`）、`WITHOUT ROWID`、`STRICT`、生成列、
+- 不支持临时表和 TEMP 触发器、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`WITHOUT ROWID`、`STRICT`、生成列、
   表达式索引和部分索引、`UPDATE ... FROM`；`localtime` 修饰符只在一个时区的机器上对照过。
 - 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、
