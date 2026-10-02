@@ -603,13 +603,18 @@ class Compiler:
         if not 0 <= position < len(entry.table.columns):
             merge = next((m for m in scope.merged.values() if m.slot == slot), None)
             if merge is None:
-                return "BINARY"  # the row id
+                return None  # the row id: none (SQLite's sqlite3ExprCollSeq for a column numbered -1)
             first = scope.entries[merge.index]  # (a FULL JOIN's USING column: its first table's)
             for e in scope.entries:
                 if e.offset <= merge.parts[0] < e.offset + len(e.table.columns):
                     first = e
             entry, position = first, merge.parts[0] - first.offset
-        return entry.table.collations[position] or "BINARY"
+        if position == getattr(entry.table, "rowid_column", None):
+            return None  # (an INTEGER PRIMARY KEY is the row id)
+        collation = entry.table.collations[position]
+        if collation is None and position in getattr(entry.table, "bare", ()):
+            return None  # (a flattened subquery's row id: SQLite puts the column itself in its place)
+        return collation or "BINARY"
 
     def comparison_collation(self, left: Expr, right: Expr) -> str:
         """The collation comparing ``left`` with ``right`` (SQLite's
@@ -5179,6 +5184,7 @@ class DerivedSource:
     indexes = ()
 
     strip = ()  # the columns whose JSON subtype the rows lose (lost_subtypes)
+    bare = frozenset()  # the columns SQLite's flattening replaces by a column of its own (bare_columns)
 
     def __init__(self, name: str, compiled: CompiledQuery, names: list[str] | None = None,
                  query: Any = None) -> None:
@@ -5187,7 +5193,9 @@ class DerivedSource:
         rows lose, as in SQLite)."""
         self.name = name or "subquery"
         self.compiled = compiled
-        self.strip = lost_subtypes(query, len(compiled.names)) if query is not None else ()
+        if query is not None:
+            self.bare = bare_columns(query, len(compiled.names))
+            self.strip = lost_subtypes(query, len(compiled.names), self.bare)
         if names is None:
             names = unique_names(compiled.names)
         elif len(names) != len(compiled.names):
@@ -5227,25 +5235,33 @@ def carries_json(query: object) -> bool:
                for node in walk_nodes(query))
 
 
-def lost_subtypes(query: object, width: int) -> tuple[int, ...]:
-    """The columns of a subquery in FROM (or a view or CTE) whose values lose
-    the JSON subtype on the way out.  In SQLite only a bare column of a
-    subquery it flattens keeps it (``value`` of json_each() under a plain
-    SELECT); any other expression, and every column of a subquery it runs
-    on its own (aggregate, DISTINCT, LIMIT, ORDER BY, compound), loses it."""
-    if not carries_json(query):
-        return ()
+def bare_columns(query: object, width: int) -> frozenset[int]:
+    """The result columns of a subquery in FROM (or a view or CTE) that are
+    bare column references of a subquery SQLite flattens into the query
+    using it (roughly: a plain SELECT; the outer query is not looked at).
+    SQLite's substExpr puts such a column itself in place of the subquery's,
+    so it keeps its JSON subtype and, for a row id, has no collation; any
+    other expression gets an implicit COLLATE (BINARY if none) and loses the
+    subtype."""
     flattened = (isinstance(query, Select) and not (query.distinct or query.group_by or query.order_by or query.windows)
                  and query.having is None and query.limit is None
                  and not any(contains_aggregate(item.expr) or contains_window(item.expr)
                              for item in query.items if not isinstance(item.expr, Star)))
     if not flattened:
-        return tuple(range(width))
+        return frozenset()
     if any(isinstance(item.expr, Star) for item in query.items):
         if all(isinstance(item.expr, (Star, Column)) for item in query.items):
-            return ()
-        return tuple(range(width))  # (not worked out column by column)
-    return tuple(i for i, item in enumerate(query.items) if not isinstance(item.expr, Column))
+            return frozenset(range(width))
+        return frozenset()  # (not worked out column by column)
+    return frozenset(i for i, item in enumerate(query.items) if isinstance(item.expr, Column))
+
+
+def lost_subtypes(query: object, width: int, bare: frozenset[int]) -> tuple[int, ...]:
+    """The columns of a subquery in FROM whose values lose the JSON subtype
+    on the way out: all but its bare_columns, if it may return JSON at all."""
+    if not carries_json(query):
+        return ()
+    return tuple(i for i in range(width) if i not in bare)
 
 
 def plain_text(row: Sequence, positions: tuple[int, ...]) -> list:
