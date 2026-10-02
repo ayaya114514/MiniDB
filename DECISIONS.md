@@ -956,3 +956,29 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 顺带修正（触发器 fuzz 找到，与触发器无直接关系）：NOT NULL 分两遍检查（先按列序：有默认值的 REPLACE 列取默认值、其余列
 检查；再查仍为 NULL 的 REPLACE 列，按 ABORT）；`x IN (列表)` 的每一项像 `=` 一样用左边的亲和性比较（TEXT 只在一边是文本时
 转换，SQLite 的 OP_Eq）；查询有窗口函数时，子查询里属于它的聚合是误用（SQLite 先把它挪进子查询）。
+
+## D111 JSON：照 json.c 在 JSONB 上实现，subtype 用 str 子类表示
+
+- **一切经过 JSONB**：`minidb/jsonb.py` 把 JSON 文本解析成 SQLite 的二进制格式 JSONB（头部低 4 位类型、高 4 位载荷长度或
+  后随 1/2/4/8 字节长度；数字和字符串保留原文，按“标准 JSON / 带转义 / JSON5”分类型），函数都在 JSONB 上做：路径查找
+  和就地编辑（`jsonLookupStep` 的增量 delta、`jsonAfterEditSizeAdjust`）、合并补丁、渲染（紧凑与 pretty）、有效性检查。
+  逐步照抄 json.c，而不是用 Python 的 `json` 模块：结果文本要和 SQLite 逐字节相同（`json('1.50')` 保留 `1.50`，
+  `0x1F` 变 `31`，`1e20` 的 REAL 写成 `1.0e+20`），`jsonb()` 的字节、`json_each` 的 `id`（JSONB 偏移）、
+  `json_error_position` 也都要相同；Python 的解析器既不认 JSON5，也会丢掉原文。
+- **头部取最小长度**：SQLite 解析文本时先按估计大小写容器头再回填，最终是能容纳载荷的最小头部；MiniDB 直接回填最小头部，
+  字节相同。
+- **JSON subtype**：SQLite 给 JSON 函数的文本结果打 subtype，别的 JSON 函数拿到它会当 JSON 嵌入而不是当字符串引起来。
+  MiniDB 用 `str` 的子类 `JSONText` 表示：它在表达式、标量子查询、CASE / coalesce / iif / min / max / likely 之间原样
+  传递（这些都直接返回参数对象），字符串运算（`||`、upper、trim…）产生普通 `str`，自然丢掉 subtype——和 SQLite 一致。
+  丢失点按 SQLite 实测：存进表（`prepare_row` 统一转回 `str`；内存格式不序列化记录，不转就会留在索引键里）、FROM 里
+  调用了 JSON 函数的子查询 / 视图 / CTE（SQLite 不展平这种子查询，行出来时丢掉 subtype；`json_each` 的 `value` 所在
+  子查询会被展平，保留）。比较、排序把它当普通文本（`values.compare` 等处对子类放宽）。
+- **json_each / json_tree**：FROM 里的虚表，列声明无类型（BLOB 亲和性：和 TEXT 列比较时不转换，两列比较的规则），
+  有 rowid（从 0 开始），隐藏列 `json` / `root`。参数可以引用前面的表：每行外层重新计算（`JsonEachScan`），连接重排
+  把它放在依赖的表之后。参数在它自己加入作用域之后解析：引用到它自己的列（例如子查询里裸写的 `rowid`）时 SQLite 的
+  xBestIndex 拿不到参数，结果为空，MiniDB 照此。没有参数也是空表。
+- **聚合**：`json_group_array` / `json_group_object`（及 jsonb 版本）也可作窗口函数，xInverse 照 SQLite 从文本开头切掉
+  第一个元素。`DISTINCT` 聚合放过一个 NULL（SQLite 的去重表把 NULL 当相等值；以前 MiniDB 跳过 NULL，对忽略 NULL 的
+  内置聚合没有区别，对 `json_group_array(DISTINCT x)` 有）。
+- **运算符**：`->` / `->>` 与 `||` 同一优先级；右边按 SQLite 的缩写规则变成路径（整数 → `[N]`、负数 → `[#N]`，
+  字母数字 → `.key`，`[..]` 原样，其余 `."key"`）。`->` 返回 JSON 文本，`->>` 返回 SQL 值。

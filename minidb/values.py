@@ -343,6 +343,12 @@ def compare(a: int | float | str | bytes, b: int | float | str | bytes) -> int:
     """Three-way comparison of two non-NULL values (-1, 0 or 1):
     numbers < text < BLOBs; text and BLOBs byte by byte."""
     a_text, b_text = type(a) is str, type(b) is str
+    if not (a_text and b_text):
+        # (text with the JSON subtype, minidb.jsonb.JSONText, is text)
+        if not a_text and isinstance(a, str):
+            a, a_text = str.__str__(a), True
+        if not b_text and isinstance(b, str):
+            b, b_text = str.__str__(b), True
     if a_text and b_text:
         if not (a.isascii() and b.isascii()):
             a, b = _text_key(a), _text_key(b)
