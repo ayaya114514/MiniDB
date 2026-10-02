@@ -409,3 +409,25 @@ def test_row_id_and_flattened_subqueries_have_no_collation(pair):
         "SELECT x FROM (SELECT id x FROM t0) WHERE x = '1'",
     ]:
         pair.run(sql)
+
+
+def test_excluded_has_no_collation(pair):
+    """An upsert's excluded.x has the column's affinity but no collation:
+    the other operand's collation (or BINARY) decides a comparison."""
+    for sql in [
+        'CREATE TABLE t (id INTEGER PRIMARY KEY, a COLLATE NOCASE, b, n INT)',
+        'CREATE TABLE u (k COLLATE RTRIM)',
+        "INSERT INTO t VALUES (1, 'x', 'y', 5)",
+        "INSERT INTO t VALUES (1, 'ABC', 'q', '7') ON CONFLICT (id) DO UPDATE SET b = (excluded.a = 'abc') || (t.a = 'X') || (excluded.a > 'Zz') || ('Zz' < excluded.a) || ('abc' = excluded.a) || (excluded.n = '7') || (excluded.a COLLATE nocase = 'abc')",
+        'SELECT * FROM t',
+        "INSERT INTO t VALUES (1, 'ABC', 'q', '7') ON CONFLICT (id) DO UPDATE SET b = ('Zz' BETWEEN excluded.a AND 'zzz') || (excluded.a IN ('abc')) || max(excluded.a, 'abd') || (CASE excluded.a WHEN 'abc' THEN 'y' ELSE 'n' END)",
+        'SELECT * FROM t',
+        "INSERT INTO t VALUES (1, 'ABC', 'q', '7') ON CONFLICT (id) DO UPDATE SET b = 'w' WHERE excluded.a = 'abc'",
+        'SELECT * FROM t',
+        "INSERT INTO t VALUES (1, 'X', 'q', 1) ON CONFLICT (id) DO UPDATE SET b = (excluded.a = t.a) || (t.a = excluded.a) || (SELECT count(*) FROM u WHERE k = excluded.a)",
+        'SELECT * FROM t',
+        "INSERT INTO u VALUES ('X  ')",
+        "INSERT INTO t VALUES (1, 'X', 'q', 1) ON CONFLICT (id) DO UPDATE SET b = (SELECT count(*) FROM u WHERE excluded.a = k)",
+        'SELECT * FROM t',
+    ]:
+        pair.run(sql)

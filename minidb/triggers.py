@@ -88,7 +88,7 @@ class Program:
     """A trigger's WHEN and statements, compiled for one table and conflict resolution."""
 
     def __init__(self, executor: Executor, trigger: TriggerInfo, source: Any, orconf: str | None) -> None:
-        from minidb.executor import Compiler, Scope
+        from minidb.executor import Compiler, Scope, calls_function
 
         self.trigger = trigger
         self.executor = executor
@@ -96,6 +96,9 @@ class Program:
         self.has_new = trigger.event in ("INSERT", "UPDATE")
         self.has_old = trigger.event in ("UPDATE", "DELETE")
         self.width = len(source.columns) + 1
+        # SQLite reads NEW.x / OLD.x of a REAL column with OP_RealAffinity (an
+        # integer in a view's row becomes a REAL).
+        self.real = [i for i, a in enumerate(source.affinities) if a == values.REAL]
         for name, present in (("new", self.has_new), ("old", self.has_old)):
             if present:
                 scope.add(PseudoSource(name, source))
@@ -118,7 +121,8 @@ class Program:
                           for stmt in self.statements]
             # Whether running it may abort the statement (SQLite's mayAbort, which
             # with a multi-row write asks for a statement journal).
-            self.may_abort = any(getattr(plan, "aborts", False) for plan, _ in self.plans) or any(
+            self.may_abort = any(getattr(plan, "aborts", False) for plan, _ in self.plans) or calls_function(
+                trigger.when) or any(
                 isinstance(node, Raise) and node.kind == "ABORT"
                 for node in walk_tree([trigger.when, trigger.body]))
         except OperationalError as exc:
@@ -140,6 +144,11 @@ class Program:
             row += new if new is not None else [None] * self.width
         if self.has_old:
             row += old if old is not None else [None] * self.width
+        if self.real:
+            for start in range(0, len(row), self.width):
+                for i in self.real:
+                    if type(row[start + i]) is int:
+                        row[start + i] = float(row[start + i])
         cell[0] = row
         try:
             if self.when is not None:

@@ -995,3 +995,27 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 - **fuzz 的步数上限**：随机触发器偶尔级联出上千万次改动（种子 240 的一条 INSERT 在 SQLite 里改了 3600 万行，24 秒），
   MiniDB 要跑几个小时。对照层给 sqlite3 设 progress handler，约 500 万 VM 步后中断语句，MiniDB 跳过这一句（显式事务里
   被中断的写语句 SQLite 会回滚整个事务，MiniDB 照做 ROLLBACK）。种子 0–59 里没有一句被跳过，所以它不削弱覆盖。
+
+## D112 照搬 SQLite 在 REPLACE、外键和触发器上的代码生成怪癖
+
+阶段 23 的 fuzz（JSON 让种子流整个换了一遍）找出一批与 JSON 无关、却在阶段 21–22 的种子里没出现的差异。它们都是 SQLite
+代码生成的副作用，不是文档写明的语义；MiniDB 仍然照搬，理由同 D110：对照测试以 SQLite 3.53.4 的实际行为为准，而且这些
+行为看得见（结果、错误、`total_changes()`、语句是否回滚）。每条都用最小用例在 SQLite 上实测过再实现：
+
+- **pinned cursor**：UPDATE 的 REPLACE 删除冲突行、并运行 DELETE 触发器时，SQLite 用 `OP_CursorLock` 固定正在更新的行；
+  触发器里再写这张表就报 `constraint failed`（`SQLITE_CONSTRAINT_PINNED`）。rowid 冲突的 REPLACE 不固定。
+- **REPLACE 后的复查**：可能有 DELETE 触发器或外键工作时（insert.c 的 regTrigCnt），REPLACE 之后再按 ABORT 查一遍
+  REPLACE 的索引；复查复制第一遍的代码但跳过 `OP_IdxRowid`，拿第一遍最后找到的 rowid 跟本行比——UPDATE 没改键的索引
+  会撞上自己。UPDATE 只查含被改列的索引（update.c 的 aRegIdx；改 rowid 或有 ON UPDATE 动作时查全部）。复查以 ABORT
+  halt，所以这种语句 may abort，多行时有语句日志。
+- **外键扫描改写 OLD**：删除父行时用子表索引找子行，单列外键的 `codeAllEqualityTerms` 直接复用 OLD 寄存器并
+  `OP_Affinity`（索引亲和性钳到 NUMERIC），之后的动作、AFTER 触发器、RETURNING 看到的是转换后的值（'2.5' → 2.5）。
+  这就是阶段 22 记下未修的种子 4181 / 6037。
+- **isSetNullAction 按编译顺序**：upsert 的 UPDATE 在 REPLACE 的 DELETE 之前编译，不受后者 SET NULL 动作的影响。
+- **may abort 的来源**：触发器 WHEN 里的函数调用（LIKE 也是函数）、程序里往子表插入（立即外键，无论 OR 子句）都算。
+- **计数**：触发器程序每条语句执行完就把改动加进 `total_changes()`（`OP_ResetCount`），之后出错也不收回；FAIL 时
+  AFTER 触发器出错的那一行算作已改。
+- **读取 REAL 列**：`NEW.x` / `OLD.x`（以及视图 INSERT 的 RETURNING）读 REAL 列时带 `OP_RealAffinity`，视图行里的整数
+  读成 REAL；RETURNING 里 `typeof()` 的参数绕过这一步，MiniDB 不区分（见 PROGRESS 的已知问题）。
+- **排序规则**：rowid / INTEGER PRIMARY KEY 没有排序规则（多参数 max/min 取下一个参数的）；被展平的子查询里裸列就是
+  该列本身，其他表达式带隐式 COLLATE（substExpr）；upsert 的 `excluded.x` 没有排序规则。
