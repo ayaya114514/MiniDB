@@ -33,7 +33,7 @@ FUNCTIONS = [
     "substr", "replace", "trim", "ltrim", "rtrim", "instr", "round", "hex", "quote", "unicode",
     "sign", "octet_length", "char", "iif", "concat", "concat_ws", "printf", "glob", "ceil", "floor",
     "trunc", "sqrt", "ln", "exp", "mod", "pow", "atan2", "date", "datetime", "julianday", "strftime",
-    "unixepoch",
+    "unixepoch", "likely",
 ]
 DATE_MODIFIERS = ["'+1 day'", "'-3 months'", "'start of month'", "'weekday 2'", "'+1.5 hours'", "'unixepoch'",
                   "'floor'", "'+1-01-01'", "'subsec'"]
@@ -305,6 +305,9 @@ class Generator:
         elif function in ("typeof", "hex", "quote", "unicode", "sign", "octet_length", "ceil",
                           "floor", "trunc", "sqrt", "ln", "exp", "length", "lower", "upper"):
             args = [sub()]
+        elif function == "likely":
+            function = rng.choice(["likely", "unlikely", "likelihood"])
+            args = [sub()] + (["0.25"] if function == "likelihood" else [])
         elif function in ("ifnull", "nullif", "instr", "glob", "mod", "pow", "atan2"):
             args = [sub(), sub()]
         elif function in ("trim", "ltrim", "rtrim", "round"):

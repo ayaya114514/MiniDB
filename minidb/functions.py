@@ -596,6 +596,8 @@ SCALAR_FUNCTIONS = {
     "IIF": (iif, 2, None),
     "INSTR": (instr, 2, 2),
     "LIKE": (like, 2, 3),
+    "LIKELIHOOD": (lambda value, _: value, 2, 2),  # (hints for SQLite's planner: the value itself)
+    "LIKELY": (lambda value: value, 1, 1),
     "LTRIM": (ltrim, 1, 2),
     "OCTET_LENGTH": (octet_length, 1, 1),
     "PRINTF": (_printf, 0, None),
@@ -611,6 +613,7 @@ SCALAR_FUNCTIONS = {
     "TRIM": (trim, 1, 2),
     "UNHEX": (unhex, 1, 2),
     "UNICODE": (unicode, 1, 1),
+    "UNLIKELY": (lambda value: value, 1, 1),
     "UNISTR": (unistr, 1, 1),
     "UNISTR_QUOTE": (unistr_quote, 1, 1),
     "ZEROBLOB": (zeroblob, 1, 1),
