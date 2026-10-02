@@ -318,3 +318,69 @@
 - Windows：推送后第一次在 windows-latest 上运行，SQLite 格式的 23 个测试失败。(1) SQLite 的协议要把 SHARED 升级为 EXCLUSIVE，`msvcrt.locking` 不能转换锁，新建文件就超时——先照 SQLite 的 winLock 先解锁再加锁，修掉 19 个；(2) 第二次运行剩下的`test_locks_against_a_sqlite_process` 暴露了真问题：sqlite3 在 NT 上对 SHARED 区间加的是共享锁，MiniDB 用排他字节模拟共享锁必然冲突，于是 Windows 后端改用 ctypes 的 LockFileEx（D104）；(3) 两个 fuzz 种子是 Windows 上 Python 自带的 SQLite 版本不同（REAL 转文本、求和精度），该测试改为只在参考版本上运行；(4) 多进程测试里读者 2 秒内只读到 1 次（回滚日志模式读写互斥，Windows 上 fsync 慢），断言改为至少 1 次。同一次运行里 `test_threads_reading_and_writing` 又因线程调度没等到日志重启，改为读者停下后必须重启（读者持续读时的上界由多进程测试检查）。LockFileEx 后端推送后（f551a3f）CI 全绿：windows-latest 上 359 个通过、3 个跳过（需要参考 SQLite 的 fuzz 对照），Linux 3.11–3.14、fuzz、sqllogictest 全部通过。
 - 行顺序：连接顺序仍是 MiniDB 自己的代价模型，可能与 SQLite 不同；MULTI-INDEX 的子项不做覆盖读取。
 - sqlite_stat1 在 ≥10 张表时的行顺序与 SQLite 可能不同（D101 的测试只覆盖少量表）。
+
+## 阶段 21：约束、排序规则与 PRAGMA（完成，2026-10-02）
+- **约束**（D105）：列级 / 表级 `CHECK`（报错文本与 SQLite 相同，未命名的照 sqlite3Dequote 取原文），表级 `PRIMARY KEY`
+  / `UNIQUE`、约束上的 `ON CONFLICT`、`AUTOINCREMENT`（`sqlite_sequence`）；schema 文本按原样保存，ALTER TABLE 照
+  alter.c 改文本。`WITHOUT ROWID`、`STRICT`、生成列、表达式索引、部分索引明确报 “not supported”。
+- **排序规则**（D106）：BINARY / NOCASE / RTRIM 在比较、IN、BETWEEN、CASE、min/max/nullif、DISTINCT 聚合、ORDER BY、
+  GROUP BY / DISTINCT、复合查询、窗口、子查询列、索引（两种文件格式，含 SQLite 写的带排序规则的索引）里都照 SQLite 推导。
+- **PRAGMA**（D107）：`table_info` / `table_xinfo`、`index_list` / `index_info` / `index_xinfo`、`foreign_key_list`、
+  `foreign_key_check`、`table_list`、`database_list`、`integrity_check` / `quick_check`（含 NOT NULL / CHECK）、
+  `user_version` / `application_id` / `schema_version`（两种格式的文件头）、`page_size` / `page_count` /
+  `freelist_count`、`journal_mode`（只读）、`data_version`、设置类（`foreign_keys`、`defer_foreign_keys`、
+  `ignore_check_constraints` 等），以及 `pragma_xxx()` 表值函数（可横向引用）。
+- **外键**（D108，`minidb/foreign_keys.py`）：`REFERENCES` / `FOREIGN KEY`、`PRAGMA foreign_keys`、ON DELETE / ON UPDATE
+  的 CASCADE / SET NULL / SET DEFAULT / RESTRICT / NO ACTION、`DEFERRABLE INITIALLY DEFERRED`、`defer_foreign_keys`，
+  照 fkey.c 的计数器模型；编译期的 “foreign key mismatch” / “no such table”；子表有合适索引时按索引找子行。
+- **SQLite 格式里带这些对象的表可写**；`tools/sample_databases.py` 下载 Chinook 1.4.5 与 Northwind（固定版本、SHA3-256
+  校验、存 `.sample-databases/`、不入库），`tests/test_sample_databases.py`：同一批语句（外键开，含 FK 报错、延迟外键的
+  事务、CHECK 报错、AUTOINCREMENT、NOCASE 索引、视图）在 MiniDB 和 sqlite3 各一份拷贝上执行、结果逐条相同，之后 sqlite3
+  对 MiniDB 的文件 `integrity_check` 为 ok、`foreign_key_check` 与自己的相同、`sqlite_schema` 和每张表逐行相同。这条
+  测试当场找到两个真问题：INTEGER PRIMARY KEY 加 NOT NULL 时插入 NULL 被拦（Chinook 的写法）、未命名 CHECK 的报错名
+  （Northwind 的 `[UnitPrice]>=(0)`）。
+- fuzzer：COLLATE（列、索引、表达式）、CHECK、ON CONFLICT、表级约束、REFERENCES（随机动作与延迟）、PRAGMA 语句、
+  `likely()` 系列；奇数种子开 `PRAGMA foreign_keys`。变形测试的 TLP distinct / having / min / max 在排序规则下改为
+  按折叠后的文本比较（哪一个“相等的文本”被留下取决于行序，这是 oracle 的局限，不是引擎问题）。
+- 阶段内 fuzz 找到并修复（都与 SQLite 对过）：两遍式 UPDATE / DELETE 按 rowid 顺序处理行（RowSet）；外键动作的比较
+  没有父列亲和性（`OLD.x`）；单行 INSERT 不找新父键修复的子行；外键只在可能中止时才要语句日志；`defer_foreign_keys`
+  在事务外随“读了文件”的语句结束；RIGHT JOIN 的 USING `coalesce()` 带第一个参数的排序规则；单独的 `min/max(x)` 遇到
+  `x = <外部表达式>` 只读第一行；`x IS NOT (TRUE COLLATE ...)` 是真值测试；缺少 `likely()` / `unlikely()` /
+  `likelihood()`；GROUP BY 走能给出分组顺序的索引（D109）；复合查询相等行的代表、裸列的 regHit、NOCASE 遇 NUL、
+  `LIMIT 0`、别名替换前的 AND 折叠（D106）。
+
+**benchmark**（10 万行，同一台机器；“前”是阶段 20 末 f6588a3，“后”是 cf2d77d）：
+
+| 操作 | MiniDB 格式 前 | MiniDB 格式 后 | SQLite 格式 前 | SQLite 格式 后 | sqlite3 |
+|---|---:|---:|---:|---:|---:|
+| 逐条 INSERT，一个事务 | 2.95 s | 2.99 s | 4.78 s | 4.98 s | 0.20 s |
+| 逐条 INSERT，`?` 参数 | 1.08 s | 1.11 s | 2.61 s | 2.74 s | 0.07 s |
+| 每条 INSERT 1000 行 | 2.48 s | 2.49 s | 4.00 s | 4.01 s | 0.07 s |
+| 1000 次 autocommit 插入 | 0.144 s | 0.143 s | 0.461 s | 0.436 s | 0.210 s |
+| 1 万次主键点查 | 0.850 s | 0.919 s | 0.890 s | 0.978 s | 0.058 s |
+| 1 万次主键点查，`?` 参数 | 0.147 s | 0.150 s | 0.144 s | 0.150 s | 0.041 s |
+| 100 次主键范围扫描 | 0.091 s | 0.091 s | 0.099 s | 0.102 s | 0.022 s |
+| 全扫 count(*) WHERE | 0.066 s | 0.064 s | 0.072 s | 0.075 s | 0.002 s |
+| GROUP BY 3 个聚合 | 0.100 s | 0.108 s | 0.112 s | 0.119 s | 0.041 s |
+| CREATE INDEX | 0.475 s | 0.474 s | 0.413 s | 0.410 s | 0.022 s |
+| 73 次索引等值查找 | 0.077 s | 0.079 s | 0.138 s | 0.144 s | 0.002 s |
+| 索引嵌套循环连接 | 0.175 s | 0.170 s | 0.198 s | 0.208 s | 0.006 s |
+
+第一次跑“后”时 `?` 点查从 0.147 s 变成 0.278 s、插入慢 6%：每条语句都遍历语法树判断“是否读文件”（只在
+`defer_foreign_keys` 开着时才需要），以及给新生成的 rowid 多查了一次 B 树；修掉后如上表。剩下的差距：字面量 SQL 的
+编译多了排序规则推导（点查 +8%），GROUP BY 的裸列要按 regHit 记录行（+6–8%），SQLite 格式插入 +4%。
+
+**验证**：测试 1343 个全部通过；fuzz（阶段末，最终代码）：MiniDB 格式内存 2000 种子 × 400 语句、SQLite 格式文件模式
+1200 种子 × 400 语句，全部 0 失败；变形测试文件模式 300 × 300 0 失败；sqllogictest 全量 5,939,852 / 5,939,879（与阶段 20
+相同：23 条是 TRIGGER，4 条是已知的 `sum`/`total` 精度与整数溢出）。
+
+**已知问题 / 做得不扎实的地方**：
+- 视图不做谓词下推：Northwind 的 `SELECT * FROM [Order Details Extended] WHERE OrderID = 10250` 要 3.4 s（sqlite3
+  0.4 ms），`[Order Subtotals]` 同样；外键的子表没有索引时每次父键变化都全表扫描子表（Northwind 改一次 ProductID 约 1 s）。
+- Chinook 的页大小是 1024，测试先用 sqlite3 `VACUUM` 成 4096（阶段 25 支持各种页大小）。
+- 带统计信息时 GROUP BY 的索引选择是 SQLite 的代价模型，MiniDB 只照搬“无统计”的规则：fuzz 种子 2266（旧随机流）里
+  `GROUP BY c3, c0` 在 ANALYZE 之后 SQLite 选了只排好 c0 的索引，组内显示的 NOCASE 文本因此不同（依赖查询计划的一类）。
+- CHECK 里双引号标识符找不到列时 SQLite 当字符串（DQS），MiniDB 报 “no such column”。
+- 外键动作语句是否需要语句日志是保守估计（动作碰到任何约束就算）；`defer_foreign_keys` 的“读文件”判断里 CTE 名
+  不分作用域。
+- `WITHOUT ROWID`、`STRICT`、生成列、表达式 / 部分索引仍不支持（SQLite 写的含这些对象的表只读）。
