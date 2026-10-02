@@ -4007,7 +4007,7 @@ class Executor:
                 raise OperationalError("non-text filename")
             if os.path.exists(path) and os.path.getsize(path) > 0:
                 raise OperationalError("output file already exists")
-            target = SqlitePager(path) if self.catalog.sqlite else Pager(path)
+            target = SqlitePager(path, page_size=self.vacuum_page_size()) if self.catalog.sqlite else Pager(path)
             try:
                 self.copy_database(target, keep_rowids=True)
                 target.commit()
@@ -4017,8 +4017,10 @@ class Executor:
                 target.close_files()
             return Result()
         pager = self.catalog.pager
-        copy = SqlitePager() if self.catalog.sqlite else Pager()
+        copy = SqlitePager(page_size=self.vacuum_page_size()) if self.catalog.sqlite else Pager()
         self.copy_database(copy, keep_rowids=False)
+        if self.catalog.sqlite and copy.geometry.page_size != pager.geometry.page_size:
+            pager.resize(copy.geometry.page_size)
         count = copy.page_count
         for pgno in range(1, count + self.catalog.sqlite):  # (SQLite's pages count from 1)
             if pgno in copy.cache:
@@ -4037,6 +4039,14 @@ class Executor:
             pager.dirty.discard(pgno)
         self.catalog.load()
         return Result()
+
+    def vacuum_page_size(self) -> int:
+        """The page size VACUUM writes: what PRAGMA page_size asked for, except
+        for an in-memory database (as SQLite)."""
+        pager = self.catalog.pager
+        if pager.next_page_size is not None and pager.path is not None:
+            return pager.next_page_size
+        return pager.geometry.page_size
 
     def copy_database(self, target: Pager | SqlitePager, keep_rowids: bool) -> None:
         """Copy the schema, tables and indexes into the empty database ``target``

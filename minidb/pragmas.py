@@ -266,6 +266,16 @@ def _set_header(field: str) -> Callable[[Executor, object], None]:
     return write
 
 
+def _page_size(executor: Executor) -> int:
+    catalog = executor.catalog
+    return catalog.pager.geometry.page_size if catalog.sqlite else 4096
+
+
+def _set_page_size(executor: Executor, value: object) -> None:
+    if executor.catalog.sqlite:  # (MiniDB's own format has 4096-byte pages only)
+        executor.catalog.pager.set_page_size(int32(value))
+
+
 def _setting(name: str) -> Callable[[Executor], object]:
     return lambda executor: executor.settings[name]
 
@@ -358,7 +368,7 @@ PRAGMAS = {
                              writes=True),
     "schema_version": _value("schema_version", _header_value("schema_version"), _set_header("schema_version"),
                              writes=True),
-    "page_size": _value("page_size", lambda e: 4096, lambda e, v: None),
+    "page_size": _value("page_size", _page_size, _set_page_size, writes=True),
     "page_count": _value("page_count", _page_count),
     "freelist_count": _value("freelist_count", _freelist_count),
     "journal_mode": _value("journal_mode", _journal_mode, lambda e, v: None, returns_on_set=True),

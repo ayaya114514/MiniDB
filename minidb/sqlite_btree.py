@@ -30,8 +30,8 @@ from minidb import record as minidb_record
 from minidb import values
 from minidb.btree import DuplicateKeyError
 from minidb.sqlite_format import (
-    INDEX_INTERIOR, INDEX_LEAF, OVERFLOW_DATA, TABLE_INTERIOR, TABLE_LEAF, USABLE, BtreePage, Cell,
-    OverflowPage, corrupt, decode_record, encode_record, local_size,
+    INDEX_INTERIOR, INDEX_LEAF, TABLE_INTERIOR, TABLE_LEAF, BtreePage, Cell, OverflowPage, corrupt,
+    decode_record, encode_record,
 )
 
 _HEADER = {TABLE_LEAF: 8, INDEX_LEAF: 8, TABLE_INTERIOR: 12, INDEX_INTERIOR: 12}
@@ -59,11 +59,13 @@ class _Tree:
     def _cell(self, payload: bytes, rowid: int = 0) -> Cell:
         """A new leaf cell for ``payload`` (writing its overflow pages)."""
         size = len(payload)
-        local = local_size(size, self.table)
+        geometry = self.pager.geometry
+        local = geometry.local_size(size, self.table)
         cell = Cell(rowid=rowid, local=payload[:local], size=size)
         if local < size:
             rest = payload[local:]
-            chunks = [rest[i:i + OVERFLOW_DATA] for i in range(0, len(rest), OVERFLOW_DATA)]
+            step = geometry.overflow_data
+            chunks = [rest[i:i + step] for i in range(0, len(rest), step)]
             pages = [self.pager.allocate(OverflowPage) for _ in chunks]
             for page, chunk, following in zip(pages, chunks, pages[1:] + [None]):
                 page.data = chunk
@@ -183,12 +185,11 @@ class _Tree:
             parent.right = new_pages[-1].pgno
         parent.cells = parent.cells[:low] + up + rest
 
-    @staticmethod
-    def _distribute(cells: list[Cell], kind: int) -> tuple[list[list[Cell]], list[Cell]]:
+    def _distribute(self, cells: list[Cell], kind: int) -> tuple[list[list[Cell]], list[Cell]]:
         """Split ``cells`` into page-sized groups, as evenly as they allow.
         Except on table leaves, one cell between two groups becomes their
         divider in the parent; returns (groups, dividers)."""
-        capacity = USABLE - _HEADER[kind]
+        capacity = self.pager.geometry.usable - _HEADER[kind]
         sizes = [cell.byte_size(kind) for cell in cells]
         moves_up = kind != TABLE_LEAF
 
@@ -237,7 +238,7 @@ class _Tree:
         tree = cls(pager, 0)
         leaf_kind = TABLE_LEAF if cls.table else INDEX_LEAF
         level, dividers, page, used = [], [], [], 0
-        capacity = USABLE - _HEADER[leaf_kind]
+        capacity = pager.geometry.usable - _HEADER[leaf_kind]
         for rowid, payload in entries:
             cell = tree._cell(payload, rowid)
             size = cell.byte_size(leaf_kind)
@@ -269,7 +270,7 @@ class _Tree:
         """The interior pages above ``children`` (``dividers[i]`` lies
         between children i and i + 1), and the dividers between them."""
         kind = TABLE_INTERIOR if self.table else INDEX_INTERIOR
-        capacity = USABLE - _HEADER[kind]
+        capacity = self.pager.geometry.usable - _HEADER[kind]
         pages, up, cells, used = [], [], [], 0
         for i, divider in enumerate(dividers):
             divider = divider.copy()

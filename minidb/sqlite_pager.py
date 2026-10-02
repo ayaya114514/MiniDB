@@ -19,12 +19,14 @@ after the other, and (on POSIX) even at the same time:
   written and fsynced, and the journal is deleted.  A journal left by a
   crash ("hot": present, valid, and no one holding RESERVED) is played back
   by whoever opens the database next - MiniDB or SQLite.
-* pages: 4096 bytes, numbered from 1; page 1 starts with the database
-  header (kept as page 0 of the cache, as MiniDB's own header is); free
-  pages on SQLite's freelist of trunk and leaf pages.
+* pages: of the size the header says (512-65536 bytes; 4096 for a new
+  database unless PRAGMA page_size chose another), numbered from 1; page 1
+  starts with the database header (kept as page 0 of the cache, as
+  MiniDB's own header is); free pages on SQLite's freelist of trunk and
+  leaf pages.
 
-Not supported (refused when opening): other page sizes, WAL mode, UTF-16,
-auto-vacuum.  Large transactions keep every changed page in memory (no
+Not supported (refused when opening): WAL mode, UTF-16, auto-vacuum,
+reserved bytes at the end of pages.  Large transactions keep every changed page in memory (no
 spilling, unlike MiniDB's own format).
 """
 
@@ -39,8 +41,8 @@ from minidb.errors import DatabaseError
 from minidb.locking import LockTimeout, _LockFile, fsync_directory
 from minidb.pager import PageCache
 from minidb.sqlite_format import (
-    HEADER_SIZE, LOCK_PAGE, PAGE_SIZE, PENDING_BYTE, TABLE_LEAF, BtreePage, DbHeader, FreePage,
-    OverflowPage, TrunkPage, corrupt,
+    DEFAULT_PAGE_SIZE, HEADER_SIZE, PENDING_BYTE, TABLE_LEAF, BtreePage, DbHeader, FreePage, Geometry,
+    OverflowPage, TrunkPage, corrupt, valid_page_size,
 )
 
 PENDING, RESERVED, SHARED = 0, 1, 2  # lock numbers (see SPANS)
@@ -188,7 +190,8 @@ class SqlitePager(PageCache):
     committed = 0  # no log: Database's checkpoint condition never fires
     checkpoint_frames = 1 << 62
 
-    def __init__(self, path: str | None = None, timeout: float = 5.0, image: bytes = b"") -> None:
+    def __init__(self, path: str | None = None, timeout: float = 5.0, image: bytes = b"",
+                 page_size: int = DEFAULT_PAGE_SIZE) -> None:
         self.path = path
         self.journal_path = None if path is None else path + "-journal"
         self.crash_hook = None
@@ -201,6 +204,11 @@ class SqlitePager(PageCache):
         self.schema_changed = False
         self.original_pages = 0  # the page count before this transaction
         self.read_counter = None  # the change counter when the cache was last validated
+        self.new_page_size = page_size  # for the database, if it is still to be created
+        self.geometry = Geometry(page_size)
+        self.next_page_size = None  # PRAGMA page_size on an existing database: for the next VACUUM
+        self.fresh = False  # this connection created the database and nothing was written since
+        self.resized_from = None  # the geometry before this transaction changed the page size
         if path is None:
             self.locks = None
             self.io = _MemoryFile(image)
@@ -240,19 +248,21 @@ class SqlitePager(PageCache):
         if len(data) < HEADER_SIZE:
             raise DatabaseError("file is not a database")
         header = DbHeader(data)
-        header.check(self._file_size() // PAGE_SIZE)
+        header.check(self._file_size())
         return header
 
     def get(self, pgno: int, page_class: Any) -> Any:
         page = self.cache.get(pgno)
         if page is None:
-            if not 1 <= pgno <= self.header.page_count or pgno == LOCK_PAGE:
+            geometry = self.geometry
+            if not 1 <= pgno <= self.header.page_count or pgno == geometry.lock_page:
                 raise corrupt(f"page {pgno} out of range")
-            data = self.io.read((pgno - 1) * PAGE_SIZE, PAGE_SIZE)
-            if len(data) != PAGE_SIZE:
+            size = geometry.page_size
+            data = self.io.read((pgno - 1) * size, size)
+            if len(data) != size:
                 raise corrupt(f"short read of page {pgno}")
             try:
-                page = page_class.from_bytes(pgno, data)
+                page = page_class.from_bytes(pgno, data, geometry)
             except DatabaseError:
                 raise
             except Exception as exc:
@@ -276,10 +286,10 @@ class SqlitePager(PageCache):
             header.freelist_count -= 1
         else:
             pgno = header.page_count + 1
-            if pgno == LOCK_PAGE:  # never used (SQLite's locks live there)
+            if pgno == self.geometry.lock_page:  # never used (SQLite's locks live there)
                 pgno += 1
             header.page_count = pgno
-        page = page_class(pgno, *args)
+        page = page_class(pgno, *args, geometry=self.geometry)
         self.write(page)
         return page
 
@@ -289,12 +299,12 @@ class SqlitePager(PageCache):
         header.freelist_count += 1
         if header.freelist_trunk:
             trunk = self.get(header.freelist_trunk, TrunkPage)
-            if len(trunk.leaves) < TrunkPage.MAX_LEAVES:
+            if len(trunk.leaves) < self.geometry.max_leaves:
                 self.write(trunk)
                 trunk.leaves.append(pgno)
-                self.write(FreePage(pgno))
+                self.write(FreePage(pgno, geometry=self.geometry))
                 return
-        self.write(TrunkPage(pgno, header.freelist_trunk))
+        self.write(TrunkPage(pgno, header.freelist_trunk, geometry=self.geometry))
         header.freelist_trunk = pgno
 
     def free_page_count(self) -> int:
@@ -335,7 +345,8 @@ class SqlitePager(PageCache):
             pgno = trunk.next_trunk
         if count != self.header.freelist_count:
             problems.append(f"freelist: {count} pages, the header says {self.header.freelist_count}")
-        unused = [p for p in range(1, self.header.page_count + 1) if p not in owner and p != LOCK_PAGE]
+        lock_page = self.geometry.lock_page
+        unused = [p for p in range(1, self.header.page_count + 1) if p not in owner and p != lock_page]
         if unused:
             problems.append(f"pages never used: {unused[:10]}")
         return problems
@@ -359,8 +370,9 @@ class SqlitePager(PageCache):
         self.reading = True
         header = self._read_header()
         if header is None:  # an empty file: a new database
-            header = DbHeader()
-            self.cache = {0: header, 1: BtreePage(1, TABLE_LEAF)}
+            header = DbHeader(page_size=self.new_page_size)
+            self.geometry = Geometry(header.page_size)
+            self.cache = {0: header, 1: BtreePage(1, TABLE_LEAF, geometry=self.geometry)}
             self.header = header
             self.dirty = {0, 1}
             self.original_pages = 0
@@ -370,6 +382,8 @@ class SqlitePager(PageCache):
             return False
         self.cache = {0: header}
         self.header = header
+        if header.page_size != self.geometry.page_size:
+            self.geometry = Geometry(header.page_size)
         self.read_counter = header.change_counter
         self.dirty = set()
         return True
@@ -382,6 +396,28 @@ class SqlitePager(PageCache):
         self.reading = False
         if self.locks is not None:
             self.locks.release_all()
+
+    def set_page_size(self, size: int) -> None:
+        """PRAGMA page_size = ``size``: at once for a database nothing was
+        written to yet (as SQLite, whose file is still empty then), at the
+        next VACUUM otherwise; anything but a power of two from 512 to 65536
+        is ignored."""
+        if not valid_page_size(size):
+            return
+        self.next_page_size = size
+        if self.fresh and self.header.page_count == 1 and size != self.geometry.page_size:
+            self.resize(size)
+            self.write(BtreePage(1, TABLE_LEAF, geometry=self.geometry))  # (sqlite_schema is empty)
+
+    def resize(self, size: int) -> None:
+        """Change the page size in this transaction (every page is rewritten:
+        VACUUM, or a new database)."""
+        if self.resized_from is None:
+            self.resized_from = self.geometry
+        self.geometry = Geometry(size)
+        self.write(self.header)
+        self.header.page_size = size
+        self.cache = {pgno: page for pgno, page in self.cache.items() if pgno == 0 or pgno in self.dirty}
 
     def _crash_point(self, point: str, detail: int | None = None) -> None:
         if self.crash_hook is not None:
@@ -404,15 +440,20 @@ class SqlitePager(PageCache):
         self.write(self.get(1, BtreePage))  # page 1 holds the header
         pages = sorted(self.dirty - {0})
         if self.locks is not None:  # (also for a new file: a crash then leaves it empty)
-            self._write_journal([p for p in pages if p <= self.original_pages])
+            if self.resized_from is not None:  # the whole file changes: keep all of it, in the old page size
+                old = self.resized_from
+                self._write_journal([p for p in range(1, self.original_pages + 1) if p != old.lock_page], old)
+            else:
+                self._write_journal([p for p in pages if p <= self.original_pages], self.geometry)
+        size = self.geometry.page_size
         for i, pgno in enumerate(pages):
             self._crash_point("db_page", i)
             image = self.cache[pgno].to_bytes()
             if pgno == 1:
                 image = header.to_bytes() + image[HEADER_SIZE:]
-            self.io.write((pgno - 1) * PAGE_SIZE, image)
-        if self.io.size() > header.page_count * PAGE_SIZE:
-            self.io.truncate(header.page_count * PAGE_SIZE)
+            self.io.write((pgno - 1) * size, image)
+        if self.io.size() > header.page_count * size:
+            self.io.truncate(header.page_count * size)
         self._crash_point("db_sync")
         self.io.sync()
         if self.locks is not None:
@@ -421,6 +462,8 @@ class SqlitePager(PageCache):
             fsync_directory(self.journal_path)
         self.dirty.clear()
         self.schema_changed = False
+        self.fresh = False
+        self.resized_from = None
         self.original_pages = header.page_count
         self.read_counter = header.change_counter
         if self.locks is not None:
@@ -429,21 +472,23 @@ class SqlitePager(PageCache):
     def serialize(self) -> bytes:
         """The database file as this connection sees it, uncommitted changes
         included (sqlite3_serialize)."""
-        size = self.header.page_count * PAGE_SIZE
+        page_size = self.geometry.page_size
+        size = self.header.page_count * page_size
         image = bytearray(self.io.read(0, size).ljust(size, b"\x00"))
         for pgno in self.dirty - {0}:
             if pgno <= self.header.page_count:
-                image[(pgno - 1) * PAGE_SIZE:pgno * PAGE_SIZE] = self.cache[pgno].to_bytes()
+                image[(pgno - 1) * page_size:pgno * page_size] = self.cache[pgno].to_bytes()
         image[:HEADER_SIZE] = self.header.to_bytes()
         return bytes(image)
 
-    def _write_journal(self, pgnos: list[int]) -> None:
+    def _write_journal(self, pgnos: list[int], geometry: Geometry) -> None:
         seed = int.from_bytes(os.urandom(4), "big")
         records = []
+        size = geometry.page_size
         for pgno in pgnos:
-            data = self.io.read((pgno - 1) * PAGE_SIZE, PAGE_SIZE)
+            data = self.io.read((pgno - 1) * size, size)
             records.append(_u32.pack(pgno) + data + _u32.pack(page_checksum(seed, data)))
-        header = _journal_header.pack(JOURNAL_MAGIC, len(records), seed, self.original_pages, SECTOR_SIZE, PAGE_SIZE)
+        header = _journal_header.pack(JOURNAL_MAGIC, len(records), seed, self.original_pages, SECTOR_SIZE, size)
         with open(self.journal_path, "wb", buffering=0) as journal:
             self._crash_point("journal_header")
             journal.write(header.ljust(SECTOR_SIZE, b"\x00"))
@@ -461,10 +506,14 @@ class SqlitePager(PageCache):
         self.dirty.clear()
         self.end_statement()
         self.schema_changed = False
+        if self.resized_from is not None:
+            self.geometry, self.resized_from = self.resized_from, None
+            self.cache = {}
         header = self._read_header()
         if header is None:
-            header = DbHeader()
-            self.cache[1] = BtreePage(1, TABLE_LEAF)
+            header = DbHeader(page_size=self.new_page_size)
+            self.geometry = Geometry(header.page_size)
+            self.cache[1] = BtreePage(1, TABLE_LEAF, geometry=self.geometry)
             self.dirty = {0, 1}
         self.header = header
         self.cache[0] = header
@@ -504,35 +553,37 @@ class SqlitePager(PageCache):
             self.locks.downgrade()
 
     def _play_back(self, data: bytes) -> None:
-        offset, original_pages = 0, None
+        offset, original_pages, journal_page_size = 0, None, None
         while offset + _journal_header.size <= len(data):
             magic, count, seed, pages, sector, page_size = _journal_header.unpack_from(data, offset)
-            if magic != JOURNAL_MAGIC or page_size != PAGE_SIZE:
+            if magic != JOURNAL_MAGIC or not valid_page_size(page_size):
                 break
             if original_pages is None:
-                original_pages = pages
+                original_pages, journal_page_size = pages, page_size
+            elif page_size != journal_page_size:
+                break
             if not sector or sector & (sector - 1):
                 sector = SECTOR_SIZE
             offset += sector
-            size = 8 + PAGE_SIZE
+            size = 8 + page_size
             if count == 0xFFFFFFFF:
                 count = (len(data) - offset) // size
             for _ in range(count):
                 if offset + size > len(data):
                     break
                 pgno = _u32.unpack_from(data, offset)[0]
-                image = data[offset + 4:offset + 4 + PAGE_SIZE]
-                if _u32.unpack_from(data, offset + 4 + PAGE_SIZE)[0] != page_checksum(seed, image):
+                image = data[offset + 4:offset + 4 + page_size]
+                if _u32.unpack_from(data, offset + 4 + page_size)[0] != page_checksum(seed, image):
                     break  # a torn record: everything before it is what counts
                 if pgno and pgno <= pages:
-                    self.io.write((pgno - 1) * PAGE_SIZE, image)
+                    self.io.write((pgno - 1) * page_size, image)
                 offset += size
             else:
                 offset = -(-offset // sector) * sector  # the next segment starts on a sector boundary
                 continue
             break
         if original_pages is not None:
-            self.io.truncate(original_pages * PAGE_SIZE)
+            self.io.truncate(original_pages * journal_page_size)
 
     # ---- the end ------------------------------------------------------------------
 

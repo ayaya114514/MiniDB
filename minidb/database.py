@@ -85,7 +85,8 @@ class Database:
     def _open(self, pager: Pager | SqlitePager) -> None:
         """Start using ``pager`` (inside its read transaction): read the schema."""
         try:
-            if pager.is_new:
+            new = pager.is_new
+            if new:
                 # Creating the file: become the writer first (RESERVED before the snapshot).
                 pager.end_transaction()
                 pager.begin_write()
@@ -93,6 +94,8 @@ class Database:
             catalog = Catalog(pager)
             pager.commit()
             pager.end_transaction()
+            if new and isinstance(pager, SqlitePager):
+                pager.fresh = True  # (PRAGMA page_size may still change its page size)
         except BaseException:
             pager.close_files()
             raise

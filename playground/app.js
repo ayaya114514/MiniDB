@@ -536,6 +536,7 @@ async function showPage(pgno) {
     $("pageinfo").textContent = layout.error;
     return;
   }
+  $("pagescale").replaceChildren(...[0, 1, 2, 3, 4].map((q) => element("span", "", String(layout.size * q / 4))));
   const unallocated = layout.regions.find((r) => r.kind === "unallocated");
   const freeblocks = layout.regions.filter((r) => r.kind === "freeblock").reduce((n, r) => n + r.end - r.start, 0);
   $("pageinfo").textContent = `${PAGE_KINDS[layout.kind]} · ${layout.cells} 个单元格 · 内容区从 ${layout.content_start} 开始 · `

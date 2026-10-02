@@ -16,6 +16,8 @@ and ``minidb.sqlite_btree`` for databases in SQLite's own format.
 * a cell's payload is stored in the page up to a limit that depends on the
   page kind; the rest goes to a chain of overflow pages (4 bytes: next
   page, then data).
+* pages are 512 to 65536 bytes (a power of two), the same size in a whole
+  database; ``Geometry`` holds the limits that follow from it.
 """
 
 from __future__ import annotations
@@ -26,10 +28,9 @@ from minidb.errors import DatabaseError
 from minidb.values import SQLValue
 
 MAGIC = b"SQLite format 3\x00"
-PAGE_SIZE = 4096  # the only page size MiniDB writes or reads
+DEFAULT_PAGE_SIZE = 4096  # for new databases (SQLite's default)
 HEADER_SIZE = 100
 PENDING_BYTE = 0x40000000  # SQLite's locks live here; the page holding it is never used
-LOCK_PAGE = PENDING_BYTE // PAGE_SIZE + 1
 SQLITE_VERSION_NUMBER = 3053004  # written as "last writer" (the format version MiniDB follows)
 
 # B-tree page kinds (the first byte of the page header)
@@ -195,11 +196,11 @@ class DbHeader:
 
     _format = struct.Struct(">16sHBBBBBBIIIIIIIIIIII20sII")
 
-    def __init__(self, data: bytes | None = None) -> None:
+    def __init__(self, data: bytes | None = None, page_size: int = DEFAULT_PAGE_SIZE) -> None:
         self.pgno = 0
         if data is None:  # a new database
             data = self._format.pack(
-                MAGIC, PAGE_SIZE, 1, 1, 0, 64, 32, 32, 0, 1, 0, 0, 0, 4, 0, 0, 1, 0, 0, 0,
+                MAGIC, 1 if page_size == 65536 else page_size, 1, 1, 0, 64, 32, 32, 0, 1, 0, 0, 0, 4, 0, 0, 1, 0, 0, 0,
                 b"\x00" * 20, 0, SQLITE_VERSION_NUMBER)
         fields = list(self._format.unpack_from(data))
         (self.magic, page_size, self.write_version, self.read_version, self.reserved, self.max_fraction,
@@ -210,16 +211,16 @@ class DbHeader:
         self.page_size = 65536 if page_size == 1 else page_size
 
     @classmethod
-    def from_bytes(cls, pgno: int, data: bytes) -> DbHeader:
+    def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry | None = None) -> DbHeader:
         return cls(data)
 
-    def check(self, file_pages: int) -> None:
+    def check(self, file_size: int) -> None:
         """Refuse what MiniDB does not handle (and say why)."""
         if self.magic != MAGIC:
             raise DatabaseError("file is not a database")
-        if self.page_size != PAGE_SIZE:
-            raise DatabaseError(f"SQLite databases with a page size of {self.page_size} are not supported "
-                                f"(only {PAGE_SIZE}; VACUUM it with PRAGMA page_size = {PAGE_SIZE})")
+        if not valid_page_size(self.page_size):
+            raise DatabaseError("file is not a database")
+        file_pages = file_size // self.page_size
         if self.write_version == 2 or self.read_version == 2:
             raise DatabaseError("SQLite databases in WAL mode are not supported: "
                                 "PRAGMA journal_mode = DELETE with sqlite3 first")
@@ -253,20 +254,35 @@ class DbHeader:
 
 # ---- payloads and cells -------------------------------------------------------------
 
-USABLE = PAGE_SIZE  # no reserved bytes
-_MIN_LOCAL = (USABLE - 12) * 32 // 255 - 23
-_TABLE_MAX_LOCAL = USABLE - 35
-_INDEX_MAX_LOCAL = (USABLE - 12) * 64 // 255 - 23
-OVERFLOW_DATA = USABLE - 4  # payload bytes per overflow page
+def valid_page_size(size: int) -> bool:
+    return 512 <= size <= 65536 and size & (size - 1) == 0
 
 
-def local_size(payload: int, table: bool) -> int:
-    """How much of a payload of ``payload`` bytes is stored in the cell."""
-    max_local = _TABLE_MAX_LOCAL if table else _INDEX_MAX_LOCAL
-    if payload <= max_local:
-        return payload
-    size = _MIN_LOCAL + (payload - _MIN_LOCAL) % OVERFLOW_DATA
-    return size if size <= max_local else _MIN_LOCAL
+class Geometry:
+    """The sizes that follow from a database's page size (no reserved bytes
+    at the end of pages, so all of a page is usable)."""
+
+    def __init__(self, page_size: int) -> None:
+        self.page_size = page_size
+        self.usable = usable = page_size
+        self.min_local = (usable - 12) * 32 // 255 - 23
+        self.table_max_local = usable - 35
+        self.index_max_local = (usable - 12) * 64 // 255 - 23
+        self.overflow_data = usable - 4  # payload bytes per overflow page
+        self.lock_page = PENDING_BYTE // page_size + 1
+        self.max_leaves = usable // 4 - 8  # leaves SQLite writes on a freelist trunk
+        self.read_leaves = usable // 4 - 2  # leaves it accepts there
+
+    def local_size(self, payload: int, table: bool) -> int:
+        """How much of a payload of ``payload`` bytes is stored in the cell."""
+        max_local = self.table_max_local if table else self.index_max_local
+        if payload <= max_local:
+            return payload
+        size = self.min_local + (payload - self.min_local) % self.overflow_data
+        return size if size <= max_local else self.min_local
+
+
+DEFAULT = Geometry(DEFAULT_PAGE_SIZE)
 
 
 class Cell:
@@ -327,7 +343,7 @@ class Cell:
         return b"".join(parts)
 
 
-def parse_cell(data: bytes, pos: int, kind: int) -> Cell:
+def parse_cell(data: bytes, pos: int, kind: int, geometry: Geometry) -> Cell:
     cell = Cell()
     if kind in (TABLE_INTERIOR, INDEX_INTERIOR):
         cell.child = _u32.unpack_from(data, pos)[0]
@@ -338,7 +354,7 @@ def parse_cell(data: bytes, pos: int, kind: int) -> Cell:
     cell.size, pos = get_varint(data, pos)
     if kind == TABLE_LEAF:
         cell.rowid, pos = get_signed_varint(data, pos)
-    local = local_size(cell.size, kind == TABLE_LEAF)
+    local = geometry.local_size(cell.size, kind == TABLE_LEAF)
     cell.local = bytes(data[pos:pos + local])
     if local < cell.size:
         cell.overflow = _u32.unpack_from(data, pos + local)[0]
@@ -354,11 +370,13 @@ class BtreePage:
     """A decoded B-tree page.  On page 1 the B-tree part starts after the
     database header (``offset`` 100)."""
 
-    def __init__(self, pgno: int, kind: int, cells: list[Cell] | None = None, right: int = 0) -> None:
+    def __init__(self, pgno: int, kind: int, cells: list[Cell] | None = None, right: int = 0, *,
+                 geometry: Geometry) -> None:
         self.pgno = pgno
         self.kind = kind
         self.cells = cells if cells is not None else []
         self.right = right
+        self.geometry = geometry
 
     @property
     def offset(self) -> int:
@@ -375,7 +393,7 @@ class BtreePage:
     @property
     def capacity(self) -> int:
         """Bytes available for cells and their pointers."""
-        return USABLE - self.offset - self.header_size
+        return self.geometry.usable - self.offset - self.header_size
 
     def used(self) -> int:
         kind = self.kind
@@ -385,7 +403,7 @@ class BtreePage:
         return total
 
     @classmethod
-    def from_bytes(cls, pgno: int, data: bytes) -> BtreePage:
+    def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry) -> BtreePage:
         offset = HEADER_SIZE if pgno == 1 else 0
         kind = data[offset]
         if kind not in (INDEX_INTERIOR, TABLE_INTERIOR, INDEX_LEAF, TABLE_LEAF):
@@ -395,15 +413,16 @@ class BtreePage:
         right = 0 if leaf else _u32.unpack_from(data, offset + 8)[0]
         pointers = offset + (8 if leaf else 12)
         try:
-            cells = [parse_cell(data, _u16.unpack_from(data, pointers + 2 * i)[0], kind) for i in range(count)]
+            cells = [parse_cell(data, _u16.unpack_from(data, pointers + 2 * i)[0], kind, geometry)
+                     for i in range(count)]
         except (IndexError, struct.error):
             raise corrupt(f"bad cell on page {pgno}") from None
-        return cls(pgno, kind, cells, right)
+        return cls(pgno, kind, cells, right, geometry=geometry)
 
     def to_bytes(self) -> bytes:
         kind, offset = self.kind, self.offset
-        page = bytearray(USABLE)
-        top = USABLE
+        page = bytearray(self.geometry.page_size)
+        top = self.geometry.usable
         pointers = []
         for cell in self.cells:
             data = cell.to_bytes(kind)
@@ -425,63 +444,66 @@ class BtreePage:
         return bytes(page)
 
     def copy(self) -> BtreePage:
-        return BtreePage(self.pgno, self.kind, list(self.cells), self.right)  # (cells are not changed)
+        return BtreePage(self.pgno, self.kind, list(self.cells), self.right,
+                         geometry=self.geometry)  # (cells are not changed)
 
 
 class OverflowPage:
-    def __init__(self, pgno: int, next_page: int = 0, data: bytes = b"") -> None:
+    def __init__(self, pgno: int, next_page: int = 0, data: bytes = b"", *, geometry: Geometry) -> None:
         self.pgno = pgno
         self.next_page = next_page
         self.data = data
+        self.geometry = geometry
 
     @classmethod
-    def from_bytes(cls, pgno: int, data: bytes) -> OverflowPage:
-        return cls(pgno, _u32.unpack_from(data)[0], bytes(data[4:]))
+    def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry) -> OverflowPage:
+        return cls(pgno, _u32.unpack_from(data)[0], bytes(data[4:geometry.usable]), geometry=geometry)
 
     def to_bytes(self) -> bytes:
-        return (_u32.pack(self.next_page) + self.data).ljust(USABLE, b"\x00")
+        return (_u32.pack(self.next_page) + self.data).ljust(self.geometry.page_size, b"\x00")
 
     def copy(self) -> OverflowPage:
-        return OverflowPage(self.pgno, self.next_page, self.data)
+        return OverflowPage(self.pgno, self.next_page, self.data, geometry=self.geometry)
 
 
 class TrunkPage:
     """A freelist trunk page: the next trunk and a list of free leaf pages."""
 
-    MAX_LEAVES = USABLE // 4 - 8  # what SQLite writes (it reads up to USABLE // 4 - 2)
-
-    def __init__(self, pgno: int, next_trunk: int = 0, leaves: list[int] | None = None) -> None:
+    def __init__(self, pgno: int, next_trunk: int = 0, leaves: list[int] | None = None, *,
+                 geometry: Geometry) -> None:
         self.pgno = pgno
         self.next_trunk = next_trunk
         self.leaves = leaves if leaves is not None else []
+        self.geometry = geometry
 
     @classmethod
-    def from_bytes(cls, pgno: int, data: bytes) -> TrunkPage:
+    def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry) -> TrunkPage:
         next_trunk, count = struct.unpack_from(">II", data)
-        if count > USABLE // 4 - 2:
+        if count > geometry.read_leaves:
             raise corrupt(f"freelist trunk page {pgno}")
-        return cls(pgno, next_trunk, list(struct.unpack_from(f">{count}I", data, 8)))
+        return cls(pgno, next_trunk, list(struct.unpack_from(f">{count}I", data, 8)), geometry=geometry)
 
     def to_bytes(self) -> bytes:
         data = struct.pack(f">II{len(self.leaves)}I", self.next_trunk, len(self.leaves), *self.leaves)
-        return data.ljust(USABLE, b"\x00")
+        return data.ljust(self.geometry.page_size, b"\x00")
 
     def copy(self) -> TrunkPage:
-        return TrunkPage(self.pgno, self.next_trunk, list(self.leaves))
+        return TrunkPage(self.pgno, self.next_trunk, list(self.leaves), geometry=self.geometry)
 
 
 class FreePage:
     """A free leaf page: its content does not matter (written as zeros)."""
 
-    def __init__(self, pgno: int) -> None:
+    def __init__(self, pgno: int, *, geometry: Geometry) -> None:
         self.pgno = pgno
+        self.geometry = geometry
 
     @classmethod
-    def from_bytes(cls, pgno: int, data: bytes) -> FreePage:
-        return cls(pgno)
+    def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry) -> FreePage:
+        return cls(pgno, geometry=geometry)
 
     def to_bytes(self) -> bytes:
-        return bytes(USABLE)
+        return bytes(self.geometry.page_size)
 
     def copy(self) -> FreePage:
-        return FreePage(self.pgno)
+        return FreePage(self.pgno, geometry=self.geometry)

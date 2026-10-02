@@ -107,7 +107,8 @@ def test_sqlite_files_pages_and_export(tmp_path):
 
     image = sqlite_file(tmp_path / "f.sqlite")
     info = json.loads(bridge.open_file(image, "f.sqlite"))
-    assert info == {"name": "f.sqlite", "format": "sqlite", "pages": len(image) // 4096, "bytes": len(image)}
+    assert info == {"name": "f.sqlite", "format": "sqlite", "pages": len(image) // 4096, "bytes": len(image),
+                    "page_size": 4096}
     names = [o["name"] for o in json.loads(bridge.objects())]
     assert names == ["sqlite_schema", "t", "t_name"]
     reference = sqlite3.connect(tmp_path / "f.sqlite")
@@ -177,12 +178,12 @@ def test_files_the_playground_refuses(tmp_path):
     bridge.reset()
     with pytest.raises(ValueError, match="不是 SQLite 数据库文件"):
         bridge.open_file(b"MiniDB or anything else", "x.db")
-    small = tmp_path / "small.sqlite"
-    connection = sqlite3.connect(small)
-    connection.executescript("PRAGMA page_size = 1024; CREATE TABLE t (x); INSERT INTO t VALUES (1);")
+    utf16 = tmp_path / "utf16.sqlite"
+    connection = sqlite3.connect(utf16)
+    connection.executescript("PRAGMA encoding = 'UTF-16le'; CREATE TABLE t (x); INSERT INTO t VALUES (1);")
     connection.close()
-    with pytest.raises(Exception, match="page size of 1024"):
-        bridge.open_file(small.read_bytes(), "small.sqlite")
+    with pytest.raises(Exception, match="UTF-16"):
+        bridge.open_file(utf16.read_bytes(), "utf16.sqlite")
     assert json.loads(bridge.info())["format"] == "minidb"  # (still the database it had)
     with pytest.raises(Exception, match="SQLite's file format"):
         bridge.export()
