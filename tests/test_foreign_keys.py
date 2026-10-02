@@ -254,3 +254,86 @@ def test_defer_foreign_keys_ends_with_an_implicit_transaction(pair, statement):
     for sql in ["CREATE TABLE t (a)", "CREATE INDEX ti ON t (a)", "PRAGMA defer_foreign_keys = ON", statement,
                 "PRAGMA defer_foreign_keys"]:
         pair.run(sql)
+
+
+def test_replace_rechecks_with_a_stale_row_id(pair):
+    """With foreign keys on, after a REPLACE SQLite checks the REPLACE indexes
+    again, comparing the row id its last index lookup found (not the one it
+    finds now) with the updated row's: an index the UPDATE checks but whose
+    key it kept reports a conflict with the row itself.  Which indexes an
+    UPDATE checks: those with a column it sets, all with an ON UPDATE action."""
+    for sql in [
+        'PRAGMA foreign_keys = ON',
+        'CREATE TABLE t0 (id INTEGER PRIMARY KEY, c0, c1 TEXT UNIQUE)',
+        'CREATE TABLE t1 (c0 REFERENCES t0(c1) ON UPDATE CASCADE)',
+        'CREATE UNIQUE INDEX i11 ON t0 (id)',
+        "INSERT INTO t0 VALUES (27, NULL, NULL), (29, 1.0, '1')",
+        'UPDATE OR REPLACE t0 SET c1 = 1 WHERE rowid = 27',
+        'SELECT * FROM t0',
+        'CREATE TABLE p (id INTEGER PRIMARY KEY, a UNIQUE, b UNIQUE)',
+        'CREATE TABLE c (x REFERENCES p(a))',
+        "INSERT INTO p VALUES (1, 'a', 'b'), (2, 'x', 'y')",
+        "UPDATE OR REPLACE p SET a = 'x', b = b WHERE id = 1",
+        'SELECT * FROM p',
+        "UPDATE OR REPLACE p SET b = b, a = 'x' WHERE id = 1",
+        'SELECT * FROM p',
+        "INSERT INTO p VALUES (3, 'q', 'r')",
+        "UPDATE OR REPLACE p SET a = 'x' WHERE id = 3",
+        'SELECT * FROM p',
+        'CREATE TABLE q (id INTEGER PRIMARY KEY, a UNIQUE ON CONFLICT REPLACE, b UNIQUE)',
+        'CREATE TABLE qc (x REFERENCES q(a))',
+        "INSERT INTO q VALUES (1, 'a', 'b'), (2, 'x', 'y')",
+        "UPDATE q SET a = 'x', b = b WHERE id = 1",
+        'SELECT * FROM q',
+        "REPLACE INTO q VALUES (1, 'x', 'z')",
+        'SELECT * FROM q',
+        'PRAGMA foreign_keys = OFF',
+        "INSERT INTO p VALUES (4, 'm', 'n')",
+        "UPDATE OR REPLACE p SET a = 'm', b = b WHERE id = 1",
+        'SELECT * FROM p',
+    ]:
+        pair.run(sql)
+
+
+def test_upsert_update_checks_its_own_foreign_keys(pair):
+    """An upsert's UPDATE is compiled before the REPLACE's DELETE, so the
+    SET NULL action of that DELETE does not make SQLite leave out the
+    UPDATE's check of the new row (isSetNullAction)."""
+    for sql in [
+        "PRAGMA foreign_keys = ON",
+        "CREATE TABLE t1 (id INTEGER PRIMARY KEY, c0 REFERENCES t1(id) ON DELETE SET NULL, c1 TEXT, "
+        "c2 INT NOT NULL, c4, UNIQUE (c1, c2))",
+        "REPLACE INTO t1 VALUES (1, NULL, NULL, 'a1', 1), (1, 1, 0, 0, 'A') ON CONFLICT (id) DO UPDATE SET c1 = 0, c0 = 2",
+        "INSERT INTO t1 VALUES (1, NULL, NULL, 'a1', 1), (1, 1, 0, 0, 'A') ON CONFLICT (id) DO UPDATE SET c1 = 0, c0 = 2",
+        "REPLACE INTO t1 VALUES (3, NULL, 'x', 1, 1), (3, 1, 0, 0, 'A') ON CONFLICT (id) DO UPDATE SET c0 = 3",
+        "SELECT * FROM t1",
+    ]:
+        pair.run(sql)
+
+
+@pytest.mark.parametrize("child, index, value, parent", [
+    ("INTEGER", "CREATE INDEX ci ON c(x)", "'2.5'", "TEXT"),
+    ("REAL", "CREATE UNIQUE INDEX ci ON c(x, y)", "'5'", "TEXT"),
+    ("NUMERIC", "CREATE INDEX ci ON c(x)", "5.0", ""),
+    ("NUMERIC", "CREATE INDEX ci ON c(x)", "5.0", "REAL"),
+    ("INTEGER", "CREATE INDEX ci ON c(x)", "'abc'", "TEXT"),
+    ("INTEGER", "CREATE INDEX ci ON c(y, x)", "'2.5'", "TEXT"),
+    ("INTEGER", "CREATE INDEX ci ON c(x COLLATE nocase)", "'2.5'", "TEXT"),
+    ("INTEGER", None, "'2.5'", "TEXT"),
+    ("TEXT", "CREATE INDEX ci ON c(x)", "5", "INTEGER"),
+])
+def test_child_index_converts_the_old_parent_key(pair, child, index, value, parent):
+    """SQLite applies a numeric child index's affinity to the deleted parent
+    row's key in place while it looks for children (ForeignKeys.convert_old):
+    the actions, AFTER triggers and RETURNING see the converted value."""
+    for sql in [
+        "PRAGMA foreign_keys = ON", f"CREATE TABLE p (id INTEGER PRIMARY KEY, k {parent} UNIQUE)",
+        f"CREATE TABLE c (x {child} REFERENCES p(k) ON DELETE SET NULL, y)", index or "SELECT 1",
+        "CREATE TABLE log (a, b)",
+        "CREATE TRIGGER t AFTER DELETE ON p BEGIN INSERT INTO log VALUES (old.k, typeof(old.k)); END",
+        "CREATE TRIGGER u AFTER UPDATE ON p BEGIN INSERT INTO log VALUES (old.k || '>' || new.k, typeof(old.k)); END",
+        f"INSERT INTO p VALUES (1, {value}), (2, {value} || 'z')", "INSERT INTO c VALUES ((SELECT k FROM p WHERE id = 1), 1)",
+        "UPDATE p SET k = k || 'q' WHERE id = 2 RETURNING k", "DELETE FROM p WHERE id = 1 RETURNING k",
+        "SELECT * FROM log", "SELECT * FROM c",
+    ]:
+        pair.run(sql)

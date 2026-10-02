@@ -244,6 +244,47 @@ class ForeignKeys:
         return any(self.child_changed(link, changed) for link in self.children_of(table)) or any(
             self.parent_changed(link, table, changed) for link in self.parents_of(table))
 
+    def every_index(self, table: TableInfo, changed: set[int] | None) -> bool:
+        """Whether an UPDATE setting ``changed`` makes SQLite check every
+        index of the row (sqlite3FkRequired returning 2): it sets a parent
+        key with an ON UPDATE action, or the child key of a foreign key to
+        its own table."""
+        if not self.enabled:
+            return False
+        name = ascii_lower(table.name)
+        return any(self.child_changed(link, changed) and ascii_lower(link.key.parent) == name
+                   for link in self.children_of(table)) or any(
+            self.parent_changed(link, table, changed) and link.key.on_update != "NO ACTION"
+            for link in self.parents_of(table))
+
+    def convert_old(self, table: TableInfo, row: list, changed: set[int] | None = None) -> None:
+        """A SQLite quirk: to find the children of a deleted (or re-keyed) parent
+        row with an index on a single-column child key, codeAllEqualityTerms
+        reuses the register of the old parent key and applies the index's
+        affinity (NUMERIC for a numeric child column) to it in place.  What
+        runs after that - the actions, AFTER triggers, RETURNING - sees the
+        converted value in ``row`` ('2.5' becomes 2.5).  The index must be
+        usable: the child column numeric (else the comparison is numeric
+        and a TEXT index is not), its first column with the parent's
+        collation; a parent key that is the row id is not converted."""
+        for link in self.parents_of(table):
+            if len(link.child_positions) != 1 or not self._usable(link) or link.index is None:
+                continue
+            if changed is not None and not self.parent_changed(link, table, changed):
+                continue
+            child, position = link.child, link.child_positions[0]
+            parent_position = link.parent_positions[0]
+            if position == child.rowid_column or child.affinities[position] not in (
+                    values.INTEGER, values.REAL, values.NUMERIC):
+                continue
+            collation = values.collation_name(table.collations[parent_position] or "BINARY")
+            if any(index.positions[0] == position and values.collation_name(index.collation_names[0]) == collation
+                   for index in child.indexes):
+                value = row[parent_position]
+                # (text is converted; a REAL too in a column without a type, not in a REAL column)
+                if isinstance(value, str) or isinstance(value, float) and table.affinities[parent_position] == values.BLOB:
+                    row[parent_position] = values.apply_affinity(value, values.NUMERIC)
+
     def may_abort(self, table: TableInfo, kind: str, changed: set[int] | None = None,
                   seen: set | None = None) -> bool:
         """Whether the foreign key code of an INSERT / UPDATE / DELETE on
