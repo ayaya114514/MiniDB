@@ -2187,6 +2187,7 @@ class Executor:
         self.outer_scope = None  # the NEW / OLD scope while a trigger's statements are compiled
         self.compiling_trigger = 0  # > 0: RAISE() is allowed
         self.frame_depth = 0  # trigger programs and foreign key actions running (SQLite's nFrame)
+        self.pinned = {}  # table name -> frame depth of an UPDATE whose REPLACE runs DELETE triggers (check_pinned)
         self.compile_depth = 0  # prepare() calls in progress
         self.program_log = []  # the programs the statement being compiled compiled, in order (log_program)
         self.program_seen = set()
@@ -3281,15 +3282,36 @@ class Executor:
         """Whether a REPLACE's delete of a row of ``table`` runs triggers."""
         return bool(self.settings["recursive_triggers"]) and self.triggers.exist(table.name, "DELETE")
 
-    def recheck_unique(self, table: TableInfo, tree: BTree, row: Row, rowid: int, own: int | None) -> None:
-        """After REPLACE ran DELETE triggers, SQLite checks the uniqueness
-        constraints again, as ABORT (the triggers may have kept a row - RAISE
-        (IGNORE) - or added one).  ``own``: the row id of the row being updated."""
-        for index in table.indexes:
-            if index.unique and self.find_conflict(index, row, own) is not None:
-                raise self.constraint_error(self.unique_error(table, index), "ABORT")
+    def replace_rechecks(self, table: TableInfo) -> bool:
+        """Whether SQLite checks the uniqueness constraints again after a
+        REPLACE deleted a row of ``table`` (its regTrigCnt): DELETE triggers
+        may run, or foreign key work (the table is in a foreign key)."""
+        return self.replace_fires(table) or self.foreign_keys.involved(table)
+
+    def recheck_unique(self, table: TableInfo, tree: BTree, row: Row, rowid: int, own: int | None,
+                       indexes: list[IndexInfo], last_found: int | None = None) -> None:
+        """After a REPLACE that may have run triggers or foreign key actions,
+        SQLite checks the row id and the REPLACE ``indexes`` again, as ABORT
+        (the triggers may have kept a row - RAISE(IGNORE) - or added one).
+        ``own``: the row id of the row being updated.  The recheck copies the
+        first pass's code without reading the found entry's row id: it
+        compares the row id the first pass found last (``last_found``) with
+        ``own``, so an UPDATE trips over its own entry of an index whose key
+        it did not change when the first pass last found another row."""
         if rowid != own and rowid in tree:
             raise self.constraint_error(self.rowid_conflict(table).args[0], "ABORT")
+        for index in indexes:
+            if self.find_conflict(index, row, None) is not None and (own is None or last_found != own):
+                raise self.constraint_error(self.unique_error(table, index), "ABORT")
+
+    def check_pinned(self, table: TableInfo) -> None:
+        """SQLite pins the cursor of the row an UPDATE is changing while a
+        REPLACE of a UNIQUE conflict deletes another row and runs its DELETE
+        triggers (OP_CursorLock); a write to that table from them fails with
+        SQLITE_CONSTRAINT_PINNED."""
+        depth = self.pinned.get(table.name)
+        if depth is not None and self.frame_depth > depth:
+            raise self.constraint_error("constraint failed", "ABORT")
 
     def delete_row(self, table: TableInfo, tree: BTree, rowid: int, replace: bool = False,
                    orconf: str | None = None, fire: bool = True) -> Row | None:
@@ -3317,9 +3339,12 @@ class Executor:
         involved = keys.involved(table)
         if involved:
             keys.row_removing(table, row)
+        if self.pinned:
+            self.check_pinned(table)
         self.remove_index_entries(table, current, rowid)
         tree.delete(rowid)
         if involved:
+            keys.convert_old(table, row)
             keys.actions(table, row)
         if fire and triggers.matching(table.name, "AFTER", "DELETE"):
             try:
@@ -3454,16 +3479,19 @@ class Executor:
                 return None
             if how == "REPLACE":
                 self.delete_row(table, tree, other, replace=True)
-                replaced = replaced or self.replace_fires(table)
+                replaced = replaced or self.replace_rechecks(table)
                 continue
             message = self.rowid_conflict(table).args[0] if constraint == "rowid" else self.unique_error(table, constraint)
             raise self.constraint_error(message, how)
         if replaced:
-            self.recheck_unique(table, tree, row, rowid, None)
+            self.recheck_unique(table, tree, row, rowid, None,
+                                [c for c in constraints if c != "rowid" and (conflict or c.conflict) == "REPLACE"])
         if defaults is not None:
             defaults.converted = True  # (OP_MakeRecord converts in place too)
         if self.foreign_keys.involved(table):
             self.foreign_keys.row_inserted(table, row + [rowid], single)
+        if self.pinned:
+            self.check_pinned(table)
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
         if triggers.matching(table.name, "AFTER", "INSERT"):
@@ -3523,21 +3551,30 @@ class Executor:
                 if violation[1] == "IGNORE":
                     return None
                 raise self.constraint_error(*violation)
-        constraints = [i for i in table.indexes if i.unique]
+        # SQLite checks the indexes with a column the UPDATE sets, or all of
+        # them when it sets the row id or a foreign key needs it (update.c's aRegIdx).
+        width = len(table.columns)
+        every = (changed is None or table.rowid_column in changed or width in changed
+                 or self.foreign_keys.every_index(table, changed))
+        constraints = [i for i in table.indexes if i.unique and (every or any(p in changed for p in i.positions))]
         rowid_how = conflict or table.rowid_conflict() or "ABORT"
         if rowid_how == "REPLACE" and conflict is None and constraints:
             constraints.append("rowid")
         else:
             constraints.insert(0, "rowid")
-        replaced = False  # a REPLACE deleted a row and its DELETE triggers ran
+        replaced = False  # a REPLACE deleted a row and SQLite will check again (replace_rechecks)
+        last_found = None  # the row id the last index lookup found (recheck_unique)
         for constraint in constraints:
             if constraint == "rowid":
                 if new_rowid == rowid or new_rowid not in tree:
                     continue
                 other, how = new_rowid, rowid_how
             else:
-                other = self.find_conflict(constraint, row, rowid)
+                other = self.find_conflict(constraint, row, None)
                 if other is None:
+                    continue
+                last_found = other
+                if other == rowid:
                     continue
                 how = conflict or constraint.conflict or "ABORT"
             if how == "IGNORE":
@@ -3546,15 +3583,33 @@ class Executor:
                 message = (self.rowid_conflict(table).args[0] if constraint == "rowid"
                            else self.unique_error(table, constraint))
                 raise self.constraint_error(message, how)
-            self.delete_row(table, tree, other, replace=True)
-            replaced = replaced or self.replace_fires(table)
+            fires = self.replace_fires(table)
+            pin = fires and constraint != "rowid"
+            if pin:
+                saved_pin = self.pinned.get(table.name)
+                self.pinned[table.name] = self.frame_depth
+            try:
+                self.delete_row(table, tree, other, replace=True)
+            finally:
+                if pin:
+                    if saved_pin is None:
+                        del self.pinned[table.name]
+                    else:
+                        self.pinned[table.name] = saved_pin
+            replaced = replaced or fires or self.foreign_keys.involved(table)
         if replaced:
-            self.recheck_unique(table, tree, row, new_rowid, rowid)
+            self.recheck_unique(table, tree, row, new_rowid, rowid,
+                                [c for c in constraints if c != "rowid" and (conflict or c.conflict) == "REPLACE"],
+                                last_found)
         keys = self.foreign_keys
         involved = keys.involved(table) and keys.required(table, changed)
         if involved:
             keys.row_removing(table, old, changed)
+        if self.pinned:
+            self.check_pinned(table)
         self.remove_index_entries(table, current, rowid)
+        if involved:
+            keys.convert_old(table, old, changed)
         if new_rowid != rowid:
             tree.delete(rowid)
         if involved:
@@ -4602,7 +4657,7 @@ class PreparedInsert:
         for upsert in self.upserts:
             if upsert.assignments:
                 positions = {position for position, _ in upsert.assignments}
-                executor.compile_update(table, positions, "ABORT")
+                upsert.unchecked = executor.compile_update(table, positions, "ABORT")
                 names = [table.columns[p].name if p < width else "rowid" for p in positions]
                 multi = multi or triggers.exist(table.name, "UPDATE", names) or (
                     keys.enabled and keys.required(table, positions))
@@ -5013,6 +5068,7 @@ class PreparedUpsert:
         self.do_update = clause.assignments is not None
         self.assignments = []
         self.where = None
+        self.unchecked = None  # the foreign key its UPDATE leaves unchecked (Executor.set_null_link)
 
     def resolve(self) -> None:
         """Compile DO UPDATE's SET and WHERE.  Like SQLite, PreparedInsert
@@ -5088,8 +5144,13 @@ class PreparedUpsert:
         for position, function in self.assignments:
             new[position] = function(context)
         # (SQLite runs DO UPDATE as an UPDATE OR ABORT: the constraints' own ON CONFLICT does not apply.)
-        stored = executor.update_row(table, tree, rowid, old, new, "ABORT",
-                                     {position for position, _ in self.assignments})
+        keys = executor.foreign_keys
+        saved, keys.unchecked = keys.unchecked, self.unchecked  # (its UPDATE's own, see compile_update)
+        try:
+            stored = executor.update_row(table, tree, rowid, old, new, "ABORT",
+                                         {position for position, _ in self.assignments})
+        finally:
+            keys.unchecked = saved
         return None if stored is None else ("update", stored)  # (None: a trigger deleted or kept the row)
 
 

@@ -398,3 +398,34 @@ def test_upsert_skipped_by_a_trigger(pair):
         'SELECT changes(), total_changes()',
         'SELECT * FROM uu',
     ])
+
+
+def test_replace_pins_the_updated_row(pair):
+    """While an UPDATE's REPLACE of a UNIQUE conflict runs DELETE triggers,
+    a write to the same table from them fails ("constraint failed": SQLite's
+    pinned cursor); a REPLACE of the row id does not pin it."""
+    run(pair, [
+        'PRAGMA recursive_triggers = ON',
+        'CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE, c)',
+        'CREATE TABLE log(x)',
+        "INSERT INTO t VALUES (1, 'x', 0), (2, 'y', 0), (3, 'z', 0)",
+        'CREATE TRIGGER d AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.b); UPDATE t SET c = c + 1 WHERE a = 3; END',
+        "UPDATE OR REPLACE t SET b = 'y' WHERE a = 1",
+        'SELECT * FROM t',
+        'SELECT * FROM log',
+        'DROP TRIGGER d',
+        "CREATE TRIGGER d BEFORE DELETE ON t BEGIN INSERT INTO log VALUES ('b' || old.b); END",
+        "UPDATE OR REPLACE t SET b = 'z' WHERE a = 1",
+        'SELECT * FROM t',
+        'SELECT * FROM log',
+        "CREATE TRIGGER e AFTER DELETE ON t BEGIN DELETE FROM t WHERE a = 99; INSERT INTO t VALUES (50, 'q', 0); END",
+        "INSERT INTO t VALUES (10, 'k', 0), (11, 'm', 0)",
+        "UPDATE OR REPLACE t SET b = 'k' WHERE a = 11",
+        'SELECT * FROM t',
+        'UPDATE OR REPLACE t SET a = 10 WHERE a = 11',
+        'SELECT * FROM t',
+        'SELECT * FROM log',
+        'PRAGMA recursive_triggers = OFF',
+        "UPDATE OR REPLACE t SET b = 'k' WHERE a = 11",
+        'SELECT * FROM t',
+    ])
