@@ -107,6 +107,8 @@ class Generator:
                 constraint = (constraint + " COLLATE " + rng.choice(COLLATIONS)).strip()
             if rng.random() < 0.15:
                 constraint = (constraint + f" CHECK ({self.check(f'c{i}')})").strip()
+            if i == 0 and rng.random() < 0.4 and self.tables:
+                constraint = (constraint + " " + self.references(name)).strip()
             columns.append((f"c{i}", col_type, constraint))
         table = Table(name, columns, rowid_alias)
         self.tables.append(table)
@@ -121,6 +123,24 @@ class Generator:
         if rng.random() < 0.15:
             definitions.append(f"CHECK ({self.check(rng.choice(columns)[0])} OR c0 IS c1)")
         return f"CREATE TABLE {name} ({', '.join(definitions)})"
+
+    def references(self, name):
+        """A foreign key to an earlier table (or this one): its row id alias
+        or a UNIQUE column (else a mismatch, which SQLite reports as well)."""
+        rng = self.rng
+        parent = rng.choice(self.tables + [None])
+        if parent is None:
+            target = f"{name}(id)"
+        else:
+            keys = [c[0] for c in parent.columns if "UNIQUE" in c[2] or "PRIMARY KEY" in c[2]]
+            column = rng.choice(keys + ["c1"]) if keys else "c0"
+            target = f"{parent.name}({column})" if rng.random() < 0.8 else parent.name
+        actions = ""
+        for event in ("DELETE", "UPDATE"):
+            if rng.random() < 0.5:
+                actions += f" ON {event} " + rng.choice(["CASCADE", "SET NULL", "SET DEFAULT", "RESTRICT", "NO ACTION"])
+        deferred = " DEFERRABLE INITIALLY DEFERRED" if rng.random() < 0.2 else ""
+        return f"REFERENCES {target}{actions}{deferred}"
 
     def check(self, column):
         """A CHECK constraint that some rows fail."""
@@ -645,6 +665,9 @@ class Generator:
             return self.drop_index()
         if roll < 0.08:
             return rng.choice(["BEGIN", "COMMIT", "ROLLBACK"])
+        if roll < 0.082:
+            return rng.choice(["PRAGMA foreign_keys = ON", "PRAGMA foreign_keys = OFF", "PRAGMA foreign_key_check",
+                               "PRAGMA defer_foreign_keys = ON", "PRAGMA integrity_check"])
         if roll < 0.085:
             return "ANALYZE"  # statistics change later plans, never results
         if roll < 0.095:
@@ -675,7 +698,8 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
     snapshots = SnapshotReader(pair.mini, path, seed) if path is not None and format != "sqlite" else None
     history = []
     try:
-        setup = [(generator.create_table(), None) for _ in range(2)]
+        setup = [("PRAGMA foreign_keys = ON", None)] if seed % 2 else []
+        setup += [(generator.create_table(), None) for _ in range(2)]
         setup.append((generator.create_index(), None))
         for sql, parameters in setup + [generator.statement_with_parameters() for _ in range(statements)]:
             history.append(sql if parameters is None else f"{sql}  -- parameters: {parameters!r}")
@@ -707,6 +731,8 @@ def check_sqlite_file(pair, path):
 
     if pair.mini.in_transaction:
         pair.run("COMMIT")
+    if pair.mini.in_transaction:
+        pair.run("ROLLBACK")  # (COMMIT failed: deferred foreign key violations)
     other = sqlite3.connect(path)
     other.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
     try:

@@ -31,6 +31,7 @@ from operator import itemgetter
 from typing import Any, Protocol, Union
 
 from minidb import dates, functions, pragmas, values, window
+from minidb.foreign_keys import ForeignKeys
 from minidb.btree import BTree, IntKey
 from minidb.catalog import (
     HIGH, Catalog, IndexInfo, IndexKeyCodec, TableInfo, ViewInfo,
@@ -576,6 +577,8 @@ class Compiler:
                 expr = expr.operand
             elif isinstance(expr, Column):
                 return self.column_collation(expr)
+            elif isinstance(expr, Call) and expr.defer_affinity:
+                expr = expr.args[0]  # (a RIGHT JOIN's USING coalesce(): its first table's, as SQLite)
             else:
                 expr = next((child for child in collation_children(expr) if has_collate(child)), None)
                 if expr is None:
@@ -877,8 +880,8 @@ class Compiler:
             return lambda row: result
         items = [self.compile(item) for item in expr.items]
         convert = _AFFINITY_FUNCTIONS.get(affinity)
-        # SQLite makes x IN (y) x = y; otherwise the left side's collation applies.
-        if len(expr.items) == 1:
+        # SQLite makes x IN (<constant>) x = +<constant>; otherwise the left side's collation applies.
+        if len(expr.items) == 1 and is_parse_constant(expr.items[0]):
             collation = self.comparison_collation(expr.expr, expr.items[0])
         else:
             collation = self.collation(expr.expr)
@@ -1848,7 +1851,7 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
             if position is not None:
                 keys = [key_function(position, item, "IN") for item in conjunct.items]
                 if all(keys):
-                    if len(conjunct.items) == 1:
+                    if len(conjunct.items) == 1 and is_parse_constant(conjunct.items[0]):
                         collation = compiler.comparison_collation(conjunct.expr, conjunct.items[0])
                     else:
                         collation = compiler.collation(conjunct.expr) or "BINARY"
@@ -2111,6 +2114,7 @@ class Executor:
         self.data_version = 1  # PRAGMA data_version: bumped when another connection commits
         self.integrity_problems = None  # Database.integrity_check, for PRAGMA integrity_check
         self.in_transaction = lambda: False  # set by Database
+        self.foreign_keys = ForeignKeys(self)
 
     def execute(self, stmt: Statement, parameters: Sequence[SQLValue] = ()) -> Result:
         """Execute a parsed statement with the given parameter values (a list
@@ -2118,17 +2122,24 @@ class Executor:
         self.parameters[:] = parameters
         self.statement_journal = True
         dates.statement_time[0] = None  # 'now' is fixed for the length of a statement
+        keys = self.foreign_keys
+        keys.immediate = 0
+        keys.unchecked = None
         if isinstance(stmt, (Select, Compound, Values, Insert, Update, Delete)):
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
                 cache.clear()
             self.statement_journal = getattr(plan, "statement_journal", True)
-            return plan.run()
+            if keys.enabled and isinstance(stmt, (Insert, Update, Delete)) and keys.involved(plan.table):
+                self.statement_journal = self.statement_journal or self.foreign_keys_may_abort(stmt, plan)
+            result = plan.run()
+            self.check_foreign_keys()
+            return result
         if isinstance(stmt, CreateTable):
             self.catalog.create_table(stmt, self.check_constraints_compile)
             return Result()
         if isinstance(stmt, DropTable):
-            self.catalog.drop_table(stmt.name, stmt.if_exists)
+            self.drop_table(stmt)
             return Result()
         if isinstance(stmt, CreateIndex):
             return self.create_index(stmt)
@@ -2157,9 +2168,83 @@ class Executor:
             return Result(rows, columns)
         raise OperationalError(f"unsupported statement: {type(stmt).__name__}")
 
+    def foreign_keys_may_abort(self, stmt: Insert | Update | Delete, plan: Any) -> bool:
+        """Whether SQLite gives a statement on a table with foreign keys a
+        statement journal for them: when it writes several rows (any UPDATE
+        or DELETE with foreign key work does) and their code may abort."""
+        keys = self.foreign_keys
+        if isinstance(stmt, Insert):
+            # (a REPLACE deletes rows; an upsert updates them)
+            return plan.multi_write and (keys.may_abort(plan.table, "insert") or (
+                replace_possible(plan.table, plan.conflict, True) and keys.may_abort(plan.table, "delete")) or (
+                any(u.do_update for u in plan.upserts) and keys.may_abort(plan.table, "update")))
+        if isinstance(stmt, Update):
+            return keys.required(plan.table, plan.changed) and keys.may_abort(plan.table, "update", plan.changed)
+        return keys.may_abort(plan.table, "delete")
+
+    def check_foreign_keys(self) -> None:
+        """At the end of a statement: immediate foreign key violations fail
+        it; deferred ones too when it is not inside a transaction (it
+        commits now)."""
+        keys = self.foreign_keys
+        if keys.statement_failed() or (not self.in_transaction() and keys.transaction_failed()):
+            raise self.constraint_error("FOREIGN KEY constraint failed", "ABORT")
+
+    def drop_table(self, stmt: DropTable) -> None:
+        """DROP TABLE; with foreign keys on, a parent table is emptied first
+        (its children's actions run, violations count), as SQLite does."""
+        keys = self.foreign_keys
+        table = self.catalog.tables.get(ascii_lower(stmt.name))
+        if keys.enabled and table is not None and ascii_lower(table.name) != "sqlite_sequence":
+            self.catalog.check_writable(table, "dropped")
+            deferred_child = any(link.deferred or keys.defer_all() for link in keys.children_of(table))
+            if keys.parents_of(table) or (deferred_child and keys.transaction_failed()):
+                tree = self.catalog.table_tree(table)
+                for rowid in list(tree.keys()):
+                    if rowid in tree:
+                        self.delete_row(table, tree, rowid)
+                        keys.extra_changes += 1  # (total_changes() counts them, as in SQLite)
+                if not keys.defer_all() and keys.statement_failed():
+                    raise self.constraint_error("FOREIGN KEY constraint failed", "ABORT")
+        self.catalog.drop_table(stmt.name, stmt.if_exists)
+
+    def constant(self, expr: Expr) -> SQLValue:
+        """The value of a constant expression (a DEFAULT)."""
+        return Compiler(Scope(), executor=self).compile(expr)([])
+
     def foreign_key_violations(self, table_name: object = None) -> list[tuple]:
-        """PRAGMA foreign_key_check: (table, rowid, parent, foreign key number) rows."""
-        return []
+        """PRAGMA foreign_key_check: (table, rowid, parent, foreign key number)
+        for each child row whose parent is missing, as SQLite reports them."""
+        keys = self.foreign_keys
+        catalog = self.catalog
+        if table_name is not None:
+            table = catalog.tables.get(ascii_lower(str(table_name)))
+            if table is None:
+                raise OperationalError(f"no such table: {table_name}")
+            tables = [table]
+        else:
+            tables = sorted(catalog.tables.values(), key=lambda t: t.schema_key or 0, reverse=True)
+        found = []
+        for table in tables:
+            links = keys.children_of(table)
+            if not links:
+                continue
+            for link in links:
+                if ascii_lower(link.key.parent) in catalog.tables:
+                    try:
+                        link.locate(catalog.tables)
+                    except Exception as exc:  # (a mismatch)
+                        raise OperationalError(str(exc)) from None
+            for rowid, record in catalog.table_tree(table).scan():
+                row = self.load_row(table, rowid, record)
+                for link in links:
+                    if ascii_lower(link.key.parent) not in catalog.tables:
+                        missing = all(row[table.column_index(n)] is not None for n in link.key.columns)
+                    else:
+                        missing = keys.parent_exists(link, row) is False
+                    if missing:
+                        found.append((table.name, rowid, link.key.parent, link.number))
+        return found
 
     def prepare(self, stmt: Select | Compound | Insert | Update | Delete) -> PreparedStatement:
         """The compiled plan of a SELECT/INSERT/UPDATE/DELETE.  Plans are kept
@@ -2875,7 +2960,7 @@ class Executor:
         becomes the column's default first, if that is not NULL (also in
         ``raw``, the values before affinities, which upserts may see)."""
         for i, column in enumerate(table.columns):
-            if column.not_null and row[i] is None:
+            if column.not_null and row[i] is None and i != table.rowid_column:  # (a NULL there: a new row id)
                 how = conflict or column.not_null_conflict or "ABORT"
                 if how == "REPLACE" and column.default is not None:
                     value = Compiler(Scope(), executor=self).compile(column.default)([])
@@ -2930,7 +3015,7 @@ class Executor:
             def failed(row, test=test):
                 value = test(row)
                 return value is not None and not truth(value)
-            checks.append((f"CHECK constraint failed: {check.name or check.text}", failed, positions))
+            checks.append((f"CHECK constraint failed: {check.name or sqlite_dequote(check.text)}", failed, positions))
         return checks
 
     @staticmethod
@@ -2959,10 +3044,17 @@ class Executor:
         return "UNIQUE constraint failed: " + ", ".join(f"{table.name}.{c}" for c in index.column_names)
 
     def delete_row(self, table: TableInfo, tree: BTree, rowid: int) -> Row:
-        """Delete a row and its index entries; returns it (with its row id)."""
+        """Delete a row and its index entries; returns it (with its row id).
+        With foreign keys on: their checks before, their actions after."""
         row = self.load_row(table, rowid, tree.get(rowid))
+        keys = self.foreign_keys
+        involved = keys.involved(table)
+        if involved:
+            keys.row_removing(table, row)
         self.remove_index_entries(table, row, rowid)
         tree.delete(rowid)
+        if involved:
+            keys.actions(table, row)
         return row
 
     def check_unique(self, table: TableInfo, row: Row, rowid: int) -> None:
@@ -3080,6 +3172,8 @@ class Executor:
             raise self.constraint_error(message, how)
         if defaults is not None:
             defaults.converted = True  # (OP_MakeRecord converts in place too)
+        if self.foreign_keys.involved(table):
+            self.foreign_keys.row_inserted(table, row + [rowid])
         tree.insert(rowid, self.encode(table, row))
         self.add_index_entries(table, row, rowid)
         return "insert", row + [rowid]
@@ -3137,11 +3231,19 @@ class Executor:
                            else self.unique_error(table, constraint))
                 raise self.constraint_error(message, how)
             self.delete_row(table, tree, other)
+        keys = self.foreign_keys
+        involved = keys.involved(table) and keys.required(table, changed)
+        if involved:
+            keys.row_removing(table, old, changed)
         self.remove_index_entries(table, old, rowid)
         if new_rowid != rowid:
             tree.delete(rowid)
+        if involved:
+            keys.row_adding(table, row + [new_rowid], changed)
         tree.insert(new_rowid, self.encode(table, row), replace=True)
         self.add_index_entries(table, row, new_rowid)
+        if involved:
+            keys.actions(table, old, row + [new_rowid], changed)
         return row + [new_rowid]
 
     def compile_returning(self, items: list[SelectItem] | None, scope: Scope) -> tuple[list[RowFunction], list[str]] | None:
@@ -3686,6 +3788,7 @@ class CompiledSelect:
             self.windows = None
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
+        self.first_row_only = self.is_aggregate and self.min_max_on_equal_column(stmt)
         # True when the first table's access path already yields ORDER BY order.
         self.presorted = bool(
             self.levels and order_columns and not self.is_aggregate and self.windows is None
@@ -3693,6 +3796,52 @@ class CompiledSelect:
             and self.levels[0].offset == scope.entries[0].offset  # (the join order may put another table first)
             and follows_order(order_columns, self.levels[0].access.order())
         )
+
+    def min_max_on_equal_column(self, stmt: Select) -> bool:
+        """Whether SQLite reads only the first row of this aggregate query.
+        For a lone min(x) / max(x) without GROUP BY, SQLite asks the WHERE
+        loop for rows in x order and stops after the first; a WHERE term
+        "x = <expression of other tables>" (or IS) under x's collation makes
+        that order hold for any loop - although under a numeric comparison
+        '1' and '1.0' both equal 1.0.  So the result is the first matching
+        row's x, as SQLite gives it."""
+        scope, calls = self.scope, self.aggregates.calls
+        if stmt.group_by or stmt.having is not None or len(calls) != 1 or len(scope.entries) != 1:
+            return False
+        name, args, _, filter_ = calls[0]
+        if name not in ("MIN", "MAX") or len(args) != 1 or filter_ is not None:
+            return False
+        call = next((node for e in self.exprs for node in walk(e) if isinstance(node, Call)
+                     and node.name.upper() == name and len(node.args) == 1 and node.over is None), None)
+        if call is None or not isinstance(strip_collate(call.args[0]), Column):
+            return False
+        compiler = Compiler(scope, executor=self.executor)
+
+        def local_slot(expr):
+            try:
+                slot, _, _, depth = scope.resolve(expr)
+            except (AliasReference, OperationalError):
+                return None
+            return slot if depth == 0 else None
+
+        slot = local_slot(strip_collate(call.args[0]))
+        if slot is None:
+            return False
+        wanted = compiler.collation(call.args[0]) or "BINARY"
+        for term in split_conjuncts(stmt.where):
+            if not isinstance(term, Binary) or term.op not in ("=", "==", "IS"):
+                continue
+            for column, other in ((term.left, term.right), (term.right, term.left)):
+                column = strip_collate(column)
+                if not isinstance(column, Column) or local_slot(column) != slot:
+                    continue
+                if any(isinstance(node, (Column, Select, Compound, Exists, InSelect, Subquery))
+                       and (not isinstance(node, Column) or local_slot(node) is not None)
+                       for node in walk(other)):
+                    continue
+                if ascii_lower(compiler.comparison_collation(term.left, term.right)) == ascii_lower(wanted):
+                    return True
+        return False
 
     @property
     def collations(self) -> list[str | None]:
@@ -3797,6 +3946,8 @@ class CompiledSelect:
         if max_rows is not None and not self.order_terms and not self.distinct:
             end = max_rows if end is None else min(end, start + max_rows)
         if self.is_aggregate:
+            if self.first_row_only:
+                rows = itertools.islice(rows, 1)
             truth, having = values.truth, self.having
             rows = (
                 group_row
@@ -3974,7 +4125,7 @@ class PreparedInsert:
             self.check_count(stmt, len(exprs))
             self.rows.append([compiler.compile(e) for e in exprs])
         self.tree = executor.catalog.table_tree(table)
-        multi_write = self.query is not None or len(self.rows) > 1
+        multi_write = self.multi_write = self.query is not None or len(self.rows) > 1
         self.statement_journal = multi_write and (self.may_abort() or calls_function(stmt))
 
     def may_abort(self) -> bool:
@@ -4034,6 +4185,25 @@ class PreparedInsert:
             for position, default in self.defaults:
                 row[position] = default([])
             rows.append(row)
+        keys = executor.foreign_keys
+        if keys.enabled:
+            # As SQLite compiles it: a REPLACE that may delete rows codes the
+            # foreign key work of a delete; it, RETURNING and a SELECT make
+            # the statement a multi-row write; DO UPDATE is an UPDATE.
+            replaces = keys.involved(table) and replace_possible(
+                table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
+            multi = self.multi_write or self.returning is not None or replaces
+            keys.prepare(table, "insert", single_insert=not multi)
+            if replaces:
+                keys.prepare(table, "delete")
+            steps = []
+            for upsert in self.upserts:
+                if upsert.assignments:
+                    keys.prepare(table, "update", {position for position, _ in upsert.assignments})
+                    steps.append(("update", {position for position, _ in upsert.assignments}))
+            if replaces:
+                steps.append(("delete", None))
+            keys.unchecked = keys.last_action_program(table, steps) if steps else None
         changed = []  # rows inserted or updated by an upsert, with their row ids
         defaults = DefaultRegisters([position for position, _ in self.defaults])
         sequence = None
@@ -4085,12 +4255,19 @@ class PreparedSingleTable:
         self.levels, self.constants = executor.plan_joins(self.scope, joins, where)
         self.rowid_slot = self.scope.rowid_slot(0)
 
-    def matching_rows(self) -> list[tuple[int, Row]]:
-        """(rowid, row copy) of every matching row, all found before any change."""
+    def matching_rows(self, two_pass: bool = False) -> list[tuple[int, Row]]:
+        """(rowid, row copy) of every matching row, all found before any
+        change.  When SQLite can't change the rows during its scan (foreign
+        keys, RETURNING, REPLACE, a new rowid), it collects the rowids in a
+        RowSet or a temporary table first, and so works through them in
+        rowid order: an order foreign key actions and REPLACE can show."""
         slot = self.rowid_slot
         if not passes_constants(self.constants, self.scope):
             return []
-        return [(row[slot], list(row)) for row in self.executor.join_rows(self.scope, self.levels)]
+        rows = [(row[slot], list(row)) for row in self.executor.join_rows(self.scope, self.levels)]
+        if two_pass:
+            rows.sort(key=itemgetter(0))
+        return rows
 
 
 class PreparedUpdate(PreparedSingleTable):
@@ -4112,7 +4289,7 @@ class PreparedUpdate(PreparedSingleTable):
         # take part in, under ABORT (REPLACE, for NOT NULL).
         changed = self.changed = {p for p, _ in self.assignments}
         width = len(table.columns)
-        rowid_changed = bool(changed & {width, table.rowid_column})
+        rowid_changed = self.rowid_changed = bool(changed & {width, table.rowid_column})
         conflict = stmt.conflict
         self.statement_journal = calls_function(stmt) or any(
             (conflict or table.columns[p].not_null_conflict or "ABORT") in ("ABORT", "REPLACE")
@@ -4128,11 +4305,21 @@ class PreparedUpdate(PreparedSingleTable):
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
+        keys = executor.foreign_keys
+        if keys.enabled:
+            keys.prepare(table, "update", self.changed)
+            keys.unchecked = None
+            if keys.involved(table) and replace_possible(table, self.conflict, bool(
+                    self.changed & {len(table.columns), table.rowid_column}), self.changed):
+                keys.prepare(table, "delete")
+                keys.unchecked = keys.last_action_program(table, [("delete", None)])
         changed = []
         try:
-            for rowid, old in self.matching_rows():
-                if self.may_replace and rowid not in tree:
-                    continue  # an earlier row's REPLACE deleted it
+            two_pass = self.may_replace or self.rowid_changed or self.returning is not None or (
+                keys.enabled and keys.required(table, self.changed))
+            for rowid, old in self.matching_rows(two_pass):
+                if (self.may_replace or keys.enabled) and rowid not in tree:
+                    continue  # an earlier row's REPLACE (or a foreign key action) deleted it
                 new = list(old)
                 for position, function in self.assignments:
                     new[position] = function(old)
@@ -4153,17 +4340,32 @@ class PreparedDelete(PreparedSingleTable):
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
-        if self.delete_all:
+        keys = executor.foreign_keys
+        involved = keys.involved(table)
+        if involved:
+            keys.prepare(table, "delete")
+        if self.delete_all and not involved:
             count = len(tree)
             tree.clear()
             for index in table.indexes:
                 executor.catalog.index_tree(index).clear()
             return Result(rowcount=count)
-        matches = self.matching_rows()
-        for rowid, row in matches:
-            executor.remove_index_entries(table, row, rowid)
-            tree.delete(rowid)
-        return returning_result(self.returning, [row for _, row in matches])
+        matches = self.matching_rows(involved or self.returning is not None)
+        if not involved:
+            for rowid, row in matches:
+                executor.remove_index_entries(table, row, rowid)
+                tree.delete(rowid)
+            return returning_result(self.returning, [row for _, row in matches])
+        deleted = []
+        try:
+            for rowid, row in matches:
+                if rowid not in tree:
+                    continue  # (a foreign key action deleted it)
+                deleted.append(executor.delete_row(table, tree, rowid))
+        except Error as exc:
+            exc.changes = len(deleted)
+            raise
+        return returning_result(self.returning, deleted)
 
 
 class PreparedUpsert:
@@ -4432,6 +4634,46 @@ def walk_nodes(node: object) -> Iterator[object]:
         for f in dataclasses.fields(node):
             if f.compare:
                 yield from walk_nodes(getattr(node, f.name))
+
+
+def replace_possible(table: TableInfo, conflict: str | None, rowid_checked: bool,
+                     changed: set[int] | None = None, handled: list | None = None) -> bool:
+    """Whether a REPLACE could delete rows of ``table`` (a uniqueness
+    constraint resolved by REPLACE that the statement checks; an UPDATE that
+    changes the row id rewrites, so checks, every index).  ``handled``: the
+    constraints an upsert takes over (None among them: all)."""
+    handled = handled or []
+    if None in handled:
+        return False
+    if changed is not None and rowid_checked:
+        changed = None
+    rowid_checked = rowid_checked and "rowid" not in handled
+    indexes = [index for index in table.indexes if index.unique and index not in handled
+               and (changed is None or changed & set(index.positions))]
+    if conflict is not None:
+        return conflict == "REPLACE" and (rowid_checked or bool(indexes))
+    if rowid_checked and table.rowid_conflict() == "REPLACE":
+        return True
+    return any(index.conflict == "REPLACE" for index in indexes)
+
+
+def sqlite_dequote(text: str) -> str:
+    """SQLite's sqlite3Dequote, which names an unnamed CHECK constraint after
+    its text: text starting with a quote keeps only what is quoted there
+    (so "CHECK ([UnitPrice] >= 0)" fails as "UnitPrice")."""
+    if not text or text[0] not in "\"'`[":
+        return text
+    quote = "]" if text[0] == "[" else text[0]
+    result = []
+    i = 1
+    while i < len(text):
+        if text[i] == quote:
+            if text[i + 1:i + 2] != quote:
+                break
+            i += 1
+        result.append(text[i])
+        i += 1
+    return "".join(result)
 
 
 def check_positions(table: TableInfo, check: CheckConstraint) -> set[int]:

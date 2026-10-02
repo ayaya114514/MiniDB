@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sys
 from collections import OrderedDict
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from minidb.catalog import Catalog
-from minidb.errors import DatabaseError, OperationalError, ProgrammingError
+from minidb.errors import DatabaseError, IntegrityError, OperationalError, ProgrammingError
 from minidb.executor import Executor, Result
 from minidb.locking import LockTimeout
 from minidb.pager import Pager
@@ -157,11 +158,15 @@ class Database:
                 raise
             self.in_transaction = True
             return Result()
+        keys = self.executor.foreign_keys
         if isinstance(stmt, Commit):
             if not self.in_transaction:
                 raise OperationalError("cannot commit - no transaction is active")
+            if keys.transaction_failed():
+                raise IntegrityError("FOREIGN KEY constraint failed")  # (the transaction stays open)
             self._commit()  # a lock timeout leaves the transaction open
             self.in_transaction = False
+            self._transaction_ended()
             pager.end_transaction()
             return Result()
         if isinstance(stmt, Rollback):
@@ -188,6 +193,8 @@ class Database:
         elif writes:
             pager.begin_write(wait=False)
         pager.begin_statement()
+        saved = keys.deferred, keys.deferred_immediate
+        keys.extra_changes = 0
         try:
             result = self.executor.execute(stmt, parameters)
         except BaseException as exc:
@@ -197,6 +204,15 @@ class Database:
             # another reason only if it compiled it with a statement journal
             # (Executor.statement_journal); otherwise the changes stay.
             resolution = getattr(exc, "resolution", None)
+            if resolution == "FAIL" and (keys.statement_failed() or (
+                    not self.in_transaction and keys.transaction_failed())):
+                # SQLite checks foreign keys when OR FAIL stops a statement too:
+                # a violation turns it into a foreign key error that undoes the statement.
+                failure = IntegrityError("FOREIGN KEY constraint failed")
+                failure.resolution = resolution = "ABORT"
+                exc = failure
+            self.total_changes += keys.extra_changes  # (completed foreign key actions count anyway)
+            self.executor.total_changes = self.total_changes
             if isinstance(stmt, (Insert, Update, Delete)):
                 self.executor.changes = 0
             if resolution == "FAIL":
@@ -208,6 +224,7 @@ class Database:
             if resolution == "FAIL":
                 self._end_statement()
                 raise
+            keys.deferred, keys.deferred_immediate = saved  # (SQLite's statement journal keeps them too)
             pager.rollback_statement()
             self.catalog.load()
             if resolution == "ROLLBACK" and self.in_transaction:
@@ -216,15 +233,20 @@ class Database:
                 pager.end_transaction()
             elif not self.in_transaction:
                 pager.end_transaction()
+            if exc is not sys.exc_info()[1]:
+                raise exc from None
             raise
         self._end_statement()
         if isinstance(stmt, Vacuum) and writes and not self.broken:
             pager.checkpoint()  # shrinks the file, unless another connection is reading
         if result.rowcount > 0:
             self.total_changes += result.rowcount
+        self.total_changes += keys.extra_changes  # (rows foreign key actions changed)
+        if writes and not self.in_transaction:
+            self._transaction_ended()
         if isinstance(stmt, (Insert, Update, Delete)):
             self.executor.changes = max(result.rowcount, 0)
-            self.executor.total_changes = self.total_changes
+        self.executor.total_changes = self.total_changes
         return result
 
     def _end_statement(self) -> None:
@@ -270,6 +292,12 @@ class Database:
         """Discard all uncommitted changes."""
         self.pager.rollback()
         self.catalog.load()
+        self._transaction_ended()
+
+    def _transaction_ended(self) -> None:
+        """Deferred foreign key violations and PRAGMA defer_foreign_keys end with the transaction."""
+        self.executor.foreign_keys.reset_transaction()
+        self.executor.settings["defer_foreign_keys"] = 0
 
     def integrity_check(self) -> list[str]:
         """Check page checksums, every B+ tree and every index; returns a list

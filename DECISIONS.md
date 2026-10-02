@@ -851,3 +851,48 @@ BINARY / NOCASE / RTRIM 三种内置规则，其它名字报 “no such collatio
 是把两边排好序后归并，此前 MiniDB 取最后一行，1 与 1.0 时就能看出来）；裸列（以及在一个 NOCASE 分组里各不相同的
 GROUP BY 值）取哪一行照 SQLite 的 updateAccumulator：每个 `min()` / `max()` 设置“命中”寄存器（跳过即不载入；值为 NULL
 而已有最值时也算跳过），带 FILTER 的先设成“不是组内第一行”，没有 min/max 时只取组内第一行。
+
+## D107 PRAGMA：一张规格表，值和报告照 SQLite
+`minidb/pragmas.py` 里每个 PRAGMA 是一条 `Spec`（报告的列、读写函数、是否需要表名参数、是否写库），`PRAGMA x`、
+`PRAGMA x = v`、`PRAGMA x(v)` 和表值函数 `pragma_x(参数, schema)` 都走它。
+- **值的解析**照 SQLite：整数用 sqlite3Atoi 的规则（`'12abc'` 是 12，`-3.9` 是 -3，超出 32 位截断），布尔用
+  sqlite3GetBoolean（on/yes/true/数字），不认识的值静默忽略。未知 PRAGMA 不报错、没有结果。
+- **文件头里的值**：`user_version`、`application_id`、`schema_version` 在 SQLite 格式里就是文件头的那几个字段；MiniDB
+  格式的文件头加了同样三项（旧文件读作 0）。改 schema 的提交把 `schema_version` 加一（两种格式），sqlite3 读得到。
+- **报告**：`table_info` / `table_xinfo`（声明类型照 SQLite 大写标准类型名，默认值去掉一层括号）、`index_list` /
+  `index_info` / `index_xinfo`、`foreign_key_list`（id 逆序编号，与 SQLite 相同）、`table_list`、`integrity_check` /
+  `quick_check`（在结构检查之外报告违反 NOT NULL / CHECK 的行，文本同 SQLite）、`foreign_key_check`、
+  `page_size` / `page_count` / `freelist_count`、`journal_mode`（只读：SQLite 格式是 delete，MiniDB 格式是 wal）、
+  `data_version`（其它连接提交过就变）。设置类（`foreign_keys`、`defer_foreign_keys`、`ignore_check_constraints`、
+  `recursive_triggers`、`cache_size` 等）是连接上的字典。
+- **表值函数**：`pragma_x` 的参数是隐藏列 `arg` / `schema`，横向引用（`FROM sqlite_master m JOIN pragma_table_info(m.name)`）
+  按 NOCASE 的等值连接实现；`*` 不展开隐藏列。
+
+## D108 外键：照 SQLite fkey.c 的计数器模型
+`minidb/foreign_keys.py`。`PRAGMA foreign_keys` 默认关，事务里改它无效（与 SQLite 相同）。
+- **计数器**：立即约束的违反记在语句计数器上，语句结束时非零就报 “FOREIGN KEY constraint failed” 并撤销语句；
+  `DEFERRABLE INITIALLY DEFERRED` 的记在事务计数器上，COMMIT 时非零则 COMMIT 失败、事务保持打开；`PRAGMA
+  defer_foreign_keys` 把立即约束也推迟（并让 RESTRICT 退化成 NO ACTION）。子表加一行而父行不存在 +1，删一行 -1；父表
+  删除一行时，引用它的子行各 +1，新出现的父键让等着它的子行 -1（只在计数非零时才去找）。语句失败时延迟计数器随语句
+  日志一起恢复。
+- **找父行**照 sqlite3FkLocateIndex：父键是 rowid（INTEGER PRIMARY KEY）或一个列与排序规则都相同的 UNIQUE 索引，
+  找不到就是 “foreign key mismatch”，父表不存在是 “no such table: main.X”——都在编译语句时报（SQLite 的 sqlite3FkCheck
+  和 sqlite3FkOldmask：UPDATE 改到外键相关列、或任何 DELETE 时，涉及的所有外键都要能定位，动作要执行的语句也递归编译）。
+- **找子行**照 fkScanChildren：父键值带父列的亲和性和排序规则，与子列比较；而动作（SET NULL / SET DEFAULT / CASCADE /
+  RESTRICT）是 SQLite 生成的触发器 `... WHERE OLD.父列 = 子列`，OLD.x 有父列的排序规则却**没有亲和性**，所以比较用子列的
+  亲和性（实测：REAL 父键 -1.0 与 TEXT 子值 '-1' 计数时相等，SET NULL 却找不到它，于是删除报错）。ON UPDATE 动作只在
+  键在父列排序规则下真的变了时执行（`OLD.x IS NOT NEW.x`）。子表上有以外键列开头、排序规则相同、亲和性允许的索引时
+  按索引查（SQLite 的 sqlite3IndexAffinityOk），否则全表扫描。
+- **顺序**：动作在父行删除/更新之后执行；两遍式的 UPDATE / DELETE（有外键工作、RETURNING、REPLACE、改 rowid）
+  按 rowid 顺序处理行——SQLite 先把 rowid 收进 RowSet / 临时表再逐个处理，外键动作和 REPLACE 都看得出顺序。
+- **语句日志**：SQLite 只在外键代码可能中止语句时（sqlite3MayAbort：加行时有立即外键；删父键而动作不是 CASCADE /
+  SET NULL；RESTRICT；动作执行的语句里同样的情况）给多行语句开语句日志；没有日志时，事务里因别的原因失败的语句保留
+  已做的修改。MiniDB 照此判断（动作语句里稍保守：碰到任何约束都算）。
+- **怪癖照搬**：sqlite3FkCheck 的 isSetNullAction——最后编译的动作程序若是 SET NULL，就跳过那个外键对新行的检查；
+  OR FAIL 停下时若有外键违反，变成撤销语句的外键错误；`total_changes()` 计入已完成的动作改动（即使语句随后失败）和
+  DROP TABLE 删父表前隐式删除的行。DROP TABLE 父表时先删全部行（执行动作，不报 mismatch）。
+顺带修正（fuzz 找到）：RIGHT / FULL JOIN 的 USING 用的 `coalesce(左边各表的列)` 带第一个参数的排序规则（SQLite 的
+AFF_DEFER）；单独的 `min(x)` / `max(x)` 且 WHERE 有 `x = <别的表的表达式>` 时，SQLite 认为 x 已有序，只读第一行
+（所以数值比较下 '1' 和 '1.0' 都相等时，结果是扫描到的第一行，不是最小值），MiniDB 照做；INTEGER PRIMARY KEY 上的
+NOT NULL 不拦插入 NULL（那是“分配新 rowid”，Chinook 的表都这样写）；未命名 CHECK 的报错名照 sqlite3Dequote 处理原文
+（`[UnitPrice]>=(0)` 报成 “UnitPrice”，Northwind）。
