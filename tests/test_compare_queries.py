@@ -1286,6 +1286,42 @@ def test_which_row_compounds_and_groups_keep():
     pair.close()
 
 
+def test_right_join_using_collation():
+    """In a FROM clause with a RIGHT JOIN, USING compares coalesce() of the
+    left tables' columns: it has the first one's collation (and affinity)."""
+    pair = Pair()
+    for sql in [
+        "CREATE TABLE t0 (c0 INT)", "CREATE TABLE t1 (c0 REAL COLLATE rtrim, c3)",
+        "INSERT INTO t0 VALUES (1), ('b')", "INSERT INTO t1 VALUES ('b ', -4), (0.0, 1), (1.0, 2)",
+        "SELECT a.c3, c.c0 FROM t1 a LEFT JOIN t1 b USING (c0) RIGHT JOIN t0 c USING (c0)",
+        "SELECT a.c0, c.c3 FROM t0 a LEFT JOIN t1 b USING (c0) RIGHT JOIN t1 c USING (c0)",
+        "SELECT a.c0, c.c3 FROM t0 a LEFT JOIN t0 b USING (c0) RIGHT JOIN t1 c USING (c0)",
+        "SELECT * FROM t1 a FULL JOIN t1 b USING (c0) FULL JOIN t0 c USING (c0)",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
+def test_min_max_on_an_equal_column():
+    """A lone min(x) / max(x) with "x = <other tables' expression>" in WHERE
+    reads only the first matching row in SQLite (it takes x as ordered),
+    even where a numeric comparison lets '1' and '1.0' both match."""
+    pair = Pair()
+    for sql in [
+        "CREATE TABLE t1 (c1 FLOAT, c2 INTEGER, c3 TEXT, n TEXT COLLATE nocase, UNIQUE (c3, c2))",
+        "INSERT INTO t1 VALUES (1.0, NULL, '1.0', 'b'), (3.0, 0, '1.0', 'B'), (1.0, NULL, '1', 'A'), (3.0, 1, '1', 'a')",
+        "CREATE TABLE a (c1 FLOAT)", "INSERT INTO a VALUES (1.0)",
+        "SELECT (SELECT min(c3) FROM t1 AS s WHERE (c1 > 1) AND s.c3 = a.c1) FROM a",
+        "SELECT (SELECT max(c3) || c2 FROM t1 AS s WHERE a.c1 = s.c3 AND c1 > 0) FROM a",
+        "SELECT (SELECT min(c3) FROM t1 AS s WHERE s.c3 = a.c1 AND c2 IS NOT NULL) FROM a",
+        "SELECT (SELECT min(c3), count(*) FROM t1 AS s WHERE (c1 > 1) AND s.c3 = a.c1) FROM a",
+        "SELECT max(n), c2 FROM t1 WHERE n = 'a'", "SELECT max(n COLLATE binary), c2 FROM t1 WHERE n = 'a'",
+        "SELECT min(c3) FROM t1 WHERE c3 = c1", "SELECT min(c3) FROM t1 WHERE c3 = 1 GROUP BY c2",
+    ]:
+        pair.run(sql)
+    pair.close()
+
+
 def test_limit_zero_runs_nothing():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")

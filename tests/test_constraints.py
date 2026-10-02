@@ -75,6 +75,13 @@ def test_check_constraint_errors(pair):
                 "CREATE TABLE e (a CHECK (e.a > 0), b CHECK (random() IS NOT NULL))"]:
         pair.run(sql)
     pair.run("INSERT INTO e VALUES (1, 1)")
+    # An unnamed CHECK is named after its text, which SQLite dequotes: a
+    # leading quoted part is all that remains (Northwind's [UnitPrice]>=(0)).
+    pair.run("CREATE TABLE q (x CHECK ([x]>=(0)), y CHECK (\"y\" > 0 OR y < -5), z CHECK ('a''b' != z), "
+             "w CHECK ( `w` > 1 ))")
+    for sql in ["INSERT INTO q VALUES (-1, 1, 1, 2)", "INSERT INTO q VALUES (1, -1, 1, 2)",
+                "INSERT INTO q VALUES (1, 1, 'a''b', 2)", "INSERT INTO q VALUES (1, 1, 1, 0)"]:
+        pair.run(sql)
 
 
 def test_table_constraints_and_automatic_indexes(pair):
@@ -148,6 +155,18 @@ def test_on_conflict_clauses_of_constraints(pair):
         UPDATE r SET a = 2 WHERE a = 1;
         SELECT * FROM r
         """)
+
+
+def test_not_null_rowid_alias(pair):
+    """NULL into an INTEGER PRIMARY KEY NOT NULL (also a table-level PRIMARY
+    KEY, as Chinook declares them) means a new row id, not a NOT NULL error."""
+    for sql in ["CREATE TABLE a (id INTEGER PRIMARY KEY NOT NULL, n)",
+                "CREATE TABLE b ([id] INTEGER NOT NULL ON CONFLICT IGNORE, n, CONSTRAINT [pk] PRIMARY KEY ([id]))",
+                "INSERT INTO a (n) VALUES ('x')", "INSERT INTO a VALUES (NULL, 'y')",
+                "INSERT OR REPLACE INTO a VALUES (NULL, 'z')", "UPDATE a SET id = NULL WHERE id = 1",
+                "UPDATE OR IGNORE a SET id = NULL", "SELECT rowid, * FROM a", "INSERT INTO b (n) VALUES ('x')",
+                "INSERT INTO b VALUES (NULL, 'x')", "UPDATE b SET id = NULL", "SELECT rowid, * FROM b"]:
+        pair.run(sql)
 
 
 def test_autoincrement(pair):
