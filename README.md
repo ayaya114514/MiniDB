@@ -52,7 +52,7 @@
   （`date`、`time`、`datetime`、`julianday`、`unixepoch`、`strftime`、`timediff`，全部修饰符）；
   聚合 `count`、`sum`、`avg`、`min`、`max`、`total`、`group_concat`、`string_agg`（支持 `DISTINCT`）。
 - JSON：`json`、`json_valid`、`json_type`、`json_extract` 与 `->` / `->>`、`json_array` / `json_object`、
-  `json_insert` / `json_replace` / `json_set` / `json_remove` / `json_patch`、`json_quote`、`json_array_length`、
+  `json_insert` / `json_replace` / `json_set` / `json_array_insert` / `json_remove` / `json_patch`、`json_quote`、`json_array_length`、
   `json_pretty`、`json_error_position`，对应的 `jsonb_*` 二进制版本（与 SQLite 的 JSONB 字节相同），聚合
   `json_group_array` / `json_group_object`（也可作窗口函数），表值函数 `json_each` / `json_tree`；支持 JSON5 输入。
 - 索引：`CREATE [UNIQUE] INDEX [IF NOT EXISTS]`、`DROP INDEX [IF EXISTS]`，UNIQUE 列自动建索引；

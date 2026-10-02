@@ -982,6 +982,17 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   这是看得见的语义：`json_set('{a:0x10}', '$.b', 1)` 返回 `{"a":16,"b":1}`，同一语句里这段文本的 `jsonb()` 保留
   `0x10` 的 INT5 节点，`json_valid()` 也因为 JSON5 标记返回 0。MiniDB 照搬（`ParseCache`：按内容找第一个、命中移到
   最近、满了丢最旧），每条语句开始时清空；`json_each` 在 SQLite 里没有函数上下文，不用缓存。
+  编辑结果只有在 SQLite 的 JsonString 离开了 100 字节的静态缓冲区时才进缓存（jsonReturnString：还在 `zSpace` 里的
+  文本直接复制返回）。离开的时机是“写到第 100 字节”，或者某次追加提前预留了空间：渲染 INT5 时 `jsonPrintf(100, ...)`
+  一定预留，转义控制字符时预留“剩余长度 + 7”。渲染器照这些条件记一个 `grown` 标记（fuzz 种子 1822 发现）。
+- **嵌套上限**：JSON_MAX_DEPTH = 1000 照 json.c 分散在各处，条件各不相同——解析器 `> 1000` 报 malformed；路径查找每下
+  一层 `++iDepth >= 1000` 返回 TOODEEP（`JSON path too deep`），为不存在的路径造子结构也算一层；compact 渲染
+  `> 1000`、pretty 渲染（非空容器）`>= 1000` 报 `JSON nested too deep`（编辑或 JSONB 参数可以拼出超过 1000 层的
+  值）；json_patch 的递归 `>= 1000` 同样报错。Python 每层要两三个栈帧，默认递归上限 1000 不够：处理 100 字节以上的
+  JSON 前把上限提到 20000（triggers.py 同样按需提高）。以前 998 层的文档就会抛 RecursionError。
+- **json_array_insert**（3.53 新增）：同一个编辑器，路径必须以 `[N]` 结尾（找到时在该位置之前插入，`[#]` 追加），否则
+  `not an array element: '路径'`。“以 `]` 结尾”照 json.c 看路径的前一个字符，所以 `$.a]` 这种键也算，结果是把值插进
+  对象里、渲染时报 malformed——与 SQLite 相同。
 - **json_each / json_tree**：FROM 里的虚表，列声明无类型（BLOB 亲和性：和 TEXT 列比较时不转换，两列比较的规则），
   有 rowid（从 0 开始），隐藏列 `json` / `root`。参数可以引用前面的表：每行外层重新计算（`JsonEachScan`），连接重排
   把它放在依赖的表之后。参数在它自己加入作用域之后解析：引用到它自己的列（例如子查询里裸写的 `rowid`）时 SQLite 的

@@ -12,8 +12,9 @@ from typing import Callable, Iterator
 from minidb import jsonb, values
 from minidb.errors import OperationalError
 from minidb.jsonb import (
-    ARRAY, EDIT_DEL, EDIT_INS, EDIT_REPL, EDIT_SET, FALSE, FLOAT, FLOAT5, INT, INT5, LOOKUP_ERROR, LOOKUP_NOTFOUND,
-    LOOKUP_PATHERROR, NULL, OBJECT, TEXT, TEXT5, TEXTJ, TEXTRAW, TRUE, JSONBlob, JSONText, Malformed, payload_size,
+    ARRAY, EDIT_AINS, EDIT_DEL, EDIT_INS, EDIT_REPL, EDIT_SET, FALSE, FLOAT, FLOAT5, INT, INT5, LOOKUP_ERROR,
+    LOOKUP_NOTARRAY, LOOKUP_NOTFOUND, LOOKUP_TOODEEP, NULL, OBJECT, TEXT, TEXT5, TEXTJ, TEXTRAW, TRUE, JSONBlob,
+    JSONText, Malformed, payload_size,
 )
 from minidb.values import SQLValue
 
@@ -45,6 +46,17 @@ def malformed() -> OperationalError:
 def bad_path(path: object) -> OperationalError:
     text = values.to_text(path)
     return OperationalError("bad JSON path: '" + text.replace("'", "''") + "'")  # (SQLite's %Q)
+
+
+def path_error(rc: int, path: object) -> OperationalError:
+    """The error for a failed lookup (SQLite's jsonBadPathError)."""
+    if rc == LOOKUP_NOTARRAY:
+        return OperationalError("not an array element: '" + values.to_text(path).replace("'", "''") + "'")
+    if rc == LOOKUP_ERROR:
+        return malformed()
+    if rc == LOOKUP_TOODEEP:
+        return OperationalError("JSON path too deep")
+    return bad_path(path)
 
 
 # ---- arguments ---------------------------------------------------------------------------
@@ -201,11 +213,17 @@ def render(blob: bytes | bytearray, i: int = 0) -> JSONText:
 def result_parse(blob: bytes | bytearray, binary: bool, nonstandard: bool | None = None) -> SQLValue:
     """SQLite's jsonReturnParse: the JSONB, or its text with the JSON subtype.
     The text of an edited JSONB (``nonstandard``: whether the JSON it came
-    from used JSON5) goes into the statement's ParseCache."""
+    from used JSON5) goes into the statement's ParseCache - if SQLite's
+    JsonString allocated it (jsonReturnString)."""
     if binary:
         return bytes(blob)
-    text = render(blob)
-    if nonstandard is not None:
+    renderer = jsonb.Renderer(blob)
+    try:
+        text = _json(renderer.render(0))
+    except Malformed:
+        raise malformed() from None
+    if nonstandard is not None and (renderer.grown or len(renderer.out) >= jsonb.STATIC_SPACE):
+        # (a text still in the JsonString's static space is returned as a copy, not cached)
         CACHE.insert(str.__str__(text), bytes(blob), nonstandard)
     return text
 
@@ -374,11 +392,9 @@ def json_array_length(value: SQLValue, path: SQLValue = None, *, with_path: bool
         text = path_bytes(path)
         i, _ = jsonb.lookup(blob, text[1:] if text[:1] == b"$" else b"@")
         if i < 0:
-            if i == LOOKUP_PATHERROR:
-                raise bad_path(path)
-            if i == LOOKUP_ERROR:
-                raise malformed()
-            return None
+            if i == LOOKUP_NOTFOUND:
+                return None
+            raise path_error(i, path)
     if blob[i] & 0x0F == ARRAY:
         return jsonb.Editor(blob).array_count(i)
     return 0
@@ -400,9 +416,7 @@ def json_type(value: SQLValue, path: SQLValue = None, *, with_path: bool = False
         if i < 0:
             if i == LOOKUP_NOTFOUND:
                 return None
-            if i == LOOKUP_PATHERROR:
-                raise bad_path(path)
-            raise malformed()
+            raise path_error(i, path)
     return jsonb.TYPE_NAMES[blob[i] & 0x0F]
 
 
@@ -490,10 +504,8 @@ def extract(value: SQLValue, paths: tuple, mode: str) -> SQLValue:
             if k:
                 out.append(0x2C)
             out += b"null"
-        elif j == LOOKUP_ERROR:
-            raise malformed()
         else:
-            raise bad_path(path)
+            raise path_error(j, path)
     out.append(0x5D)
     return _text_to_blob(_text(out)) if mode == "blob" else _json(out)
 
@@ -540,9 +552,7 @@ def edit(value: SQLValue, args: tuple, how: int, name: str, binary: bool) -> SQL
         if rc == LOOKUP_NOTFOUND:
             continue
         if rc < 0:
-            if rc == LOOKUP_ERROR:
-                raise malformed()
-            raise bad_path(path)
+            raise path_error(rc, path)
     return result_parse(editor.blob, binary, parsed[1])
 
 
@@ -564,9 +574,7 @@ def json_remove(value: SQLValue, *paths: SQLValue, binary: bool = False) -> SQLV
         if rc < 0:
             if rc == LOOKUP_NOTFOUND:
                 continue
-            if rc == LOOKUP_PATHERROR:
-                raise bad_path(path)
-            raise malformed()
+            raise path_error(rc, path)
     return result_parse(editor.blob, binary, parsed[1] if paths else None)  # (without paths: json())
 
 
@@ -582,6 +590,8 @@ def json_patch(target: SQLValue, patch: SQLValue, binary: bool = False) -> SQLVa
         jsonb.merge_patch(editor, 0, patched[0], 0)
     except (jsonb.BadPatch, IndexError):
         raise malformed() from None
+    except jsonb.PatchTooDeep:
+        raise OperationalError("JSON nested too deep") from None
     return result_parse(editor.blob, binary, parsed[1])
 
 
@@ -618,6 +628,8 @@ SCALAR_FUNCTIONS = {
     "JSONB_REPLACE": (lambda value, *args: edit(value, args, EDIT_REPL, "replace", True), 1, None),
     "JSON_SET": (lambda value, *args: edit(value, args, EDIT_SET, "set", False), 1, None),
     "JSONB_SET": (lambda value, *args: edit(value, args, EDIT_SET, "set", True), 1, None),
+    "JSON_ARRAY_INSERT": (lambda value, *args: edit(value, args, EDIT_AINS, "array_insert", False), 1, None),
+    "JSONB_ARRAY_INSERT": (lambda value, *args: edit(value, args, EDIT_AINS, "array_insert", True), 1, None),
     "JSON_REMOVE": (lambda value, *paths: json_remove(value, *paths), 1, None),
     "JSONB_REMOVE": (lambda value, *paths: json_remove(value, *paths, binary=True), 1, None),
     "JSON_PATCH": (json_patch, 2, 2),

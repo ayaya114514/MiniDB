@@ -360,8 +360,9 @@ class Generator:
         if kind < 0.8:
             return f"json_quote({self.json_value(scope, depth)})"
         if kind < 0.9:
-            function = rng.choice(["json_set", "json_insert", "json_replace"])
-            return (f"{function}({self.json_doc(scope, depth + 1)}, {rng.choice(JSON_PATHS)}, "
+            function = rng.choice(["json_set", "json_insert", "json_replace", "json_array_insert"])
+            paths = JSON_PATHS if function != "json_array_insert" else [p for p in JSON_PATHS if p.endswith("]'")]
+            return (f"{function}({self.json_doc(scope, depth + 1)}, {rng.choice(paths)}, "
                     f"{self.json_value(scope, depth + 1)})")
         return f"json_patch({self.json_doc(scope, depth + 1)}, {self.json_doc(scope, depth + 1)})"
 

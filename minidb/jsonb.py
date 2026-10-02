@@ -17,6 +17,8 @@ UTF-8 text (with a NUL after it, as SQLite's parser sees it).
 
 from __future__ import annotations
 
+import sys
+
 from minidb.errors import OperationalError
 
 NULL, TRUE, FALSE, INT, INT5, FLOAT, FLOAT5, TEXT, TEXTJ, TEXT5, TEXTRAW, ARRAY, OBJECT = range(13)
@@ -27,10 +29,24 @@ MAX_DEPTH = 1000  # SQLite's JSON_MAX_DEPTH
 LOOKUP_ERROR = -1  # malformed JSONB
 LOOKUP_NOTFOUND = -2
 LOOKUP_PATHERROR = -3
+LOOKUP_TOODEEP = -4  # the path goes MAX_DEPTH levels down
+LOOKUP_NOTARRAY = -5  # json_array_insert() at a path that does not end in [N]
 
-EDIT_DEL, EDIT_REPL, EDIT_INS, EDIT_SET = 1, 2, 3, 4
+EDIT_DEL, EDIT_REPL, EDIT_INS, EDIT_SET, EDIT_AINS = 1, 2, 3, 4, 5
+
+# Python takes a few frames per level of JSON: MAX_DEPTH levels need more
+# than its default recursion limit (triggers.py raises it too).
+STACK_LIMIT = 20_000
+
+
+def make_room(size: int) -> None:
+    """Before recursing through JSON of ``size`` bytes (its nesting is at
+    most that deep): make sure Python can go MAX_DEPTH levels down."""
+    if size >= 100 and sys.getrecursionlimit() < STACK_LIMIT:
+        sys.setrecursionlimit(STACK_LIMIT)
 
 INVALID_CHAR = 0x99999  # SQLite's JSON_INVALID_CHAR
+STATIC_SPACE = 100  # the bytes a JsonString holds before it allocates (zSpace)
 
 
 class JSONText(str):
@@ -203,6 +219,7 @@ class TextParser:
     def parse(self) -> bytes:
         """The JSONB of the whole text; raises Malformed (SQLite's jsonConvertTextToBlob)."""
         z = self.z
+        make_room(self.n)
         i = self.value(0)
         if i > 0:
             while z[i] in _SPACES:
@@ -609,6 +626,23 @@ def _control(c: int) -> str:
     return "\\u%04x" % c
 
 
+def control_grows(raw: bytes, used: int) -> bool:
+    """Whether jsonAppendString, appending ``raw`` (with control characters)
+    after ``used`` bytes, grows the JsonString: before each control character
+    it makes room for 7 bytes more than what is left."""
+    used += 1
+    for k, c in enumerate(raw):
+        if _OK[c] or c == 0x27:
+            used += 1
+        elif c in (0x22, 0x5C):
+            used += 2
+        else:
+            if used + len(raw) - k + 7 > STATIC_SPACE:
+                return True
+            used += len(_control(c))
+    return False
+
+
 def quote_string(raw: bytes) -> bytes:
     """SQLite's jsonAppendString: a string as a JSON string literal."""
     out = bytearray(b'"')
@@ -631,7 +665,12 @@ class Renderer:
         self.out = bytearray()
         self.indent = indent
         self.level = 0
+        self.depth = 0
         self.error = False
+        # Whether SQLite's JsonString would have left its static space before
+        # reaching STATIC_SPACE bytes (which only some appends reserve ahead).
+        self.grown = False
+        make_room(len(blob))
 
     def render(self, i: int = 0) -> bytes:
         self.element(i)
@@ -680,6 +719,7 @@ class Renderer:
                 else:
                     value = value * 16 + _hex_value(c)
             out += b"9.0e999" if overflow else str(value).encode()
+            self.grown = True  # (jsonPrintf(100, ...) makes room for 100 bytes)
         elif kind == FLOAT5:
             if sz == 0:
                 self.error = True
@@ -700,6 +740,8 @@ class Renderer:
         elif kind == TEXT5:
             self.text5(p)
         elif kind == TEXTRAW:
+            if not self.grown and any(c < 0x20 for c in p):
+                self.grown = control_grows(p, len(out))
             out += quote_string(bytes(p))
         elif kind == ARRAY:
             out.append(0x5B)
@@ -707,9 +749,11 @@ class Renderer:
                 self.pretty_container(i + n, i + n + sz, False)
             else:
                 j, end = i + n, i + n + sz
+                self.deeper()
                 while j < end and not self.error:
                     j = self.element(j)
                     out.append(0x2C)
+                self.depth -= 1
                 if j > end:
                     self.error = True
                 if sz > 0:
@@ -721,10 +765,12 @@ class Renderer:
                 self.pretty_container(i + n, i + n + sz, True)
             else:
                 j, end, x = i + n, i + n + sz, 0
+                self.deeper()
                 while j < end and not self.error:
                     j = self.element(j)
                     out.append(0x2C if x & 1 else 0x3A)
                     x += 1
+                self.depth -= 1
                 if x & 1 or j > end:
                     self.error = True
                 if sz > 0:
@@ -734,12 +780,19 @@ class Renderer:
             self.error = True
         return i + n + sz
 
+    def deeper(self) -> None:
+        self.depth += 1
+        if self.depth > MAX_DEPTH:  # (possible with JSONB arguments and edits)
+            raise error("JSON nested too deep")
+
     def pretty_container(self, j: int, end: int, is_object: bool) -> None:
         out = self.out
         if j >= end:
             return
         out.append(0x0A)
         self.level += 1
+        if self.level >= MAX_DEPTH:
+            raise error("JSON nested too deep")
         while j < end and not self.error:
             out += self.indent * self.level
             j = self.element(j)
@@ -769,6 +822,8 @@ class Renderer:
                 k += 1
                 continue
             if c <= 0x1F:
+                if len(out) + 7 > STATIC_SPACE:
+                    self.grown = True
                 out += _control(c).encode()
                 k += 1
                 continue
@@ -952,6 +1007,8 @@ def validity_check(z: bytes, i: int, end: int, depth: int = 1) -> int:
     """0 if the element at ``i`` (ending at ``end``) is well formed, else an error offset + 1."""
     if depth > MAX_DEPTH:
         return i + 1
+    if depth == 1:
+        make_room(end - i)
     n, sz = payload_size(z, i)
     if n == 0 or i + n + sz != end:
         return i + 1
@@ -1120,8 +1177,10 @@ class Editor:
         self.blob = bytearray(blob)
         self.delta = 0
         self.edit = 0
-        self.insert = b""  # the JSONB to put in (EDIT_REPL / INS / SET)
+        self.insert = b""  # the JSONB to put in (EDIT_REPL / INS / SET / AINS)
         self.label = 0  # the label of the element found (iLabel)
+        self.depth = 0  # how far down the lookup is (iDepth)
+        make_room(len(blob))
 
     def change_payload_size(self, i: int, size: int) -> int:
         """Rewrite the header at ``i`` for a payload of ``size``; returns the change in bytes."""
@@ -1158,9 +1217,10 @@ class Editor:
             count += 1
         return count
 
-    def lookup(self, root: int, path: bytes, label: int = 0) -> int:
+    def lookup(self, root: int, path: bytes, label: int = 0, indexed: bool = False) -> int:
         """Follow ``path`` (after the '$') from the element at ``root``; returns
-        the offset of the element found or a LOOKUP_ code, editing as self.edit says."""
+        the offset of the element found or a LOOKUP_ code, editing as self.edit
+        says.  ``indexed``: the path so far ends in [N]."""
         blob = self.blob
         if not path:
             if self.edit:
@@ -1171,6 +1231,10 @@ class Editor:
                         sz += root - label
                         root = label
                     self.replace(root, sz, b"")
+                elif self.edit == EDIT_AINS:
+                    if not indexed:
+                        return LOOKUP_NOTARRAY
+                    self.replace(root, 0, self.insert)
                 elif self.edit != EDIT_INS:
                     self.replace(root, sz, self.insert)
             self.label = label
@@ -1217,7 +1281,11 @@ class Editor:
                     n, sz = payload_size(blob, v)
                     if n == 0 or v + n + sz > end:
                         return LOOKUP_ERROR
-                    rc = self.lookup(v, path[i:], j)
+                    self.depth += 1
+                    if self.depth >= MAX_DEPTH:
+                        return LOOKUP_TOODEEP
+                    rc = self.lookup(v, path[i:], j, path[i - 1:i] == b"]")  # (SQLite looks at zPath[-1])
+                    self.depth -= 1
                     if self.delta:
                         self.after_edit(root)
                     return rc
@@ -1231,6 +1299,8 @@ class Editor:
             if j > end:
                 return LOOKUP_ERROR
             if self.edit >= EDIT_INS:
+                if self.edit == EDIT_AINS and path[i:][-1:] != b"]":
+                    return LOOKUP_NOTARRAY
                 label_header = header(TEXTRAW if raw_key else TEXT5, len(key))
                 rc, inserted = self.substructure(path[i:])
                 if rc >= 0:
@@ -1268,7 +1338,11 @@ class Editor:
             end = j + sz
             while j < end:
                 if k == 0:
-                    rc = self.lookup(j, path[i + 1:], 0)
+                    self.depth += 1
+                    if self.depth >= MAX_DEPTH:
+                        return LOOKUP_TOODEEP
+                    rc = self.lookup(j, path[i + 1:], 0, True)
+                    self.depth -= 1
                     if self.delta:
                         self.after_edit(root)
                     return rc
@@ -1300,6 +1374,10 @@ class Editor:
         sub = Editor(bytes((OBJECT if tail[:1] == b"." else ARRAY,)))
         sub.edit = self.edit
         sub.insert = self.insert
+        sub.depth = self.depth + 1
+        if sub.depth >= MAX_DEPTH:
+            return LOOKUP_TOODEEP, b""
+        make_room(len(tail))
         rc = sub.lookup(0, tail, 0)
         return rc, bytes(sub.blob)
 
@@ -1315,8 +1393,14 @@ class BadPatch(Exception):
     pass
 
 
+class PatchTooDeep(Exception):
+    pass
+
+
 def merge_patch(target: Editor, i_target: int, patch: bytes, i_patch: int, depth: int = 0) -> None:
     """RFC 7396 MergePatch, as SQLite's jsonMergePatch does it on JSONB."""
+    if depth == 0:
+        make_room(len(patch))
     if patch[i_patch] & 0x0F != OBJECT:
         n, sz = payload_size(patch, i_patch)
         size_patch = n + sz
@@ -1372,6 +1456,8 @@ def merge_patch(target: Editor, i_target: int, patch: bytes, i_patch: int, depth
             else:
                 saved = target.delta
                 target.delta = 0
+                if depth >= MAX_DEPTH:
+                    raise PatchTooDeep()
                 merge_patch(target, t_value, patch, p_value, depth + 1)
                 target.delta += saved
         elif x != NULL:
@@ -1382,6 +1468,8 @@ def merge_patch(target: Editor, i_target: int, patch: bytes, i_patch: int, depth
                 target.replace(t_end, 0, new_label + b"\x0c")
                 saved = target.delta
                 target.delta = 0
+                if depth >= MAX_DEPTH:
+                    raise PatchTooDeep()
                 merge_patch(target, t_end + len(new_label), patch, p_value, depth + 1)
                 target.delta += saved
     if target.delta:

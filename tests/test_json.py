@@ -110,6 +110,36 @@ def test_edit_functions(pair):
     ])
 
 
+def test_array_insert(pair):
+    run(pair, [
+        "SELECT json_array_insert('[1,2,3]', '$[1]', 9), json_array_insert('[1,2]', '$[#]', 9, '$[0]', 'x')",
+        "SELECT json_array_insert('{\"a\":[1]}', '$.a[0]', json('[7]')), jsonb_array_insert('[1]', '$[1]', 2)",
+        "SELECT json_array_insert('{}', '$.c.d[0]', 9), json_array_insert('[1]', '$[5]', 9), json_array_insert('[1]', '$', 9)",
+        "SELECT json_array_insert('[1]', '$.a', 9), json_array_insert(NULL, '$[0]', 1), json_array_insert('[1]', NULL, 1)",
+        "SELECT json_array_insert('{}', '$.a', 9)", "SELECT json_array_insert('[[1]]', '$[0].x', 9)",
+        "SELECT json_array_insert('{\"a]\":1}', '$.a]', 9)", "SELECT json_array_insert('[1]', '$[0]')",
+        "SELECT json_array_insert('[1]', '$[1')", "SELECT json_array_insert('{a:[0x10]}', '$.a[0]', 1)",
+    ])
+
+
+def test_nesting_limits(pair):
+    # JSON_MAX_DEPTH (1000) levels: in the parser, lookups, edits that build
+    # substructure, the renderers (compact and pretty) and json_patch.
+    def nested(n, leaf="1"):
+        return "[" * n + leaf + "]" * n
+    run(pair, [
+        f"SELECT length(json('{nested(1000)}')), json_valid('{nested(1001)}'), json_error_position('{nested(1001)}')",
+        f"SELECT json('{nested(1001)}')", f"SELECT json_pretty('{nested(999)}') IS NOT NULL",
+        f"SELECT json_pretty('{nested(1000)}')", f"SELECT json_extract('{nested(999)}', '$' || '{'[0]' * 999}')",
+        f"SELECT json_extract('{nested(1000)}', '$' || '{'[0]' * 1000}')",
+        f"SELECT length(json_set('{{}}', '$' || '{'.a' * 1000}', 1))", f"SELECT json_set('{{}}', '$' || '{'.a' * 1001}', 1)",
+        f"SELECT json_set('[1]', '$' || '{'[0]' * 1001}', 1)",
+        f"SELECT json(json_set(jsonb('{nested(600)}'), '$' || '{'[0]' * 599}', jsonb('{nested(500)}')))",
+        f"SELECT length(json_patch('{{}}', '{'{"a":' * 1000 + '1' + '}' * 1000}'))",
+        f"SELECT count(*) FROM json_tree('{nested(1000)}')",
+    ])
+
+
 def test_type_length_valid(pair):
     run(pair, [
         "SELECT json_type('{\"a\":[1,2.5,\"x\",null,true]}', '$.a[1]'), json_type('[1]'), json_type('{\"a\":1}', '$.b')",
@@ -272,6 +302,10 @@ def test_parse_cache(pair):
         'SELECT json_patch(\'{}\', \'{a:0x10}\'), json_valid(\'{"a":16}\'), hex(jsonb(\'{"a":16}\'))',
         "SELECT json_remove('[0x1, 2]', '$[1]'), hex(jsonb('[1]')), json_remove('[0x2]'), hex(jsonb('[2]'))",
         "SELECT key, value FROM json_each(json_set('{a:0x10}','$.b',1))",
+        # Only a text that left the JsonString's 100 static bytes is cached
+        # (a hex integer and a control character reserve room ahead).
+        *(f"SELECT hex(jsonb(json_set('{{\"a\":\"{'x' * n}\"}}', '$.b', {v})))"
+          for n in (80, 85, 86, 87, 88, 90) for v in ("'it''s'", "'a' || char(10) || 'b'", "json('[0x1F]')")),
         'SELECT json_set(\'{a:0x10}\',\'$.b\',1), (SELECT hex(jsonb(\'{"a":16,"b":1}\')))',
         'SELECT json_set(\'{a:0x10}\',\'$.b\',1) FROM t WHERE hex(jsonb(\'{"a":16,"b":1}\')) LIKE \'BC%\'',
         'SELECT hex(jsonb(\'{"a":16,"b":1}\')) FROM t WHERE json_set(\'{a:0x10}\',\'$.b\',1) IS NOT NULL',
