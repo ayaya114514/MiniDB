@@ -172,6 +172,7 @@ class Scope:
         self.phase = None  # the clause of the query being compiled: "outputs", "where", "group", ...
         self.in_aggregate = False  # compiling the arguments of one of its aggregate calls
         self.watch = None  # a set to collect the indexes of the tables references resolve to
+        self.has_windows = False  # its query has window functions
 
     def add(self, table: Source, alias: str | None = None) -> None:
         name = ascii_lower(alias if alias is not None else table.name)
@@ -886,13 +887,14 @@ class Compiler:
             result = int(expr.negated)
             return lambda row: result
         items = [self.compile(item) for item in expr.items]
-        convert = _AFFINITY_FUNCTIONS.get(affinity)
         # SQLite makes x IN (<constant>) x = +<constant>; otherwise the left side's collation applies.
         if len(expr.items) == 1 and is_parse_constant(expr.items[0]):
             collation = self.comparison_collation(expr.expr, expr.items[0])
         else:
             collation = self.collation(expr.expr)
-        compare = values.collation_compare(collation)
+        # Each item is compared as by "=" with the left side's affinity (SQLite's
+        # OP_Eq: TEXT converts only when one side is text).
+        equal = value_comparator("=", affinity, None, collation)
         found, missing = (0, 1) if expr.negated else (1, 0)
 
         def in_list(row):
@@ -905,9 +907,7 @@ class Compiler:
                 if candidate is None:
                     saw_null = True
                     continue
-                if convert:
-                    candidate = convert(candidate)
-                if compare(v, candidate) == 0:
+                if equal(v, candidate) == 1:
                     return found
             return None if saw_null else missing
 
@@ -1127,6 +1127,9 @@ class Compiler:
         owner = self.scope.ancestor(depth)
         if owner.phase == "group":
             raise OperationalError("aggregate functions are not allowed in the GROUP BY clause")
+        if owner.has_windows:
+            # (SQLite moves a query with window functions into a subquery, which the aggregate cannot reach)
+            raise OperationalError(f"misuse of aggregate: {name}()")
         if owner.aggregates is None:
             if owner.phase == "outputs":
                 raise NeedsAggregate(owner)
@@ -2276,25 +2279,25 @@ class Executor:
 
     def compile_delete(self, table: TableInfo, orconf: str | None, triggers: bool = True) -> None:
         """What SQLite compiles to delete a row of ``table`` (sqlite3GenerateRowDelete):
-        BEFORE triggers, the foreign keys of the row, their actions, AFTER triggers."""
+        the triggers (all of them first, for their column masks), the foreign
+        keys of the row, their actions."""
         if triggers:
-            self.triggers.prepare(table.name, "DELETE", None, orconf, ("BEFORE",))
+            self.triggers.prepare_listed(table.name, "DELETE", None, orconf)
         keys = self.foreign_keys
         if keys.involved(table):
             keys.prepare(table, "delete")
-        if triggers:
-            self.triggers.prepare(table.name, "DELETE", None, orconf, ("AFTER",))
 
     def compile_update(self, table: TableInfo, changed: set[int], orconf: str | None,
                        replace: bool = False, rowid_changed: bool = False) -> Link | None:
         """What SQLite compiles to update rows of ``table`` setting ``changed``
-        (sqlite3Update): BEFORE triggers; the constraint checks (REPLACE's
-        DELETE); the foreign keys of the old and the new row; their actions;
-        AFTER triggers.  Returns the foreign key whose new-row check it leaves out."""
+        (sqlite3Update): the triggers (all of them first, for their column
+        masks); the constraint checks (REPLACE's DELETE); the foreign keys of
+        the old and the new row; their actions.  Returns the foreign key whose
+        new-row check it leaves out."""
         width = len(table.columns)
         names = [table.columns[p].name if p < width else "rowid" for p in changed]
         triggers, keys = self.triggers, self.foreign_keys
-        triggers.prepare(table.name, "UPDATE", names, orconf, ("BEFORE",))
+        triggers.prepare_listed(table.name, "UPDATE", names, orconf)
         if replace and replace_possible(table, orconf, rowid_changed, changed):
             self.compile_delete(table, "REPLACE", bool(self.settings["recursive_triggers"]))
         unchecked = None
@@ -2303,7 +2306,6 @@ class Executor:
             unchecked = self.set_null_link(table)
             if keys.required(table, changed):
                 keys.prepare_actions(table, "update", changed)
-        triggers.prepare(table.name, "UPDATE", names, orconf, ("AFTER",))
         return unchecked
 
     def foreign_keys_may_abort(self, stmt: Insert | Update | Delete, plan: Any) -> bool:
@@ -4097,6 +4099,8 @@ class CompiledSelect:
             raise OperationalError("HAVING clause on a non-aggregate query")
         self.aggregates = scope.aggregates = AggregateCollector(scope.width) if self.is_aggregate else None
         self.windows = WindowCollector(stmt.windows)
+        scope.has_windows = any(isinstance(node, Call) and node.over is not None
+                                for e in [*self.exprs, *(item.expr for item in stmt.order_by)] for node in walk(e))
         compiler = Compiler(scope, self.aggregates, misuse="misuse of aggregate: {name}()",
                             executor=executor, allow_aggregates=True, windows=self.windows)
         scope.phase = "outputs"
@@ -4507,7 +4511,14 @@ class PreparedInsert:
         # ABORT, a function call, a trigger program that may abort.
         triggers = executor.triggers
         self.aborts = self.may_abort() or calls_function(stmt) or triggers.may_abort(
-            table.name, "INSERT", None, self.conflict)
+            table.name, "INSERT", None, self.conflict) or any(
+            # (an upsert's UPDATE runs its triggers' programs as OR ABORT)
+            upsert.assignments and triggers.may_abort(table.name, "UPDATE", [
+                table.columns[p].name if p < width else "rowid" for p, _ in upsert.assignments], "ABORT")
+            for upsert in self.upserts) or (
+            bool(executor.settings["recursive_triggers"]) and replace_possible(
+                table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
+            and triggers.may_abort(table.name, "DELETE", None, "REPLACE"))
         self.statement_journal = (multi_write or triggers.exist(table.name, "INSERT")) and self.aborts
 
     def prepare_programs(self) -> None:
@@ -4749,6 +4760,11 @@ class PreparedDelete(PreparedSingleTable):
         keys = executor.foreign_keys
         self.aborts = calls_function(stmt) or executor.triggers.may_abort(self.table.name, "DELETE", None, None) or (
             keys.enabled and keys.involved(self.table) and keys.may_abort(self.table, "delete"))
+        # (SQLite: a statement journal for a multi-row write - triggers, foreign
+        # keys, RETURNING - that may abort; a plain DELETE cannot fail half way.)
+        self.statement_journal = self.aborts and (
+            executor.triggers.exist(self.table.name, "DELETE") or keys.involved(self.table)
+            or self.returning is not None)
 
     def run(self) -> Result:
         executor, table, tree = self.executor, self.table, self.tree
