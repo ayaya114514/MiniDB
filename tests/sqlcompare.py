@@ -42,17 +42,23 @@ def row_order_key(normalized_row):
     return tuple((sort_key(value), kind) for kind, value in normalized_row)
 
 
+SKIPPED = "skipped"  # Pair.run(): sqlite3 interrupted the statement (step_limit)
+
+
 class Pair:
     """A MiniDB database and a sqlite3 database fed with identical SQL."""
 
     open_pairs = set()  # not yet closed; conftest.py closes them after each test
 
-    def __init__(self, path=None, check_messages=False, loose_numbers=False, format=None):
+    def __init__(self, path=None, check_messages=False, loose_numbers=False, format=None, step_limit=None):
         """``loose_numbers`` compares numbers by value only.  The fuzzer uses it:
         when several rows hold equal values of different types (1 and 1.0),
         which one DISTINCT, GROUP BY or MIN/MAX reports depends on the order
         SQLite's query plan visits rows in.  ``format``: MiniDB's file format
-        (see ``Database``)."""
+        (see ``Database``).  ``step_limit``: sqlite3 interrupts a statement
+        after about this many virtual machine steps, and MiniDB then skips
+        it (run() returns SKIPPED) -- random triggers can cascade into
+        millions of changes, which MiniDB would take hours for."""
         self.mini = Database(path, format=format)
         self.lite = sqlite3.connect(":memory:", isolation_level=None)
         # Text made from a BLOB may not be valid UTF-8: keep the bytes, as
@@ -61,6 +67,14 @@ class Pair:
         Pair.open_pairs.add(self)
         self.check_messages = check_messages
         self.normalize = loose if loose_numbers else typed
+        if step_limit is not None:
+            self.steps = 0
+            self.lite.set_progress_handler(self.count_steps, 1000)
+            self.step_limit = step_limit
+
+    def count_steps(self):
+        self.steps += 1000
+        return self.steps > self.step_limit
 
     def run(self, sql, ordered=None, parameters=None):
         """Execute ``sql`` on both; assert that both fail or both return the same rows.
@@ -68,6 +82,7 @@ class Pair:
         Rows are compared in order when ``ordered`` is true (default: when the
         statement has ORDER BY), otherwise as multisets.
         """
+        self.steps = 0
         try:
             if parameters is None:
                 expected = [tuple(r) for r in self.lite.execute(sql).fetchall()]
@@ -76,6 +91,11 @@ class Pair:
             lite_error = None
         except sqlite3.Error as exc:
             expected, lite_error = None, exc
+        if lite_error is not None and str(lite_error) == "interrupted":
+            # (an interrupted write in a transaction rolls the transaction back)
+            if self.mini.in_transaction and not self.lite.in_transaction:
+                self.mini.execute("ROLLBACK")
+            return SKIPPED
         try:
             actual = list(self.mini.execute(sql, parameters))
             mini_error = None
