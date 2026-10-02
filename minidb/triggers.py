@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 from minidb import values
 from minidb.catalog import TableInfo, TriggerInfo
 from minidb.errors import IntegrityError, OperationalError
-from minidb.parser import Compound, Insert, Select, Update, Values
+from minidb.parser import Compound, Insert, Raise, Select, Update, Values
 from minidb.values import ascii_lower
 
 ROWID_NAMES = ("rowid", "oid", "_rowid_")  # (as in minidb.executor)
@@ -39,6 +39,19 @@ else:
     Executor = Any
 
 MAX_DEPTH = 1000  # SQLite's SQLITE_MAX_TRIGGER_DEPTH (trigger programs and foreign key actions)
+
+
+def walk_tree(node: object) -> Any:
+    """Every syntax tree node under ``node``, subqueries included."""
+    import dataclasses
+
+    yield node
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            yield from walk_tree(item)
+    elif dataclasses.is_dataclass(node) and not isinstance(node, type):
+        for f in dataclasses.fields(node):
+            yield from walk_tree(getattr(node, f.name))
 
 
 class TriggerIgnore(Exception):
@@ -103,6 +116,11 @@ class Program:
                 self.statements.append(stmt)
             self.plans = [(executor.prepare(stmt), not isinstance(stmt, (Select, Compound, Values)))
                           for stmt in self.statements]
+            # Whether running it may abort the statement (SQLite's mayAbort, which
+            # with a multi-row write asks for a statement journal).
+            self.may_abort = any(getattr(plan, "aborts", False) for plan, _ in self.plans) or any(
+                isinstance(node, Raise) and node.kind == "ABORT"
+                for node in walk_tree([trigger.when, trigger.body]))
         except OperationalError as exc:
             message = str(exc)
             if message.startswith("no such table: ") and "." not in message:
@@ -145,6 +163,8 @@ class Triggers:
         self.executor = executor
         self.active = []  # programs running, innermost last
         self.disabled = 0  # > 0: no trigger fires (DROP TABLE's implicit DELETE)
+        self._version = None
+        self._by_table = {}  # lower-case table name -> its triggers, newest first
 
     def matching(self, name: str, timing: str, event: str, changed: list[str] | None = None) -> list[TriggerInfo]:
         """The triggers that fire for an event on table (or view) ``name``,
@@ -153,8 +173,14 @@ class Triggers:
         catalog = self.executor.catalog
         if not catalog.triggers or self.disabled:
             return []
+        if self._version != catalog.version:
+            self._version, self._by_table = catalog.version, {}
+        lowered = ascii_lower(name)
+        on_table = self._by_table.get(lowered)
+        if on_table is None:
+            on_table = self._by_table[lowered] = catalog.triggers_on(name)
         found = []
-        for trigger in catalog.triggers_on(name):
+        for trigger in on_table:
             if trigger.timing != timing or trigger.event != event:
                 continue
             if trigger.columns is not None and changed is not None and not (
@@ -163,13 +189,29 @@ class Triggers:
             found.append(trigger)
         return found
 
+    def may_abort(self, name: str, event: str, changed: list[str] | None, orconf: str | None) -> bool:
+        """Whether a program the statement may run may abort it (compiled already by prepare())."""
+        return any(getattr(self.program(trigger, orconf), "may_abort", False)
+                   for timing in ("BEFORE", "AFTER", "INSTEAD OF")
+                   for trigger in self.matching(name, timing, event, changed))
+
     def exist(self, name: str, event: str, changed: list[str] | None = None) -> bool:
         return any(self.matching(name, timing, event, changed) for timing in ("BEFORE", "AFTER", "INSTEAD OF"))
 
-    def program(self, trigger: TriggerInfo, orconf: str | None) -> Program:
+    def program(self, trigger: TriggerInfo, orconf: str | None, compiling: bool = False) -> Program:
+        """The program of ``trigger`` for ``orconf``.  ``compiling``: for a
+        statement being compiled, which (like SQLite) compiles each program
+        it may run once, and the programs those compile (Executor.log_program)."""
         executor = self.executor
         key = (executor.catalog.version, orconf)
         program = trigger.programs.get(key)
+        if compiling:
+            if not executor.log_program(("trigger", id(trigger), orconf), ("trigger", trigger, orconf)):
+                return program if program is not None else self.program(trigger, orconf)
+            if program is not None:
+                for log_key, entry in program.compiled:
+                    executor.log_program(log_key, entry)  # (it compiled them when it was compiled)
+                return program
         if program is None:
             trigger.programs = {k: p for k, p in trigger.programs.items() if k[0] == key[0]}
             source = executor.catalog.tables.get(ascii_lower(trigger.table_name))
@@ -177,11 +219,15 @@ class Triggers:
                 source = executor.view_source(executor.catalog.find_view(trigger.table_name))
             program = Program.__new__(Program)
             trigger.programs[key] = program  # (a program that fires itself finds it)
+            program.compiled = []  # the programs compiling it asked for, in order
+            executor.program_stack.append(program.compiled)
             try:
                 program.__init__(executor, trigger, source, orconf)
             except BaseException:
                 del trigger.programs[key]
                 raise
+            finally:
+                executor.program_stack.pop()
         return program
 
     def prepare(self, name: str, event: str, changed: list[str] | None, orconf: str | None,
@@ -190,7 +236,7 @@ class Triggers:
         compiles the statement (so their errors come first)."""
         for timing in timings:
             for trigger in self.matching(name, timing, event, changed):
-                self.program(trigger, orconf)
+                self.program(trigger, orconf, compiling=True)
 
     def fire(self, name: str, timing: str, event: str, old: list | None, new: list | None,
              changed: list[str] | None = None, orconf: str | None = None) -> None:

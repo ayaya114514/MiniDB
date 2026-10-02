@@ -121,7 +121,7 @@ class ForeignKeys:
         self.deferred = 0  # the transaction's violations of deferred constraints
         self.deferred_immediate = 0  # violations of immediate ones while PRAGMA defer_foreign_keys is on
         self.extra_changes = 0  # rows the actions changed (total_changes() counts them)
-        self.unchecked = None  # see last_action_program
+        self.unchecked = None  # the foreign key whose new-row check SQLite leaves out (Executor.set_null_link)
         self._version = None
         self._children = {}  # lower-case table name -> [Link] (its own foreign keys)
         self._parents = {}  # lower-case table name -> [Link] (the foreign keys naming it)
@@ -188,7 +188,7 @@ class ForeignKeys:
     # ---- checks before a statement changes anything -----------------------------------
 
     def prepare(self, table: TableInfo, kind: str, changed: set[int] | None = None, single_insert: bool = False,
-                ignore_errors: bool = False, seen: set | None = None) -> None:
+                ignore_errors: bool = False, seen: set | None = None, actions: bool = True) -> None:
         """Raise the errors SQLite reports when it compiles the statement:
         a missing parent table, a foreign key mismatch.  ``kind``: "insert",
         "update" (``changed``: the positions set) or "delete".  As SQLite
@@ -212,33 +212,32 @@ class ForeignKeys:
             except (OperationalError, Mismatch) as exc:
                 if not ignore_errors:
                     raise OperationalError(str(exc)) from None
-        if kind != "insert":
-            self.prepare_actions(table, kind, changed, set() if seen is None else seen)
+        if kind != "insert" and actions:
+            self.prepare_actions(table, kind, changed)
 
-    def prepare_actions(self, table: TableInfo, kind: str, changed: set[int] | None, seen: set) -> None:
+    def prepare_actions(self, table: TableInfo, kind: str, changed: set[int] | None) -> None:
         """SQLite compiles the action triggers of a DELETE or UPDATE with the
-        statement, and the statements they run (a CASCADE delete, the
-        UPDATE of SET NULL ...) in turn: their errors come now, once each."""
+        statement (sqlite3FkActions), and the statements they run (a CASCADE
+        delete, the UPDATE of SET NULL ...) in turn: their errors come now.
+        Each program is compiled once per statement (Executor.log_program)."""
+        executor = self.executor
         for link in self.parents_of(table):
             if kind == "update" and not self.parent_changed(link, table, changed):
                 continue
             action = link.key.on_delete if kind == "delete" else link.key.on_update
-            if action in ("NO ACTION", "RESTRICT") or (id(link), kind) in seen or not self._usable(link):
+            if action == "NO ACTION" or (action == "RESTRICT" and self.defer_all()) or not self._usable(link):
                 continue
-            seen.add((id(link), kind))
+            if not executor.log_program(("action", id(link), kind), ("action", link, kind, action)):
+                continue
+            if action == "RESTRICT":
+                continue  # (its program only raises an error)
             child = link.child
-            triggers = self.executor.triggers
             if action == "CASCADE" and kind == "delete":
-                triggers.prepare(child.name, "DELETE", None, "ABORT", ("BEFORE",))
-                self.prepare(child, "delete", seen=seen)
-                triggers.prepare(child.name, "DELETE", None, "ABORT", ("AFTER",))
+                executor.compile_delete(child, "ABORT")
             else:
                 width = len(child.columns)
                 positions = {width if p == child.rowid_column else p for p in link.child_positions}
-                names = [child.columns[p].name if p < width else "rowid" for p in positions]
-                triggers.prepare(child.name, "UPDATE", names, "ABORT", ("BEFORE",))
-                self.prepare(child, "update", positions, seen=seen)
-                triggers.prepare(child.name, "UPDATE", names, "ABORT", ("AFTER",))
+                executor.compile_update(child, positions, "ABORT")
 
     def required(self, table: TableInfo, changed: set[int] | None) -> bool:
         """Whether an UPDATE setting ``changed`` needs foreign key work (sqlite3FkRequired)."""
@@ -327,41 +326,6 @@ class ForeignKeys:
             return False  # (reported by prepare(); ignored while a table is dropped)
         return True
 
-    def last_action_program(self, table: TableInfo, steps: list[tuple[str, set[int] | None]]) -> Link | None:
-        """A SQLite quirk: when compiling a statement codes action triggers
-        before the checks of a new row (a REPLACE codes a delete, a DO UPDATE
-        an update), the check of foreign key F is left out if the trigger
-        program coded last is F's ON DELETE / ON UPDATE SET NULL action
-        (isSetNullAction() looks at the newest program only).  ``steps``:
-        ("delete", None) / ("update", changed) in the order SQLite codes
-        them.  Returns that F, or None."""
-        created, seen = [], set()
-
-        def code(table: TableInfo, event: str, changed: set[int] | None) -> None:
-            for link in self.parents_of(table):
-                if event == "update" and not self.parent_changed(link, table, changed):
-                    continue
-                action = link.key.on_delete if event == "delete" else link.key.on_update
-                if action == "NO ACTION" or (action == "RESTRICT" and self.defer_all()) or not self._usable(link):
-                    continue
-                if (id(link), event) in seen:
-                    continue  # (a program is coded once per statement)
-                seen.add((id(link), event))
-                created.append((link, action))
-                child = link.child
-                if action == "CASCADE" and event == "delete":
-                    code(child, "delete", None)
-                elif action != "RESTRICT":
-                    width = len(child.columns)
-                    positions = {width if p == child.rowid_column else p for p in link.child_positions}
-                    code(child, "update", positions)
-
-        for event, changed in steps:
-            code(table, event, changed)
-        if created and created[-1][1] == "SET NULL":
-            return created[-1][0]
-        return None
-
     # ---- the parent of a child row ----------------------------------------------------
 
     def parent_exists(self, link: Link, row: list) -> bool | None:
@@ -388,7 +352,7 @@ class ForeignKeys:
         if increment < 0 and self.zero(link):
             return
         if increment > 0 and link is self.unchecked:
-            return  # (see last_action_program)
+            return  # (see Executor.set_null_link)
         if increment > 0 and own is not None and link.parent is link.child:
             key = [row[p] for p in link.child_positions]
             parent_key = [own[-1] if link.index is None else own[p] for p in link.parent_positions]
