@@ -276,6 +276,35 @@ def _set_page_size(executor: Executor, value: object) -> None:
         executor.catalog.pager.set_page_size(int32(value))
 
 
+def _auto_vacuum(executor: Executor) -> int:
+    catalog = executor.catalog
+    return catalog.pager.auto_vacuum if catalog.sqlite else 0
+
+
+def auto_vacuum_mode(value: object) -> int:
+    """SQLite's getAutoVacuum: NONE / FULL / INCREMENTAL or 0-2 (anything else is 0)."""
+    text = ascii_lower(str(value))
+    if text in ("none", "full", "incremental"):
+        return ("none", "full", "incremental").index(text)
+    number = int32(value)
+    return number if 0 <= number <= 2 else 0
+
+
+def _set_auto_vacuum(executor: Executor, value: object) -> None:
+    if executor.catalog.sqlite:  # (MiniDB's own format has no auto_vacuum)
+        executor.catalog.pager.set_auto_vacuum(auto_vacuum_mode(value))
+
+
+def incremental_vacuum(executor: Executor, arg: object) -> list[tuple]:
+    """Up to ``arg`` steps (all, if none or not positive), one empty row each."""
+    catalog = executor.catalog
+    if not catalog.sqlite or not catalog.pager.auto_vacuum:
+        return []
+    limit = int32(arg) if arg is not None else 0
+    steps = catalog.pager.vacuum_pages(limit if limit > 0 else 0x7FFFFFFF)
+    return [()] * steps
+
+
 def _setting(name: str) -> Callable[[Executor], object]:
     return lambda executor: executor.settings[name]
 
@@ -369,6 +398,8 @@ PRAGMAS = {
     "schema_version": _value("schema_version", _header_value("schema_version"), _set_header("schema_version"),
                              writes=True),
     "page_size": _value("page_size", _page_size, _set_page_size, writes=True),
+    "auto_vacuum": _value("auto_vacuum", _auto_vacuum, _set_auto_vacuum, writes=True),
+    "incremental_vacuum": Spec([], incremental_vacuum, "optional", writes=True),
     "page_count": _value("page_count", _page_count),
     "freelist_count": _value("freelist_count", _freelist_count),
     "journal_mode": _value("journal_mode", _journal_mode, lambda e, v: None, returns_on_set=True),
@@ -381,7 +412,6 @@ PRAGMAS = {
     "cache_size": _value("cache_size", _setting("cache_size"), _set_number("cache_size")),
     "synchronous": _value("synchronous", _setting("synchronous"), lambda e, v: None),
     "temp_store": _value("temp_store", lambda e: 0, lambda e, v: None),
-    "auto_vacuum": _value("auto_vacuum", lambda e: 0, lambda e, v: None),
     "locking_mode": _value("locking_mode", lambda e: "normal", lambda e, v: None, returns_on_set=True),
     "data_version": _value("data_version", lambda e: e.data_version),
     "busy_timeout": _value("busy_timeout", lambda e: int(e.catalog.pager.timeout * 1000)
@@ -440,7 +470,7 @@ def reads_file(executor: Executor, name: str, value: object) -> bool:
 
 def is_write(name: str, value: object) -> bool:
     spec = PRAGMAS.get(name)
-    return spec is not None and spec.writes and value is not None
+    return spec is not None and spec.writes and (value is not None or name == "incremental_vacuum")
 
 
 # ---- pragma_xxx() in FROM ------------------------------------------------------------

@@ -689,14 +689,14 @@ class Catalog:
         self.check_writable(table, "dropped")
         for trigger in self.triggers_on(table.name):
             self._drop_trigger(trigger)
+        self._destroy_trees(list(table.indexes) + [table])
         for index in list(table.indexes):
-            self._drop_index(index)
+            self._drop_index(index, destroy=False)
         if self.sqlite:
             self._delete_sqlite_stats(table.name)
         if table.stat_key is not None:
             self.schema.delete(table.stat_key)
         del self.tables[ascii_lower(name)]
-        self.table_tree(table).destroy()
         self.schema.delete(table.schema_key)
         sequence = self.tables.get("sqlite_sequence")
         if table.autoincrement and sequence is not None:
@@ -760,11 +760,12 @@ class Catalog:
             )
         self._drop_index(index)
 
-    def _drop_index(self, index: IndexInfo) -> None:
+    def _drop_index(self, index: IndexInfo, destroy: bool = True) -> None:
         self.version += 1
         if self.sqlite:
             self._delete_sqlite_stats(index.table.name, index.name)
-        self.index_tree(index).destroy()
+        if destroy:
+            self._destroy_trees([index])
         self.schema.delete(index.schema_key)
         if index.stat_key is not None:
             self.schema.delete(index.stat_key)
@@ -790,6 +791,30 @@ class Catalog:
         if table.stat_key is not None:
             self.schema.insert(table.stat_key, encode_record(
                 ["stat", table.name, table.name, 0, str(table.stat_rows)]), replace=True)
+
+    def _destroy_trees(self, objects: list[TableInfo | IndexInfo]) -> None:
+        """Free the trees of tables and indexes, the largest root first (as
+        SQLite's destroyTable): with auto_vacuum the largest root of the
+        database then moves into each freed root page, and the schema says so."""
+        objects = list(objects)
+        while objects:
+            target = max(objects, key=lambda o: o.root)
+            objects.remove(target)
+            (self.index_tree(target) if isinstance(target, IndexInfo) else self.table_tree(target)).destroy()
+            moved = self.pager.release_root(target.root) if self.sqlite else None
+            if moved is not None:
+                self._root_moved(*moved)
+
+    def _root_moved(self, old: int, new: int) -> None:
+        for key, record in list(self.schema.scan()):
+            row = record if type(record) is list else decode_record(record)[0]
+            if row[0] in ("table", "index") and row[3] == old:
+                row[3] = new
+                self.schema.insert(key, encode_record(row), replace=True)
+        for table in self.tables.values():
+            for item in [table] + table.indexes:
+                if item.root == old and not table.is_schema:
+                    item.root = new
 
     def rewrite_trigger(self, trigger: TriggerInfo, sql: str, table_name: str) -> None:
         self.version += 1

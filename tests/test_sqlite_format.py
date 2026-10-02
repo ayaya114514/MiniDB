@@ -535,13 +535,159 @@ def test_crash_during_a_vacuum_that_changes_the_page_size(tmp_path, point, detai
         assert db.execute("SELECT * FROM t") == before
 
 
+def test_crash_after_a_vacuum_shrank_the_file(tmp_path):
+    """The pages a commit cuts off the end of the file go to the journal
+    too (as SQLite's CommitPhaseOne does), or a rollback could not bring
+    them back."""
+    path = str(tmp_path / "db")
+    with Database(path, format="sqlite") as db:
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        db.execute("INSERT INTO t (a) VALUES " + ", ".join(f"('{'v' * (i % 90)}{i}')" for i in range(600)))
+        db.execute("DELETE FROM t WHERE id % 3 = 0")
+        before = db.execute("SELECT * FROM t")
+    size = os.path.getsize(path)
+    db = Database(path)
+    db.pager.crash_hook = crash_at("db_sync")
+    with pytest.raises(SimulatedCrash):
+        db.execute("VACUUM")
+    db.pager.close_files()
+    assert os.path.getsize(path) < size  # (the file was cut)
+    with closing(lite(path)) as connection:
+        assert connection.execute("SELECT * FROM t").fetchall() == before
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
+def test_index_built_when_its_last_entry_just_misses_a_leaf():
+    """CREATE INDEX builds bottom up: when the last entry does not fit the
+    leaf it moves up as a divider and comes back down alone, and the leaf
+    before it must send its own last entry up (fuzz seed 2184 lost a leaf)."""
+    for rows in range(1, 300):
+        db = Database(format="sqlite")
+        db.execute("PRAGMA page_size = 512")
+        db.execute("CREATE TABLE t (a)")
+        db.execute(f"INSERT INTO t SELECT printf('%030d', value) FROM (WITH RECURSIVE c(value) AS "
+                   f"(SELECT 1 UNION ALL SELECT value + 1 FROM c WHERE value < {rows}) SELECT * FROM c)")
+        db.execute("CREATE INDEX ti ON t (a)")
+        assert db.integrity_check() == [], rows
+        assert db.execute("SELECT count(*) FROM t INDEXED BY ti WHERE a > ''") == [(rows,)]
+
+
+# ---- auto_vacuum -------------------------------------------------------------------------
+
+AUTO_VACUUM_CHANGES = [
+    "INSERT INTO t (name, data) SELECT name || 'x', zeroblob(length(data) + 5000) FROM t WHERE id % 9 = 0",
+    "DELETE FROM t WHERE id % 3 = 1",
+    "CREATE TABLE w (a INTEGER PRIMARY KEY AUTOINCREMENT, b)",
+    "CREATE INDEX w_b ON w (b)",
+    "INSERT INTO w (b) SELECT name FROM t",
+    "DROP INDEX t_name",
+    "DROP TABLE u",
+    "UPDATE t SET data = zeroblob(9000) WHERE id % 11 = 0",
+    "CREATE INDEX t_data ON t (data, name)",
+]
+
+
+@pytest.mark.parametrize("mode", ["FULL", "INCREMENTAL"])
+@pytest.mark.parametrize("size", [1024, 4096])
+def test_auto_vacuum_files(tmp_path, mode, size):
+    """sqlite3 writes an auto_vacuum database; MiniDB changes it (moving root
+    pages, keeping the pointer map, shrinking the file in FULL mode) and
+    sqlite3 finds it sound and agrees with making the same changes itself."""
+    path, copy = str(tmp_path / "db"), str(tmp_path / "copy")
+    with closing(lite(path)) as connection:
+        connection.execute(f"PRAGMA page_size = {size}")
+        connection.execute(f"PRAGMA auto_vacuum = {mode}")
+        connection.executescript(PAGE_SIZE_SETUP)
+    with open(path, "rb") as source, open(copy, "wb") as target:
+        target.write(source.read())
+    with Database(path) as db:
+        assert db.execute("PRAGMA auto_vacuum") == [(1 if mode == "FULL" else 2,)]
+        for sql in AUTO_VACUUM_CHANGES:
+            db.execute(sql)
+            assert db.integrity_check() == [], sql
+            assert integrity(path) == [("ok",)], sql
+        if mode == "FULL":
+            assert db.execute("PRAGMA freelist_count") == [(0,)]
+        else:
+            free = db.execute("PRAGMA freelist_count")[0][0]
+            pages = db.execute("PRAGMA page_count")[0][0]
+            steps = min(free, 3)
+            assert free and len(db.execute("PRAGMA incremental_vacuum(3)")) == steps
+            assert db.execute("PRAGMA page_count")[0][0] <= pages - steps
+            assert len(db.execute("PRAGMA incremental_vacuum")) == free - steps
+            assert db.execute("PRAGMA freelist_count") == [(0,)]
+            assert integrity(path) == [("ok",)]
+    with closing(lite(copy)) as connection:
+        for sql in AUTO_VACUUM_CHANGES:
+            connection.execute(sql)
+    queries = ["SELECT id, name, length(data) FROM t ORDER BY id", "SELECT * FROM w ORDER BY a",
+               "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name",
+               "SELECT name, length(data) FROM t INDEXED BY t_data WHERE data > x'00' ORDER BY 1, 2"]
+    with Database(copy) as db:
+        same_results(path, db, queries)
+    with closing(lite(path)) as connection:  # (sqlite3 goes on writing what MiniDB left)
+        connection.execute("DELETE FROM w WHERE a % 2 = 0")
+        connection.execute("DROP TABLE w")
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
+def test_auto_vacuum_pragma(tmp_path):
+    """PRAGMA auto_vacuum as SQLite: on a new database at once, between FULL
+    and INCREMENTAL any time, on or off for an existing one at VACUUM; roots
+    stay at the front, and DROP moves the largest root into the gap."""
+    path = str(tmp_path / "db")
+    db = Database(path, format="sqlite")
+    db.execute("PRAGMA auto_vacuum = full")
+    assert db.execute("PRAGMA auto_vacuum") == [(1,)]
+    for sql in ["CREATE TABLE a (x)", "CREATE TABLE b (y)", "CREATE INDEX ai ON a (x)",
+                "INSERT INTO a SELECT zeroblob(3000) FROM (WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 50) SELECT * FROM n)",
+                "DROP TABLE b", "DELETE FROM a WHERE rowid % 2 = 0"]:
+        db.execute(sql)
+    # (the same statements in sqlite3: root pages 3, 4, 5; ai moves to 4; 60 pages)
+    assert db.execute("SELECT name, rootpage FROM sqlite_schema") == [("a", 3), ("ai", 4)]
+    assert db.execute("PRAGMA page_count") == [(60,)]
+    db.execute("PRAGMA auto_vacuum = 'incremental'")
+    assert db.execute("PRAGMA auto_vacuum") == [(2,)]
+    db.execute("PRAGMA auto_vacuum = none")
+    assert db.execute("PRAGMA auto_vacuum") == [(2,)]  # (waits for VACUUM)
+    db.execute("VACUUM")
+    assert db.execute("PRAGMA auto_vacuum") == [(0,)]
+    db.execute("PRAGMA auto_vacuum = 1")
+    db.execute("VACUUM")
+    assert db.execute("PRAGMA auto_vacuum") == [(1,)]
+    assert db.execute("SELECT name, rootpage FROM sqlite_schema") == [("a", 3), ("ai", 4)]
+    db.execute("PRAGMA auto_vacuum = 7")  # (anything else: NONE)
+    db.close()
+    assert integrity(path) == [("ok",)]
+    with Database(str(tmp_path / "other"), format="sqlite") as other:
+        other.execute("CREATE TABLE t (a)")
+        other.execute("PRAGMA auto_vacuum = 1")
+        assert other.execute("PRAGMA auto_vacuum") == [(0,)]
+
+
+@pytest.mark.parametrize("point, detail", [("journal_page", 2), ("db_page", 3), ("db_sync", None)])
+def test_crash_during_an_auto_vacuum_commit(tmp_path, point, detail):
+    path = str(tmp_path / "db")
+    with closing(lite(path)) as connection:
+        connection.execute("PRAGMA auto_vacuum = FULL")
+        connection.executescript(PAGE_SIZE_SETUP)
+        before = connection.execute("SELECT id, name, length(data) FROM t ORDER BY id").fetchall()
+    db = Database(path)
+    db.pager.crash_hook = crash_at(point, detail)
+    with pytest.raises(SimulatedCrash):
+        db.execute("DELETE FROM t WHERE id % 2 = 0")  # (frees pages: the commit moves pages and shrinks the file)
+    db.pager.close_files()
+    with closing(lite(path)) as connection:
+        assert connection.execute("SELECT id, name, length(data) FROM t ORDER BY id").fetchall() == before
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+
+
 # ---- what is not supported ------------------------------------------------------------
 
 
 @pytest.mark.parametrize("setting, message", [
     ("PRAGMA journal_mode = WAL", "WAL mode"),
     ("PRAGMA encoding = 'UTF-16le'", "UTF-16"),
-    ("PRAGMA auto_vacuum = FULL", "auto_vacuum"),
 ])
 def test_files_minidb_refuses(tmp_path, setting, message):
     path = str(tmp_path / "db")

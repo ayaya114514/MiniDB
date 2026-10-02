@@ -4009,6 +4009,8 @@ class Executor:
                 raise OperationalError("output file already exists")
             target = SqlitePager(path, page_size=self.vacuum_page_size()) if self.catalog.sqlite else Pager(path)
             try:
+                if self.catalog.sqlite:
+                    self.vacuum_auto_vacuum(target)
                 self.copy_database(target, keep_rowids=True)
                 target.commit()
                 target.end_transaction()
@@ -4018,6 +4020,8 @@ class Executor:
             return Result()
         pager = self.catalog.pager
         copy = SqlitePager(page_size=self.vacuum_page_size()) if self.catalog.sqlite else Pager()
+        if self.catalog.sqlite:
+            self.vacuum_auto_vacuum(copy)
         self.copy_database(copy, keep_rowids=False)
         if self.catalog.sqlite and copy.geometry.page_size != pager.geometry.page_size:
             pager.resize(copy.geometry.page_size)
@@ -4030,6 +4034,8 @@ class Executor:
         last = count  # the last page kept
         if self.catalog.sqlite:
             pager.header.freelist_trunk = pager.header.freelist_count = 0
+            pager.header.autovacuum_root = copy.header.autovacuum_root
+            pager.header.incremental_vacuum = copy.header.incremental_vacuum
             pager.note_schema_change()
         else:
             pager.header.freelist_head = 0
@@ -4039,6 +4045,15 @@ class Executor:
             pager.dirty.discard(pgno)
         self.catalog.load()
         return Result()
+
+    def vacuum_auto_vacuum(self, target: SqlitePager) -> None:
+        """The new database VACUUM writes has the auto_vacuum mode PRAGMA
+        auto_vacuum asked for, or the current one (as SQLite)."""
+        pager = self.catalog.pager
+        mode = pager.next_auto_vacuum if pager.next_auto_vacuum is not None else pager.auto_vacuum
+        target.write(target.header)
+        target.header.autovacuum_root = 1 if mode else 0
+        target.header.incremental_vacuum = int(mode == 2)
 
     def vacuum_page_size(self) -> int:
         """The page size VACUUM writes: what PRAGMA page_size asked for, except
@@ -4085,8 +4100,27 @@ class Executor:
         source = self.catalog
         pager = source.pager
         schema = SqliteTable(target, 1)
-        for key, value in list(source.schema.scan()):
-            row = decode_record(value)[0]
+        rows = [(key, decode_record(value)[0]) for key, value in list(source.schema.scan())]
+        roots = {}  # schema key -> root page made beforehand (auto_vacuum)
+        if target.auto_vacuum:
+            # Root pages first, at the front of the file, in the order SQLite's
+            # VACUUM creates them: the tables, then the indexes (sqlite_sequence
+            # comes with the first AUTOINCREMENT table).
+            tables = [(k, r) for k, r in rows if r[0] == "table" and r[3]]
+            sequence = next((k for k, r in tables if ascii_lower(r[1]) == "sqlite_sequence"), None)
+            for key, row in tables:
+                if key == sequence:
+                    continue
+                roots[key] = TableTree.create(target)
+                info = source.tables.get(ascii_lower(row[1]))
+                if sequence is not None and sequence not in roots and info is not None and info.autoincrement:
+                    roots[sequence] = TableTree.create(target)
+            if sequence is not None and sequence not in roots:
+                roots[sequence] = TableTree.create(target)
+            for key, row in rows:
+                if row[0] == "index" and row[3]:
+                    roots[key] = IndexTree.create(target)
+        for key, row in rows:
             kind, name, root = row[0], row[1], row[3]
             if kind in ("table", "index") and root:
                 if kind == "table":
@@ -4100,7 +4134,12 @@ class Executor:
                 else:
                     tree = IndexTree(pager, root)
                     row[3] = IndexTree.build(target, ((0, tree.payload(cell)) for cell in tree.cells()))
+                if key in roots:  # (into the root made for it)
+                    (TableTree if kind == "table" else IndexTree)(target, roots[key]).adopt(row[3])
+                    row[3] = roots[key]
             schema.insert(key, encode_record(row))
+        if target.auto_vacuum and target.header.freelist_count:
+            target.vacuum_pages()  # (the pages adopt() freed: the copy has none)
         target.header.user_version = pager.header.user_version
         target.header.application_id = pager.header.application_id
 
