@@ -53,6 +53,14 @@ def loose(row):
     return tuple(("num", float(v)) if isinstance(v, (int, float)) else (type(v).__name__, v) for v in row)
 
 
+def folded(row):
+    """Like ``loose``, with texts compared as NOCASE and RTRIM would: of texts
+    a collation makes equal, which one DISTINCT or a group shows depends on
+    the order the rows come in."""
+    return tuple(("num", float(v)) if isinstance(v, (int, float))
+                 else ("str", v.lower().rstrip(" ")) if isinstance(v, str) else (type(v).__name__, v) for v in row)
+
+
 class Mismatch(AssertionError):
     pass
 
@@ -193,7 +201,7 @@ class Checker:
         results = self.run_all(base, partitioned)
         if results:
             oracle = "TLP distinct" if distinct else "TLP where"
-            self.compare(oracle, results[0], results[1], loose if distinct else typed, [base, partitioned])
+            self.compare(oracle, results[0], results[1], folded if distinct else typed, [base, partitioned])
 
     def tlp_aggregate(self):
         from_sql, scope = self.from_clause()
@@ -202,18 +210,28 @@ class Checker:
         argument = "*" if function == "count" and self.rng.random() < 0.4 else self.items(scope, 1)[0]
         whole = f"SELECT {function}({argument}) FROM {from_sql}"
         combine = {"min": "min", "max": "max", "count": "sum", "sum": "sum"}[function]
-        partitioned = (f"SELECT {combine}(x) FROM ("
-                       + " UNION ALL ".join(
-                           f"SELECT {function}({argument}) AS x FROM {from_sql} WHERE {condition}"
-                           for condition in (f"({p})", f"NOT ({p})", f"({p}) IS NULL"))
-                       + ") AS s")
+        conditions = (f"({p})", f"NOT ({p})", f"({p}) IS NULL")
+        if function in ("min", "max"):
+            # min() / max() over the partitions' rows: a column keeps its
+            # collation through the UNION ALL, not through min() itself.
+            partitioned = (f"SELECT {function}(x) FROM ("
+                           + " UNION ALL ".join(f"SELECT {argument} AS x FROM {from_sql} WHERE {condition}"
+                                                for condition in conditions)
+                           + ") AS s")
+        else:
+            partitioned = (f"SELECT {combine}(x) FROM ("
+                           + " UNION ALL ".join(
+                               f"SELECT {function}({argument}) AS x FROM {from_sql} WHERE {condition}"
+                               for condition in conditions)
+                           + ") AS s")
         results = self.run_all(whole, partitioned)
         if not results:
             return
         expected, actual = results
         if function == "sum" and any(isinstance(r[0], float) for r in expected + actual):
             return  # REAL sums depend on the order of addition
-        self.compare(f"TLP {function}", expected, actual, loose, [whole, partitioned])
+        self.compare(f"TLP {function}", expected, actual, folded if function in ("min", "max") else loose,
+                     [whole, partitioned])
 
     def tlp_having(self):
         from_sql, scope = self.from_clause()
@@ -232,7 +250,7 @@ class Checker:
         )
         results = self.run_all(base, partitioned)
         if results:
-            self.compare("TLP having", results[0], results[1], loose, [base, partitioned])
+            self.compare("TLP having", results[0], results[1], folded, [base, partitioned])
 
     def norec(self):
         from_sql, scope = self.from_clause()
