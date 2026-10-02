@@ -203,6 +203,79 @@ def test_in_memory_sqlite_format():
 # ---- ANALYZE and VACUUM, as SQLite does them ------------------------------------------
 
 
+def test_serialize_and_deserialize(tmp_path):
+    """sqlite3's Connection.serialize / deserialize: an SQLite file image in
+    memory, both ways (what the playground opens and exports)."""
+    source = sqlite3.connect(":memory:")
+    source.executescript("""
+        CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT, c BLOB);
+        CREATE INDEX tb ON t (b);
+        CREATE TRIGGER tr AFTER DELETE ON t BEGIN INSERT INTO log VALUES (old.a); END;
+        CREATE TABLE log (a);
+        WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 300)
+        INSERT INTO t (b, c) SELECT 'v' || i, randomblob(i * 20) FROM n;
+    """)
+    image = source.serialize()
+    db = Database()
+    db.deserialize(image)
+    queries = ["SELECT a, b, hex(c) FROM t ORDER BY a", "SELECT b FROM t ORDER BY b", "SELECT * FROM log"]
+    for sql in queries:
+        assert [typed(r) for r in db.execute(sql)] == [typed(r) for r in source.execute(sql).fetchall()]
+
+    def same_as_sqlite(data, statements):
+        check = sqlite3.connect(":memory:")
+        check.deserialize(data)
+        assert check.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        for sql in statements:
+            source.execute(sql)
+        for sql in queries:
+            assert check.execute(sql).fetchall() == source.execute(sql).fetchall(), sql
+
+    changes = ["DELETE FROM t WHERE a % 3 = 0", "UPDATE t SET b = upper(b) WHERE a % 5 = 0",
+               "INSERT INTO t (b, c) VALUES ('new', zeroblob(9000))"]
+    for sql in changes:
+        db.execute(sql)
+    same_as_sqlite(db.serialize(), changes)
+    # Uncommitted changes are in the image (as sqlite3's are); a transaction blocks deserialize.
+    db.execute("BEGIN")
+    db.execute("DELETE FROM t WHERE a < 100")
+    same_as_sqlite(db.serialize(), ["DELETE FROM t WHERE a < 100"])
+    with pytest.raises(OperationalError, match="database is locked"):
+        db.deserialize(image)
+    db.execute("ROLLBACK")
+    with pytest.raises(DatabaseError, match="file is not a database"):
+        db.deserialize(b"not a database" * 100)
+    assert list(db.execute("SELECT count(*) FROM t")) == [(201,)]  # (still the database it had)
+
+    # A file connection becomes an in-memory one; the file stays as it was.
+    path = str(tmp_path / "f.db")
+    on_file = Database(path, format="sqlite")
+    on_file.execute("CREATE TABLE x (y)")
+    on_file.deserialize(image)
+    on_file.execute("DELETE FROM t")
+    assert list(on_file.execute("SELECT count(*) FROM t")) == [(0,)]
+    on_file.close()
+    with closing(lite(path)) as other:
+        assert other.execute("SELECT name FROM sqlite_schema").fetchall() == [("x",)]
+    # An empty image is a new database; a MiniDB-format database cannot be serialized.
+    fresh = Database()
+    fresh.deserialize(b"")
+    fresh.execute("CREATE TABLE z (w)")
+    assert sqlite3.connect(":memory:").deserialize(fresh.serialize()) is None
+    with pytest.raises(NotSupportedError):
+        Database().serialize()
+
+    # The DB-API connection: its open transaction starts again.
+    connection = minidb.connect(":memory:", format="sqlite")
+    connection.deserialize(image)
+    assert connection.execute("SELECT count(*) FROM t").fetchall() == [(300,)]
+    connection.execute("DELETE FROM t")
+    with pytest.raises(OperationalError, match="database is locked"):
+        connection.deserialize(image)
+    connection.commit()
+    assert len(connection.serialize()) % 4096 == 0
+
+
 def test_analyze_and_vacuum_match_sqlite(tmp_path):
     path = str(tmp_path / "db")
     statements = [

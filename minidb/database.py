@@ -9,7 +9,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
 from minidb.catalog import Catalog
-from minidb.errors import DatabaseError, IntegrityError, OperationalError, ProgrammingError
+from minidb.errors import DatabaseError, IntegrityError, NotSupportedError, OperationalError, ProgrammingError
 from minidb.executor import Executor, Result
 from minidb.locking import LockTimeout
 from minidb.pager import Pager
@@ -80,19 +80,24 @@ class Database:
         ``format``: "minidb" (the default for new databases) or "sqlite"
         (SQLite's own file format, see ``minidb.sqlite_pager``).  An existing
         file is opened in the format its header says."""
-        self.pager = open_pager(path, timeout, format)  # starts inside a read transaction
+        self._open(open_pager(path, timeout, format))
+
+    def _open(self, pager: Pager | SqlitePager) -> None:
+        """Start using ``pager`` (inside its read transaction): read the schema."""
         try:
-            if self.pager.is_new:
+            if pager.is_new:
                 # Creating the file: become the writer first (RESERVED before the snapshot).
-                self.pager.end_transaction()
-                self.pager.begin_write()
-                self.pager.begin_read()
-            self.catalog = Catalog(self.pager)
-            self.pager.commit()
-            self.pager.end_transaction()
+                pager.end_transaction()
+                pager.begin_write()
+                pager.begin_read()
+            catalog = Catalog(pager)
+            pager.commit()
+            pager.end_transaction()
         except BaseException:
-            self.pager.close_files()
+            pager.close_files()
             raise
+        self.pager = pager
+        self.catalog = catalog
         self.executor = Executor(self.catalog)
         self.executor.integrity_problems = self._integrity_check
         self.executor.in_transaction = lambda: self.in_transaction
@@ -375,6 +380,29 @@ class Database:
                 if catalog.index_tree(index).keys() != expected:
                     problems.append(f"index {index.name} does not match table {table.name}")
         return problems
+
+    def serialize(self) -> bytes:
+        """The database as the bytes of an SQLite file, this connection's
+        uncommitted changes included (sqlite3's ``Connection.serialize``)."""
+        if not isinstance(self.pager, SqlitePager):
+            raise NotSupportedError("serialize() needs a database in SQLite's file format")
+        if self.in_transaction:
+            return self.pager.serialize()
+        self.pager.begin_read()
+        try:
+            return self.pager.serialize()
+        finally:
+            self.pager.end_transaction()
+
+    def deserialize(self, data: bytes) -> None:
+        """Replace the database with an in-memory one that starts as the
+        SQLite file ``data`` (sqlite3's ``Connection.deserialize``).  The file
+        this connection had open is left as it was."""
+        if self.in_transaction:
+            raise OperationalError("database is locked")
+        pager = SqlitePager(None, image=bytes(data))  # (raises if it is not a database)
+        self.close()
+        self._open(pager)
 
     def close(self) -> None:
         """Close the database; an open transaction is rolled back."""
