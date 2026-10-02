@@ -9,3 +9,4 @@ __pycache__/
 .reference-sqlite/
 .sqllogictest/
 site/
+.sample-databases/
