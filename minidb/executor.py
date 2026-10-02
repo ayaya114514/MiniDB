@@ -4816,6 +4816,7 @@ class PreparedViewInsert:
         self.returning = executor.compile_returning(stmt.returning, scope)
         self.conflict = stmt.conflict
         executor.triggers.prepare(view.name, "INSERT", None, self.conflict)
+        self.instead = bool(executor.triggers.matching(view.name, "INSTEAD OF", "INSERT"))
         self.aborts = calls_function(stmt) or executor.triggers.may_abort(view.name, "INSERT", None, self.conflict)
         self.statement_journal = self.aborts
 
@@ -4837,8 +4838,9 @@ class PreparedViewInsert:
             new = [None] * (width + 1)
             for position, value in zip(self.positions, values_):
                 new[position] = value
-            if new[width] is not None and not isinstance(values.apply_affinity(new[width], values.INTEGER), int):
-                raise IntegrityError("datatype mismatch")  # (SQLite checks the row id it then ignores)
+            if self.instead and new[width] is not None and not isinstance(
+                    values.apply_affinity(new[width], values.INTEGER), int):
+                raise IntegrityError("datatype mismatch")  # (building NEW, SQLite checks the row id it ignores)
             new[width] = None
             try:
                 executor.triggers.fire(self.view.name, "INSTEAD OF", "INSERT", None, new, None, self.conflict)
