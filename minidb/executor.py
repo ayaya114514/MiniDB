@@ -3316,6 +3316,9 @@ class Executor:
                 triggers.fire(table.name, "AFTER", "DELETE", row, None, None, orconf)
             except TriggerIgnore:
                 pass
+            except Error as exc:
+                exc.row_done = 1  # (SQLite counted the row before its AFTER triggers)
+                raise
         return row
 
     def check_unique(self, table: TableInfo, row: Row, rowid: int) -> None:
@@ -3459,6 +3462,9 @@ class Executor:
                 triggers.fire(table.name, "AFTER", "INSERT", None, row + [rowid], None, conflict)
             except TriggerIgnore:
                 pass
+            except Error as exc:
+                exc.row_done = 1
+                raise
         return "insert", row + [rowid]
 
     def update_row(self, table: TableInfo, tree: BTree, rowid: int, old: Row, new: Row, conflict: str | None = None,
@@ -3552,6 +3558,9 @@ class Executor:
                 triggers.fire(table.name, "AFTER", "UPDATE", old, row + [new_rowid], names, conflict)
             except TriggerIgnore:
                 pass
+            except Error as exc:
+                exc.row_done = 1
+                raise
         return row + [new_rowid]
 
     def compile_returning(self, items: list[SelectItem] | None, scope: Scope) -> tuple[list[RowFunction], list[str]] | None:
@@ -4674,7 +4683,7 @@ class PreparedInsert:
                         executor.last_insert_rowid = stored[-1]
                     changed.append(stored)
         except Error as exc:
-            exc.changes = len(changed)  # the rows that FAIL (or no statement journal) keeps
+            exc.changes = len(changed) + exc.__dict__.pop("row_done", 0)  # the rows that FAIL (or no statement journal) keeps
             raise
         finally:
             keys.unchecked = saved_unchecked
@@ -4786,7 +4795,7 @@ class PreparedUpdate(PreparedSingleTable):
                 if stored is not None:
                     changed.append(stored)
         except Error as exc:
-            exc.changes = len(changed)
+            exc.changes = len(changed) + exc.__dict__.pop("row_done", 0)
             raise
         finally:
             keys.unchecked = saved_unchecked
@@ -4834,7 +4843,7 @@ class PreparedDelete(PreparedSingleTable):
                 if row is not None:
                     deleted.append(row)
         except Error as exc:
-            exc.changes = len(deleted)
+            exc.changes = len(deleted) + exc.__dict__.pop("row_done", 0)
             raise
         return returning_result(self.returning, deleted)
 
@@ -4905,6 +4914,9 @@ class PreparedViewInsert:
                 executor.triggers.fire(self.view.name, "INSTEAD OF", "INSERT", None, new, None, self.conflict)
             except TriggerIgnore:
                 continue
+            except Error as exc:
+                exc.changes = 0  # (a view's changes() is 0, also after RAISE(FAIL))
+                raise
             done.append(new)
         return view_result(self.returning, done)
 
@@ -4966,6 +4978,9 @@ class PreparedViewChange:
                 executor.triggers.fire(self.view.name, "INSTEAD OF", self.event, old, new, self.names, self.conflict)
             except TriggerIgnore:
                 continue
+            except Error as exc:
+                exc.changes = 0
+                raise
             done.append(new if new is not None else old)
         return view_result(self.returning, done)
 
@@ -5063,8 +5078,9 @@ class PreparedUpsert:
         for position, function in self.assignments:
             new[position] = function(context)
         # (SQLite runs DO UPDATE as an UPDATE OR ABORT: the constraints' own ON CONFLICT does not apply.)
-        return "update", executor.update_row(table, tree, rowid, old, new, "ABORT",
-                                             {position for position, _ in self.assignments})
+        stored = executor.update_row(table, tree, rowid, old, new, "ABORT",
+                                     {position for position, _ in self.assignments})
+        return None if stored is None else ("update", stored)  # (None: a trigger deleted or kept the row)
 
 
 # Functions SQLite compiles inline (no function call that could raise an error).

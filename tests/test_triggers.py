@@ -314,3 +314,87 @@ def test_views_corners(pair):
         "INSERT INTO v (rowid, a) VALUES (3, 1)", "INSERT INTO v (rowid, a) VALUES ('x', 1)",
         "INSERT INTO v (oid, a) VALUES (NULL, 1)", "SELECT * FROM log",
     ])
+
+
+def test_total_changes_when_a_trigger_fails(pair):
+    """A program's completed statements count in total_changes() even when a
+    later one fails (SQLite's OP_ResetCount); the failing statement's rows
+    do not.  Under FAIL the statement's own rows count, the row whose AFTER
+    trigger failed included.  An upsert whose UPDATE a trigger skipped
+    returns no row."""
+    run(pair, [
+        'CREATE TABLE w(x)',
+        'CREATE TABLE t(x)',
+        'CREATE TABLE a(x)',
+        'CREATE TABLE n(x)',
+        'CREATE TABLE u(x UNIQUE)',
+        'CREATE TABLE m(x)',
+        'CREATE VIEW v AS SELECT x FROM m',
+        "CREATE TRIGGER vi INSTEAD OF INSERT ON v BEGIN INSERT INTO m VALUES (new.x); SELECT RAISE(FAIL, 'stop') WHERE new.x = 2; END",
+        "CREATE TRIGGER ta BEFORE INSERT ON a BEGIN INSERT INTO m VALUES (new.x); SELECT RAISE(ABORT, 'stop') WHERE new.x = 2; END",
+        'CREATE TRIGGER tn BEFORE INSERT ON n BEGIN INSERT INTO t VALUES (new.x); END',
+        "CREATE TRIGGER tt BEFORE INSERT ON t BEGIN INSERT INTO m VALUES (new.x); INSERT INTO m VALUES (new.x); SELECT RAISE(FAIL, 'stop') WHERE new.x = 2; END",
+        'CREATE TRIGGER tu AFTER INSERT ON w WHEN new.x = 5 BEGIN INSERT INTO u VALUES (1); INSERT OR FAIL INTO u VALUES (1); END',
+        'INSERT INTO v VALUES (2)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO v VALUES (1), (2), (3)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO a VALUES (2)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO a VALUES (1), (2)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO n VALUES (1), (2)',
+        'SELECT total_changes(), changes()',
+        'BEGIN',
+        'INSERT INTO a VALUES (1), (2)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO n VALUES (1), (2)',
+        'SELECT total_changes(), changes()',
+        'COMMIT',
+        'INSERT INTO w VALUES (5)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO w VALUES (4), (5)',
+        'SELECT total_changes(), changes()',
+        'INSERT OR FAIL INTO w VALUES (4), (5)',
+        'SELECT total_changes(), changes()',
+        'CREATE TRIGGER tm AFTER INSERT ON m WHEN new.x = 9 BEGIN INSERT INTO u SELECT 7 UNION ALL SELECT 8 UNION ALL SELECT 1; END',
+        'INSERT INTO m VALUES (9)',
+        'SELECT total_changes(), changes()',
+        'INSERT INTO m VALUES (8), (9)',
+        'SELECT total_changes(), changes()',
+        'SELECT count(*) FROM m',
+    ])
+    run(pair, [
+        'CREATE TABLE p(x)',
+        'CREATE TABLE q(x UNIQUE)',
+        'CREATE TABLE lg(x)',
+        'INSERT INTO q VALUES (1)',
+        'INSERT INTO p VALUES (1), (2), (3)',
+        'CREATE TRIGGER pu AFTER UPDATE ON p WHEN new.x = 20 BEGIN INSERT INTO lg VALUES (new.x); INSERT OR FAIL INTO q VALUES (1); END',
+        "CREATE TRIGGER pd AFTER DELETE ON p WHEN old.x = 3 BEGIN INSERT INTO lg VALUES (old.x); SELECT RAISE(FAIL, 'nope'); END",
+        'UPDATE p SET x = x * 10',
+        'SELECT total_changes(), changes()',
+        'SELECT * FROM p',
+        'UPDATE OR FAIL p SET x = x + 1 WHERE x < 5',
+        'SELECT total_changes(), changes()',
+        'DELETE FROM p WHERE x < 40',
+        'SELECT total_changes(), changes()',
+        'SELECT * FROM p',
+        'UPDATE p SET x = 3 WHERE x = 30',
+        'DELETE FROM p',
+        'SELECT total_changes(), changes()',
+        'SELECT * FROM p',
+        'SELECT * FROM lg',
+    ])
+
+
+def test_upsert_skipped_by_a_trigger(pair):
+    run(pair, [
+        'CREATE TABLE uu (a UNIQUE, b)',
+        "INSERT INTO uu VALUES (1, 'one'), (2, 'two')",
+        'CREATE TRIGGER ig BEFORE UPDATE ON uu WHEN old.a = 1 BEGIN SELECT RAISE(IGNORE); END',
+        'CREATE TRIGGER del BEFORE UPDATE ON uu WHEN old.a = 2 BEGIN DELETE FROM uu WHERE a = 2; END',
+        "INSERT INTO uu VALUES (1, 'x'), (2, 'y'), (3, 'z') ON CONFLICT (a) DO UPDATE SET b = excluded.b RETURNING a, b",
+        'SELECT changes(), total_changes()',
+        'SELECT * FROM uu',
+    ])
