@@ -520,3 +520,44 @@ SQLite 格式文件模式 2400 种子（2000–3199、6000–7199）、MiniDB �
 - 没有 `pragma_function_list`。
 - JSON 性能见上表，没有优化。
 - fuzz 的步数上限会跳过级联改动过多的语句（种子 0–59 里没有一句被跳过）。
+
+## 阶段 24：Playground 打开本地 SQLite 文件（本地完成，2026-10-02；部署待确认）
+- **打开与导出**（D113）：页面上“打开文件”或把文件拖进页面，文件读成字节交给 worker，MiniDB 用新的
+  `Database.deserialize()` 把它变成内存里的 SQLite 格式库；查询、修改都在它上面，“导出”用 `serialize()` 交回文件下载
+  （文件名沿用原名）。数据全程只在浏览器内存里。打开后若编辑器里是示例，换成列出 `sqlite_schema` 的查询并运行。
+  不是 SQLite 文件、或 MiniDB 还不支持的 SQLite 文件（如 1024 字节页），给出明确的报错，原来的库保持不变。
+- **`serialize()` / `deserialize()`**（`Database` 与 DB-API `Connection`）：照 Python sqlite3 同名方法，语义按实测对齐
+  （含未提交改动、事务中 deserialize 报 `database is locked`、文件连接变成内存库而原文件不动）。
+- **真实页面布局**：SQLite 格式的库在右侧多两块——“文件”：每页一格，按类型着色（表 / 索引的内部页与叶子页、溢出页、
+  空闲列表主干页与空闲页、锁字节页），高亮所选表或索引的页，点击查看；“第 N 页”：按页面原始字节画出 4096 字节的分布
+  （文件头、页头、单元格指针数组、未分配区、各单元格、空闲块、碎片），给出内容区起点、空闲字节构成、最右子页，下面列出
+  单元格（偏移、字节数、rowid 或索引项、负载、左子页、溢出页链）。点击 B 树节点或页面格子切换。SQLite 的索引是 B 树
+  （内部页也存条目），树的标题随格式写“B 树”/“B+ 树”。大文件的树和页面图按 change counter 缓存。
+- fuzzer：SQLite 格式（内存与文件）的每个种子结束时做 `serialize()` / `deserialize()` 双向对照（sqlite3 打开 MiniDB 的
+  镜像做 integrity_check 并逐表比较，MiniDB 打开 sqlite3 的镜像同样比较）。
+- 测试：`test_serialize_and_deserialize`（与 sqlite3 互相交换镜像、事务中、无效数据、文件连接、DB-API）；
+  `test_playground.py` 新增两项：用 sqlite3 写出带空闲块、碎片、溢出页、空闲列表的文件，检查每页的区域恰好覆盖 4096
+  字节、碎片字节数等于页头记录、叶子页 rowid 与 sqlite3 一致、空闲页数等于 `PRAGMA freelist_count`、修改后导出的文件
+  sqlite3 `integrity_check` 通过且内容一致；以及拒绝的文件。
+- **浏览器实测**（本机 Chrome，经 `python -m http.server` 打开构建好的 `site/`）：
+  - 桌面 1440×900：示例照常（首个示例 76 ms）；“打开文件”打开 Chinook（217 页）显示 schema、文件图、各页布局；
+    拖入 24 MB 的 Northwind（6031 页）0.1 秒打开，切换到 60 万行的 `Order Details` 后树与页面正确；
+    在 Pyodide 里 `SELECT count(*), sum(...)` 扫 60 万行 2.3 秒，结果与 sqlite3 相同。
+  - 修改 Chinook 后导出：浏览器导出的字节与本机 Python 跑同样语句的导出 SHA-256 相同；点“导出”真实下载到
+    `~/Downloads/Chinook.sqlite` 的文件同一哈希，sqlite3 `integrity_check` 为 ok。
+  - 1024 字节页的 Chinook 给出 MiniDB 的报错原文（只显示异常信息，不带 traceback），原库不变。
+  - 在打开的文件上运行示例、⌘+Enter、清空数据库后回到 MiniDB 格式（导出禁用、页面区隐藏）都正常。
+  - 390×844（移动端模拟）：无横向溢出（scrollWidth = 390）。上述过程 console 无报错。
+  - 实测中发现并修复：构建出的 app.js 里有一处变量重名的语法错误（之后构建都先 `node --check`）；打开文件后立刻切换
+    对象时，两次刷新交错导致页面区停在旧页（加了世代号，过期的刷新和页面请求作废）；示例下拉在编辑器不是示例时显示空白
+    （加了占位项）。
+- 性能：本阶段没有改动查询 / 存储的热路径（只有 `Database` 打开时的代码拆分），没有重跑 benchmark。
+
+**验证**：测试 1431 个全部通过；fuzz：SQLite 格式内存 2000 种子（0–1999，每个种子结束时做镜像双向对照）、SQLite 格式文件模式 1200 种子（2000–3199）、MiniDB 格式内存 2000 种子（4000–5999）、MiniDB 格式文件 300 种子（5000–5299）——只有已归类的 248、1961、2789 不同（依赖查询计划，同阶段 23）；变形测试文件模式 300 × 300 0 失败。
+
+**已知问题 / 做得不扎实的地方**：
+- **部署未做**：推送到 GitHub（Pages 工作流部署）需要用户确认，本地领先若干提交，线上仍是阶段 19 的版本。
+- 只能打开 4096 字节页、非 WAL、无 auto_vacuum 的 SQLite 文件（阶段 25 的范围）；MiniDB 自己格式的文件不能在页面里打开。
+- 页面布局只画 B 树页；溢出页、空闲列表页只标出类型。文件图对上万页的库仍是一页一格（可滚动）。
+- 整个文件读进内存（Pyodide 的 WebAssembly 内存），没有测过百 MB 以上的文件。
+- 只在本机 Chrome 上实测，Safari / Firefox 未运行；拖放用合成的 DragEvent 测试，没有真人拖拽。
