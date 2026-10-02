@@ -2649,6 +2649,16 @@ class Executor:
         order = list(range(len(joins)))
         if len(joins) > 1 and all(join.kind == "INNER" for join in joins):
             order = self.join_order(scope, [(c, tables) for c, tables, _, _ in referenced], compiler)
+            if group_hint and order[0] != 0 and all(len(tables) < 2 for _, tables, _, _ in referenced) and not any(
+                    0 in tables for _, tables, _, _ in referenced):
+                # A cross join whose first table has an index ordering the
+                # groups: SQLite keeps that table outermost to save the sort.
+                entry = scope.entries[0]
+                if not isinstance(entry.table, DerivedSource):
+                    scan = FullScan(self.catalog.table_tree(entry.table), table_rows(self.catalog, entry.table))
+                    found = grouping_index_scan(scope, 0, self.catalog, scan, group_hint)
+                    if found is not None and found.grouping == "all":
+                        order = [0] + [i for i in order if i != 0]
         position = {table: i for i, table in enumerate(order)}
         placed = {}
         for conjunct, tables, lowest, home in referenced:
