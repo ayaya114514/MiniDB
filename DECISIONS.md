@@ -888,6 +888,12 @@ GROUP BY 值）取哪一行照 SQLite 的 updateAccumulator：每个 `min()` / `
 - **语句日志**：SQLite 只在外键代码可能中止语句时（sqlite3MayAbort：加行时有立即外键；删父键而动作不是 CASCADE /
   SET NULL；RESTRICT；动作执行的语句里同样的情况）给多行语句开语句日志；没有日志时，事务里因别的原因失败的语句保留
   已做的修改。MiniDB 照此判断（动作语句里稍保守：碰到任何约束都算）。
+- **单行 INSERT**：SQLite 认为插入一行父表不会修复立即约束的违反，所以不去找它的子行（不减计数，也不定位父键索引，
+  因而不报 mismatch）；多行写入（多行 VALUES、INSERT ... SELECT、RETURNING、可能 REPLACE 的）才找。自引用表里新行
+  自己的悬空外键因此照样报错。
+- **`PRAGMA defer_foreign_keys` 的寿命**：随事务结束。事务外，SQLite 的语句只要读了数据库文件（程序里有
+  OP_Transaction：读表、读 sqlite_schema、读文件头的 PRAGMA、对存在的表/索引的 table_info / index_list / index_info，
+  以及任何写）就结束隐式事务、清掉这个开关；`SELECT 1`、只用 CTE 的查询、设置类 PRAGMA 不会。编译就失败的语句也不会。
 - **怪癖照搬**：sqlite3FkCheck 的 isSetNullAction——最后编译的动作程序若是 SET NULL，就跳过那个外键对新行的检查；
   OR FAIL 停下时若有外键违反，变成撤销语句的外键错误；`total_changes()` 计入已完成的动作改动（即使语句随后失败）和
   DROP TABLE 删父表前隐式删除的行。DROP TABLE 父表时先删全部行（执行动作，不报 mismatch）。
@@ -896,3 +902,11 @@ AFF_DEFER）；单独的 `min(x)` / `max(x)` 且 WHERE 有 `x = <别的表的表
 （所以数值比较下 '1' 和 '1.0' 都相等时，结果是扫描到的第一行，不是最小值），MiniDB 照做；INTEGER PRIMARY KEY 上的
 NOT NULL 不拦插入 NULL（那是“分配新 rowid”，Chinook 的表都这样写）；未命名 CHECK 的报错名照 sqlite3Dequote 处理原文
 （`[UnitPrice]>=(0)` 报成 “UnitPrice”，Northwind）。
+
+## D109 GROUP BY 走能给出分组顺序的索引
+SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统计信息时，只要某个索引的前几列恰好是全部 GROUP BY 列
+（顺序不限、排序规则相同），或者是 GROUP BY 按书写顺序的前几项（部分有序，块排序），它就全扫这个索引——不覆盖也扫。
+这决定了每组“第一行”是哪一行：裸列、`max()` 都是 NULL 时的值、NOCASE / RTRIM 下相等的不同文本显示哪一个（fuzz 种子
+1404：RTRIM 下的 'b' 与 'b '）。MiniDB 在第一张表没有别的访问路径（全表扫描）时照此选索引：能排好的项多的优先，
+再覆盖的优先，再窄的优先；全部排好时各组按索引顺序输出（不再按键排序）。带统计信息时 SQLite 按代价决定（种子 2266
+里它在 `GROUP BY c3, c0` 上仍选了只排好 c0 的索引），这一点不模拟，记为已知差异。

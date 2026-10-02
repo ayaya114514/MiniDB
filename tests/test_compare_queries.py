@@ -1360,6 +1360,9 @@ def test_group_by_through_an_ordering_index():
         "SELECT a, c FROM t GROUP BY a", "SELECT a, max(b) FROM t GROUP BY a", "SELECT d, a, count(*) FROM t GROUP BY a, d",
         "SELECT b, a FROM t GROUP BY b, a COLLATE nocase", "SELECT a, c, count(*) FROM t GROUP BY a, c",
         "SELECT a, c, count(*) FROM t GROUP BY c, a",
+        # A cross join keeps the table whose index orders the groups outermost, even after ANALYZE.
+        "CREATE TABLE u (x)", "INSERT INTO u VALUES (1), (2), (3)", "ANALYZE",
+        "SELECT t.a, count(*) FROM t, u GROUP BY t.a", "SELECT t.a, count(*), max(u.x) FROM t, u GROUP BY t.a",
     ]:
         pair.run(sql, ordered=True)
     pair.close()
