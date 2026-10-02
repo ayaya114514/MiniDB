@@ -238,3 +238,19 @@ def test_sqlite_agrees_with_what_minidb_wrote(tmp_path):
         assert lite.execute("PRAGMA foreign_key_check").fetchall() == []
         assert lite.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
         assert lite.execute("SELECT * FROM album").fetchall() == rows
+
+
+@pytest.mark.parametrize("statement", [
+    "SELECT 1", "SELECT * FROM t", "VALUES (1)", "WITH c AS (SELECT 1) SELECT * FROM c", "SELECT * FROM sqlite_master",
+    "SELECT 1 WHERE EXISTS (SELECT 1 FROM t)", "SELECT * FROM pragma_table_info('t')", "SELECT * FROM nosuch",
+    "INSERT INTO t VALUES (1)", "INSERT INTO nosuch VALUES (1)", "CREATE TABLE t (b)", "PRAGMA user_version",
+    "PRAGMA user_version = 1", "PRAGMA foreign_keys", "PRAGMA cache_size = 10", "PRAGMA table_info(t)",
+    "PRAGMA table_info", "PRAGMA index_list(t)", "PRAGMA index_list(nosuch)", "PRAGMA index_info(ti)",
+    "PRAGMA index_info(t)", "PRAGMA integrity_check",
+])
+def test_defer_foreign_keys_ends_with_an_implicit_transaction(pair, statement):
+    """Outside a transaction, PRAGMA defer_foreign_keys lasts until a
+    statement whose SQLite program reads the database file has run."""
+    for sql in ["CREATE TABLE t (a)", "CREATE INDEX ti ON t (a)", "PRAGMA defer_foreign_keys = ON", statement,
+                "PRAGMA defer_foreign_keys"]:
+        pair.run(sql)

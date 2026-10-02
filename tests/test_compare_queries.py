@@ -1345,6 +1345,26 @@ def test_truth_tests_and_likely():
     pair.close()
 
 
+def test_group_by_through_an_ordering_index():
+    """SQLite scans an index that orders the GROUP BY columns (all of them in
+    any order, or the first terms in order) rather than sort: a group's
+    first row - its bare columns, the value shown for a collation's equal
+    texts - comes in index order, and so do the groups."""
+    pair = Pair()
+    for sql in [
+        "CREATE TABLE t (a TEXT COLLATE rtrim, b INT, c, d TEXT)",
+        "INSERT INTO t VALUES ('b', 10, 1, 'x'), ('x', 1, 2, 'y'), ('b ', -5, 3, 'z'), ('B', 0, 4, 'w')",
+        "CREATE INDEX i1 ON t (a, b)", "CREATE INDEX i2 ON t (b, a COLLATE nocase)", "CREATE INDEX i3 ON t (d, a)",
+        "SELECT a, count(*) FROM t GROUP BY a", "SELECT a, b, count(*) FROM t GROUP BY b, a",
+        "SELECT a, count(*) FROM t GROUP BY a COLLATE nocase", "SELECT a, b FROM t GROUP BY a COLLATE binary",
+        "SELECT a, c FROM t GROUP BY a", "SELECT a, max(b) FROM t GROUP BY a", "SELECT d, a, count(*) FROM t GROUP BY a, d",
+        "SELECT b, a FROM t GROUP BY b, a COLLATE nocase", "SELECT a, c, count(*) FROM t GROUP BY a, c",
+        "SELECT a, c, count(*) FROM t GROUP BY c, a",
+    ]:
+        pair.run(sql, ordered=True)
+    pair.close()
+
+
 def test_limit_zero_runs_nothing():
     pair = Pair(check_messages=True)
     pair.run("CREATE TABLE t (a)")
