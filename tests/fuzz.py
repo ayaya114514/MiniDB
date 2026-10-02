@@ -41,6 +41,7 @@ JSON_DOCS = ['{"a":1,"b":[2,3.5,"x"],"c":{"d":null}}', '[1,[2,{"a":3}],"s",true]
 JSON_TEXTS = JSON_DOCS + ['[1,2', '{"a":}', '', 'x', '[1] 2', '{"a":1,}', '01']
 JSON_PATHS = ["'$'", "'$.a'", "'$.b[0]'", "'$[1]'", "'$[#-1]'", "'$.a.b'", "'$.\"x y\"'", "'$[0].a'", "'$.c.d'",
               "'$.b[#]'", "'$.a[1].b'", "'$.z'"]
+PAGE_SIZES = [512, 1024, 2048, 4096, 8192, 16384, 65536]
 ARROW_PATHS = ["'a'", "0", "1", "-1", "'$.b'", "'[1]'", "'x y'", "'$.a[0]'", "'b'"]
 DATE_MODIFIERS = ["'+1 day'", "'-3 months'", "'start of month'", "'weekday 2'", "'+1.5 hours'", "'unixepoch'",
                   "'floor'", "'+1-01-01'", "'subsec'"]
@@ -91,6 +92,7 @@ class Generator:
         self.no_parameters = False  # views and triggers may not contain parameters
         self.qualify = False  # always qualify column names (NEW.x / OLD.x in triggers)
         self.triggers = []  # names of the triggers created
+        self.page_sizes = False  # also PRAGMA page_size (SQLite's file format)
 
     # ---- schema -------------------------------------------------------------
 
@@ -843,6 +845,8 @@ class Generator:
         if roll < 0.098:
             return self.add_column()
         if roll < 0.1:
+            if self.page_sizes and rng.random() < 0.4:
+                return f"PRAGMA page_size = {rng.choice(PAGE_SIZES)}"  # (the next VACUUM uses it)
             return "VACUUM"
         if roll < 0.11:
             return self.create_trigger() if rng.random() < 0.8 else self.drop_trigger()
@@ -867,11 +871,14 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
     from sqlcompare import SKIPPED, Pair  # only here: the generator itself (metamorphic.py) needs no sqlite3
 
     generator = Generator(seed)
+    generator.page_sizes = format == "sqlite"
     pair = Pair(path, loose_numbers=True, format=format, step_limit=STEP_LIMIT)
     snapshots = SnapshotReader(pair.mini, path, seed) if path is not None and format != "sqlite" else None
     history = []
     try:
         setup = [("PRAGMA foreign_keys = ON", None)] if seed % 2 else []
+        if format == "sqlite":  # (a new database: both take the page size at once)
+            setup.insert(0, (f"PRAGMA page_size = {PAGE_SIZES[seed % len(PAGE_SIZES)]}", None))
         setup += [(generator.create_table(), None) for _ in range(2)]
         setup.append((generator.create_index(), None))
         for sql, parameters in setup + [generator.statement_with_parameters() for _ in range(statements)]:

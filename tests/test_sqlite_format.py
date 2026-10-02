@@ -67,7 +67,7 @@ def test_records_are_byte_for_byte_sqlites(tmp_path):
             connection.execute("INSERT INTO t VALUES (?, ?)", row[:2])
     with open(path, "rb") as f:
         data = f.read()
-    page = F.BtreePage.from_bytes(2, data[F.PAGE_SIZE:2 * F.PAGE_SIZE])
+    page = F.BtreePage.from_bytes(2, data[4096:2 * 4096], F.DEFAULT)
     for cell, value in zip(page.cells, samples):
         row = value[:2] if isinstance(value, list) else [value, None]
         assert cell.local == F.encode_record(row)
@@ -431,12 +431,115 @@ def test_locks_against_a_sqlite_process(tmp_path):
     db.close()
 
 
+# ---- page sizes -------------------------------------------------------------------------
+
+PAGE_SIZE_SETUP = """
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, data BLOB);
+    CREATE INDEX t_name ON t (name);
+    CREATE TABLE u (k TEXT PRIMARY KEY, v);
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 700)
+    INSERT INTO t (name, data) SELECT printf('%.*c%d', i % 60, 'n', i), zeroblob(CASE WHEN i % 50 = 0 THEN 70000 ELSE i % 90 END) FROM n;
+    INSERT INTO u SELECT name, id FROM t WHERE id % 3 = 0;
+    DELETE FROM t WHERE id % 4 = 0;
+"""
+PAGE_SIZE_CHANGES = [
+    "INSERT INTO t (name, data) VALUES ('big', zeroblob(150000)), ('" + "x" * 3000 + "', x'00ff')",
+    "UPDATE t SET name = upper(name), data = zeroblob(id % 7 * 600) WHERE id % 5 = 0",
+    "DELETE FROM t WHERE id BETWEEN 100 AND 300",
+    "CREATE INDEX t_data ON t (data)",
+    "DROP TABLE u",
+    "CREATE TABLE w (a, b)",
+    "INSERT INTO w SELECT name, length(data) FROM t",
+]
+PAGE_SIZE_QUERIES = ["SELECT id, name, length(data), hex(substr(data, 1, 8)) FROM t ORDER BY id",
+                     "SELECT name FROM t ORDER BY name, id",
+                     "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY name"]  # (root pages differ)
+
+
+@pytest.mark.parametrize("size", [512, 1024, 2048, 8192, 16384, 32768, 65536])
+def test_page_sizes(tmp_path, size):
+    """Files of every page size: sqlite3 writes one, MiniDB changes it, and
+    both agree with sqlite3 making the same changes to a copy."""
+    path, copy = str(tmp_path / "db"), str(tmp_path / "copy")
+    with closing(lite(path)) as connection:
+        connection.execute(f"PRAGMA page_size = {size}")
+        connection.executescript(PAGE_SIZE_SETUP)
+    with open(path, "rb") as source, open(copy, "wb") as target:
+        target.write(source.read())
+    with Database(path) as db:
+        assert db.execute("PRAGMA page_size") == [(size,)]
+        same_results(path, db, PAGE_SIZE_QUERIES + ["PRAGMA freelist_count", "PRAGMA page_count"])
+        for sql in PAGE_SIZE_CHANGES:
+            db.execute(sql)
+        assert db.integrity_check() == []
+    assert integrity(path) == [("ok",)]
+    with closing(lite(copy)) as connection:
+        for sql in PAGE_SIZE_CHANGES:
+            connection.execute(sql)
+    with Database(copy) as db:
+        same_results(path, db, PAGE_SIZE_QUERIES + ["SELECT * FROM w ORDER BY a, b"])
+    assert os.path.getsize(path) % size == 0
+
+
+def test_page_size_pragma_and_vacuum(tmp_path):
+    """PRAGMA page_size: at once on a new database, at the next VACUUM
+    otherwise (also VACUUM INTO), ignored when invalid - as SQLite."""
+    path = str(tmp_path / "db")
+    db = Database(path, format="sqlite")
+    db.execute("PRAGMA page_size = 1024")
+    assert db.execute("PRAGMA page_size") == [(1024,)]
+    db.execute("CREATE TABLE t (a)")
+    db.execute("INSERT INTO t VALUES (zeroblob(5000)), ('x')")
+    db.execute("PRAGMA page_size = 8192")
+    assert db.execute("PRAGMA page_size") == [(1024,)]  # (existing: waits for VACUUM)
+    db.execute("PRAGMA page_size = 1000")  # (ignored)
+    db.execute("VACUUM")
+    assert db.execute("PRAGMA page_size") == [(8192,)]
+    with closing(lite(path)) as connection:
+        assert connection.execute("PRAGMA page_size").fetchall() == [(8192,)]
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    db.execute("PRAGMA page_size = 512")
+    db.execute(f"VACUUM INTO '{tmp_path / 'into.db'}'")
+    with closing(lite(str(tmp_path / "into.db"))) as connection:
+        assert connection.execute("PRAGMA page_size").fetchall() == [(512,)]
+        assert connection.execute("SELECT length(a) FROM t").fetchall() == [(5000,), (1,)]
+    db.execute("PRAGMA user_version = 1")
+    db.close()
+    # Written once (a header field): the page size of a new database is fixed.
+    other = Database(str(tmp_path / "other"), format="sqlite")
+    other.execute("PRAGMA user_version = 3")
+    other.execute("PRAGMA page_size = 2048")
+    assert other.execute("PRAGMA page_size") == [(4096,)]
+    other.close()
+
+
+@pytest.mark.parametrize("point, detail", [("journal_page", 3), ("db_page", 0), ("db_page", 5), ("db_sync", None)])
+def test_crash_during_a_vacuum_that_changes_the_page_size(tmp_path, point, detail):
+    path = str(tmp_path / "db")
+    with Database(path, format="sqlite") as db:
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)")
+        db.execute("INSERT INTO t (a) VALUES " + ", ".join(f"('{'v' * (i % 70)}{i}')" for i in range(400)))
+        before = db.execute("SELECT * FROM t")
+    db = Database(path)
+    db.execute("PRAGMA page_size = 1024")
+    db.pager.crash_hook = crash_at(point, detail)
+    with pytest.raises(SimulatedCrash):
+        db.execute("VACUUM")
+    db.pager.close_files()
+    with closing(lite(path)) as connection:  # sqlite3 plays the journal back: 4096-byte pages again
+        assert connection.execute("SELECT * FROM t").fetchall() == before
+        assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+        # (asked first, sqlite3's PRAGMA page_size reports the header it saw when it opened the file)
+        assert connection.execute("PRAGMA page_size").fetchall() == [(4096,)]
+    with Database(path) as db:
+        assert db.execute("SELECT * FROM t") == before
+
+
 # ---- what is not supported ------------------------------------------------------------
 
 
 @pytest.mark.parametrize("setting, message", [
     ("PRAGMA journal_mode = WAL", "WAL mode"),
-    ("PRAGMA page_size = 1024", "page size of 1024"),
     ("PRAGMA encoding = 'UTF-16le'", "UTF-16"),
     ("PRAGMA auto_vacuum = FULL", "auto_vacuum"),
 ])

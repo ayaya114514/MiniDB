@@ -55,7 +55,8 @@ def info() -> str:
         "name": file_name,
         "format": "sqlite" if sqlite else "minidb",
         "pages": db.pager.header.page_count if sqlite else None,
-        "bytes": db.pager.header.page_count * F.PAGE_SIZE if sqlite else None,
+        "bytes": db.pager.header.page_count * db.pager.geometry.page_size if sqlite else None,
+        "page_size": db.pager.geometry.page_size if sqlite else None,
     })
 
 
@@ -211,7 +212,8 @@ def page_bytes(pgno: int) -> bytes:
     if pgno in pager.dirty:
         data = pager.cache[pgno].to_bytes()
         return pager.header.to_bytes() + data[F.HEADER_SIZE:] if pgno == 1 else data
-    return pager.io.read((pgno - 1) * F.PAGE_SIZE, F.PAGE_SIZE)
+    size = pager.geometry.page_size
+    return pager.io.read((pgno - 1) * size, size)
 
 
 def find_root(name: str) -> int:
@@ -233,7 +235,7 @@ def payload(cell: F.Cell) -> bytes:
     parts, pgno, remaining = [cell.local], cell.overflow, cell.size - len(cell.local)
     while pgno and remaining > 0:
         data = page_bytes(pgno)
-        parts.append(data[4:4 + min(remaining, F.OVERFLOW_DATA)])
+        parts.append(data[4:4 + min(remaining, db.pager.geometry.overflow_data)])
         remaining -= len(parts[-1])
         pgno = struct.unpack_from(">I", data)[0]
     return b"".join(parts)
@@ -260,7 +262,7 @@ def sqlite_tree(name: str) -> str:
     while level:
         nodes, following = [], []
         for pgno in level:
-            page = F.BtreePage.from_bytes(pgno, page_bytes(pgno))
+            page = F.BtreePage.from_bytes(pgno, page_bytes(pgno), db.pager.geometry)
             cells = page.cells
             shown = cells if len(cells) <= MAX_KEYS_SHOWN else cells[:MAX_KEYS_SHOWN - 1] + [cells[-1]]
             children = [] if page.is_leaf else [c.child for c in cells] + [page.right]
@@ -289,7 +291,7 @@ def count_entries(root: int) -> int:
     entries, stack = 0, [root]
     while stack:
         pgno = stack.pop()
-        page = F.BtreePage.from_bytes(pgno, page_bytes(pgno))
+        page = F.BtreePage.from_bytes(pgno, page_bytes(pgno), db.pager.geometry)
         if page.kind != F.TABLE_INTERIOR:
             entries += len(page.cells)
         if not page.is_leaf:
@@ -299,7 +301,7 @@ def count_entries(root: int) -> int:
 
 def cell_extent(data: bytes, start: int, kind: int) -> tuple[int, F.Cell]:
     """The bytes a cell takes on its page (SQLite's cellSizePtr), and the cell."""
-    cell = F.parse_cell(data, start, kind)
+    cell = F.parse_cell(data, start, kind, db.pager.geometry)
     if kind == F.TABLE_INTERIOR:
         return 4 + F.varint_size(cell.rowid), cell
     size = F.varint_size(cell.size) + len(cell.local) + (4 if cell.overflow else 0)
@@ -343,7 +345,7 @@ def page(pgno: int) -> str:
         size, cell = cell_extent(data, start, kind)
         regions.append({"kind": "cell", "start": start, "end": start + size, "cell": i})
         if i < MAX_CELLS_LISTED:
-            entry = {"index": i, "offset": start, "size": size, "key": cell_key(F.BtreePage(pgno, kind), cell)}
+            entry = {"index": i, "offset": start, "size": size, "key": cell_key(F.BtreePage(pgno, kind, geometry=db.pager.geometry), cell)}
             if not kind == F.TABLE_INTERIOR:
                 entry["payload"] = cell.size
             if cell.child:
@@ -360,13 +362,14 @@ def page(pgno: int) -> str:
     # What is left in the content area: fragments (gaps of 1-3 bytes).
     covered = sorted((r["start"], r["end"]) for r in regions if r["start"] >= content)
     position = content
-    for start, end in covered + [(F.PAGE_SIZE, F.PAGE_SIZE)]:
+    size = db.pager.geometry.page_size
+    for start, end in covered + [(size, size)]:
         if start > position:
             regions.append({"kind": "fragment", "start": position, "end": start})
         position = max(position, end)
     regions.sort(key=lambda r: r["start"])
     return json.dumps({
-        "page": pgno, "kind": KINDS[kind], "size": F.PAGE_SIZE, "cells": count, "listed": cells,
+        "page": pgno, "kind": KINDS[kind], "size": size, "cells": count, "listed": cells,
         "first_freeblock": first_free, "content_start": content, "fragmented": fragments,
         "free": content - (pointers + 2 * count) + free_bytes + fragments,
         "right": None if leaf else struct.unpack_from(">I", data, offset + 8)[0], "regions": regions,
@@ -398,7 +401,7 @@ def walk_file() -> str:
             pgno = stack.pop()
             if not 1 <= pgno <= count or kinds[pgno] != "unknown":
                 continue
-            page = F.BtreePage.from_bytes(pgno, page_bytes(pgno))
+            page = F.BtreePage.from_bytes(pgno, page_bytes(pgno), db.pager.geometry)
             kinds[pgno], owners_of[pgno] = KINDS[page.kind], owner
             for cell in page.cells:
                 chain = cell.overflow
@@ -412,10 +415,10 @@ def walk_file() -> str:
         kinds[trunk] = "freelist-trunk"
         data = page_bytes(trunk)
         following, leaves = struct.unpack_from(">II", data)
-        for leaf in struct.unpack_from(f">{min(leaves, F.USABLE // 4 - 2)}I", data, 8):
+        for leaf in struct.unpack_from(f">{min(leaves, db.pager.geometry.read_leaves)}I", data, 8):
             if 1 <= leaf <= count:
                 kinds[leaf] = "freelist-leaf"
         trunk = following
-    if F.LOCK_PAGE <= count:
-        kinds[F.LOCK_PAGE] = "lock-byte"
+    if db.pager.geometry.lock_page <= count:
+        kinds[db.pager.geometry.lock_page] = "lock-byte"
     return json.dumps({"pages": [[kinds[p], owners_of[p]] for p in range(1, count + 1)], "owners": owners})
