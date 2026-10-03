@@ -369,6 +369,24 @@ class BTree:
                 return
             leaf, i = self.node(leaf.next_leaf), 0
 
+    def count_range(self, start: Any = None, end: Any = None, start_inclusive: bool = True,
+                    end_inclusive: bool = True) -> int:
+        """How many keys ``scan`` with the same bounds would yield (a bisection per leaf)."""
+        if start is None:
+            leaf, i = self._leftmost_leaf(), 0
+        else:
+            _, leaf = self._find_leaf(start)
+            i = (bisect_left if start_inclusive else bisect_right)(leaf.keys, start)
+        count = 0
+        while True:
+            keys = leaf.keys
+            if end is not None and keys and (keys[-1] > end or (keys[-1] == end and not end_inclusive)):
+                return count + max(0, (bisect_right if end_inclusive else bisect_left)(keys, end) - i)
+            count += max(0, len(keys) - i)
+            if not leaf.next_leaf:
+                return count
+            leaf, i = self.node(leaf.next_leaf), 0
+
     def keys(self) -> list:
         return [key for key, _ in self.scan()]
 
