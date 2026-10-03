@@ -135,13 +135,13 @@ def test_a_transaction_bigger_than_a_hash_table(tmp_path):
         db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b BLOB)")
         db.execute("CREATE INDEX ta ON t (a)")
         db.execute("BEGIN")
-        for i in range(3000):
+        for i in range(3500):
             db.execute("INSERT INTO t (a, b) VALUES (?, ?)", (f"{i:05}" * 8, bytes(300)))
         db.execute("COMMIT")
         db.execute("UPDATE t SET b = x'01' WHERE id % 10 = 0")
         assert db.pager.committed > 4100
         assert lite_child(path, "SELECT count(*), sum(length(b)) FROM t", "PRAGMA integrity_check",
-                          "UPDATE t SET b = x'02' WHERE id = 2999") == [[(3000, 2700 * 300 + 300)], [("ok",)], []]
+                          "UPDATE t SET b = x'02' WHERE id = 2999") == [[(3500, 3150 * 300 + 350)], [("ok",)], []]
         assert db.execute("SELECT b FROM t WHERE id = 2999") == [(b"\x02",)]
     # The log is gone; recovery of a log that big:
     with closing(lite(path)) as connection:

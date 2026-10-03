@@ -441,10 +441,12 @@ class TableTree(_Tree):
         else:
             self.pager.write(leaf)
             cells.insert(i, self._cell(payload, rowid))
-            if i == len(cells) - 1 and leaf.pgno != self.root and all(j == len(p.cells) for p, j in path) \
-                    and leaf.used() > leaf.capacity:
-                self._append(path, leaf)
-                return
+        # As sqlite3BtreeInsert: only a leaf that overflows is balanced.
+        if leaf.used() <= leaf.capacity:
+            return
+        if i == len(cells) - 1 and leaf.pgno != self.root and all(j == len(p.cells) for p, j in path):
+            self._append(path, leaf)
+            return
         self._fix(path, leaf)
 
     def _append(self, path: list[tuple[BtreePage, int]], leaf: BtreePage) -> None:
@@ -622,7 +624,8 @@ class IndexTree(_Tree):
         cell.key = key
         self.pager.write(page)
         page.cells.insert(i, cell)
-        self._fix(path, page)
+        if page.used() > page.capacity:  # (as sqlite3BtreeInsert: balance only a page that overflows)
+            self._fix(path, page)
 
     def delete(self, key: tuple) -> bool:
         path, page, i, found = self._find(key)
