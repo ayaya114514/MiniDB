@@ -290,3 +290,50 @@ def test_equality_join_without_index_hashes_the_inner_table():
     assert sorted(db.execute("SELECT v, w FROM small JOIN big ON big.k = small.k")) == [("b", "x"), ("c", "x")]
     # A constant key is no join: the table is scanned.
     assert db.execute("EXPLAIN SELECT * FROM big WHERE k = 2") == [("big", "SCAN")]
+
+
+@pytest.mark.parametrize("format", [None, "sqlite"])
+def test_counting_index_ranges_agrees_with_sqlite(format):
+    """count(*) over an index range alone counts the keys (count_range)
+    instead of visiting rows, and the index's equality terms are not tested
+    again: both must give what sqlite3 gives, across page boundaries, mixed
+    types, collations and DESC columns."""
+    pair = Pair(format=format)
+    pair.run("PRAGMA page_size = 512")  # (deep trees: interior entries in a SQLite index)
+    pair.run("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT COLLATE NOCASE, c REAL, d)")
+    pair.run("CREATE INDEX t_a ON t (a)")
+    pair.run("CREATE INDEX t_bc ON t (b, c)")
+    pair.run("CREATE INDEX t_d ON t (d DESC)")
+    rng = random.Random(5)
+    values = ["NULL", "'x'", "'X'", "x'00'", "2.5", "'7'", "''"]
+    for start in range(0, 3000, 300):
+        rows = ", ".join(
+            f"({i}, {rng.choice([str(rng.randint(0, 40))] * 6 + values)}, "
+            f"'{rng.choice('aAbBc')}{rng.randint(0, 3)}', {rng.choice(['NULL', rng.randint(0, 9), 1.5])}, "
+            f"{rng.choice(['NULL', rng.randint(0, 5), repr('k')])})"
+            for i in range(start, start + 300))
+        pair.run(f"INSERT INTO t VALUES {rows}")
+    keys = ["0", "7", "'7'", "7.0", "2.5", "40", "41", "-1", "NULL", "'x'", "'X'", "x'00'", "''", "'abc'"]
+    for key in keys:
+        pair.run(f"SELECT count(*) FROM t WHERE a = {key}")
+        pair.run(f"SELECT count(*), count(*) * 2 FROM t WHERE {key} = a")
+        pair.run(f"SELECT count(*) FROM t WHERE a > {key}")
+        pair.run(f"SELECT count(*) FROM t WHERE a >= {key} AND a < 20")
+        pair.run(f"SELECT count(*) FROM t WHERE d = {key}")
+        pair.run(f"SELECT count(*) FROM t WHERE a = {key} AND a = 7")
+    for b in ["'a1'", "'A1'", "'b3'", "'c0'", "'z'"]:
+        pair.run(f"SELECT count(*) FROM t WHERE b = {b}")
+        pair.run(f"SELECT count(*) FROM t WHERE b = {b} COLLATE BINARY")
+        pair.run(f"SELECT count(*) FROM t WHERE b = {b} AND c = 1.5")
+        pair.run(f"SELECT count(*) FROM t WHERE b = {b} AND c > 4")
+        pair.run(f"SELECT count(*) FROM t WHERE b = {b} AND c BETWEEN 2 AND 6")
+        pair.run(f"SELECT count(*), c FROM t WHERE b = {b}")  # (the bare column: the first row's)
+        pair.run(f"SELECT count(*) FROM t WHERE b = {b} HAVING count(*) > 40")
+    pair.run("SELECT a, (SELECT count(*) FROM t AS u WHERE u.a = t.a) FROM t WHERE id < 50")
+    pair.run("SELECT count(*) FROM t AS x JOIN t AS y ON y.a = x.id WHERE x.id < 30")
+    pair.run("SELECT x.id, count(*) FROM t AS x JOIN t AS y ON y.a = x.id GROUP BY x.id")
+    pair.run("DELETE FROM t WHERE a = 7")
+    pair.run("UPDATE t SET a = 99 WHERE b = 'a1' AND c = 1.5")
+    pair.run("SELECT count(*) FROM t WHERE a = 99")
+    pair.run("SELECT count(*) FROM t WHERE a = 7")
+    pair.close()

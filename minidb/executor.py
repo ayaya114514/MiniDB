@@ -1597,6 +1597,9 @@ class IndexScan:
         self.upper = upper
         self.table_rows = table_rows
         self.covering = False  # rows are built from index keys alone
+        # The equality conjuncts the lookup decides exactly (SQLite's
+        # disableTerm): the join loop need not test them again.
+        self.consumed = []
         self.index_values = True  # a SELECT's: indexed VIRTUAL columns come from the index (candidates)
         self.unused = {}  # VIRTUAL columns the query does not use (left NULL)
 
@@ -1615,12 +1618,30 @@ class IndexScan:
 
     def keys(self, row: Row) -> Iterator[tuple]:
         """The index keys in range, in order."""
+        bounds = self.bounds(row)
+        if bounds is None:
+            return iter(())
+        return (key for key, _ in self.index_tree.scan(*bounds))
+
+    def count(self, row: Row) -> int:
+        """How many index keys are in range."""
+        bounds = self.bounds(row)
+        if bounds is None:
+            return 0
+        count_range = getattr(self.index_tree, "count_range", None)
+        if count_range is None:
+            return sum(1 for _ in self.index_tree.scan(*bounds))
+        return count_range(*bounds)
+
+    def bounds(self, row: Row) -> tuple[tuple, tuple, bool, bool] | None:
+        """(start, end, start inclusive, end inclusive) of the index keys in
+        range, or None when nothing can be."""
         key_functions = self.index.key_functions
         prefix = []
         for key_function, sort_key in zip(self.equal, key_functions):
             value = key_function(row)
             if value is None:
-                return iter(())  # col = NULL is never true
+                return None  # col = NULL is never true
             prefix.append(sort_key(value))
         prefix = tuple(prefix)
         sort_key = key_functions[len(prefix)] if len(prefix) < len(key_functions) else values.sort_key
@@ -1631,7 +1652,7 @@ class IndexScan:
         if self.lower:
             value = self.lower[0](row)
             if value is None:
-                return iter(())
+                return None
             if self.lower[1]:
                 start, start_inclusive = prefix + (sort_key(value),), True
             else:
@@ -1639,12 +1660,12 @@ class IndexScan:
         if self.upper:
             value = self.upper[0](row)
             if value is None:
-                return iter(())
+                return None
             if self.upper[1]:
                 end = prefix + (sort_key(value), HIGH)
             else:
                 end, end_inclusive = prefix + (sort_key(value),), False
-        return (key for key, _ in self.index_tree.scan(start, end, start_inclusive, end_inclusive))
+        return start, end, start_inclusive, end_inclusive
 
     def rowids(self, row: Row) -> list[int]:
         if self.index.pk_parts is not None:
@@ -1837,13 +1858,14 @@ ROWID = -1  # column position standing for the row id in constraints
 class Constraint:
     """A WHERE/ON conjunct of the form ``column op key`` usable by an access path."""
 
-    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction], convert: Callable[[SQLValue], SQLValue] | None = None, joined: bool = False, collation: str = "BINARY") -> None:
+    def __init__(self, position: int, op: str, key: RowFunction | list[RowFunction], convert: Callable[[SQLValue], SQLValue] | None = None, joined: bool = False, collation: str = "BINARY", source: Expr | None = None) -> None:
         self.position = position  # column position in the table, or ROWID
         self.op = op  # "=", "<", "<=", ">", ">=" or "IN"
         self.key = key  # key function(s) evaluated on the outer row
         self.convert = convert  # the affinity conversion the key gets
         self.joined = joined  # the key uses a table joined before this one
         self.collation = collation  # of the comparison: an index must have the same
+        self.source = source  # the conjunct itself (None: a term derived from one)
 
 
 def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int]) -> list[Constraint]:
@@ -1937,7 +1959,7 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
         if key is not None:
             joined = bool(tables_referenced(right, scope) & bound)
             collation = compiler.comparison_collation(conjunct.left, conjunct.right)
-            constraints.append(Constraint(position, op, key, conversions.get(key), joined, collation))
+            constraints.append(Constraint(position, op, key, conversions.get(key), joined, collation, conjunct))
     return constraints
 
 
@@ -2026,17 +2048,20 @@ def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: lis
         # Only comparisons with the index column's collation can use it.
         usable = [c for c in constraints if c.position == ROWID or c.position not in info.positions
                   or c.collation == info.collations[info.positions.index(c.position)]]
-        equal = []
+        equal, consumed = [], []
         for position in info.positions:
-            key = next((c.key for c in usable if c.position == position and c.op == "="), None)
-            if key is None:
+            found = next((c for c in usable if c.position == position and c.op == "="), None)
+            if found is None:
                 break
-            equal.append(key)
+            equal.append(found.key)
+            if found.source is not None and position not in info.table.virtual:
+                consumed.append(found.source)
         lower = upper = None
         if len(equal) < len(info.positions):
             lower, upper = _bounds(usable, info.positions[len(equal)])
         if equal or lower or upper:
             candidates.append(IndexScan(info, catalog.index_tree(info), tree, equal, lower, upper, rows))
+            candidates[-1].consumed = consumed
         first = info.positions[0]
         for c in usable:
             if c.position == first and c.op == "IN":
@@ -2894,7 +2919,7 @@ class Executor:
             match = None
             if join.kind != "INNER" and join.on is not None:
                 match = compiler.compile(join.on)
-            compiled.append((match, [compiler.compile(f) for f in placed.get(level, [])]))
+            compiled.append((match, [(f, compiler.compile(f)) for f in placed.get(level, [])]))
         levels = []
         for level, (index, (match, filters)) in enumerate(zip(order, compiled)):
             join = joins[index]
@@ -2914,8 +2939,10 @@ class Executor:
                 access.cover_if_possible(scope, index)
             elif covering and type(access) is FullScan:
                 access = covering_index_scan(scope, index, self.catalog, access) or access
+            if join.kind == "INNER" and isinstance(access, IndexScan) and access.consumed:
+                filters = [(c, f) for c, f in filters if not any(c is used for used in access.consumed)]
             levels.append(JoinLevel(entry.table, entry.offset, access,
-                                    join.kind in ("LEFT", "FULL"), match, filters))
+                                    join.kind in ("LEFT", "FULL"), match, [f for _, f in filters]))
             if join.kind in ("RIGHT", "FULL"):
                 scan = plan_access(scope, index, self.catalog, [], compiler)
                 levels[-1].unmatched = JoinLevel(entry.table, entry.offset, scan, False, None, [])
@@ -4559,6 +4586,16 @@ class CompiledSelect:
         self.distinct = stmt.distinct
         self.limit = executor.compile_limit(stmt)
         self.first_row_only = self.is_aggregate and self.min_max_on_equal_column(stmt)
+        # Only count(*) over one index range with nothing else to test: count
+        # the keys rather than visit the rows (see count_rows).
+        self.count_level = None
+        if self.is_aggregate and not self.group_functions and not self.first_row_only \
+                and self.aggregates is not None and self.aggregates.calls \
+                and all(name == "COUNT" and not args and filter_ is None
+                        for name, args, _, filter_ in self.aggregates.calls) \
+                and self.levels is not None and len(self.levels) == 1 and self.levels[0].plain \
+                and not self.levels[0].filters and isinstance(self.levels[0].access, IndexScan):
+            self.count_level = self.levels[0]
         # An index scan that orders every GROUP BY column delivers the groups in its order.
         self.groups_in_order = bool(
             self.levels and self.levels[0].offset == scope.entries[0].offset
@@ -4763,6 +4800,24 @@ class CompiledSelect:
     def correlated(self) -> bool:
         return self.scope.uses_outer
 
+    def count_rows(self) -> Row:
+        """The one group row of a query whose aggregates are all count(*) over
+        ``count_level``: the counts are the index keys in range; the group's
+        representative row (its bare columns) is the first row, as
+        group_rows would keep it."""
+        level, aggregates = self.count_level, self.aggregates
+        row = [None] * self.scope.width
+        state = aggregates.new_state()
+        candidates = level.access.candidates(row)
+        first = next(candidates, None)
+        candidates.close()
+        if first is not None:
+            count = level.access.count(row)
+            row[level.offset:level.offset + len(level.table.columns) + 1] = level.load(*first)
+            for aggregate, _ in state:
+                aggregate.count = count
+        return row + aggregates.results(state)
+
     def run(self, max_rows: int | None = None) -> list[tuple]:
         """The result rows (tuples).  ``max_rows`` lets a caller that needs
         only the first rows (EXISTS, scalar subqueries) stop early."""
@@ -4770,18 +4825,25 @@ class CompiledSelect:
         start, end = self.limit() if self.limit is not None else (0, None)
         if end is not None and end <= start:
             return []
+        counted = None
         if not passes_constants(self.constants, self.scope):
             rows = []
         elif self.levels is not None:
             for source in self.derived:
                 source.materialize()
-            rows = self.executor.join_rows(self.scope, self.levels)
+            if self.count_level is not None:
+                counted = self.count_rows()
+            else:
+                rows = self.executor.join_rows(self.scope, self.levels)
         else:
             rows = [[]]
         output_row, order_key = self.output_row, self.order_key
         if max_rows is not None and not self.order_terms and not self.distinct:
             end = max_rows if end is None else min(end, start + max_rows)
-        if self.is_aggregate:
+        if counted is not None:
+            having = self.having
+            rows = [counted] if having is None or values.truth(having(counted)) else []
+        elif self.is_aggregate:
             if self.first_row_only:
                 rows = itertools.islice(rows, 1)
             truth, having = values.truth, self.having

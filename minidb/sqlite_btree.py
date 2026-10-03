@@ -689,6 +689,38 @@ class IndexTree(_Tree):
     def count(self) -> int:
         return sum(len(page.cells) for page in self._pages())
 
+    def count_range(self, start: tuple | None = None, end: tuple | None = None, start_inclusive: bool = True,
+                    end_inclusive: bool = True) -> int:
+        """How many keys ``scan`` with the same bounds would yield: bisections
+        on the pages along the two edges of the range, whole subtrees between
+        them counted by their cells (no keys decoded)."""
+        return self._count(self.root, start, end, start_inclusive, end_inclusive)
+
+    def _count(self, pgno: int, start: tuple | None, end: tuple | None, start_inclusive: bool,
+               end_inclusive: bool) -> int:
+        page = self.page(pgno)
+        cells, key = page.cells, self.key
+        i = 0 if start is None else bisect_left(cells, start, key=key) if start_inclusive else \
+            bisect_right(cells, start, key=key)
+        j = len(cells) if end is None else bisect_right(cells, end, key=key) if end_inclusive else \
+            bisect_left(cells, end, key=key)
+        if page.is_leaf:
+            return max(0, j - i)
+        children = [cell.child for cell in cells] + [page.right]
+        if i == j:  # (both edges in one child)
+            return self._count(children[i], start, end, start_inclusive, end_inclusive)
+        count = j - i
+        count += self._count(children[i], start, None, start_inclusive, True)
+        count += sum(self._subtree_size(child) for child in children[i + 1:j])
+        return count + self._count(children[j], None, end, True, end_inclusive)
+
+    def _subtree_size(self, pgno: int) -> int:
+        page = self.page(pgno)
+        if page.is_leaf:
+            return len(page.cells)
+        return len(page.cells) + sum(self._subtree_size(cell.child) for cell in page.cells) \
+            + self._subtree_size(page.right)
+
     def check(self) -> int:
         keys = list(self._walk(self.root, None, True))
         ordered = [self.order(k) for k in keys]
@@ -871,6 +903,12 @@ class SqliteIndex:
             return
         for key in self.tree.scan(start, end, start_inclusive, end_inclusive):
             yield key, b""
+
+    def count_range(self, start: tuple | None = None, end: tuple | None = None, start_inclusive: bool = True,
+                    end_inclusive: bool = True) -> int:
+        if self.tree.descending:
+            return sum(1 for _ in self.scan(start, end, start_inclusive, end_inclusive))
+        return self.tree.count_range(start, end, start_inclusive, end_inclusive)
 
     def keys(self) -> list:
         return sorted(self.tree.scan()) if self.tree.descending else list(self.tree.scan())
