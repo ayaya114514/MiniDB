@@ -55,11 +55,12 @@ class Token:
 # (REAL and hex numbers, strings with doubled quotes, comments, parameters,
 # quoted identifiers, BLOBs, errors) goes through the code below it.
 _FAST = re.compile(
-    r"(\s+)"  # 1: white space
-    r"|((?![xX]')[^\W\d][\w$]*)"  # 2: a word (not the x of x'...')
-    r"|([0-9]+)(?![\w$.])"  # 3: an integer
-    r"|'([^']*)'(?!')"  # 4: a string without doubled quotes
-    r"|(->>|->|<<|>>|<>|<=|>=|==|!=|\|\||(?!--)-|(?!/\*)/|\.(?![0-9])|[<>=+*%&|~(),;])"  # 5: an operator
+    r"\s*(?:"  # white space before the token
+    r"((?![xX]')[^\W\d][\w$]*)"  # 1: a word (not the x of x'...')
+    r"|([0-9]+)(?![\w$.])"  # 2: an integer
+    r"|'([^']*)'(?!')"  # 3: a string without doubled quotes
+    r"|(->>|->|<<|>>|<>|<=|>=|==|!=|\|\||(?!--)-|(?!/\*)/|\.(?![0-9])|[<>=+*%&|~(),;])"  # 4: an operator
+    r")"
 )
 _KEYWORDS = {word: word for word in KEYWORDS}
 
@@ -75,25 +76,27 @@ def tokenize(text: str) -> list[Token]:
         m = fast(text, i)
         if m is not None:
             group = m.lastindex
+            i = m.start(group)
             end = m.end()
-            if group == 2:
-                word = m.group(2)
+            if group == 1:
+                word = m.group(1)
                 upper = keywords.get(word.upper() if word.isascii() else ascii_upper(word))
                 if upper is not None:
                     append(Token("KEYWORD", upper, i, word))
                 else:
                     append(Token("IDENT", word, i, word))
-            elif group == 3:
-                literal = m.group(3)
+            elif group == 2:
+                literal = m.group(2)
                 value = int(literal)
                 if value >= 2**63:  # too large for 64 bits: a REAL, as SQLite
                     append(Token("FLOAT", atof(literal), i, literal))
                 else:
                     append(Token("INTEGER", value, i, literal))
-            elif group == 4:
-                append(Token("STRING", m.group(4), i, text[i:end]))
-            elif group == 5:
-                op = m.group(5)
+            elif group == 3:
+                i -= 1  # (the opening quote)
+                append(Token("STRING", m.group(3), i, text[i:end]))
+            else:
+                op = m.group(4)
                 append(Token("OP", op, i, op))
             i = end
             continue

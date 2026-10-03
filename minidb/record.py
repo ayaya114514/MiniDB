@@ -42,7 +42,16 @@ def encode_record(values: list[SQLValue]) -> bytes:
     header = bytearray()
     body = bytearray()
     for value in values:
-        if value is None:
+        kind = type(value)
+        if kind is str:
+            data = value.encode("utf-8", "surrogateescape")
+            if len(data) <= MAX_SHORT_TEXT:
+                header.append(SHORT_TEXT_BASE + len(data))
+            else:
+                header.append(LONG_TEXT_CODE)
+                header += _u32.pack(len(data))
+            body += data
+        elif value is None:
             header.append(NULL_CODE)
         elif isinstance(value, bool):
             raise RecordError("booleans are not SQL values")
