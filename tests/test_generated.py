@@ -382,3 +382,19 @@ def test_json_subtype_through_a_temporary_table(pair):
         INSERT INTO q (c0) VALUES (json('[3]'));
         SELECT g FROM q
     """)
+
+
+def test_upsert_excluded_row_has_the_affinities_with_generated_columns(pair):
+    # sqlite3ComputeGeneratedColumns applies the column affinities to the new
+    # row before any constraint is checked: "excluded" shows them applied
+    # even for a conflict on the row id (checked first).
+    pair.run("CREATE TABLE t (a INT, c, d TEXT DEFAULT 5, g AS (a + 1))")
+    pair.run("CREATE TABLE s (a INT, c, g AS (a + 1) STORED)")
+    pair.run("INSERT INTO t (rowid, a) VALUES (1, 0)")
+    pair.run("INSERT INTO s (rowid, a) VALUES (1, 0)")
+    pair.run("INSERT INTO t (rowid, a) VALUES (1, 2.0) ON CONFLICT DO UPDATE SET c = excluded.a")
+    pair.run("SELECT a, c, typeof(c), g FROM t")
+    pair.run("INSERT INTO t (rowid, a) VALUES (1, 2.0), (1, 3.0) ON CONFLICT DO UPDATE SET c = excluded.d || excluded.a")
+    pair.run("SELECT a, c, typeof(c), g FROM t")
+    pair.run("INSERT INTO s (rowid, a) VALUES (1, '7') ON CONFLICT DO UPDATE SET c = excluded.a")
+    pair.run("SELECT a, c, typeof(c), g FROM s")

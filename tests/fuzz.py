@@ -1005,6 +1005,15 @@ def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False)
                 history[-1] += "  -- skipped: sqlite3 interrupted it (step limit)"
             if snapshots is not None:
                 snapshots.step(history)
+            if not sql.startswith(("SELECT", "WITH", "VALUES")) \
+                    and pair.lite.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+                # SQLite's own database became corrupt (an UPDATE whose
+                # generated column reads a REAL-affinity value before it is
+                # stored as an integer, D119).  MiniDB's matches it, but what
+                # follows need not: a later DELETE through that index may
+                # remove the stale entry (SQLite deletes the entry its index
+                # cursor is on), which MiniDB does not imitate.
+                return None
         if snapshots is not None:
             snapshots.finish()
         if pair.lite.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
