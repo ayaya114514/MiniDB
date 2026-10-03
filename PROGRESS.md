@@ -561,3 +561,69 @@ SQLite 格式文件模式 2400 种子（2000–3199、6000–7199）、MiniDB �
 - 页面布局只画 B 树页；溢出页、空闲列表页只标出类型。文件图对上万页的库仍是一页一格（可滚动）。
 - 整个文件读进内存（Pyodide 的 WebAssembly 内存），没有测过百 MB 以上的文件。
 - 只在本机 Chrome 上实测，Safari / Firefox 未运行；拖放用合成的 DragEvent 测试，没有真人拖拽。
+
+## 阶段 25：SQLite 文件格式补全（完成，2026-10-03）
+- **各种页大小**（D114）：512–65536 的 2 的幂都能读写；页面几何（可用字节、本地负载上下限、空闲列表容量、锁字节页）
+  由每个库的 `Geometry` 给出。`PRAGMA page_size` 对新库立即生效，已有内容的库在下一次 `VACUUM` 时生效；改页大小的提交
+  的回滚日志按旧页大小记录，sqlite3 和 MiniDB 都能在各崩溃点回放。`VACUUM` / `VACUUM INTO` 支持 SQLite 格式。
+- **auto_vacuum**（D115）：FULL / INCREMENTAL 的指针图（提交前从脏页推出），根页照 SQLite 集中在前部，`DROP` 搬页，
+  FULL 提交时搬页截断，`PRAGMA incremental_vacuum(N)`、`PRAGMA auto_vacuum`。顺带修好：提交使文件变小时被截掉的原页
+  也进回滚日志；批量建索引少一个分隔键的边界情况（种子 2184）。
+- **生成列**（D116）：`VIRTUAL` / `STORED`，两种格式；记录里只放非 VIRTUAL 列（与 SQLite 的存储布局一致，可直接读写
+  sqlite3 建的表）；计算次序、循环检测、CREATE TABLE 报错、NOT NULL 两趟、UPDATE 的依赖、ALTER TABLE ADD / RENAME /
+  DROP COLUMN 照 SQLite。
+- **临时表**（D117）：`CREATE TEMP TABLE / VIEW / INDEX / TRIGGER`，`main.` / `temp.` 限定名，`sqlite_temp_master`；
+  名字解析与主库视图 / 触发器“固定到所在库”照 SQLite。`CREATE TABLE ... AS SELECT`（D118，列名去重、类型名、SQL 文本）。
+- **WITHOUT ROWID**（D119）：两种格式；SQLite 格式里表就是主键索引 B 树，二级索引接上缺的主键列（DESC 规则含 SQLite 的
+  bAscKeyBug），`PRAGMA index_xinfo` 等与 sqlite3 一致；REPLACE / UPSERT / 外键 / 触发器 / RETURNING 都走同一套代码。
+- **WAL 模式**（D120，新模块 `minidb/sqlite_wal.py`）：SQLite 自己的 `-wal` / `-shm` 格式与锁协议（WRITE / CKPT /
+  RECOVER / READ0–4 / DMS），读者快照、写者 BUSY_SNAPSHOT、日志重开、PASSIVE 自动 checkpoint（`PRAGMA
+  wal_autocheckpoint`）、`PRAGMA wal_checkpoint(PASSIVE|FULL|RESTART|TRUNCATE)`、恢复（只认最后一个校验和正确的提交帧）、
+  最后一个连接关闭时回填并删除 `-wal` / `-shm`；`PRAGMA journal_mode = WAL / DELETE` 双向切换。
+  - 与 sqlite3 进程并发读写：测试里 MiniDB 与 sqlite3 子进程交替 / 同时读写，各自看到对方的提交，读者快照不受并发写者
+    影响；多进程（MiniDB 和 sqlite3 混合）对一个 WITHOUT ROWID 的 kv 表并发自增，最终计数正确、`integrity_check` ok。
+  - 崩溃：写日志头、写帧、sync、更新 wal-index、checkpoint 写页、checkpoint sync 各崩溃点，以及 torn frame、被 kill 的
+    进程；之后 sqlite3 和 MiniDB 分别打开恢复，内容等于最后一次提交、`integrity_check` ok。超过 4062 帧（一个 wal-index
+    块以上）的大事务。
+- **fuzz 新增**：`--wal`（SQLite 格式文件、WAL 模式；sqlite3 在子进程里跑，结果用 pickle 传回）；生成器加了各种页大小、
+  auto_vacuum、生成列、TEMP 对象、CTAS、WITHOUT ROWID 表（含 DESC / COLLATE / 复合主键、自引用外键）。镜像对照时把
+  文件头 18–19 字节改回 1 再比较；参考 SQLite 自己 `integrity_check` 不过（D119 的已知 SQLite 行为）时跳过结尾检查。
+- **fuzz 找到并修好的问题**（都有回归测试）：WITHOUT ROWID 改主键时的 REPLACE + 外键（49）、自引用外键（3713 / 3449）、
+  重查唯一性（343）、`foreign_key_check` 的 rowid（224）、NOT NULL REPLACE 后重算主键（4958）、单列 INTEGER 主键的
+  COLLATE 与 REAL 最后一列（703 / 857）、UNIQUE 自动索引的升序（149）；MiniDB 格式 B+ 树删除的长度记账（136）；
+  `hasFK>1`（173）；VIRTUAL 列不算覆盖、从索引读 VIRTUAL 列（88 / 1001）、未用到的 VIRTUAL 列不计算（2496 的一部分）；
+  GROUP BY 排序器、窗口临时表与 `scan_groups` 里的 IntReal / JSON 子类型（2197 / 177 / 3706）；upsert 的 `excluded`
+  IntReal（895）、生成列影响的语句日志（3878）、带外键 REPLACE 算多行写（4799）；多行 INSERT 何时失去 JSON 子类型
+  （4141，useTempTable 规则）；失败的 `CREATE UNIQUE INDEX` 结束隐式事务（566）；VACUUM 漏页与 schema format 0
+  （2289 / 1478）。
+
+**验证**：测试 1548 个通过、8 个跳过（MiniDB 格式的自动索引命名，与以前相同）；新增 `test_sqlite_wal.py` 29、
+`test_without_rowid.py` 24、`test_generated.py` 30、`test_temp.py` 9，`test_sqlite_format.py` 扩到 62。fuzz（各 300–400
+条语句）：MiniDB 格式内存 3000 种子（2000–4999）、SQLite 格式内存 2500 种子（2000–4499）只有 2496 不同；SQLite 格式文件
+600 种子（1000–1599）0 失败；MiniDB 格式文件 400 种子（1000–1399）只有 1234 不同；WAL 800 种子（0–799）0 失败；变形测试
+文件模式 300 × 300 0 失败。收尾改动后又跑了新种子：内存与 SQLite 格式内存各 300（5000–5299）、WAL 150（800–949）、
+SQLite 格式文件 100（1600–1699），全部 0 失败。
+
+**benchmark**（100,000 行；阶段开始 95f69cb → 现在）：
+- MiniDB 格式：各项在 ±3% 以内（insert one-each 3.555 → 3.497 s，1000-per-INSERT 2.572 → 2.575 s，CREATE INDEX
+  0.431 → 0.424 s，73 次索引查找 0.084 → 0.083 s）。中途 1000-per-INSERT 一度到 2.85 s：多行 INSERT 为判断
+  useTempTable 遍历了每个字面量；改成跳过字面量和参数后恢复。
+- SQLite 格式：insert one-each 5.147 → 5.430 s（+5%）、带参数 2.769 → 2.919 s（+5%）、1000-per-INSERT 4.149 → 4.209 s，
+  其余持平或略快（CREATE INDEX 0.471 → 0.424 s）。插入的多出部分分散在新功能的检查里（TEMP pager 的语句驱动、生成列 /
+  WITHOUT ROWID 分支），留给阶段 26。中途测到“73 次索引查找” 0.150 → 0.23 s，用 gc 回调确认是一次恰好落在这一步的
+  第 2 代 GC 停顿（0.083 s），不是代码路径变慢；最终一次为 0.144 s。
+- WAL 模式（两边都是 WAL）：自动提交插入 1000 行 0.363 s（回滚日志 0.430 s），主键点查 1.181 s（回滚日志 1.059 s，
+  每个读事务多读索引头 / read mark 并加锁），带参数点查 0.187 s（0.171 s）。
+
+**已知问题 / 做得不扎实的地方**：
+- 种子 2496：SQLite 惰性计算 VIRTUAL 列，短路求值时可以避开在 ALTER ADD COLUMN 之前就存在的行上的出错表达式；MiniDB
+  读行时算出所有用到的 VIRTUAL 列，会报错。
+- 种子 1234：NOCASE 下相等的值做 GROUP BY 时，SQLite 取哪一个作代表取决于查询计划；类似地，ORDER BY 走不覆盖的索引
+  时的计划差异（种子 88 的 `ORDER BY g0`）。
+- WAL：Windows 上未运行（`-shm` 的字节锁走 `locking.py` 的 msvcrt 后端，pread / pwrite 退回 lseek + read / write，
+  这些路径都没有实际跑过；CI 的 windows job 不含 `test_sqlite_wal.py`）；不支持 `PRAGMA locking_mode = EXCLUSIVE`（无 `-shm` 的 heap-memory wal-index）与 `journal_mode = MEMORY / OFF`；
+  checkpoint 只实现 PASSIVE 语义（FULL / RESTART / TRUNCATE 不等待忙的读者，只在没人用日志时重开）。同一进程里同时用
+  sqlite3 与 MiniDB 打开 WAL 库不安全（POSIX 锁按进程，见 D120）。
+- 临时表：写临时表的语句也拿主库 RESERVED 锁；`deserialize()` 丢掉临时表。
+- Playground：本阶段没有在浏览器里重新实测（构建测试 `test_playground.py` 通过，覆盖了新文件种类的打开）；阶段 24 的
+  部署仍待确认。
