@@ -507,6 +507,7 @@ class SqlitePager(PageCache):
                     if cell.child == source:
                         owner.cells[i] = cell = cell.copy()
                         cell.child = target
+                        owner.forget_used()  # (same size; to be safe)
                         break
         elif kind == PTRMAP_OVERFLOW1:
             owner = self.get(parent, BtreePage)
@@ -515,6 +516,7 @@ class SqlitePager(PageCache):
                 if cell.overflow == source:
                     owner.cells[i] = cell = cell.copy()
                     cell.overflow = target
+                    owner.forget_used()  # (same size; to be safe)
                     break
         elif kind == PTRMAP_OVERFLOW2:
             owner = self.get(parent, OverflowPage)

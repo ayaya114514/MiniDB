@@ -995,3 +995,37 @@ def test_an_empty_database_sqlite3_made():
     other.deserialize(image)
     assert other.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
     assert other.execute("SELECT a FROM t INDEXED BY i WHERE a > 0").fetchall() == [(3,), (1,)]
+
+
+def test_page_usage_kept_up_to_date():
+    """BtreePage.used() is kept from call to call (and grown by
+    cell_added); after random inserts, replacements, updates and deletes it
+    must equal a fresh count on every cached page, and the file stays valid."""
+    rng = random.Random(11)
+    db = minidb.Database(format="sqlite")
+    db.execute("PRAGMA page_size = 512")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT, b BLOB)")
+    db.execute("CREATE INDEX ta ON t (a)")
+    db.execute("CREATE TABLE w (k TEXT PRIMARY KEY, v) WITHOUT ROWID")
+    for step in range(1500):
+        key = rng.randint(1, 300)
+        text = "x" * rng.choice([1, 20, 200, 900])  # (900: overflow pages)
+        action = rng.random()
+        if action < 0.5:
+            db.execute("INSERT OR REPLACE INTO t VALUES (?, ?, ?)", (key, f"{key}{text}", bytes(rng.randint(0, 50))))
+            db.execute("INSERT OR REPLACE INTO w VALUES (?, ?)", (f"{key}{text[:300]}", key))
+        elif action < 0.75:
+            db.execute("UPDATE t SET a = ? WHERE id = ?", (text, key))
+        else:
+            db.execute("DELETE FROM t WHERE id BETWEEN ? AND ?", (key, key + rng.randint(0, 5)))
+            db.execute("DELETE FROM w WHERE v = ?", (key,))
+        if step % 100 == 99:
+            for page in db.pager.cache.values():
+                if isinstance(page, F.BtreePage):
+                    kept = page.used()
+                    page.forget_used()
+                    assert kept == page.used(), page.pgno
+    assert db.integrity_check() == []
+    with closing(sqlite3.connect(":memory:")) as lite:
+        lite.deserialize(db.serialize())
+        assert lite.execute("PRAGMA integrity_check").fetchall() == [("ok",)]

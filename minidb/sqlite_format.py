@@ -393,6 +393,10 @@ class BtreePage:
         self.cells = cells if cells is not None else []
         self.right = right
         self.geometry = geometry
+        # used() as last computed: (cells list, its length, kind, bytes).
+        # Valid while the same list has the same length, so code that
+        # replaces a cell in place calls forget_used().
+        self._used = None
 
     @property
     def offset(self) -> int:
@@ -412,11 +416,24 @@ class BtreePage:
         return self.geometry.usable - self.offset - self.header_size
 
     def used(self) -> int:
-        kind = self.kind
+        """Bytes the cells and their pointers take."""
+        cells, kind, known = self.cells, self.kind, self._used
+        if known is not None and known[0] is cells and known[1] == len(cells) and known[2] == kind:
+            return known[3]
         total = 0
-        for cell in self.cells:
+        for cell in cells:
             total += cell.bytes if cell.sized_for == kind else cell.byte_size(kind)
+        self._used = (cells, len(cells), kind, total)
         return total
+
+    def cell_added(self, cell: Cell) -> None:
+        """Keep used() up to date after ``cell`` was inserted into the cells."""
+        cells, kind, known = self.cells, self.kind, self._used
+        if known is not None and known[0] is cells and known[1] == len(cells) - 1 and known[2] == kind:
+            self._used = (cells, len(cells), kind, known[3] + cell.byte_size(kind))
+
+    def forget_used(self) -> None:
+        self._used = None
 
     @classmethod
     def from_bytes(cls, pgno: int, data: bytes, geometry: Geometry) -> BtreePage:
