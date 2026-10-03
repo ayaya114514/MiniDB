@@ -182,7 +182,8 @@ class Database:
                 raise OperationalError("cannot commit - no transaction is active")
             if keys.transaction_failed():
                 raise IntegrityError("FOREIGN KEY constraint failed")  # (the transaction stays open)
-            self._commit()  # a lock timeout leaves the transaction open
+            if not self.snapshot_pending:  # (a transaction that never started has nothing to write)
+                self._commit()  # a lock timeout leaves the transaction open
             self.in_transaction = self.snapshot_pending = False
             self._transaction_ended()
             pager.end_transaction()
@@ -190,8 +191,12 @@ class Database:
         if kind is Rollback:
             if not self.in_transaction:
                 raise OperationalError("cannot rollback - no transaction is active")
-            self.in_transaction = self.snapshot_pending = False
-            self.rollback()
+            if self.snapshot_pending:  # (it never started: nothing to undo, and no snapshot to read the schema in)
+                self.in_transaction = self.snapshot_pending = False
+                self._transaction_ended()
+            else:
+                self.in_transaction = False
+                self.rollback()
             pager.end_transaction()
             return Result()
         if kind is Pragma and stmt.name == "journal_mode" and stmt.value is not None \
@@ -470,8 +475,10 @@ class Database:
         if self.broken or self.pager.closed:
             return
         if self.in_transaction:
-            self.in_transaction = self.snapshot_pending = False
-            self.rollback()
+            self.in_transaction = False
+            if not self.snapshot_pending:
+                self.rollback()
+            self.snapshot_pending = False
             self.pager.end_transaction()
         try:
             self.pager.checkpoint(closing=True)  # only if nobody else is using the database

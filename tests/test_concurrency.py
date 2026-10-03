@@ -376,3 +376,37 @@ def test_deferred_transactions_start_at_their_first_statement(tmp_path, kind):
     finally:
         for connection in opened:
             connection.close()
+
+
+@pytest.mark.parametrize("kind", ["minidb", "sqlite-journal", pytest.param("sqlite-wal", marks=pytest.mark.skipif(
+    sys.platform == "win32", reason="SQLite's WAL mode has not been run on Windows"))])
+def test_a_transaction_that_never_read_ends_without_touching_the_file(tmp_path, kind):
+    # BEGIN; ROLLBACK (or COMMIT) with nothing in between has no snapshot:
+    # reloading the schema there read the database file without the pages
+    # still in the WAL - and the next table reused a page (fuzz seed 2269).
+    import sqlite3
+
+    path = str(tmp_path / "db")
+    db = Database(path, format=None if kind == "minidb" else "sqlite")
+    try:
+        if kind == "sqlite-wal":
+            db.execute("PRAGMA journal_mode = WAL")
+            db.execute("PRAGMA wal_autocheckpoint = 0")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t (v) VALUES " + ", ".join(f"('{'v' * 50}{i}')" for i in range(300)))
+        for end in ("ROLLBACK", "COMMIT"):
+            db.execute("BEGIN")
+            db.execute(end)
+        db.execute("CREATE TABLE u (w TEXT)")
+        db.execute("INSERT INTO u VALUES " + ", ".join(f"('{'w' * 50}{i}')" for i in range(300)))
+        assert db.execute("SELECT count(*) FROM t") == [(300,)]
+        assert db.integrity_check() == []
+    finally:
+        db.close()
+    if kind != "minidb":
+        connection = sqlite3.connect(path)
+        try:
+            assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+            assert connection.execute("SELECT count(*) FROM u").fetchall() == [(300,)]
+        finally:
+            connection.close()
