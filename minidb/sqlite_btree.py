@@ -529,10 +529,11 @@ class IndexTree(_Tree):
     table = False
 
     def __init__(self, pager: Any, root: int, descending: list[bool] | None = None, real: list[int] | None = None,
-                 key_functions: list | None = None) -> None:
+                 key_functions: list | None = None, rowid: bool = True) -> None:
         super().__init__(pager, root)
         self.descending = [i for i, d in enumerate(descending or []) if d]
         self.real = real or []  # positions of REAL columns (stored as integers when whole)
+        self.columns_end = -1 if rowid else 0  # (where the columns stop: the row id, if any, is last)
         # The columns' sort key functions, for NOCASE / RTRIM columns (see
         # values.collation_sort_key); None: all BINARY.
         self.key_functions = key_functions
@@ -541,7 +542,7 @@ class IndexTree(_Tree):
         if cell.key is None:
             row = decode_record(self.payload(cell))
             for i in self.real:
-                if i < len(row) - 1 and type(row[i]) is int:
+                if i < len(row) + self.columns_end and type(row[i]) is int:
                     row[i] = float(row[i])
             functions = self.key_functions
             if functions is None:
@@ -807,9 +808,10 @@ class SqliteIndex:
     such indexes for lookups; they are only kept up to date)."""
 
     def __init__(self, pager: Any, root: int, descending: list[bool] | None = None,
-                 affinities: list[str] | None = None, key_functions: list | None = None) -> None:
+                 affinities: list[str] | None = None, key_functions: list | None = None,
+                 rowid: bool = True) -> None:
         real = [i for i, a in enumerate(affinities or []) if a == values.REAL]
-        self.tree = IndexTree(pager, root, descending, real, key_functions)
+        self.tree = IndexTree(pager, root, descending, real, key_functions, rowid)
         self.root = root
 
     def get(self, key: tuple, default: bytes | None = None) -> bytes | None:
@@ -872,6 +874,101 @@ class SqliteIndex:
 
     def dump(self, max_keys: int = 8) -> list[str]:
         return _dump(self.tree, max_keys, lambda cell: [values.plain_value(p) for p in self.tree.key(cell)])
+
+
+class WithoutRowidTable:
+    """A WITHOUT ROWID table: the entries of its PRIMARY KEY index (the
+    PRIMARY KEY's columns, then the other stored columns in table order) are
+    its rows.  Seen as a table tree keyed by the PRIMARY KEY's sort keys
+    (what minidb.catalog calls such a row's row id), whose values are rows
+    (lists of the stored columns, in table order)."""
+
+    rows = True
+
+    def __init__(self, index: SqliteIndex, table: Any) -> None:
+        self.index = index
+        self.tree = index.tree
+        pk = table.pk_index.positions
+        self.width = len(pk)
+        stored = list(table.storage) if table.storage is not None else list(range(len(table.columns)))
+        self.rest = [p for p in stored if p not in pk]
+        place = {p: i for i, p in enumerate(stored)}
+        self.places = [place[p] for p in pk + self.rest]  # entry part -> place in a row
+        self.rest_places = [place[p] for p in self.rest]
+        self.stored = len(stored)
+
+    def _row(self, entry: tuple) -> list:
+        row = [None] * self.stored
+        for part, place in zip(entry, self.places):
+            row[place] = values.plain_value(part)
+        if len(entry) < len(self.places):  # written before ALTER TABLE ADD COLUMN: the last ones are missing
+            del row[self.stored - (len(self.places) - len(entry)):]
+        return row
+
+    def _find(self, key: tuple) -> tuple | None:
+        for entry in self.tree.scan(key):
+            return entry if entry[:self.width] == key else None
+        return None
+
+    def get(self, key: tuple, default: list | None = None) -> list | None:
+        entry = self._find(key)
+        return default if entry is None else self._row(entry)
+
+    def __contains__(self, key: tuple) -> bool:
+        return self._find(key) is not None
+
+    def insert(self, key: tuple, value: bytes | list, replace: bool = False) -> None:
+        row = value if type(value) is list else minidb_record.decode_record(value)[0]
+        if replace:
+            old = self._find(key)
+            if old is not None:
+                self.tree.delete(old)
+        entry = key + tuple(values.sort_key(row[i]) if i < len(row) else (0, 0) for i in self.rest_places)
+        self.tree.insert(entry)
+
+    def delete(self, key: tuple) -> bool:
+        entry = self._find(key)
+        return entry is not None and self.tree.delete(entry)
+
+    def scan(self, start: tuple | None = None, end: tuple | None = None, start_inclusive: bool = True,
+             end_inclusive: bool = True) -> Iterator[tuple[tuple, list]]:
+        width = self.width
+        for entry in self.tree.scan():
+            key = entry[:width]
+            if start is not None and (key < start or (key == start and not start_inclusive)):
+                continue
+            if end is not None and (key > end or (key == end and not end_inclusive)):
+                continue
+            yield key, self._row(entry)
+
+    def keys(self) -> list:
+        return [entry[:self.width] for entry in self.tree.scan()]
+
+    def __len__(self) -> int:
+        return self.tree.count()
+
+    def bulk_load(self, items: Iterable[tuple[tuple, list]]) -> None:
+        """Fill the (empty) tree with rows (in key order)."""
+        self.index.bulk_load(
+            (key + tuple(values.sort_key(row[i]) for i in self.rest_places), b"") for key, row in items)
+
+    def destroy(self) -> None:
+        self.index.destroy()
+
+    def clear(self) -> None:
+        self.index.clear()
+
+    def estimated_count(self) -> int:
+        return self.index.estimated_count()
+
+    def depth(self) -> int:
+        return self.index.depth()
+
+    def check(self) -> int:
+        return self.index.check()
+
+    def dump(self, max_keys: int = 8) -> list[str]:
+        return self.index.dump(max_keys)
 
 
 def _dump(tree: _Tree, max_keys: int, show: Callable[[Cell], object]) -> list[str]:

@@ -118,7 +118,7 @@ class Checker:
         # of row id and index ranges, where off-by-one bugs live.
         self.samples = {}
         for table in generator.tables:
-            names = table.column_names() + ([] if table.rowid_alias else ["rowid"])
+            names = table.column_names() + ([] if table.rowid_alias or not table.has_rowid else ["rowid"])
             for name in names:
                 found = [row[0] for row in self.execute(f"SELECT {name} FROM {table.name}")]
                 self.samples[table.name, name] = [v for v in found if v is not None]
@@ -146,7 +146,7 @@ class Checker:
         """``column op value`` with a value that occurs in the column."""
         rng = self.rng
         alias, table = rng.choice(scope)
-        names = table.column_names() + ([] if table.rowid_alias else ["rowid"])
+        names = table.column_names() + ([] if table.rowid_alias or not table.has_rowid else ["rowid"])
         name = rng.choice(names)
         found = self.samples.get((table.name, name))
         if not found:

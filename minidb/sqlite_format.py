@@ -333,11 +333,12 @@ class Cell:
         if kind == TABLE_INTERIOR:
             size = 6 + varint_size(self.rowid)
         else:
-            size = varint_size(self.size) + len(self.local) + (4 if self.overflow else 0) + 2
+            size = varint_size(self.size) + len(self.local) + (4 if self.overflow else 0)
             if kind == TABLE_LEAF:
                 size += varint_size(self.rowid)
             elif kind == INDEX_INTERIOR:
                 size += 4
+            size = max(size, MIN_CELL_SIZE) + 2
         self.sized_for, self.bytes = kind, size
         return size
 
@@ -352,7 +353,13 @@ class Cell:
         parts.append(self.local)
         if self.overflow:
             parts.append(_u32.pack(self.overflow))
-        return b"".join(parts)
+        data = b"".join(parts)
+        return data if len(data) >= MIN_CELL_SIZE else data + bytes(MIN_CELL_SIZE - len(data))
+
+
+# SQLite gives a cell at least 4 bytes (cellSizePtr: a freeblock needs them):
+# a short index entry - one column holding 0 or 1 - is padded.
+MIN_CELL_SIZE = 4
 
 
 def parse_cell(data: bytes, pos: int, kind: int, geometry: Geometry) -> Cell:

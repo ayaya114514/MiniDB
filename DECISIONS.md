@@ -1152,3 +1152,30 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 - 其他由新 fuzz 找到的老问题：INSERT 列表里同一列出现两次时第一个值有效（行号列取最后一个，sqlite3Insert）；
   `RETURNING` 是保留字（`INSERT ... SELECT ... RETURNING` 以前被当成别名）；NOCASE / RTRIM 比较遇到带 JSON 子类型的
   文本时退回了 BINARY。
+
+## D119 WITHOUT ROWID 表：行键是主键的排序键元组，SQLite 格式里表就是主键索引
+
+- **行键**：WITHOUT ROWID 表的一行在执行器里仍有一个“row id”，只是它是主键各列排序键（含排序规则）的元组。这样
+  扫描、按键取行、REPLACE / UPSERT 找冲突、外键查子表、触发器和 RETURNING 的代码路径都不用分两套；`rowid` 这个名字对
+  这类表照 SQLite 报 `no such column: rowid`，`PRAGMA foreign_key_check` 的 rowid 列给 NULL。
+- **存储**：MiniDB 格式用一棵以主键元组为键、记录为值的 B+ 树；SQLite 格式照 SQLite——表本身是一棵索引 B 树，条目是主键
+  各列再接其余存储列（`WithoutRowidTable` 把它包装成“按键取行”的表树）。主键对应的“伪索引” `pk_index` 没有自己的树和
+  schema 行（root 就是表的 root），但在自动索引里照 SQLite 编号：单列 `INTEGER` 主键（sqlite3AddPrimaryKey 当作
+  INTEGER PRIMARY KEY 的那种）编号排在最后，且它的 COLLATE 子句被丢掉（convertToWithoutRowidTable 用列名重建索引，用
+  列自己的排序规则）；主键里重复的（列, 排序规则）只算一次。
+- **二级索引**的条目是索引列再接索引里没有的主键列（`extra`，`pk_parts` 记录从条目取回主键的位置），没有 row id。主键
+  列在二级索引里的升降序：`CREATE INDEX` 照抄主键的 DESC，表定义里 UNIQUE 约束的索引一律升序（SQLite 的
+  “bAscKeyBug”）——磁盘顺序和 `PRAGMA index_xinfo` 都照此。
+- **约束**：主键变了等于重写所有索引条目，所以 UPDATE 改主键时检查所有 UNIQUE 索引，编译期也据此认为 REPLACE 可能删
+  行（会编译外键检查）；REPLACE 之后的重查（recheck_unique）对这类表按找到的条目的主键比较，不会像有 rowid 的表那样被
+  自己的条目绊倒（SQLite 的代码读的是条目的主键列）。
+- **MiniDB 格式里 DESC 主键按升序存**（与 MiniDB 格式的 DESC 索引相同，只影响无 ORDER BY 时的输出顺序）。
+- 顺带修好的老问题：SQLite 格式里 WITHOUT ROWID 的最后一列是 REAL 时没有转换（索引条目原以为最后一列总是 row id）；
+  REAL 列的 VIRTUAL 复制列 `g AS (r)`：CREATE INDEX 从表里读出的整数值的 REAL 按整数存进索引，SELECT 用这个索引扫描
+  时从索引读这一列（也包括别的生成列表达式里引用它的地方，sqlite3 的 pIdxEpr），UPDATE / DELETE 不这样；upsert 的
+  `excluded.x` 读 REAL 亲和列时把 IntReal 变成真正的 REAL；MiniDB 格式 B+ 树删除时按存着的键（1 与 1.0 相等但长度
+  不同）记账；`hasFK>1`（改了自引用外键的子键）时 UPDATE 检查所有索引，编译期的 REPLACE 判断也照此（决定 SQLite
+  isSetNullAction 那个怪癖）；失败的 `CREATE UNIQUE INDEX`（建索引时发现重复）照 SQLite 结束隐式事务、清掉
+  `PRAGMA defer_foreign_keys`。
+- 已知差别：SQLite 自己在某些 UPDATE 后会留下“索引与表不符”的库（生成列读到还没存成整数的 REAL 寄存器），MiniDB 照做；
+  fuzz 遇到参考库自己 `integrity_check` 不过时跳过结尾的完整性检查。

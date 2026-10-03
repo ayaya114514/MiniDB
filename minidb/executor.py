@@ -1492,16 +1492,17 @@ class DerivedScan:
 
 
 class FullScan:
-    def __init__(self, tree: BTree, rows: int) -> None:
+    def __init__(self, tree: BTree, rows: int, key_order: list | None = None) -> None:
         self.tree = tree
         self.rows = rows
+        self.key_order = key_order  # a WITHOUT ROWID table's: its PRIMARY KEY columns ([] if DESC)
 
     def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         return self.tree.scan()
 
     def order(self) -> tuple[list[int], set[int]] | None:
         """(columns the rows come ordered by, columns that are constant)."""
-        return [ROWID], set()
+        return ([ROWID] if self.key_order is None else self.key_order), set()
 
     def estimate(self) -> tuple[float, float]:
         return self.rows, self.rows
@@ -1596,15 +1597,16 @@ class IndexScan:
         self.upper = upper
         self.table_rows = table_rows
         self.covering = False  # rows are built from index keys alone
+        self.index_values = True  # a SELECT's: indexed VIRTUAL columns come from the index (candidates)
 
     @property
     def yields_rows(self) -> bool:
-        return self.covering
+        return self.covering or (self.index_values and bool(self.index.raw_reals))
 
     def cover_if_possible(self, scope: Scope, table_index: int) -> None:
         """Use the index alone if it holds every column the query uses."""
         table = self.index.table
-        available = set(self.index.positions) | {len(table.columns)}  # plus the row id
+        available = set(self.index.entry_positions) | {len(table.columns)}  # plus the row id
         if table.rowid_column is not None:
             available.add(table.rowid_column)
         used = {position for index, position in scope.used if index == table_index}
@@ -1644,16 +1646,22 @@ class IndexScan:
         return (key for key, _ in self.index_tree.scan(start, end, start_inclusive, end_inclusive))
 
     def rowids(self, row: Row) -> list[int]:
+        if self.index.pk_parts is not None:
+            return [self.index.row_id(key) for key in self.keys(row)]
         return [key[-1][1] for key in self.keys(row)]
 
     def candidates(self, row: Row) -> Iterator[tuple[int, Any]]:
         keys = self.keys(row)
+        if self.index.pk_parts is not None:  # (WITHOUT ROWID)
+            row_id = self.index.row_id
+            keys = ((row_id(key), key) for key in keys)
+        else:
+            keys = ((key[-1][1], key) for key in keys)
         if self.covering:
             table = self.index.table
-            width, positions, alias = len(table.columns), self.index.positions, table.rowid_column
+            width, positions, alias = len(table.columns), self.index.entry_positions, table.rowid_column
             plain_value = values.plain_value
-            for key in keys:
-                rowid = key[-1][1]
+            for rowid, key in keys:
                 built = [None] * width
                 for position, pair in zip(positions, key):
                     if pair[0]:
@@ -1664,8 +1672,20 @@ class IndexScan:
                 yield rowid, built
             return
         get = self.table_tree.get
-        for key in keys:
-            rowid = key[-1][1]
+        if self.index_values and self.index.raw_reals:
+            # SQLite reads an indexed VIRTUAL column from the index entry
+            # (where.c's pIdxEpr), also where another generated column uses
+            # it: CREATE INDEX may have stored a whole REAL as an integer.
+            table, positions = self.index.table, self.index.positions
+            fixed = [positions[i] for i in self.index.raw_reals]
+            plain_value = values.plain_value
+            for rowid, key in keys:
+                record = get(rowid)
+                stored = record if type(record) is list else decode_row(record)
+                yield rowid, expand_virtual(table, stored, rowid,
+                                            {p: plain_value(key[i]) for i, p in zip(self.index.raw_reals, fixed)})
+            return
+        for rowid, _ in keys:
             yield rowid, get(rowid)
 
     def order(self) -> tuple[list, set] | None:
@@ -1772,6 +1792,8 @@ class MultiScan:
             keys = set()
             for part in self.parts:
                 keys.update(part.keys(row))
+            if self.parts and self.parts[0].index.pk_parts is not None:  # (IN on one index)
+                return [self.parts[0].index.row_id(key) for key in sorted(keys)]
             return [key[-1][1] for key in sorted(keys)]
         seen = set()
         rowids = []
@@ -1966,12 +1988,30 @@ def table_rows(catalog: Catalog, table: TableInfo) -> int:
     return max(DEFAULT_MIN_ROWS, catalog.table_tree(table).estimated_count())
 
 
+def index_rooted(pager: SqlitePager, root: int) -> bool:
+    """Whether a tree of a SQLite file is an index tree (a WITHOUT ROWID
+    table's, when the schema calls it a table)."""
+    from minidb.sqlite_format import INDEX_INTERIOR, INDEX_LEAF
+    from minidb.sqlite_btree import IndexTree
+
+    return IndexTree(pager, root).page(root).kind in (INDEX_LEAF, INDEX_INTERIOR)
+
+
+def full_scan(tree: BTree, table: TableInfo, rows: int) -> FullScan:
+    """A scan of a whole table: in row id order, or a WITHOUT ROWID table's
+    in its PRIMARY KEY's order."""
+    if table.has_rowid:
+        return FullScan(tree, rows)
+    pk = table.pk_index
+    return FullScan(tree, rows, list(zip(pk.positions, pk.collations)) if pk.ordered else [])
+
+
 def access_candidates(scope: Scope, index: int, catalog: Catalog, conjuncts: list[Expr], compiler: Compiler, bound: set[int] | frozenset[int], rows: int) -> list[AccessPath]:
     """Every access path the conjuncts allow for table ``index``, full scan first."""
     table = scope.entries[index].table
     tree = catalog.table_tree(table)
     constraints = find_constraints(scope, index, conjuncts, compiler, bound)
-    candidates = [FullScan(tree, rows)]
+    candidates = [full_scan(tree, table, rows)]
     for c in constraints:
         if c.position == ROWID and c.op in ("=", "IN"):
             candidates.append(RowidLookup(tree, [c.key] if c.op == "=" else c.key))
@@ -2071,9 +2111,9 @@ def covering_index_scan(scope: Scope, index: int, catalog: Catalog, scan: FullSc
     table_size = log_estimate(4 * width)
     best = best_cost = None
     for info in scope.entries[index].indexes():
-        if not info.ordered:
-            continue
-        index_size = log_estimate(4 * (sum(size_estimate(table.columns[p].type) for p in info.positions) + 1))
+        if not info.ordered or info.table_pk:
+            continue  # (a WITHOUT ROWID table's PRIMARY KEY: its full scan is the table's)
+        index_size = log_estimate(4 * (sum(size_estimate(table.columns[p].type) for p in info.entry_positions) + 1))
         cost = 15 * index_size // table_size
         if index_size >= table_size or (best is not None and cost >= best_cost):
             continue
@@ -2097,7 +2137,7 @@ def grouping_index_scan(scope: Scope, index: int, catalog: Catalog, scan: FullSc
     wanted = set(group)
     best = best_rank = None
     for info in scope.entries[index].indexes():
-        if not info.ordered:
+        if not info.ordered or info.table_pk:
             continue
         columns = list(zip(info.positions, info.collations))
         if len(columns) >= len(group) and set(columns[:len(group)]) == wanted:
@@ -2319,7 +2359,8 @@ class Executor:
         names = trigger_names(table, changed)
         triggers, keys = self.triggers, self.foreign_keys
         triggers.prepare_listed(table.name, "UPDATE", names, orconf)
-        if replace and replace_possible(table, orconf, rowid_changed, changed):
+        checked = None if keys.every_index(table, changed) else changed  # (update.c's hasFK>1)
+        if replace and replace_possible(table, orconf, rowid_changed, checked):
             self.compile_delete(table, "REPLACE", bool(self.settings["recursive_triggers"]))
         unchecked = None
         if keys.enabled:
@@ -2406,7 +2447,8 @@ class Executor:
                     else:
                         missing = keys.parent_exists(link, row) is False
                     if missing:
-                        found.append((table.name, rowid, link.key.parent, link.number))
+                        found.append((table.name, rowid if table.has_rowid else None,
+                                      link.key.parent, link.number))
         return found
 
     def prepare(self, stmt: Select | Compound | Insert | Update | Delete) -> PreparedStatement:
@@ -2827,7 +2869,8 @@ class Executor:
                 # groups: SQLite keeps that table outermost to save the sort.
                 entry = scope.entries[0]
                 if not isinstance(entry.table, DerivedSource):
-                    scan = FullScan(self.catalog.table_tree(entry.table), table_rows(self.catalog, entry.table))
+                    scan = full_scan(self.catalog.table_tree(entry.table), entry.table,
+                                     table_rows(self.catalog, entry.table))
                     found = grouping_index_scan(scope, 0, self.catalog, scan, group_hint)
                     if found is not None and found.grouping == "all":
                         order = [0] + [i for i in order if i != 0]
@@ -2863,6 +2906,8 @@ class Executor:
                                  bound=set(order[:level]))
             if group_hint and type(access) is FullScan and level == 0 and index == 0 and not rights:
                 access = grouping_index_scan(scope, index, self.catalog, access, group_hint) or access
+            if isinstance(access, IndexScan) and not covering:
+                access.index_values = False  # (UPDATE / DELETE read the table)
             if covering and isinstance(access, IndexScan):
                 access.cover_if_possible(scope, index)
             elif covering and type(access) is FullScan:
@@ -3316,9 +3361,11 @@ class Executor:
         if any(v is None for v in key_values):
             return None  # NULLs never conflict
         prefix = index.prefix(key_values)
+        row_id = index.row_id
         for key, _ in self.catalog.index_tree(index).scan(prefix, prefix + (HIGH,)):
-            if key[-1][1] != own_rowid:
-                return key[-1][1]
+            other = row_id(key)
+            if other != own_rowid:
+                return other
         return None
 
     @staticmethod
@@ -3344,7 +3391,14 @@ class Executor:
         first pass's code without reading the found entry's row id: it
         compares the row id the first pass found last (``last_found``) with
         ``own``, so an UPDATE trips over its own entry of an index whose key
-        it did not change when the first pass last found another row."""
+        it did not change when the first pass last found another row.  (A
+        WITHOUT ROWID table's code reads the found entry's PRIMARY KEY, so
+        there the comparison is right; its PRIMARY KEY is among ``indexes``.)"""
+        if not table.has_rowid:
+            for index in indexes:
+                if self.find_conflict(index, row, None) not in (None, own):
+                    raise self.constraint_error(self.unique_error(table, index), "ABORT")
+            return
         if rowid != own and rowid in tree:
             raise self.constraint_error(self.rowid_conflict(table).args[0], "ABORT")
         for index in indexes:
@@ -3416,17 +3470,25 @@ class Executor:
                 continue
             prefix = index.prefix(key_values)
             for key, _ in self.catalog.index_tree(index).scan(prefix, prefix + (HIGH,)):
-                if key[-1][1] != rowid:
+                if index.row_id(key) != rowid:
                     columns = ", ".join(f"{table.name}.{c}" for c in index.column_names)
                     raise IntegrityError(f"UNIQUE constraint failed: {columns}")
 
     def add_index_entries(self, table: TableInfo, row: Row, rowid: int) -> None:
         for index in table.indexes:
-            self.catalog.index_tree(index).insert(index.key(row, rowid), b"")
+            if not index.table_pk:  # (a WITHOUT ROWID table's PRIMARY KEY tree is the table's)
+                self.catalog.index_tree(index).insert(index.key(row, rowid), b"")
 
     def remove_index_entries(self, table: TableInfo, row: Row, rowid: int) -> None:
         for index in table.indexes:
-            self.catalog.index_tree(index).delete(index.key(row, rowid))
+            if not index.table_pk:
+                self.catalog.index_tree(index).delete(index.key(row, rowid))
+
+    @staticmethod
+    def row_key(table: TableInfo, row: Row) -> tuple:
+        """A WITHOUT ROWID table's key for a row: its PRIMARY KEY's sort keys."""
+        pk = table.pk_index
+        return pk.prefix([row[p] for p in pk.positions])
 
     @staticmethod
     def encode(table: TableInfo, row: Row) -> bytes:
@@ -3480,9 +3542,10 @@ class Executor:
         if sequence is not None and rowid is not None:
             sequence[0] = max(sequence[0], rowid)
         fresh = rowid is None  # (a new row id is never taken)
+        keyed = not table.has_rowid  # (WITHOUT ROWID: the PRIMARY KEY is the key)
         if table.generated:
             # SQLite computes them once the row id is known, before the constraints.
-            if fresh:
+            if fresh and not keyed:
                 rowid = self.new_rowid(tree, sequence)
             if table.rowid_column is not None:
                 row[table.rowid_column] = raw[table.rowid_column] = rowid
@@ -3494,7 +3557,9 @@ class Executor:
             if violation[1] == "IGNORE":
                 return None
             raise self.constraint_error(*violation)
-        if fresh and not table.generated:
+        if keyed:
+            rowid = self.row_key(table, row)
+        elif fresh and not table.generated:
             rowid = self.new_rowid(tree, sequence)
         if table.rowid_column is not None:
             row[table.rowid_column] = raw[table.rowid_column] = rowid
@@ -3510,7 +3575,9 @@ class Executor:
         constraints = [u.constraint for u in upserts if u.constraint is not None]
         rowid_how = conflict or table.rowid_conflict() or "ABORT"
         unique = [i for i in table.indexes if i.unique]
-        if rowid_how == "REPLACE" and conflict is None and unique and "rowid" not in constraints:
+        if keyed:
+            pass  # (the PRIMARY KEY's uniqueness is that of its index)
+        elif rowid_how == "REPLACE" and conflict is None and unique and "rowid" not in constraints:
             unique.append("rowid")  # SQLite defers a REPLACE of the row id until after the others
         else:
             unique.insert(0, "rowid")
@@ -3556,7 +3623,8 @@ class Executor:
         tree.insert(rowid, self.encode(table, stored))
         self.add_index_entries(table, stored, rowid)
         if triggers.matching(table.name, "AFTER", "INSERT"):
-            self.last_insert_rowid = rowid  # (the trigger sees it)
+            if not keyed:
+                self.last_insert_rowid = rowid  # (the trigger sees it)
             try:
                 triggers.fire(table.name, "AFTER", "INSERT", None, row + [rowid], None, conflict)
             except TriggerIgnore:
@@ -3574,7 +3642,11 @@ class Executor:
         the CHECK constraints)."""
         width = len(table.columns)
         row = new[:width]
-        if table.rowid_column is None:
+        keyed = not table.has_rowid  # (WITHOUT ROWID: the PRIMARY KEY is the key)
+        if keyed:
+            self.prepare_row(table, row)
+            new_rowid = self.row_key(table, row)
+        elif table.rowid_column is None:
             new_rowid = values.numeric_affinity(new[width])
             if not isinstance(new_rowid, int):
                 raise IntegrityError("datatype mismatch")
@@ -3614,6 +3686,8 @@ class Executor:
                     row[i] = current[i]
             if table.generated:
                 self.generator(table)(row)
+            if keyed:
+                new_rowid = self.row_key(table, row)
         violation = self.not_null_violation(table, row, conflict)
         if violation is not None:
             if violation[1] == "IGNORE":
@@ -3632,9 +3706,13 @@ class Executor:
         width = len(table.columns)
         every = (changed is None or table.rowid_column in changed or width in changed
                  or self.foreign_keys.every_index(table, changed))
+        if keyed and not every:  # (a new PRIMARY KEY changes every index's entry: update.c's chngPk)
+            every = any(p in changed for p in table.pk_index.positions)
         constraints = [i for i in table.indexes if i.unique and (every or any(p in changed for p in i.positions))]
         rowid_how = conflict or table.rowid_conflict() or "ABORT"
-        if rowid_how == "REPLACE" and conflict is None and constraints:
+        if keyed:
+            pass  # (the PRIMARY KEY's uniqueness is that of its index)
+        elif rowid_how == "REPLACE" and conflict is None and constraints:
             constraints.append("rowid")
         else:
             constraints.insert(0, "rowid")
@@ -4019,7 +4097,7 @@ class Executor:
         stmt = parse(table.sql)
         sql = table.sql[:stmt.columns_end] + ", " + text.rstrip("; \t\n\r\f\v") + table.sql[stmt.columns_end:]
         added = TableInfo(table.name, table.columns + [column], table.root, table.schema_key,
-                          table.table_constraints, sql)
+                          table.table_constraints, sql, table.without_rowid)
         added.validate()
         self.check_constraints_compile(added)
         try:
@@ -4061,7 +4139,8 @@ class Executor:
             sql = table.sql[:start] + table.sql[stmt.columns_end:]
         try:
             changed = parse(sql)
-            dropped = TableInfo(table.name, changed.columns, table.root, None, changed.constraints, sql)
+            dropped = TableInfo(table.name, changed.columns, table.root, None, changed.constraints, sql,
+                                changed.without_rowid)
             dropped.validate()
             self.check_new_table(dropped)
         except Error as exc:
@@ -4112,6 +4191,8 @@ class Executor:
         else:
             raise OperationalError("unable to identify the object to be reindexed")
         for index in indexes:
+            if index.table_pk:
+                continue  # (the table itself)
             catalog.index_tree(index).clear()
             self.build_index(index)
         return Result()
@@ -4203,12 +4284,14 @@ class Executor:
             kind, name, table_name, root, sql = decode_record(value)[0]
             if kind in ("table", "index"):
                 index = source.indexes.get(ascii_lower(name)) if kind == "index" else None
-                # (an index's own codec: NOCASE / RTRIM keys must stay collation keys in the page cache)
-                codec = IntKey if kind == "table" else index.codec if index is not None else IndexKeyCodec
+                table = source.tables[ascii_lower(name)] if kind == "table" else None
+                # (an index's own codec: NOCASE / RTRIM keys must stay collation keys in the page cache;
+                # a WITHOUT ROWID table's is its PRIMARY KEY's)
+                codec = (IntKey if table.has_rowid else table.pk_index.codec) if kind == "table" \
+                    else index.codec if index is not None else IndexKeyCodec
                 tree = BTree.create(target, codec)
                 entries = BTree(source.pager, root, codec).scan()
-                if kind == "table" and not keep_rowids:
-                    table = source.tables[ascii_lower(name)]
+                if kind == "table" and not keep_rowids and table.has_rowid:
                     if table.rowid_column is None and not table.indexes:
                         entries = ((rowid, record) for rowid, (_, record) in enumerate(entries, 1))
                 tree.bulk_load(entries)
@@ -4234,7 +4317,7 @@ class Executor:
             for key, row in tables:
                 if key == sequence:
                     continue
-                roots[key] = TableTree.create(target)
+                roots[key] = (IndexTree if index_rooted(pager, row[3]) else TableTree).create(target)
                 info = source.tables.get(ascii_lower(row[1]))
                 if sequence is not None and sequence not in roots and info is not None and info.autoincrement:
                     roots[sequence] = TableTree.create(target)
@@ -4246,6 +4329,8 @@ class Executor:
         for key, row in rows:
             kind, name, root = row[0], row[1], row[3]
             if kind in ("table", "index") and root:
+                if kind == "table" and index_rooted(pager, root):
+                    kind = "index"  # (a WITHOUT ROWID table: an index tree, copied as one)
                 if kind == "table":
                     tree = TableTree(pager, root)
                     table = source.tables.get(ascii_lower(name))
@@ -4297,6 +4382,7 @@ class Executor:
         index = self.catalog.create_index(stmt)
         if index is None:
             return Result()
+        self.ran = True  # (a duplicate found while filling it is a run-time error)
         self.build_index(index)
         return Result()
 
@@ -4304,7 +4390,7 @@ class Executor:
         """Fill the (empty) tree of ``index`` from its table: the keys are
         sorted, checked for duplicates and loaded bottom up."""
         table = index.table
-        load_row, key = self.load_row, index.key
+        load_row, key = self.load_row, (index.build_key if index.raw_reals else index.key)
         keys = sorted(key(load_row(table, rowid, record), rowid)
                       for rowid, record in self.catalog.table_tree(table).scan())
         if index.unique:
@@ -4789,7 +4875,7 @@ class PreparedInsert:
             for name in stmt.columns:
                 position = table.column_index(name)
                 if position is None:
-                    if ascii_lower(name) not in ROWID_NAMES:
+                    if ascii_lower(name) not in ROWID_NAMES or not table.has_rowid:
                         raise OperationalError(f"table {table.name} has no column named {name}")
                     # The row id by name; "width" when it is not a column.
                     position = width if table.rowid_column is None else table.rowid_column
@@ -4983,7 +5069,7 @@ class PreparedInsert:
                                               sequence, not self.fk_multi)
                 if outcome is not None:
                     kind, stored = outcome
-                    if kind == "insert":
+                    if kind == "insert" and table.has_rowid:
                         executor.last_insert_rowid = stored[-1]
                     changed.append(stored)
         except Error as exc:
@@ -5048,7 +5134,7 @@ class PreparedUpdate(PreparedSingleTable):
         for name, expr in stmt.assignments:
             position = table.column_index(name)
             if position is None:
-                if ascii_lower(name) not in ROWID_NAMES:
+                if ascii_lower(name) not in ROWID_NAMES or not table.has_rowid:
                     raise OperationalError(f"no such column: {name}")
                 position = width if table.rowid_column is None else table.rowid_column
             elif table.columns[position].generated is not None:
@@ -5341,7 +5427,7 @@ class PreparedUpsert:
         for name, expr in clause.assignments:
             position = table.column_index(name)
             if position is None:
-                if ascii_lower(name) not in ROWID_NAMES:
+                if ascii_lower(name) not in ROWID_NAMES or not table.has_rowid:
                     raise OperationalError(f"no such column: {name}")
                 position = width if table.rowid_column is None else table.rowid_column
             elif table.columns[position].generated is not None:
@@ -5369,7 +5455,7 @@ class PreparedUpsert:
             alias = None if table.rowid_column is None else ascii_lower(table.columns[table.rowid_column].name)
             wanted = [ascii_lower(c) for c in clause.columns]
             for name in clause.columns:
-                if table.column_index(name) is None and ascii_lower(name) not in ROWID_NAMES:
+                if table.column_index(name) is None and (ascii_lower(name) not in ROWID_NAMES or not table.has_rowid):
                     raise OperationalError(f"no such column: {name}")
             if len(wanted) == 1 and wanted[0] in (alias, *ROWID_NAMES):
                 return "rowid"
@@ -5391,6 +5477,10 @@ class PreparedUpsert:
             return None
         executor, table = self.executor, self.table
         old = executor.load_row(table, rowid, tree.get(rowid))
+        if values.int_reals_made[0]:
+            # (SQLite reads excluded.x of REAL affinity with OP_RealAffinity:
+            # a generated column's IntReal is a REAL there.)
+            excluded = [float(v) if type(v) is values.IntReal else v for v in excluded]
         context = old + excluded
         if self.where is not None and not values.truth(self.where(context)):
             return None
@@ -5732,12 +5822,14 @@ def replace_possible(table: TableInfo, conflict: str | None, rowid_checked: bool
                      changed: set[int] | None = None, handled: list | None = None) -> bool:
     """Whether a REPLACE could delete rows of ``table`` (a uniqueness
     constraint resolved by REPLACE that the statement checks; an UPDATE that
-    changes the row id rewrites, so checks, every index).  ``handled``: the
-    constraints an upsert takes over (None among them: all)."""
+    changes the row id, or a WITHOUT ROWID table's PRIMARY KEY, rewrites, so
+    checks, every index).  ``handled``: the constraints an upsert takes over
+    (None among them: all)."""
     handled = handled or []
     if None in handled:
         return False
-    if changed is not None and rowid_checked:
+    if changed is not None and (rowid_checked or (
+            table.without_rowid and changed & set(table.pk_index.positions))):
         changed = None
     rowid_checked = rowid_checked and "rowid" not in handled
     indexes = [index for index in table.indexes if index.unique and index not in handled
@@ -5861,9 +5953,10 @@ def compile_generated(table: TableInfo, positions: list[int]) -> Callable[[Row],
     return checked
 
 
-def expand_virtual(table: TableInfo, stored: list, rowid: int) -> Row:
+def expand_virtual(table: TableInfo, stored: list, rowid: int, fixed: dict[int, SQLValue] | None = None) -> Row:
     """The row (with its row id) of a record of a table with VIRTUAL
-    columns: the stored values in their places, the others computed."""
+    columns: the stored values in their places, the others computed
+    (but for those ``fixed`` gives)."""
     storage = table.storage
     if len(stored) < len(storage):  # written before ALTER TABLE ADD COLUMN
         stored.extend(table.padding[p] for p in storage[len(stored):])
@@ -5872,9 +5965,19 @@ def expand_virtual(table: TableInfo, stored: list, rowid: int) -> Row:
         row[position] = value
     if table.rowid_column is not None:
         row[table.rowid_column] = rowid
-    fill = table.fill_virtual
-    if fill is None:
-        fill = table.fill_virtual = compile_generated(table, generated_order(table, table.virtual))
+    if fixed:
+        for position, value in fixed.items():
+            row[position] = value
+        key = frozenset(fixed)
+        cache = table.fill_virtual_except
+        fill = cache.get(key)
+        if fill is None:
+            fill = cache[key] = compile_generated(
+                table, generated_order(table, [p for p in table.virtual if p not in key]))
+    else:
+        fill = table.fill_virtual
+        if fill is None:
+            fill = table.fill_virtual = compile_generated(table, generated_order(table, table.virtual))
     fill(row)
     row.append(rowid)
     return row

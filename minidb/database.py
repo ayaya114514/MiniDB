@@ -386,7 +386,8 @@ class Database:
         for table in catalog.all_tables():
             trees.append((f"table {table.name}", catalog.table_tree(table)))
             for index in table.indexes:
-                trees.append((f"index {index.name}", catalog.index_tree(index)))
+                if not index.table_pk:  # (a WITHOUT ROWID table's tree)
+                    trees.append((f"index {index.name}", catalog.index_tree(index)))
         for name, tree in trees:
             try:
                 tree.check()
@@ -400,6 +401,8 @@ class Database:
                 for rowid, record in catalog.table_tree(table).scan()
             ]
             for index in table.indexes:
+                if index.table_pk:
+                    continue
                 expected = sorted(index.key(row, rowid) for rowid, row in rows)
                 if catalog.index_tree(index).keys() != expected:
                     problems.append(f"index {index.name} does not match table {table.name}")

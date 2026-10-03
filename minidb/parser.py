@@ -276,6 +276,7 @@ class CreateTable:
     columns_end: int = field(default=-1, compare=False)  # where ADD COLUMN inserts (see Catalog)
     temp: bool = False  # CREATE TEMP TABLE / CREATE TABLE temp.name: in the connection's temp database
     query: object = None  # CREATE TABLE ... AS SELECT (no columns: the executor makes them)
+    without_rowid: bool = False  # WITHOUT ROWID: rows stored by their PRIMARY KEY
 
 
 @dataclass
@@ -826,9 +827,10 @@ class Parser:
                 options.append("STRICT")
             if not self.accept_op(","):
                 break
-        if options:
-            raise NotSupportedError(f"{options[0]} tables are not supported")
-        stmt = CreateTable(name, columns, if_not_exists, constraints, temp=temp)
+        if "STRICT" in options:
+            raise NotSupportedError("STRICT tables are not supported")
+        stmt = CreateTable(name, columns, if_not_exists, constraints, temp=temp,
+                           without_rowid="WITHOUT ROWID" in options)
         stmt.sql = "CREATE TABLE " + self.text[name_pos:self.end_of_previous()]
         stmt.name_pos, stmt.columns_end = name_pos, columns_end
         return stmt

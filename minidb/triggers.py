@@ -142,7 +142,7 @@ class Program:
         if self.real:
             for start in range(0, len(row), self.width):
                 for i in self.real:
-                    if type(row[start + i]) is int:
+                    if type(row[start + i]) in (int, values.IntReal):  # (OP_RealAffinity)
                         row[start + i] = float(row[start + i])
         cell[0] = row
         try:
