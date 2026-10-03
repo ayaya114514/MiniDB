@@ -438,9 +438,12 @@ class TableTree(_Tree):
             self._free_chain(cells[i])
             self.pager.write(leaf)
             cells[i] = self._cell(payload, rowid)
+            leaf.forget_used()
         else:
             self.pager.write(leaf)
-            cells.insert(i, self._cell(payload, rowid))
+            cell = self._cell(payload, rowid)
+            cells.insert(i, cell)
+            leaf.cell_added(cell)
         # As sqlite3BtreeInsert: only a leaf that overflows is balanced.
         if leaf.used() <= leaf.capacity:
             return
@@ -624,6 +627,7 @@ class IndexTree(_Tree):
         cell.key = key
         self.pager.write(page)
         page.cells.insert(i, cell)
+        page.cell_added(cell)
         if page.used() > page.capacity:  # (as sqlite3BtreeInsert: balance only a page that overflows)
             self._fix(path, page)
 
@@ -649,6 +653,7 @@ class IndexTree(_Tree):
         predecessor = leaf.cells.pop().copy()
         predecessor.child = old.child
         page.cells[i] = predecessor
+        page.forget_used()
         self._free_chain(old)
         self._fix(leaf_path, leaf)
         # The interior page may now be too full (a longer key): find it again.
