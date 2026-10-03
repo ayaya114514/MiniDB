@@ -3586,14 +3586,18 @@ class Executor:
         fresh = rowid is None  # (a new row id is never taken)
         keyed = not table.has_rowid  # (WITHOUT ROWID: the PRIMARY KEY is the key)
         if table.generated:
-            # SQLite computes them once the row id is known, before the constraints.
+            # SQLite computes them once the row id is known, before the
+            # constraints - and first applies the column affinities in place
+            # (sqlite3ComputeGeneratedColumns calls sqlite3TableAffinity), so
+            # an upsert's "excluded" row shows the converted values.
             if fresh and not keyed:
                 rowid = self.new_rowid(tree, sequence)
             if table.rowid_column is not None:
-                row[table.rowid_column] = raw[table.rowid_column] = rowid
+                row[table.rowid_column] = rowid
             self.generator(table)(row)
-            for position in table.generated:
-                raw[position] = row[position]
+            raw = row[:]
+            if defaults is not None:
+                defaults.converted = True
         violation = self.not_null_violation(table, row, conflict, raw)
         if violation is not None:
             if violation[1] == "IGNORE":
@@ -3628,7 +3632,7 @@ class Executor:
         # it checks the first index (or a CHECK constraint); an upsert's
         # "excluded" row shows them converted only if the conflict was found
         # after that.
-        converted = bool(table.checks) and not self.settings["ignore_check_constraints"]
+        converted = bool(table.generated) or (bool(table.checks) and not self.settings["ignore_check_constraints"])
         replaced = False  # a REPLACE deleted a row and its DELETE triggers ran
         for constraint in constraints:
             if constraint == "rowid":
