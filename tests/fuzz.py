@@ -1005,8 +1005,7 @@ def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False)
                 history[-1] += "  -- skipped: sqlite3 interrupted it (step limit)"
             if snapshots is not None:
                 snapshots.step(history)
-            if not sql.startswith(("SELECT", "WITH", "VALUES")) \
-                    and pair.lite.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            if not sql.startswith(("SELECT", "WITH", "VALUES")) and not lite_intact(pair):
                 # SQLite's own database became corrupt (an UPDATE whose
                 # generated column reads a REAL-affinity value before it is
                 # stored as an integer, D119).  MiniDB's matches it, but what
@@ -1016,7 +1015,7 @@ def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False)
                 return None
         if snapshots is not None:
             snapshots.finish()
-        if pair.lite.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+        if not lite_intact(pair):
             # SQLite's own database is corrupt (an UPDATE whose generated
             # column reads a REAL-affinity value before it is stored as an
             # integer); MiniDB's matches it, the checks below cannot hold.
@@ -1035,6 +1034,18 @@ def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False)
             snapshots.reader.close()
         pair.close()
     return None
+
+
+def lite_intact(pair):
+    """Whether sqlite3's database passes its integrity check (which also
+    evaluates CHECK constraints and generated columns: an error there says
+    nothing about the file, so it counts as intact)."""
+    import sqlite3
+
+    try:
+        return pair.lite.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    except sqlite3.Error:
+        return True
 
 
 def dump_query(connection, name):
