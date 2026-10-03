@@ -2288,7 +2288,7 @@ class Executor:
         keys = self.foreign_keys
         keys.immediate = 0
         keys.unchecked = None
-        if isinstance(stmt, (Select, Compound, Values, Insert, Update, Delete)):
+        if type(stmt) in _PLANNED:
             plan = self.prepare(stmt)
             for cache in plan.once_caches:
                 cache.clear()
@@ -2298,7 +2298,8 @@ class Executor:
                     and keys.involved(plan.table):
                 self.statement_journal = self.statement_journal or self.foreign_keys_may_abort(stmt, plan)
             result = plan.run()
-            self.check_foreign_keys()
+            if keys.enabled or keys.immediate or keys.deferred or keys.deferred_immediate:
+                self.check_foreign_keys()
             return result
         if isinstance(stmt, CreateTable):
             if stmt.query is not None:
@@ -3527,12 +3528,16 @@ class Executor:
         return pk.prefix([row[p] for p in pk.positions])
 
     @staticmethod
-    def encode(table: TableInfo, row: Row) -> bytes:
+    def encode(table: TableInfo, row: Row, tree: BTree | None = None) -> bytes | list:
+        """The record to store for ``row``: as the values themselves for a
+        ``tree`` that takes them (a SQLite file's, which encodes its own)."""
         stored = list(row)
         if table.rowid_column is not None:
             stored[table.rowid_column] = None  # kept in the key, not the record
         if table.storage is not None:
             stored = [stored[p] for p in table.storage]  # (not the VIRTUAL columns)
+        if getattr(tree, "rows", False):
+            return stored
         return encode_record(stored)
 
     def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str | None = None,
@@ -3554,7 +3559,8 @@ class Executor:
         AUTOINCREMENT counter of the statement (a one-item list)."""
         # The values before column affinities (see below); SQLite has already
         # made integers in REAL columns REALs (OP_RealAffinity).
-        raw = [float(v) if a == values.REAL and type(v) is int else v for v, a in zip(row, table.affinities)]
+        raw = [float(v) if a == values.REAL and type(v) is int else v for v, a in zip(row, table.affinities)] \
+            if values.REAL in table.affinities else row[:]
         given, rowid = rowid, self.prepare_row(table, row)
         if defaults is not None and defaults.converted:
             for position in defaults.positions:
@@ -3563,8 +3569,8 @@ class Executor:
             rowid = values.apply_affinity(given, values.INTEGER)
             if not isinstance(rowid, int):
                 raise IntegrityError("datatype mismatch")
-        triggers = self.triggers
-        if triggers.matching(table.name, "BEFORE", "INSERT"):
+        triggers, any_triggers = self.triggers, self.catalog.any_triggers
+        if any_triggers and triggers.matching(table.name, "BEFORE", "INSERT"):
             # NEW has the values with their affinities, and row id -1 when it is not known yet.
             new = row + [-1 if rowid is None else rowid]
             if table.rowid_column is not None:
@@ -3608,9 +3614,9 @@ class Executor:
                 if violation[1] == "IGNORE":
                     return None
                 raise self.constraint_error(*violation)
-        constraints = [u.constraint for u in upserts if u.constraint is not None]
+        constraints = [u.constraint for u in upserts if u.constraint is not None] if upserts else []
         rowid_how = conflict or table.rowid_conflict() or "ABORT"
-        unique = [i for i in table.indexes if i.unique]
+        unique = [i for i in table.indexes if i.unique] if table.indexes else []
         if keyed:
             pass  # (the PRIMARY KEY's uniqueness is that of its index)
         elif rowid_how == "REPLACE" and conflict is None and unique and "rowid" not in constraints:
@@ -3651,14 +3657,16 @@ class Executor:
                                 [c for c in constraints if c != "rowid" and (conflict or c.conflict) == "REPLACE"])
         if defaults is not None:
             defaults.converted = True  # (OP_MakeRecord converts in place too)
-        if self.foreign_keys.involved(table):
-            self.foreign_keys.row_inserted(table, row + [rowid], single)
+        keys = self.foreign_keys
+        if keys.enabled and keys.involved(table):
+            keys.row_inserted(table, row + [rowid], single)
         if self.pinned:
             self.check_pinned(table)
         stored = self.stored_row(table, row)
-        tree.insert(rowid, self.encode(table, stored))
-        self.add_index_entries(table, stored, rowid)
-        if triggers.matching(table.name, "AFTER", "INSERT"):
+        tree.insert(rowid, self.encode(table, stored, tree))
+        if table.indexes:
+            self.add_index_entries(table, stored, rowid)
+        if any_triggers and triggers.matching(table.name, "AFTER", "INSERT"):
             if not keyed:
                 self.last_insert_rowid = rowid  # (the trigger sees it)
             try:
@@ -3812,7 +3820,7 @@ class Executor:
         if involved:
             keys.row_adding(table, row + [new_rowid], changed)
         stored = self.stored_row(table, row)
-        tree.insert(new_rowid, self.encode(table, stored), replace=True)
+        tree.insert(new_rowid, self.encode(table, stored, tree), replace=True)
         self.add_index_entries(table, stored, new_rowid)
         if involved:
             keys.actions(table, old, row + [new_rowid], changed)
@@ -4216,7 +4224,7 @@ class Executor:
             tree = self.catalog.table_tree(table)
             rows = [(rowid, self.load_row(table, rowid, record)) for rowid, record in tree.scan()]
             for rowid, row in rows:
-                tree.insert(rowid, self.encode(dropped, row[:position] + row[position + 1:-1]), replace=True)
+                tree.insert(rowid, self.encode(dropped, row[:position] + row[position + 1:-1], tree), replace=True)
         table.sql = sql
         self.catalog.rewrite_table_entries(table)
 
@@ -4421,7 +4429,7 @@ class Executor:
         for rowid, row in enumerate(list(compiled.run()), 1):
             row = list(row)
             self.prepare_row(table, row)
-            tree.insert(rowid, self.encode(table, self.stored_row(table, row)))
+            tree.insert(rowid, self.encode(table, self.stored_row(table, row), tree))
         return Result()
 
     def create_index(self, stmt: CreateIndex) -> Result:
@@ -4871,6 +4879,9 @@ class CompiledSelect:
             if values.int_reals_made[0]:
                 return [values.through_record(output) for output, _ in records]  # (SQLite's sorter)
         return [output for output, _ in records]
+
+
+_PLANNED = frozenset((Select, Compound, Values, Insert, Update, Delete))  # (statements with a prepared plan)
 
 
 def passes_constants(constants: list[RowFunction], scope: Scope) -> bool:
