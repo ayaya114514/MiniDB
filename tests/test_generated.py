@@ -220,3 +220,73 @@ def test_alter_table(pair):
         SELECT sql FROM sqlite_schema WHERE type = 'table' ORDER BY name;
         PRAGMA integrity_check
         """)
+
+
+def test_int_real_values(pair):
+    """A REAL generated column holds a whole value as SQLite's IntReal: a
+    REAL, which a record (a table, the ORDER BY sorter, UNION) keeps as an
+    integer."""
+    run_all(pair, """
+        CREATE TABLE t (a, g REAL AS (a), s REAL AS (a) STORED);
+        INSERT INTO t VALUES (3), (3.5), ('4'), (-0.0), (1e20), (140737488355328), ('x'), (NULL);
+        SELECT g, typeof(g), g || '', CAST(g AS TEXT), quote(g), s || '' FROM t;
+        SELECT g, typeof(g) FROM t ORDER BY a;
+        SELECT * FROM (SELECT g FROM t ORDER BY a LIMIT 5);
+        SELECT DISTINCT g FROM t;
+        SELECT g FROM t GROUP BY g;
+        SELECT g FROM t UNION ALL SELECT 5;
+        SELECT g FROM t UNION SELECT 5;
+        SELECT (SELECT g FROM t ORDER BY a LIMIT 1);
+        CREATE TABLE u (x, y TEXT, z INT, w REAL, v NUMERIC);
+        INSERT INTO u SELECT g, g, g, g, g FROM t;
+        SELECT x, typeof(x), y, z, w, typeof(w), v, typeof(v) FROM u;
+        INSERT INTO u (y) SELECT g FROM t ORDER BY a;
+        SELECT y FROM u WHERE x IS NULL;
+        INSERT INTO t VALUES (7) RETURNING g, s, g || '', s || ''
+        """)
+
+
+def test_new_in_before_update_triggers(pair):
+    """NEW's generated columns in a BEFORE UPDATE trigger see NULL for the
+    columns the UPDATE does not set and no trigger names as new.x."""
+    run_all(pair, """
+        CREATE TABLE t (a, b, g AS (a || '-' || b), c);
+        INSERT INTO t VALUES (1, 2, 3);
+        CREATE TABLE log (x);
+        CREATE TRIGGER tr BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (new.g); END;
+        UPDATE t SET c = 9;
+        UPDATE t SET a = 5;
+        CREATE TRIGGER tr2 BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (new.b || '/' || new.g); END;
+        UPDATE t SET c = 8;
+        CREATE TRIGGER tr3 AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('after ' || new.g); END;
+        UPDATE t SET c = 7;
+        SELECT * FROM log;
+        SELECT * FROM t
+        """)
+
+
+def test_json_subtype_of_new_values(pair):
+    """A new row's JSON values keep their subtype in RETURNING, triggers and
+    generated columns (SQLite's registers) - not in the record, and not
+    when they come from a SELECT or several VALUES rows (a co-routine)."""
+    run_all(pair, """
+        CREATE TABLE p (c0, c1 TEXT);
+        INSERT INTO p VALUES (json('{"a":1}'), json('[1]')) RETURNING json_quote(c0), json_quote(c1);
+        INSERT INTO p VALUES (json('[9]'), 2), (json('[8]'), 3) RETURNING json_quote(c0);
+        INSERT INTO p SELECT json('[9]'), 2 FROM (SELECT 1) RETURNING json_quote(c0);
+        CREATE TABLE log (x);
+        CREATE TRIGGER tr AFTER INSERT ON p BEGIN INSERT INTO log VALUES (json_quote(new.c0)); END;
+        CREATE TRIGGER tr2 BEFORE INSERT ON p BEGIN INSERT INTO log VALUES (json_quote(new.c0)); END;
+        INSERT INTO p VALUES (json('{"b":1}'), 1);
+        SELECT * FROM log;
+        UPDATE p SET c0 = json('[5]') RETURNING json_quote(c0);
+        SELECT json_quote(c0), json_quote(c1) FROM p;
+        CREATE INDEX pc ON p (c0);
+        SELECT json_quote(c0) FROM p INDEXED BY pc WHERE c0 > '';
+        CREATE TABLE t1 (c0 FLOAT, c1 TEXT, g0 INTEGER AS (json_quote(c0)) STORED, g1 AS (json_quote(c1)));
+        INSERT INTO t1 (c0, c1) VALUES (json('{"a":1}'), json('[1]')) RETURNING json_quote(c0), g0;
+        SELECT *, json_quote(c0) FROM t1;
+        CREATE TABLE q (k UNIQUE, v);
+        INSERT INTO q VALUES (1, json('[1]'));
+        INSERT INTO q VALUES (1, json('[2]')) ON CONFLICT (k) DO UPDATE SET v = json_quote(excluded.v) RETURNING v
+        """)

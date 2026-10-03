@@ -445,7 +445,7 @@ def test_insert_select():
 def test_create_and_drop_view():
     stmt = parse("CREATE VIEW IF NOT EXISTS v (x, y) AS SELECT a, b FROM t;")
     assert (stmt.name, stmt.columns, stmt.if_not_exists) == ("v", ["x", "y"], True)
-    assert stmt.sql == "CREATE VIEW IF NOT EXISTS v (x, y) AS SELECT a, b FROM t"
+    assert stmt.sql == "CREATE VIEW v (x, y) AS SELECT a, b FROM t"  # (as SQLite keeps it: from the name)
     assert isinstance(stmt.query, Select)
     assert parse("DROP VIEW IF EXISTS v") == DropView("v", True)
     assert parse("CREATE TABLE view (view TEXT)").columns[0].name == "view"  # not reserved

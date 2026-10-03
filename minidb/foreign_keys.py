@@ -76,7 +76,7 @@ class Link:
         key, child = self.key, self.child
         parent = tables.get(ascii_lower(key.parent))
         if parent is None:
-            raise OperationalError(f"no such table: main.{key.parent}")
+            raise OperationalError(f"no such table: {'temp' if child.temp else 'main'}.{key.parent}")
         self.parent = parent
         count = len(key.columns)
         mismatch = Mismatch(f'foreign key mismatch - "{child.name}" referencing "{key.parent}"')
@@ -136,21 +136,26 @@ class ForeignKeys:
             return
         self._version = catalog.version
         self._children, self._parents = {}, {}
-        for table in catalog.tables.values():
+        # (by database and name: a foreign key's parent is in its child's database)
+        for table in catalog.all_tables():
             links = [Link(table, key, number) for number, key in enumerate(reversed(table.foreign_keys))]
-            self._children[ascii_lower(table.name)] = links
+            self._children[table.temp, ascii_lower(table.name)] = links
             for link in links:
-                self._parents.setdefault(ascii_lower(link.key.parent), []).insert(0, link)
+                self._parents.setdefault((table.temp, ascii_lower(link.key.parent)), []).insert(0, link)
 
     def children_of(self, table: TableInfo) -> list[Link]:
         """The table's own foreign keys."""
         self._links()
-        return self._children.get(ascii_lower(table.name), [])
+        return self._children.get((table.temp, ascii_lower(table.name)), [])
 
     def parents_of(self, table: TableInfo) -> list[Link]:
         """The foreign keys that name the table as their parent (the newest first, as SQLite)."""
         self._links()
-        return self._parents.get(ascii_lower(table.name), [])
+        return self._parents.get((table.temp, ascii_lower(table.name)), [])
+
+    def _tables(self, link: Link) -> dict[str, TableInfo]:
+        """The tables of the link's child's database (where its parent is)."""
+        return self.executor.catalog.owner(link.child).tables
 
     def involved(self, table: TableInfo) -> bool:
         return self.enabled and bool(self.children_of(table) or self.parents_of(table))
@@ -205,10 +210,9 @@ class ForeignKeys:
         if kind == "insert":
             parents = [link for link in parents
                        if not (single_insert and not link.deferred and not self.defer_all())]
-        tables = self.executor.catalog.tables
         for link in children + parents:
             try:
-                link.locate(tables)
+                link.locate(self._tables(link))
             except (OperationalError, Mismatch) as exc:
                 if not ignore_errors:
                     raise OperationalError(str(exc)) from None
@@ -362,7 +366,7 @@ class ForeignKeys:
 
     def _usable(self, link: Link) -> bool:
         try:
-            link.locate(self.executor.catalog.tables)
+            link.locate(self._tables(link))
         except (OperationalError, Mismatch):
             return False  # (reported by prepare(); ignored while a table is dropped)
         return True

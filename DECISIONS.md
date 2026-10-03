@@ -1109,3 +1109,46 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 - **ALTER TABLE**：ADD COLUMN 可加 VIRTUAL 列，STORED 列只能加到空表（sqlite3ErrorIfNotEmpty）；新列带 NOT NULL
   或表有 CHECK 时按 quick_check 的顺序验证已有的行；RENAME COLUMN 改写生成列表达式里的引用；DROP COLUMN 删
   VIRTUAL 列不重写记录。ADD COLUMN 不查循环（SQLite 也不查，之后读表时才报）。
+
+## D117 临时表：temp 库是第二个 Catalog，按名字先找 temp
+
+- **结构**：连接第一次用到 temp 库时（建临时对象、读 `sqlite_temp_master`）建一个与主库同格式的内存 pager 和它上面的
+  `Catalog`，挂在主库 Catalog 的 `temp` 上，两者共用一个 schema 版本号（预编译计划照常失效）。表、索引、视图、触发器
+  对象带 `temp` 标记，树的读写（`table_tree` / `index_tree`）按标记分派到对应的 pager。原来只在内存字典里的
+  `CREATE TEMP VIEW` 也改为存进 temp 库的 schema 表，`sqlite_temp_master` 能看到。
+- **名字解析**照 SQLite：不限定的名字先找 temp 再找 main；`main.` / `temp.` 限定（FROM、INSERT/UPDATE/DELETE 目标、
+  DROP、ALTER、CREATE INDEX/VIEW/TRIGGER、PRAGMA 的 schema 前缀和 `pragma_xxx(arg, schema)`）；未知库在查找时报
+  `no such table: foo.t`，建对象时报 `unknown database foo`。**主库里的视图和触发器只看主库**（SQLite 加载 schema 时把
+  它们的名字“固定”到所在库，sqlite3FixSrcList）：编译它们时执行器的 `default_schema` 是 "main"，临时对象则先 temp
+  后 main——所以主库视图引用临时表在使用时报 `no such table: main.x`，与 SQLite 一致。原来“视图 / 触发器里的 no such
+  table 补上 main.”的事后改写因此去掉了。
+- **放在哪个库**照 sqlite3BeginTrigger / sqlite3CreateIndex：不限定名字的触发器、索引遇到临时表就进 temp 库；TEMP
+  触发器可以在主表上（触发顺序：TEMP 触发器在前）；主库触发器不能引用 temp 的表（`cannot reference objects in
+  database temp`）；`CREATE INDEX temp.i ON 主表` 报 `cannot create a TEMP index on non-TEMP table`。外键的父表在子表
+  所在的库里找（外键链接按“库 + 表名”索引）。ANALYZE 不带参数只做主库。
+- **事务**：Database 在语句开始 / 结束 / 回滚、提交、回滚时同时驱动 temp pager；temp 库在语句中途建出来时先提交它的空
+  schema 再开语句日志，所以失败的 `CREATE TEMP TABLE` 和回滚的事务都会让它消失。已知差别：写临时表的语句也会拿主库的
+  RESERVED 锁（SQLite 只锁被写的库），不会写主库文件；`deserialize()` 会丢掉临时表（SQLite 只替换 main）。
+- **ALTER TABLE 前的 schema 检查**（顺带发现的老问题）：SQLite 在 RENAME / RENAME COLUMN / DROP COLUMN 前检查表所在库
+  （主表还加上 temp 库）的每个视图和触发器都还能编译，否则报 `error in view v: ...`；MiniDB 以前跳过编译不了的视图。
+
+## D118 CREATE TABLE ... AS SELECT 与几处寄存器语义
+
+- **CTAS** 照 sqlite3EndTable：列名是查询的结果列名（sqlite3ColumnsFromExprList 的去重：重复名加 `:1`、`:2`……，名字
+  本身以 `:数字` 结尾时先去掉；TRUE/FALSE 当列名时用 `columnN`），类型名由列的亲和性给（TEXT / NUM / INT / REAL /
+  空），SQL 文本照 createTableStmt 生成（短的一行，长的每列一行，名字照 identPut 加引号：关键字表照 SQLite 的 147 个），
+  行号 1、2、……，不改 `changes()` 和 `last_insert_rowid()`。
+- **复合 SELECT 作为表时的亲和性**（老问题，CTAS 对照时发现）：FROM 里的子查询、视图、CTE 和 CTAS 用 sqlite3SubqueryColType
+  ——取最左边一个有亲和性的 SELECT 的，再看其余 SELECT 的 sqlite3ExprDataType 掩码，数值列遇到可能是文本、TEXT 列遇到
+  可能是数值的就变成无亲和性；而作为标量子查询或 IN 的右边时仍是最后一个 SELECT 的（原来对所有场合都用最后一个）。
+- **IntReal**：SQLite 对生成列的值做 OP_Affinity(REAL) 时，整数值的 REAL 保存为 MEM_IntReal——读出来是 REAL，但一经
+  过记录（存进表、ORDER BY 的排序器、UNION 的临时表）就成了整数。MiniDB 用 `values.IntReal`（float 子类）表示，
+  `values.record_value` / `through_record` 在这些地方转换。
+- **JSON 子类型留在“寄存器”里**（老问题）：新行的值在 RETURNING、触发器的 NEW、生成列和 CHECK 里保留 JSON 子类型，
+  只有写进记录和索引时去掉（`Executor.stored_row`）；INSERT ... SELECT 和多行 VALUES 走 SQLite 的协程，值先失去子类型。
+  原来在 `prepare_row` 一开始就去掉了。
+- **BEFORE UPDATE 触发器里 NEW 的生成列**：SQLite 只把 UPDATE 赋值的列和触发器以 `new.x` 引用的列装进寄存器
+  （sqlite3TriggerColmask），其余是 NULL，生成列据此计算——所以 `new.g` 可能是 NULL。照做。
+- 其他由新 fuzz 找到的老问题：INSERT 列表里同一列出现两次时第一个值有效（行号列取最后一个，sqlite3Insert）；
+  `RETURNING` 是保留字（`INSERT ... SELECT ... RETURNING` 以前被当成别名）；NOCASE / RTRIM 比较遇到带 JSON 子类型的
+  文本时退回了 BINARY。

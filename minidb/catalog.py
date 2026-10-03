@@ -51,8 +51,10 @@ RESERVED_PREFIX = "minidb_"
 AUTO_INDEX_PREFIX = "minidb_autoindex_"
 SQLITE_RESERVED_PREFIX = "sqlite_"
 SQLITE_AUTO_INDEX_PREFIX = "sqlite_autoindex_"
-# The schema table can be read (only) as sqlite_schema or sqlite_master, as in SQLite.
+# The schema table can be read (only) as sqlite_schema or sqlite_master, as in SQLite;
+# the temp database's also as sqlite_temp_schema or sqlite_temp_master.
 SCHEMA_TABLE_NAMES = ("sqlite_schema", "sqlite_master")
+TEMP_SCHEMA_TABLE_NAMES = ("sqlite_temp_schema", "sqlite_temp_master")
 SCHEMA_TABLE_SQL = "CREATE TABLE sqlite_master (type text, name text, tbl_name text, rootpage int, sql text)"
 
 
@@ -128,6 +130,7 @@ class AutoIndex:
 
 class TableInfo:
     has_rowid = True
+    temp = False  # in the connection's temp database (CREATE TEMP TABLE)
 
     def __init__(self, name: str, columns: list[ColumnDef], root: int, schema_key: int | None = None,
                  constraints: Sequence[object] = (), sql: str | None = None) -> None:
@@ -277,6 +280,8 @@ def is_constant_default(expr: object) -> bool:
 
 
 class IndexInfo:
+    temp = False
+
     def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int,
                  schema_key: int | None = None, auto: bool = False, descending: list[bool] | None = None,
                  collations: list[str | None] | None = None, conflict: str | None = None,
@@ -344,6 +349,8 @@ def add_index(table: TableInfo, index: IndexInfo) -> None:
 class ViewInfo:
     """A view: a stored SELECT, expanded where the view is used."""
 
+    temp = False
+
     def __init__(self, stmt: CreateView, schema_key: int | None = None) -> None:
         self.name = stmt.name
         self.columns = stmt.columns  # declared column names, or None
@@ -354,6 +361,9 @@ class ViewInfo:
 
 class TriggerInfo:
     """A trigger: when it fires and its program (compiled by minidb.triggers)."""
+
+    temp = False  # a TEMP trigger (on a temp table, or on a main one)
+    on_temp = False  # on a table or view of the temp database
 
     def __init__(self, stmt: CreateTrigger, schema_key: int | None = None) -> None:
         self.name = stmt.name
@@ -370,11 +380,22 @@ class TriggerInfo:
 
 
 class Catalog:
-    def __init__(self, pager: Pager) -> None:
+    """The schema of the main database; and through it (``temp``) that of
+    the connection's temp database, a second Catalog over an in-memory
+    pager in the same format, created by the first temporary object.
+
+    Lookups by name take a schema - "main", "temp", or None for both, temp
+    first (as SQLite searches them) - and so do the statements that create
+    and drop objects; called on the temp database's own Catalog they see
+    only it."""
+
+    def __init__(self, pager: Pager, parent: Catalog | None = None) -> None:
         self.pager = pager
-        self.version = 0  # bumped by every schema change; prepared plans check it
-        self.temp_views = {}  # CREATE TEMP VIEW: this connection only, never stored
+        self.parent = parent  # for the temp database: the main database's catalog
+        self.temp = None  # the temp database's catalog, once there is one
+        self._version = 0
         self.sqlite = getattr(pager, "format", None) == "sqlite"
+        self.schema_names = SCHEMA_TABLE_NAMES if parent is None else TEMP_SCHEMA_TABLE_NAMES
         if self.sqlite:
             from minidb.sqlite_btree import SqliteTable
 
@@ -390,8 +411,76 @@ class Catalog:
             self.schema = _SchemaTree(pager, SCHEMA_ROOT)
         self.load()
 
+    @property
+    def version(self) -> int:
+        """Bumped by every schema change (of either database); prepared plans check it."""
+        return self._version if self.parent is None else self.parent.version
+
+    @version.setter
+    def version(self, value: int) -> None:
+        if self.parent is None:
+            self._version = value
+        else:
+            self.parent.version = value
+
+    @property
+    def is_temp(self) -> bool:
+        return self.parent is not None
+
+    def temp_catalog(self) -> Catalog:
+        """The temp database's catalog, created (empty) when first needed."""
+        if self.parent is not None:
+            return self
+        if self.temp is None:
+            from minidb.sqlite_pager import SqlitePager
+
+            pager = SqlitePager(None) if self.sqlite else Pager(None)
+            self.temp = Catalog(pager, self)
+            pager.commit()  # (its empty schema; a rollback goes back to this)
+            if self.pager.journal is not None:
+                pager.begin_statement()  # (created by a statement, which may yet fail)
+        return self.temp
+
+    def search(self, schema: str | None = None) -> list[Catalog]:
+        """The databases to look a name up in, in order."""
+        if self.parent is not None:
+            return [self]
+        if schema is None:
+            return [self] if self.temp is None else [self.temp, self]
+        if schema == "main":
+            return [self]
+        if schema == "temp":
+            return [self.temp_catalog()]
+        return []  # (an unknown schema: nothing is found)
+
+    def owner(self, item: TableInfo | IndexInfo | ViewInfo | TriggerInfo) -> Catalog:
+        """The catalog of the database an object belongs to."""
+        return self.temp if item.temp and self.parent is None else self
+
+    def all_tables(self) -> list[TableInfo]:
+        """The tables of both databases (temp first)."""
+        return [t for catalog in self.search() for t in catalog.tables.values()]
+
+    def all_views(self) -> list[ViewInfo]:
+        return [v for catalog in self.search() for v in catalog.views.values()]
+
+    def all_triggers(self) -> list[TriggerInfo]:
+        return [t for catalog in self.search() for t in catalog.triggers.values()]
+
+    def all_indexes(self) -> list[IndexInfo]:
+        return [i for catalog in self.search() for i in catalog.indexes.values()]
+
+    @property
+    def any_triggers(self) -> bool:
+        return bool(self.triggers or self.temp is not None and self.temp.triggers)
+
+    def _mark(self, item: TableInfo | IndexInfo | ViewInfo | TriggerInfo) -> None:
+        if self.parent is not None:
+            item.temp = True
+
     def load(self) -> None:
-        """(Re)build the in-memory schema from the schema table."""
+        """(Re)build the in-memory schema from the schema table (both
+        databases', called on the main one)."""
         self.version += 1
         self.tables = {}
         self.indexes = {}
@@ -414,7 +503,8 @@ class Catalog:
             if kind not in ("index", "trigger"):
                 continue
             table = self.tables.get(ascii_lower(table_name))
-            if table is None and kind == "trigger" and ascii_lower(table_name) in self.views:
+            if table is None and kind == "trigger" and (ascii_lower(table_name) in self.views or self.is_temp):
+                # (on a view; or a TEMP trigger on a table of the main database)
                 try:
                     self.triggers[ascii_lower(name)] = TriggerInfo(parse(sql), key)
                 except Exception as exc:
@@ -464,60 +554,106 @@ class Catalog:
                 elif ascii_lower(name) in self.tables:
                     table = self.tables[ascii_lower(name)]
                     table.stat_rows, table.stat_key = int(numbers[0]), key
+        if self.is_temp:
+            for item in [*self.tables.values(), *self.indexes.values(), *self.views.values()]:
+                item.temp = True
+            for trigger in self.triggers.values():
+                trigger.temp = True
+                lowered = ascii_lower(trigger.table_name)
+                trigger.on_temp = trigger.stmt.table_schema != "main" and (
+                    lowered in self.tables or lowered in self.views)
+        elif self.temp is not None:
+            self.temp.load()
 
     # ---- lookups ----------------------------------------------------------
 
     def triggers_on(self, name: str) -> list[TriggerInfo]:
-        """The triggers of a table or view, newest first (the order SQLite fires them in)."""
+        """The triggers of the table or view the name finds (temp first), in
+        the order SQLite fires them: TEMP triggers on a main table first
+        (sqlite3TriggerList), each database's newest first."""
         lowered = ascii_lower(name)
-        found = [t for t in self.triggers.values() if ascii_lower(t.table_name) == lowered]
-        found.sort(key=lambda t: t.schema_key, reverse=True)
+        on_temp = self._temp_object(lowered)
+        found = []
+        for catalog in self.search():
+            own = [t for t in catalog.triggers.values()
+                   if t.on_temp == on_temp and ascii_lower(t.table_name) == lowered]
+            own.sort(key=lambda t: t.schema_key, reverse=True)
+            found += own
         return found
 
-    def get_table(self, name: str) -> TableInfo:
-        table = self.tables.get(ascii_lower(name))
-        if table is None and ascii_lower(name) in SCHEMA_TABLE_NAMES:
-            table = TableInfo(ascii_lower(name), parse(SCHEMA_TABLE_SQL).columns, SCHEMA_ROOT)
+    def _temp_object(self, lowered: str) -> bool:
+        """Whether the temp database has a table or view of this (lower-case) name."""
+        temp = self if self.is_temp else self.temp
+        return temp is not None and (lowered in temp.tables or lowered in temp.views)
+
+    def _find_table(self, name: str, qualified: bool = False) -> TableInfo | None:
+        """This database's table called ``name`` (its schema table too), or None."""
+        lowered = ascii_lower(name)
+        table = self.tables.get(lowered)
+        if table is None and (lowered in self.schema_names or (qualified and lowered in SCHEMA_TABLE_NAMES)):
+            table = TableInfo(lowered, parse(SCHEMA_TABLE_SQL).columns, SCHEMA_ROOT)
             table.is_schema = True
-            table.read_only = "table sqlite_master may not be modified"
-        if table is None:
-            reason = self.unsupported.get(ascii_lower(name))
-            if reason is not None:
-                raise NotSupportedError(f"MiniDB cannot use {reason}")
-            raise OperationalError(f"no such table: {name}")
+            table.read_only = f"table {self.schema_names[1]} may not be modified"
+            self._mark(table)
         return table
 
-    def has_table(self, name: str) -> bool:
-        return ascii_lower(name) in self.tables
+    def get_table(self, name: str, schema: str | None = None) -> TableInfo:
+        if self.temp is None and schema is None:
+            table = self.tables.get(ascii_lower(name))  # (the usual case, quickly)
+            if table is not None:
+                return table
+        if schema is None and self.parent is None and ascii_lower(name) in TEMP_SCHEMA_TABLE_NAMES:
+            self.temp_catalog()  # (sqlite_temp_master is there, empty, before anything is)
+        for catalog in self.search(schema):
+            table = catalog._find_table(name, schema is not None)
+            if table is not None:
+                return table
+        reason = self.unsupported.get(ascii_lower(name)) if schema in (None, "main") else None
+        if reason is not None:
+            raise NotSupportedError(f"MiniDB cannot use {reason}")
+        raise OperationalError(f"no such table: {name}" if schema is None else f"no such table: {schema}.{name}")
 
-    def find_view(self, name: str) -> ViewInfo | None:
-        """The view called ``name``: temporary views come first, as SQLite
-        searches the temp schema before main."""
+    def has_table(self, name: str, schema: str | None = None) -> bool:
+        return any(ascii_lower(name) in catalog.tables for catalog in self.search(schema))
+
+    def find_view(self, name: str, schema: str | None = None) -> ViewInfo | None:
+        """The view called ``name`` (temporary views first, as SQLite
+        searches the temp schema before main) - unless a table of that name
+        comes first."""
         lowered = ascii_lower(name)
-        return self.temp_views.get(lowered) or self.views.get(lowered)
+        if self.temp is None and schema is None:
+            return None if lowered in self.tables else self.views.get(lowered)
+        for catalog in self.search(schema):
+            if lowered in catalog.tables:
+                return None
+            if lowered in catalog.views:
+                return catalog.views[lowered]
+        return None
 
-    def table_to_modify(self, name: str) -> TableInfo:
+    def table_to_modify(self, name: str, schema: str | None = None) -> TableInfo:
         """The table an INSERT, UPDATE or DELETE changes (not a view)."""
-        if self.find_view(name) is not None:
+        if self.find_view(name, schema) is not None:
             raise OperationalError(f"cannot modify {name} because it is a view")
-        table = self.get_table(name)
+        table = self.get_table(name, schema)
         self.check_writable(table)
         return table
 
     def check_writable(self, table: TableInfo, verb: str = "modified") -> None:
         if table.is_schema:
-            raise OperationalError(f"table sqlite_master may not be {verb}")
+            raise OperationalError(f"table {'sqlite_temp_master' if table.temp else 'sqlite_master'} may not be {verb}")
         if table.read_only is not None:
             raise NotSupportedError(f"MiniDB cannot change table {table.name}: {table.read_only}")
 
     def check_index_hint(self, table: TableInfo, index_name: str | None) -> None:
         """INDEXED BY must name an index of the table."""
         if index_name is not None:
-            index = self.indexes.get(ascii_lower(index_name))
+            index = self.owner(table).indexes.get(ascii_lower(index_name))
             if index is None or index.table is not table:
                 raise OperationalError(f"no such index: {index_name}")
 
     def table_tree(self, table: TableInfo) -> BTree:
+        if table.temp and self.parent is None:
+            return self.temp.table_tree(table)
         if table.is_schema and not self.sqlite:
             return _SchemaRows(self)
         if self.sqlite:
@@ -528,6 +664,8 @@ class Catalog:
         return BTree(self.pager, table.root)
 
     def index_tree(self, index: IndexInfo) -> BTree:
+        if index.table.temp and self.parent is None:
+            return self.temp.index_tree(index)
         if self.sqlite:
             from minidb.sqlite_btree import SqliteIndex
 
@@ -575,6 +713,8 @@ class Catalog:
 
     def create_table(self, stmt: CreateTable, check: Callable[[TableInfo], None] | None = None) -> TableInfo | None:
         """Create a table; ``check`` (the executor's) checks its CHECK constraints."""
+        if stmt.temp and not self.is_temp:
+            return self.temp_catalog().create_table(stmt, check)
         self._check_reserved(stmt.name)
         if self._exists(stmt.name, stmt.if_not_exists):
             return None
@@ -586,6 +726,7 @@ class Catalog:
         self.version += 1
         table.root = root = self._new_tree(index=False)
         table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql)
+        self._mark(table)
         self.tables[ascii_lower(stmt.name)] = table
         for n, auto in enumerate(table.auto_indexes(), 1):
             name = f"{self.auto_prefix}{table.name}_{n}"
@@ -598,20 +739,15 @@ class Catalog:
             root = self._new_tree(index=False)
             sequence = TableInfo("sqlite_sequence", parse(sql).columns, root, None, (), sql)
             sequence.schema_key = self._add_entry("table", sequence.name, sequence.name, root, sql)
+            self._mark(sequence)
             self.tables["sqlite_sequence"] = sequence
         return table
 
     def create_view(self, stmt: CreateView) -> None:
         """Store a view.  Like SQLite, the SELECT is not checked until the
         view is used (it may name tables that do not exist yet)."""
-        if stmt.temp:
-            if ascii_lower(stmt.name) in self.temp_views:
-                if stmt.if_not_exists:
-                    return
-                raise OperationalError(f"view {stmt.name} already exists")
-            self.version += 1
-            self.temp_views[ascii_lower(stmt.name)] = ViewInfo(parse(stmt.sql))
-            return
+        if stmt.temp and not self.is_temp:
+            return self.temp_catalog().create_view(stmt)
         self._check_reserved(stmt.name)
         if self._exists(stmt.name, stmt.if_not_exists):
             return
@@ -619,20 +755,42 @@ class Catalog:
         self.version += 1
         view = ViewInfo(parse(stmt.sql))  # (positions in its own text, for ALTER TABLE)
         view.schema_key = self._add_entry("view", stmt.name, stmt.name, 0, stmt.sql)
+        self._mark(view)
         self.views[ascii_lower(stmt.name)] = view
 
     def create_trigger(self, stmt: CreateTrigger) -> None:
         """Store a trigger, with SQLite's checks (sqlite3BeginTrigger) in its
-        order.  Like SQLite, its program is not checked until it first runs."""
-        table = self.tables.get(ascii_lower(stmt.table))
-        view = self.views.get(ascii_lower(stmt.table))
+        order.  Like SQLite, its program is not checked until it first runs.
+        It goes in the temp database if TEMP (or temp.name) says so, or if
+        its (unqualified) name meets a table of the temp database; a trigger
+        of the main database is on a main table, a TEMP one on either."""
+        lowered = ascii_lower(stmt.table)
+        if stmt.temp or stmt.schema == "temp" or (
+                stmt.schema is None and stmt.table_schema != "main" and self._temp_object(lowered)):
+            database = self.temp_catalog()
+            search = self.search(stmt.table_schema)
+        else:
+            database = self
+            if stmt.table_schema not in (None, "main"):
+                raise OperationalError(f"trigger {stmt.name} cannot reference objects in database "
+                                       f"{stmt.table_schema}")
+            search = [self]
+        table = view = None
+        for catalog in search:
+            table, view = catalog.tables.get(lowered), catalog.views.get(lowered)
+            if table is not None or view is not None:
+                break
         if table is None and view is None:
-            if ascii_lower(stmt.table) in SCHEMA_TABLE_NAMES:
+            if lowered in SCHEMA_TABLE_NAMES or lowered in TEMP_SCHEMA_TABLE_NAMES:
                 raise OperationalError("cannot create trigger on system table")
-            reason = self.unsupported.get(ascii_lower(stmt.table))
+            reason = self.unsupported.get(lowered)
             if reason is not None:
                 raise NotSupportedError(f"MiniDB cannot use {reason}")
-            raise OperationalError(f"no such table: main.{stmt.table}")
+            written = stmt.table if stmt.table_schema is None else f"{stmt.table_schema}.{stmt.table}"
+            raise OperationalError(f"no such table: {'main.' + stmt.table if database is self else written}")
+        database._add_trigger(stmt, table, view)
+
+    def _add_trigger(self, stmt: CreateTrigger, table: TableInfo | None, view: ViewInfo | None) -> None:
         target = table.name if table is not None else view.name
         if ascii_lower(stmt.name).startswith(self.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {stmt.name}")
@@ -652,54 +810,75 @@ class Catalog:
         trigger = TriggerInfo(parse(stmt.sql))  # (positions in its own text, for ALTER TABLE)
         trigger.table_name = target
         trigger.schema_key = self._add_entry("trigger", stmt.name, target, 0, stmt.sql)
+        self._mark(trigger)
+        trigger.on_temp = (table or view).temp
         self.triggers[ascii_lower(stmt.name)] = trigger
 
-    def drop_trigger(self, name: str, if_exists: bool = False) -> None:
-        trigger = self.triggers.get(ascii_lower(name))
-        if trigger is None:
-            if if_exists:
+    def drop_trigger(self, name: str, if_exists: bool = False, schema: str | None = None) -> None:
+        for catalog in self.search(schema):
+            trigger = catalog.triggers.get(ascii_lower(name))
+            if trigger is not None:
+                catalog._drop_trigger(trigger)
                 return
-            raise OperationalError(f"no such trigger: {name}")
-        self._drop_trigger(trigger)
+        if if_exists:
+            return
+        raise OperationalError(f"no such trigger: {name if schema is None else schema + '.' + name}")
 
     def _drop_trigger(self, trigger: TriggerInfo) -> None:
+        catalog = self.owner(trigger)
         self.version += 1
-        self.schema.delete(trigger.schema_key)
-        del self.triggers[ascii_lower(trigger.name)]
+        catalog.schema.delete(trigger.schema_key)
+        del catalog.triggers[ascii_lower(trigger.name)]
 
-    def drop_view(self, name: str, if_exists: bool = False) -> None:
-        if ascii_lower(name) in self.temp_views:
-            self.version += 1
-            del self.temp_views[ascii_lower(name)]
-            return
-        if ascii_lower(name) in self.tables:
-            raise OperationalError(f"use DROP TABLE to delete table {name}")
-        view = self.views.get(ascii_lower(name))
-        if view is None:
-            if if_exists:
+    def triggers_of(self, item: TableInfo | ViewInfo) -> list[TriggerInfo]:
+        """The triggers of a table or view: its own database's and TEMP ones."""
+        main = self.parent or self
+        lowered = ascii_lower(item.name)
+        return [t for catalog in main.search() for t in catalog.triggers.values()
+                if t.on_temp == item.temp and ascii_lower(t.table_name) == lowered]
+
+    def drop_view(self, name: str, if_exists: bool = False, schema: str | None = None) -> None:
+        lowered = ascii_lower(name)
+        for catalog in self.search(schema):
+            if lowered in catalog.tables:
+                raise OperationalError(f"use DROP TABLE to delete table {name}")
+            if lowered in catalog.views:
+                catalog._drop_view(catalog.views[lowered])
                 return
-            raise OperationalError(f"no such view: {name}")
+        if if_exists:
+            return
+        raise OperationalError(f"no such view: {name if schema is None else schema + '.' + name}")
+
+    def _drop_view(self, view: ViewInfo) -> None:
         self.version += 1
-        for trigger in self.triggers_on(view.name):
+        for trigger in self.triggers_of(view):
             self._drop_trigger(trigger)
         self.schema.delete(view.schema_key)
-        del self.views[ascii_lower(name)]
+        del self.views[ascii_lower(view.name)]
 
-    def drop_table(self, name: str, if_exists: bool = False) -> None:
-        if self.find_view(name) is not None:
-            raise OperationalError(f"use DROP VIEW to delete view {name}")
-        if ascii_lower(name) in SCHEMA_TABLE_NAMES and not self.has_table(name):
-            raise OperationalError("table sqlite_master may not be dropped")
-        if not self.has_table(name):
-            if if_exists:
+    def drop_table(self, name: str, if_exists: bool = False, schema: str | None = None) -> None:
+        lowered = ascii_lower(name)
+        for catalog in self.search(schema):
+            if lowered in catalog.views:
+                raise OperationalError(f"use DROP VIEW to delete view {name}")
+            if lowered in catalog.tables:
+                catalog._drop_table(catalog.tables[lowered])
                 return
-            raise OperationalError(f"no such table: {name}")
-        table = self.tables[ascii_lower(name)]
+            if lowered in catalog.schema_names or (schema is not None and lowered in SCHEMA_TABLE_NAMES):
+                raise OperationalError(f"table {catalog.schema_names[1]} may not be dropped")
+        if lowered in SCHEMA_TABLE_NAMES and schema is None:
+            raise OperationalError("table sqlite_master may not be dropped")
+        if if_exists:
+            return
+        raise OperationalError(f"no such table: {name if schema is None else schema + '.' + name}")
+
+    def _drop_table(self, table: TableInfo) -> None:
+        name = table.name
         if ascii_lower(table.name) == "sqlite_sequence":
             raise OperationalError("table sqlite_sequence may not be dropped")
         self.version += 1
         self.check_writable(table, "dropped")
-        for trigger in self.triggers_on(table.name):
+        for trigger in self.triggers_of(table):
             self._drop_trigger(trigger)
         self._destroy_trees(list(table.indexes) + [table])
         for index in list(table.indexes):
@@ -719,7 +898,19 @@ class Catalog:
                     tree.delete(rowid)
 
     def create_index(self, stmt: CreateIndex) -> IndexInfo | None:
-        """Create an index; returns it (still empty) or None if it already exists."""
+        """Create an index; returns it (still empty) or None if it already exists.
+        It goes in the database its name says (main if unqualified), or the
+        temp database when an unqualified name meets a temp table (as
+        sqlite3CreateIndex); there the table may only be a temp one."""
+        if not self.is_temp:
+            if stmt.schema == "temp" or (stmt.schema is None and self.temp is not None
+                                         and ascii_lower(stmt.table) in self.temp.tables):
+                table = self.get_table(stmt.table)
+                if not table.temp:
+                    raise OperationalError(f'cannot create a TEMP index on non-TEMP table "{table.name}"')
+                return self.temp.create_index(stmt)
+            if stmt.schema not in (None, "main"):
+                raise OperationalError(f"unknown database {stmt.schema}")
         lowered = ascii_lower(stmt.name)
         if lowered in self.indexes:
             if stmt.if_not_exists:
@@ -730,12 +921,12 @@ class Catalog:
         if lowered.startswith(self.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {stmt.name}")
         table = self.tables.get(ascii_lower(stmt.table))
-        if table is None and ascii_lower(stmt.table) in SCHEMA_TABLE_NAMES:
-            raise OperationalError("table sqlite_master may not be indexed")
+        if table is None and ascii_lower(stmt.table) in self.schema_names:
+            raise OperationalError(f"table {self.schema_names[1]} may not be indexed")
         if table is None:
             if ascii_lower(stmt.table) in self.views:
                 raise OperationalError("views may not be indexed")
-            raise OperationalError(f"no such table: main.{stmt.table}")
+            raise OperationalError(f"no such table: {'temp' if self.is_temp else 'main'}.{stmt.table}")
         for column in stmt.columns:
             if table.column_index(column) is None:
                 raise OperationalError(f"no such column: {column}")
@@ -756,21 +947,23 @@ class Catalog:
         index = IndexInfo(name, table, columns, unique, root, None, auto, descending, collations, conflict,
                           origin, sql, declared)
         index.schema_key = self._add_entry("index", name, table.name, root, sql)
+        self._mark(index)
         self.indexes[ascii_lower(name)] = index
         add_index(table, index)
         return index
 
-    def drop_index(self, name: str, if_exists: bool = False) -> None:
-        index = self.indexes.get(ascii_lower(name))
-        if index is None:
+    def drop_index(self, name: str, if_exists: bool = False, schema: str | None = None) -> None:
+        catalog = next((c for c in self.search(schema) if ascii_lower(name) in c.indexes), None)
+        if catalog is None:
             if if_exists:
                 return
-            raise OperationalError(f"no such index: {name}")
+            raise OperationalError(f"no such index: {name if schema is None else schema + '.' + name}")
+        index = catalog.indexes[ascii_lower(name)]
         if index.is_auto:
             raise OperationalError(
                 "index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"
             )
-        self._drop_index(index)
+        catalog._drop_index(index)
 
     def _drop_index(self, index: IndexInfo, destroy: bool = True) -> None:
         self.version += 1
@@ -789,6 +982,8 @@ class Catalog:
     def rewrite_table_entries(self, table: TableInfo) -> None:
         """Store a table's (changed) definition, its indexes' and their
         statistics again, under their old keys; then reload the schema."""
+        if table.temp and not self.is_temp:
+            return self.temp.rewrite_table_entries(table)
         self.version += 1
         self.schema.insert(table.schema_key, encode_record(
             ["table", table.name, table.name, table.root, table.sql]), replace=True)
@@ -830,20 +1025,21 @@ class Catalog:
 
     def rewrite_trigger(self, trigger: TriggerInfo, sql: str, table_name: str) -> None:
         self.version += 1
-        self.schema.insert(trigger.schema_key, encode_record(["trigger", trigger.name, table_name, 0, sql]),
+        self.owner(trigger).schema.insert(trigger.schema_key, encode_record(["trigger", trigger.name, table_name, 0, sql]),
                            replace=True)
 
     def rewrite_view(self, view: ViewInfo, sql: str) -> None:
         self.version += 1
-        if view.schema_key is None:  # a temporary view
-            self.temp_views[ascii_lower(view.name)] = ViewInfo(parse(sql))
-            return
-        self.schema.insert(view.schema_key, encode_record(["view", view.name, view.name, 0, sql]), replace=True)
+        self.owner(view).schema.insert(view.schema_key, encode_record(["view", view.name, view.name, 0, sql]), replace=True)
 
     # ---- statistics ---------------------------------------------------------
 
     def analyze(self, name: str | None = None) -> None:
-        """Gather statistics for one table (or the table of an index) or all."""
+        """Gather statistics for one table (or the table of an index) or all
+        (of the main database: MiniDB keeps none for temporary tables)."""
+        if name is not None and self.temp is not None and (
+                ascii_lower(name) in self.temp.tables or ascii_lower(name) in self.temp.indexes):
+            return self.temp.analyze(name)
         if self.sqlite:
             self._analyze_sqlite(name)
             return
@@ -905,6 +1101,7 @@ class Catalog:
             root = self._new_tree(index=False)
             stat = TableInfo("sqlite_stat1", parse(sql).columns, root)
             stat.schema_key = self._add_entry("table", stat.name, stat.name, root, sql)
+            self._mark(stat)
             self.tables["sqlite_stat1"] = stat
         return self.table_tree(stat)
 

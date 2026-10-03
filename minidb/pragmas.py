@@ -15,9 +15,9 @@ import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from minidb.catalog import SCHEMA_TABLE_SQL, IndexInfo, TableInfo
+from minidb.catalog import IndexInfo, TableInfo
 from minidb.errors import OperationalError
-from minidb.parser import Column, ColumnDef, parse
+from minidb.parser import Column, ColumnDef
 from minidb.values import ascii_lower, ascii_upper
 
 if TYPE_CHECKING:
@@ -95,13 +95,15 @@ def collation_text(column: ColumnDef) -> str:
 
 
 def _table(executor: Executor, name: object) -> TableInfo | None:
+    """The table a pragma's argument names (in the pragma's schema; else temp first)."""
     if not isinstance(name, str):
         return None
-    catalog = executor.catalog
-    table = catalog.tables.get(ascii_lower(name))
-    if table is None and ascii_lower(name) in ("sqlite_schema", "sqlite_master"):
-        table = TableInfo(ascii_lower(name), parse(SCHEMA_TABLE_SQL).columns, 1)
-    return table
+    schema = executor.pragma_schema
+    for catalog in executor.catalog.search(schema):
+        table = catalog._find_table(name, schema is not None)
+        if table is not None:
+            return table
+    return None
 
 
 def table_info(executor: Executor, name: object, extended: bool = False) -> list[tuple]:
@@ -123,7 +125,7 @@ def table_info(executor: Executor, name: object, extended: bool = False) -> list
             rows.append((i - skipped, column.name, declared_type(column), int(column.not_null),
                          default_text(column), pk) + hidden)
         return rows
-    view = executor.catalog.find_view(name) if isinstance(name, str) else None
+    view = executor.catalog.find_view(name, executor.pragma_schema) if isinstance(name, str) else None
     if view is None:
         return []
     source = executor.view_source(view)
@@ -166,7 +168,8 @@ def index_list(executor: Executor, name: object) -> list[tuple]:
 
 
 def index_info(executor: Executor, name: object, extended: bool = False) -> list[tuple]:
-    index = executor.catalog.indexes.get(ascii_lower(name)) if isinstance(name, str) else None
+    index = next((c.indexes[ascii_lower(name)] for c in executor.catalog.search(executor.pragma_schema)
+                  if ascii_lower(name) in c.indexes), None) if isinstance(name, str) else None
     if index is None:
         return []
     rows = []
@@ -204,14 +207,30 @@ def table_list(executor: Executor, name: object = None) -> list[tuple]:
         if isinstance(item, TableInfo):
             rows.append(("main", item.name, "table", len(item.columns), 0, 0))
         else:
-            rows.append(("main", item.name, "view", len(executor.view_source(item).columns), 0, 0))
+            rows.append(("main", item.name, "view", _view_width(executor, item), 0, 0))
     rows.append(("main", "sqlite_schema", "table", 5, 0, 0))
-    for view in reversed(list(catalog.temp_views.values())):
-        rows.append(("temp", view.name, "view", len(executor.view_source(view).columns), 0, 0))
+    temp = catalog.temp
+    objects = [] if temp is None else sorted([*temp.tables.values(), *temp.views.values()],
+                                             key=lambda o: o.schema_key or 0, reverse=True)
+    for item in objects:
+        if isinstance(item, TableInfo):
+            rows.append(("temp", item.name, "table", len(item.columns), 0, 0))
+        else:
+            rows.append(("temp", item.name, "view", _view_width(executor, item), 0, 0))
     rows.append(("temp", "sqlite_temp_schema", "table", 5, 0, 0))
+    if executor.pragma_schema is not None:
+        rows = [row for row in rows if row[0] == executor.pragma_schema]
     if name is not None:
         rows = [row for row in rows if ascii_lower(row[1]) == ascii_lower(str(name))]
     return rows
+
+
+def _view_width(executor: Executor, view: object) -> int:
+    """A view's number of columns (0 if its SELECT does not compile, as SQLite shows it)."""
+    try:
+        return len(executor.view_source(view).columns)
+    except OperationalError:
+        return 0
 
 
 def integrity_check(executor: Executor, arg: object, quick: bool = False) -> list[tuple]:
@@ -220,12 +239,13 @@ def integrity_check(executor: Executor, arg: object, quick: bool = False) -> lis
     limit = 100
     only = None
     if arg is not None:
-        if isinstance(arg, str) and executor.catalog.tables.get(ascii_lower(arg)) is not None:
-            only = executor.catalog.tables[ascii_lower(arg)]
-        else:
+        only = _table(executor, arg)
+        if only is None:
             limit = int32(arg) if int32(arg) > 0 else 100
     problems = list(executor.integrity_problems()) if executor.integrity_problems is not None else []
-    tables = sorted(executor.catalog.tables.values(), key=lambda t: t.schema_key or 0, reverse=True)
+    tables = []
+    for catalog in reversed(executor.catalog.search(executor.pragma_schema)):  # (main, then temp)
+        tables += sorted(catalog.tables.values(), key=lambda t: t.schema_key or 0, reverse=True)
     for table in tables:
         if only is not None and table is not only:
             continue
@@ -352,7 +372,8 @@ def _freelist_count(executor: Executor) -> int:
 
 def _database_list(executor: Executor, _arg: object = None) -> list[tuple]:
     path = executor.catalog.pager.path
-    return [(0, "main", os.path.abspath(path) if path else "")]
+    rows = [(0, "main", os.path.abspath(path) if path else "")]
+    return rows if executor.catalog.temp is None else rows + [(1, "temp", "")]
 
 
 class Spec:
@@ -438,6 +459,7 @@ def run(executor: Executor, name: str, value: object, schema: str | None) -> tup
     if spec is None:
         return [], []
     check_schema(schema)
+    executor.pragma_schema = None if schema is None else ascii_lower(schema)
     if schema is not None and ascii_lower(schema) == "temp" and spec.get is not None:
         if spec.writes:
             return ([], []) if value is not None else ([(0,)], spec.columns)
@@ -470,9 +492,9 @@ def reads_file(executor: Executor, name: str, value: object) -> bool:
     if name in ("table_info", "table_xinfo"):
         return True
     if name == "index_list":
-        return ascii_lower(str(value)) in executor.catalog.tables
+        return executor.catalog.has_table(str(value))
     if name in ("index_info", "index_xinfo"):
-        return ascii_lower(str(value)) in executor.catalog.indexes
+        return any(ascii_lower(str(value)) in c.indexes for c in executor.catalog.search())
     return False
 
 
@@ -499,9 +521,9 @@ def argument_domain(executor: Executor, spec: Spec) -> list[str]:
     (for a call whose argument comes from an earlier table of the FROM clause)."""
     catalog = executor.catalog
     if spec.report in (index_info,) or spec is PRAGMAS["index_xinfo"]:
-        return [index.name for index in catalog.indexes.values()]
-    return [*(t.name for t in catalog.tables.values()), *(v.name for v in catalog.views.values()),
-            *(v.name for v in catalog.temp_views.values()), "sqlite_schema", "sqlite_master"]
+        return [index.name for index in catalog.all_indexes()]
+    return [*(t.name for t in catalog.all_tables()), *(v.name for v in catalog.all_views()),
+            "sqlite_schema", "sqlite_master"]
 
 
 def index_collation_names(index: IndexInfo, written: list[str | None]) -> list[str]:

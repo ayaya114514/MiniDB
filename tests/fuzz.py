@@ -75,6 +75,7 @@ class Table:
         # Column tuples of uniqueness constraints: valid ON CONFLICT targets.
         self.unique_targets = [(c[0],) for c in columns if "UNIQUE" in c[2] or "PRIMARY KEY" in c[2]]
         self.derived = False  # a subquery in FROM (no rowid)
+        self.schema = "main"  # or "temp" (CREATE TEMP TABLE)
 
     def column_names(self):
         return [c[0] for c in self.columns]
@@ -137,6 +138,10 @@ class Generator:
             columns.insert(rng.randint(1, len(columns)), self.generated_column(f"g{i}", columns))
         table = Table(name, columns, rowid_alias)
         self.tables.append(table)
+        temp = ""
+        if rng.random() < 0.2:
+            table.schema = "temp"
+            temp = rng.choice(["TEMP ", "TEMPORARY ", "temp."])
         definitions = [" ".join(p for p in c if p) for c in columns]
         if rng.random() < 0.15:
             pair = rng.sample([c[0] for c in columns[-2:]], 2)
@@ -147,7 +152,30 @@ class Generator:
             table.unique_targets.append(tuple(pair))
         if rng.random() < 0.15:
             definitions.append(f"CHECK ({self.check(rng.choice(columns)[0])} OR c0 IS c1)")
-        return f"CREATE TABLE {name} ({', '.join(definitions)})"
+        if temp == "temp.":
+            return f"CREATE TABLE temp.{name} ({', '.join(definitions)})"
+        return f"CREATE {temp}TABLE {name} ({', '.join(definitions)})"
+
+    def create_table_as(self):
+        """CREATE [TEMP] TABLE ... AS SELECT some columns of a table (in row
+        id order, so that both number the new rows alike)."""
+        rng = self.rng
+        source = rng.choice([t for t in self.tables if not t.derived])
+        columns = rng.sample(source.column_names(), rng.randint(1, len(source.columns)))
+        table = Table(f"t{len(self.tables)}", [(c, "", "") for c in columns], None)
+        self.tables.append(table)
+        temp = ""
+        if rng.random() < 0.5:
+            table.schema, temp = "temp", "TEMP "
+        where = f" WHERE {self.condition([('s', source)])}" if rng.random() < 0.5 else ""
+        return (f"CREATE {temp}TABLE {table.name} AS SELECT {', '.join(columns)} FROM {source.name} AS s{where} "
+                f"ORDER BY s.rowid")
+
+    def from_name(self, table):
+        """A table's name in FROM, now and then with its schema."""
+        if not table.derived and self.rng.random() < 0.1:
+            return f"{table.schema}.{table.name}"
+        return table.name
 
     def generated_column(self, name, columns):
         """A VIRTUAL or STORED generated column computed from the columns so far."""
@@ -729,7 +757,7 @@ class Generator:
             from_sql = f"{derived_sql} AS a"
         else:
             scope = [("a", rng.choice(self.tables))]
-            from_sql = f"{scope[0][1].name} AS a"
+            from_sql = f"{self.from_name(scope[0][1])} AS a"
         if rng.random() < 0.3 and len(self.tables) > 1:
             from_sql += self.join(scope, "b")
             if rng.random() < 0.25:
@@ -866,6 +894,8 @@ class Generator:
         roll = rng.random()
         if roll < 0.02 and len(self.tables) < 3:
             return self.create_table()
+        if roll < 0.025 and len(self.tables) < 4:
+            return self.create_table_as()
         if roll < 0.05:
             return self.create_index()
         if roll < 0.06:

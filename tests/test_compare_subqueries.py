@@ -248,3 +248,24 @@ def test_constant_conditions_are_tested_before_the_loop():
     pair.run("SELECT a FROM t WHERE ?", parameters=[0])
     pair.run("SELECT a FROM t WHERE ? AND a < 3", parameters=[1])
     pair.close()
+
+
+def test_affinity_of_compound_subqueries(pair):
+    """A compound SELECT in FROM (a view, a CTE) gets the affinity
+    sqlite3SubqueryColType gives it - none when its SELECTs disagree -
+    while as a scalar subquery or IN's right side it has its last SELECT's."""
+    pair.run("CREATE TABLE c (a INTEGER, b TEXT, r REAL, d)")
+    pair.run("INSERT INTO c VALUES (1, '1', 1.0, '1')")
+    for arms in ["a, b", "b, a", "d, a", "b, d", "a, r", "'x', a", "+a, b", "CAST(b AS INT), r",
+                 "NULL, b, a", "NULL, a, r", "b, CASE WHEN 1 THEN 'x' ELSE 2 END", "a, CASE WHEN 1 THEN 3 ELSE 2 END",
+                 "a, a || 'x'", "a, abs(a)", "b, x'31'"]:
+        parts = [f"SELECT {arm} AS k FROM c" for arm in arms.split(", ")]
+        for operator in ("UNION ALL", "UNION", "EXCEPT"):
+            body = f" {operator} ".join(parts)
+            for literal in ("1", "'1'"):
+                pair.run(f"SELECT * FROM ({body}) WHERE k = {literal}")
+        pair.run(f"WITH w AS ({' UNION ALL '.join(parts)}) SELECT * FROM w WHERE k = '1'")
+    pair.run("CREATE VIEW cv AS SELECT a FROM c UNION ALL SELECT b FROM c")
+    pair.run("SELECT * FROM cv WHERE a = '1'")
+    pair.run("SELECT * FROM c WHERE a IN (SELECT a FROM c UNION SELECT b FROM c)")
+    pair.run("SELECT (SELECT b FROM c UNION SELECT a FROM c ORDER BY 1 LIMIT 1) = 1")
