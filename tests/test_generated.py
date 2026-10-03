@@ -398,3 +398,21 @@ def test_upsert_excluded_row_has_the_affinities_with_generated_columns(pair):
     pair.run("SELECT a, c, typeof(c), g FROM t")
     pair.run("INSERT INTO s (rowid, a) VALUES (1, '7') ON CONFLICT DO UPDATE SET c = excluded.a")
     pair.run("SELECT a, c, typeof(c), g FROM s")
+
+
+def test_intreal_through_window_tables(pair):
+    # A window function's arguments are computed into the window's
+    # ephemeral table and read back without affinity (a whole REAL computed
+    # for a VIRTUAL column - an IntReal - comes back an integer), except for
+    # functions that read subtypes (json_group_array: bExprArgs).  An outer
+    # window reads the inner one's columns back with their affinity (REAL).
+    run_all(pair, """
+        CREATE TABLE t (id INTEGER PRIMARY KEY, c FLOAT, g REAL AS (upper(c)), j AS (json_array(c)));
+        INSERT INTO t (id, c) VALUES (-4, -4), (23, 3);
+        SELECT group_concat(g) OVER (ORDER BY rowid ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) FROM t;
+        SELECT sum(g) OVER (), max(g) OVER (), typeof(max(g) OVER ()), g, typeof(g) FROM t;
+        SELECT json_group_array(g) OVER (ORDER BY id), json_group_array(j) OVER (ORDER BY id), json_array(j) FROM t;
+        SELECT typeof(lag(g) OVER (ORDER BY id)), typeof(first_value(g) OVER (ORDER BY id)), typeof(nth_value(g, 1) OVER ()) FROM t;
+        SELECT typeof(max(g) OVER ()), typeof(max(g) OVER (ORDER BY id)), typeof(max(g) OVER (PARTITION BY c)) FROM t;
+        SELECT count(*), typeof(sum(g) OVER ()) FROM t GROUP BY c
+    """)

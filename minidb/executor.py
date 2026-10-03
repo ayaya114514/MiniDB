@@ -1225,11 +1225,36 @@ class Compiler:
         inner = Compiler(self.scope, self.aggregates, misuse=self.misuse, executor=self.executor,
                          allow_aggregates=self.allow_aggregates)  # no window functions inside
         args = [] if star else [inner.compile(arg) for arg in expr.args]
+        if name not in SUBTYPE_WINDOW_FUNCTIONS:
+            # SQLite computes the arguments in the subquery that fills the
+            # window's ephemeral table and reads them back from its records
+            # (an IntReal as an integer, no JSON subtype); only functions
+            # that read subtypes compute them afterwards (bExprArgs), from
+            # the columns as read back (CompiledSelect.window_sorter).
+            args = [record_argument(arg) for arg in args]
+        else:
+            args = [table_argument(arg) for arg in args]
         filter_ = inner.compile(expr.filter) if expr.filter is not None else None
         collation = inner.collation(expr.args[0]) if name in ("MIN", "MAX") and args else None
         number = self.windows.add(definition, frame, name, args, filter_, inner, collation)
         windows = self.windows
         return lambda row: row[windows.base + number]
+
+
+SUBTYPE_WINDOW_FUNCTIONS = {"JSON_GROUP_ARRAY", "JSON_GROUP_OBJECT", "JSONB_GROUP_ARRAY", "JSONB_GROUP_OBJECT"}
+
+
+def record_argument(function: RowFunction) -> RowFunction:
+    """``function`` with its result as a record gives it back (values.record_value)."""
+    record_value, plain = values.record_value, values._PLAIN_TYPES
+    return lambda row: v if type(v := function(row)) in plain else record_value(v)
+
+
+def table_argument(function: RowFunction) -> RowFunction:
+    """``function`` of the row's values as read back from a window's
+    ephemeral table (values.through_sorter: a no-op on plain values)."""
+    through_sorter = values.through_sorter
+    return lambda row: function(through_sorter(row))
 
 
 def in_select_affinity(left: str | None, right: str | None) -> str | None:
@@ -1337,14 +1362,20 @@ class WindowCollector:
         group.functions.append(window.WindowFunction(name, args, filter_, number, collation))
         return number
 
-    def apply(self, rows: Iterable[Row]) -> list[Row]:
+    def apply(self, rows: Iterable[Row], through_table: bool = False) -> list[Row]:
         """The rows with the window functions' results appended, in the order
         SQLite returns them: the window seen first is computed last (SQLite
-        nests the others in subqueries)."""
+        nests the others in subqueries).  ``through_table``: the query reads
+        its values back from the window's ephemeral table (values.through_sorter)."""
         padding = [None] * self.count
         rows = [list(row) + padding for row in rows]
-        for _, group in reversed(self.groups):
-            rows = group.run(rows, self.base)
+        base = self.base
+        for k, (_, group) in enumerate(reversed(self.groups)):
+            if k and through_table:  # (an outer window reads the values back from the inner one's table)
+                rows = [values.through_sorter(row[:base]) + row[base:] for row in rows]
+            rows = group.run(rows, base)
+        if through_table:
+            rows = [values.through_sorter(row[:base]) + row[base:] for row in rows]
         return rows
 
 
@@ -3523,9 +3554,12 @@ class Executor:
 
     @staticmethod
     def row_key(table: TableInfo, row: Row) -> tuple:
-        """A WITHOUT ROWID table's key for a row: its PRIMARY KEY's sort keys."""
+        """A WITHOUT ROWID table's key for a row: its PRIMARY KEY's sort keys,
+        of the values as the record holds them (no JSON subtype: the key's
+        values are read back by covering index scans)."""
         pk = table.pk_index
-        return pk.prefix([row[p] for p in pk.positions])
+        record_value, affinities = values.record_value, table.affinities
+        return pk.prefix([record_value(row[p], affinities[p]) for p in pk.positions])
 
     @staticmethod
     def encode(table: TableInfo, row: Row, tree: BTree | None = None) -> bytes | list:
@@ -4869,9 +4903,7 @@ class CompiledSelect:
                 if having is None or truth(having(group_row))
             )
         if self.windows is not None:
-            if self.window_sorter:
-                rows = (values.through_sorter(row) for row in rows)
-            rows = self.windows.apply(rows)
+            rows = self.windows.apply(rows, self.window_sorter)
         records = ((output_row(row), order_key(row)) for row in rows)
         if self.distinct:
             records = distinct_records(records, self.collations)

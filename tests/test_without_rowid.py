@@ -329,3 +329,18 @@ def test_replace_gives_a_primary_key_column_its_default(pair):
         SELECT * FROM t2;
         PRAGMA integrity_check
     """)
+
+
+@pytest.mark.parametrize("format", [None, "sqlite"])
+def test_json_primary_key_read_back_from_an_index(format):
+    # The key holds the values as the record does: a PRIMARY KEY value
+    # inserted as JSON (with the subtype) reads back from a covering index
+    # scan as plain text.
+    pair = Pair(format=format)
+    pair.run("CREATE TABLE t (c0 BLOB PRIMARY KEY, c1 UNIQUE, c2) WITHOUT ROWID")
+    pair.run("""INSERT INTO t VALUES (json('[1,[2,{"a":3}],"s",true]'), 7.75, 1), (0, '1', 2), (2.5, '0', 3)""")
+    pair.run("INSERT INTO t VALUES (json('[9]'), 1.5, 4) ON CONFLICT (c0) DO UPDATE SET c2 = 5")
+    pair.run("SELECT a.c0, j.key FROM t AS a, json_each(a.c0) AS j")
+    pair.run("SELECT json_quote(c0), json_array(c0) FROM t")
+    pair.run("SELECT c1, json_array(c0) FROM t WHERE c1 > '0'")
+    pair.close()
