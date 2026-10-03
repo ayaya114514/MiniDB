@@ -428,7 +428,7 @@ class ForeignKeys:
             collations = [parent.collations[p] for p in link.parent_positions]
         if any(v is None for v in parent_values):
             return []
-        from minidb.executor import value_comparator
+        from minidb.expressions import value_comparator
         tests = [(position, value, value_comparator("=", affinity, child.affinities[position], collation))
                  for position, value, affinity, collation
                  in zip(link.child_positions, parent_values, affinities, collations)]

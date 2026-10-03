@@ -136,7 +136,9 @@ def table_info(executor: Executor, name: object, extended: bool = False) -> list
 def source_types(compiled: Any) -> list[str]:
     """The declared types of a query's result columns (as SQLite gives a view's
     columns): a column reference's declared type, else ''."""
-    from minidb.executor import AliasReference, CompiledCompound, DerivedSource
+    from minidb.expressions import AliasReference
+    from minidb.queries import CompiledCompound
+    from minidb.sources import DerivedSource
 
     if isinstance(compiled, CompiledCompound):
         compiled = compiled.parts[0]

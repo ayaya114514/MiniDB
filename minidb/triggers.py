@@ -88,7 +88,7 @@ class Program:
     """A trigger's WHEN and statements, compiled for one table and conflict resolution."""
 
     def __init__(self, executor: Executor, trigger: TriggerInfo, source: Any, orconf: str | None) -> None:
-        from minidb.executor import Compiler, Scope, calls_function
+        from minidb.expressions import Compiler, Scope, calls_function
 
         self.trigger = trigger
         self.executor = executor

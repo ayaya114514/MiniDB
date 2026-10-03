@@ -10,7 +10,8 @@ from typing import Any
 
 from minidb.catalog import Catalog
 from minidb.errors import DatabaseError, IntegrityError, NotSupportedError, OperationalError, ProgrammingError
-from minidb.executor import Executor, Result
+from minidb.executor import Executor
+from minidb.expressions import Result
 from minidb.locking import LockTimeout
 from minidb.pager import Pager
 from minidb.record import decode_record
