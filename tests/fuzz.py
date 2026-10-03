@@ -970,6 +970,9 @@ class Generator:
 
 
 STEP_LIMIT = 5_000_000  # (see Pair; about 0.05 s of sqlite3 time)
+# SQLITE_LIMIT_LENGTH on both sides: a recursive trigger doubling a string
+# fails at 10 MB instead of a billion bytes (gigabytes in this process).
+LENGTH_LIMIT = 10_000_000
 
 
 def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False):
@@ -983,7 +986,15 @@ def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False)
 
     generator = Generator(seed)
     generator.page_sizes = format == "sqlite"
+    import sqlite3
+
+    from minidb import functions, values, window
+
     pair = Pair(path, loose_numbers=True, format=format, step_limit=STEP_LIMIT)
+    pair.lite.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, LENGTH_LIMIT)
+    saved_limits = [(module, module.LENGTH_LIMIT) for module in (values, functions, window)]
+    for module, _ in saved_limits:
+        module.LENGTH_LIMIT = LENGTH_LIMIT
     snapshots = SnapshotReader(pair.mini, path, seed) if path is not None and format != "sqlite" else None
     history = []
     try:
@@ -1033,6 +1044,8 @@ def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False)
         if snapshots is not None:
             snapshots.reader.close()
         pair.close()
+        for module, limit in saved_limits:
+            module.LENGTH_LIMIT = limit
     return None
 
 
