@@ -2159,6 +2159,8 @@ def is_parse_constant(expr: Expr) -> bool:
     """Whether SQLite's parser takes ``expr`` as constant (sqlite3ExprIsConstant
     before names are resolved): no columns other than TRUE and FALSE, no
     subqueries, only deterministic scalar functions."""
+    if type(expr) is Literal or type(expr) is Parameter:
+        return True
     for node in walk_expr(expr):
         if isinstance(node, (Subquery, InSelect, Exists)):
             return False
@@ -2179,6 +2181,8 @@ def is_true_false_name(expr: object) -> bool:
 def plain_truth_tests(expr: object) -> object:
     """``expr`` with ``x IS [NOT] TRUE / FALSE`` as plain ``x IS [NOT] 1 / 0``
     comparisons (see Parser.value_rows)."""
+    if type(expr) is Literal or type(expr) is Parameter:
+        return expr
     if isinstance(expr, Binary) and expr.op in ("IS", "IS NOT") and is_true_false_name(expr.right):
         value = int(ascii_lower(expr.right.name) == "true")
         return Binary(expr.op, plain_truth_tests(expr.left), Literal(value))

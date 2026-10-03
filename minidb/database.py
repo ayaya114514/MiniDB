@@ -34,6 +34,7 @@ WRITE_STATEMENTS = (
     Insert, Update, Delete, CreateTable, DropTable, CreateIndex, DropIndex, CreateView, DropView,
     Analyze, Reindex, AlterTable, CreateTrigger, DropTrigger,
 )
+WRITE_TYPES = frozenset(WRITE_STATEMENTS)
 
 
 def file_format(path: str) -> str | None:
@@ -156,7 +157,8 @@ class Database:
         if self.broken:
             raise DatabaseError("a commit failed: reopen the database to recover")
         pager = self.pager
-        if isinstance(stmt, Begin):
+        kind = type(stmt)  # (statement classes have no subclasses)
+        if kind is Begin:
             if self.in_transaction:
                 raise OperationalError("cannot start a transaction within a transaction")
             try:
@@ -169,7 +171,7 @@ class Database:
             self.in_transaction = True
             return Result()
         keys = self.executor.foreign_keys
-        if isinstance(stmt, Commit):
+        if kind is Commit:
             if not self.in_transaction:
                 raise OperationalError("cannot commit - no transaction is active")
             if keys.transaction_failed():
@@ -179,20 +181,19 @@ class Database:
             self._transaction_ended()
             pager.end_transaction()
             return Result()
-        if isinstance(stmt, Rollback):
+        if kind is Rollback:
             if not self.in_transaction:
                 raise OperationalError("cannot rollback - no transaction is active")
             self.in_transaction = False
             self.rollback()
             pager.end_transaction()
             return Result()
-        if isinstance(stmt, Pragma) and stmt.name == "journal_mode" and stmt.value is not None \
+        if kind is Pragma and stmt.name == "journal_mode" and stmt.value is not None \
                 and isinstance(pager, SqlitePager) and pager.path is not None \
                 and (stmt.schema is None or ascii_lower(stmt.schema) == "main"):
             return self._set_journal_mode(ascii_lower(str(stmt.value)))
-        writes = isinstance(stmt, WRITE_STATEMENTS) or (
-            isinstance(stmt, Pragma) and pragmas.is_write(stmt.name, stmt.value))
-        if isinstance(stmt, Vacuum):
+        writes = kind in WRITE_TYPES or (kind is Pragma and pragmas.is_write(stmt.name, stmt.value))
+        if kind is Vacuum:
             if self.in_transaction:
                 raise OperationalError("cannot VACUUM from within a transaction")
             writes = stmt.schema == "main" and stmt.into is None
@@ -231,7 +232,7 @@ class Database:
                 exc = failure
             self.total_changes += keys.extra_changes  # (completed foreign key actions count anyway)
             self.executor.total_changes = self.total_changes
-            if isinstance(stmt, (Insert, Update, Delete)):
+            if kind is Insert or kind is Update or kind is Delete:
                 self.executor.changes = 0
             if resolution == "FAIL":
                 self.total_changes += exc.changes  # SQLite counts them only for FAIL
@@ -263,7 +264,7 @@ class Database:
                 raise exc from None
             raise
         self._end_statement()
-        if isinstance(stmt, Vacuum) and writes and not self.broken:
+        if kind is Vacuum and writes and not self.broken:
             pager.checkpoint()  # shrinks the file, unless another connection is reading
         if result.rowcount > 0:
             self.total_changes += result.rowcount
@@ -271,7 +272,7 @@ class Database:
         if not self.in_transaction and (writes or (self.executor.settings["defer_foreign_keys"]
                                                    and self._reads_file(stmt))):
             self._transaction_ended()
-        if isinstance(stmt, (Insert, Update, Delete)):
+        if kind is Insert or kind is Update or kind is Delete:
             self.executor.changes = max(result.rowcount, 0)
         self.executor.total_changes = self.total_changes
         return result
@@ -473,7 +474,12 @@ class Database:
 
 def adapt(value: object, position: int) -> SQLValue:
     """Check a bound Python value and convert it to a SQL value."""
-    if value is None or isinstance(value, (float, str, bytes)):
+    kind = type(value)
+    if kind is str or kind is float or value is None or kind is bytes:
+        return value
+    if kind is int and INT_MIN <= value <= INT_MAX:
+        return value
+    if isinstance(value, (float, str, bytes)):
         return value
     if isinstance(value, (bytearray, memoryview)):
         return bytes(value)
@@ -495,7 +501,7 @@ def resolve_parameters(stmt: Any, parameters: Parameters | None) -> list[SQLValu
     if parameters is None:
         parameters = ()
     values = [None] * count
-    if isinstance(parameters, Mapping):
+    if type(parameters) is not tuple and type(parameters) is not list and isinstance(parameters, Mapping):
         for index in range(1, count + 1):
             name = stmt.param_names.get(index)
             if name is None:
@@ -507,14 +513,16 @@ def resolve_parameters(stmt: Any, parameters: Parameters | None) -> list[SQLValu
                 raise ProgrammingError(f"You did not supply a value for binding parameter {name}.")
             values[index - 1] = adapt(parameters[name[1:]], index)
         return values
-    parameters = list(parameters)
+    if type(parameters) is not tuple and type(parameters) is not list:
+        parameters = list(parameters)
     if len(parameters) != count:
         raise ProgrammingError(
             "Incorrect number of bindings supplied. The current statement uses "
             f"{count}, and there are {len(parameters)} supplied."
         )
+    names = stmt.param_names
     for index, value in enumerate(parameters, 1):
-        name = stmt.param_names.get(index)
+        name = names.get(index) if names else None
         if name is not None:  # Python 3.14's rule (3.12 and 3.13 only warn)
             raise ProgrammingError(
                 f"Binding {index} ('{name}') is a named parameter, but you supplied a "
