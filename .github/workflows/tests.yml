@@ -77,6 +77,11 @@ jobs:
           start=$((100000 + GITHUB_RUN_NUMBER * 50))
           python tests/crash_fuzz.py --seeds "$start-$((start + 49))"
           python tests/crash_fuzz.py --wal --seeds "$start-$((start + 49))"
+      - name: MiniDB and sqlite3 processes writing one file at once (journal, WAL, MiniDB's format)
+        run: |
+          for mode in journal wal minidb; do
+            python tests/concurrency_fuzz.py --mode $mode --seeds 0-9 --workers 6 --operations 300
+          done
       - name: Metamorphic testing, TLP and NoREC (no reference database)
         run: |
           python tests/metamorphic.py --seeds 0-199 --queries 300

@@ -106,6 +106,10 @@ class Database:
         self.executor.integrity_problems = self._integrity_check
         self.executor.in_transaction = lambda: self.in_transaction
         self.in_transaction = False
+        # BEGIN (DEFERRED) takes no snapshot and no lock yet: as in SQLite,
+        # the transaction starts reading - or, with a writing statement,
+        # writing first - at its first statement.
+        self.snapshot_pending = False
         self.broken = False
         self.total_changes = 0
         self._statements = OrderedDict()  # SQL text -> parsed statements
@@ -161,14 +165,15 @@ class Database:
         if kind is Begin:
             if self.in_transaction:
                 raise OperationalError("cannot start a transaction within a transaction")
-            try:
-                if stmt.mode != "DEFERRED":
+            if stmt.mode != "DEFERRED":
+                try:
                     pager.begin_write()
-                self._begin_read()
-            except BaseException:
-                pager.end_transaction()
-                raise
+                    self._begin_read()
+                except BaseException:
+                    pager.end_transaction()
+                    raise
             self.in_transaction = True
+            self.snapshot_pending = stmt.mode == "DEFERRED"
             return Result()
         keys = self.executor.foreign_keys
         if kind is Commit:
@@ -177,14 +182,14 @@ class Database:
             if keys.transaction_failed():
                 raise IntegrityError("FOREIGN KEY constraint failed")  # (the transaction stays open)
             self._commit()  # a lock timeout leaves the transaction open
-            self.in_transaction = False
+            self.in_transaction = self.snapshot_pending = False
             self._transaction_ended()
             pager.end_transaction()
             return Result()
         if kind is Rollback:
             if not self.in_transaction:
                 raise OperationalError("cannot rollback - no transaction is active")
-            self.in_transaction = False
+            self.in_transaction = self.snapshot_pending = False
             self.rollback()
             pager.end_transaction()
             return Result()
@@ -197,7 +202,9 @@ class Database:
             if self.in_transaction:
                 raise OperationalError("cannot VACUUM from within a transaction")
             writes = stmt.schema == "main" and stmt.into is None
-        if not self.in_transaction:
+        if not self.in_transaction or self.snapshot_pending:
+            # (Outside a transaction, or the first statement of a deferred
+            # one: a writer waits for RESERVED first, so its snapshot is the newest.)
             try:
                 if writes:
                     pager.begin_write()
@@ -205,6 +212,7 @@ class Database:
             except BaseException:
                 pager.end_transaction()
                 raise
+            self.snapshot_pending = False
         elif writes:
             pager.begin_write(wait=False)
         pager.begin_statement()
@@ -252,7 +260,7 @@ class Database:
                 temp.rollback_statement()
             self.catalog.load()
             if resolution == "ROLLBACK" and self.in_transaction:
-                self.in_transaction = False
+                self.in_transaction = self.snapshot_pending = False
                 self.rollback()
                 pager.end_transaction()
             elif not self.in_transaction:
@@ -297,6 +305,12 @@ class Database:
             finally:
                 if not self.broken:
                     pager.end_transaction()
+
+    def _take_pending_snapshot(self) -> None:
+        """Start reading in a deferred transaction that has not read yet."""
+        if self.snapshot_pending:
+            self._begin_read()
+            self.snapshot_pending = False
 
     def _begin_read(self) -> None:
         if self.pager.begin_read():
@@ -382,6 +396,7 @@ class Database:
         """Check page checksums, every B+ tree and every index; returns a list
         of problems (empty if all is well)."""
         if self.in_transaction:
+            self._take_pending_snapshot()
             return self._integrity_check()
         self._begin_read()
         try:
@@ -431,6 +446,7 @@ class Database:
         if not isinstance(self.pager, SqlitePager):
             raise NotSupportedError("serialize() needs a database in SQLite's file format")
         if self.in_transaction:
+            self._take_pending_snapshot()
             return self.pager.serialize()
         self.pager.begin_read()
         try:
@@ -453,7 +469,7 @@ class Database:
         if self.broken or self.pager.closed:
             return
         if self.in_transaction:
-            self.in_transaction = False
+            self.in_transaction = self.snapshot_pending = False
             self.rollback()
             self.pager.end_transaction()
         try:
