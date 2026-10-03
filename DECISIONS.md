@@ -1145,7 +1145,9 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   过记录（存进表、ORDER BY 的排序器、UNION 的临时表）就成了整数。MiniDB 用 `values.IntReal`（float 子类）表示，
   `values.record_value` / `through_record` 在这些地方转换。
 - **JSON 子类型留在“寄存器”里**（老问题）：新行的值在 RETURNING、触发器的 NEW、生成列和 CHECK 里保留 JSON 子类型，
-  只有写进记录和索引时去掉（`Executor.stored_row`）；INSERT ... SELECT 和多行 VALUES 走 SQLite 的协程，值先失去子类型。
+  只有写进记录和索引时去掉（`Executor.stored_row`）；INSERT ... SELECT 和多行 VALUES 的行只有先进临时表时才失去子类型
+  ——表上有 INSERT 触发器（RETURNING 也算）或这些行读了目标表（sqlite3Insert 的 useTempTable，阶段 25 收尾时更正）；
+  否则协程的寄存器保留子类型，生成列也看得到。
   原来在 `prepare_row` 一开始就去掉了。
 - **BEFORE UPDATE 触发器里 NEW 的生成列**：SQLite 只把 UPDATE 赋值的列和触发器以 `new.x` 引用的列装进寄存器
   （sqlite3TriggerColmask），其余是 NULL，生成列据此计算——所以 `new.g` 可能是 NULL。照做。
@@ -1179,3 +1181,37 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   `PRAGMA defer_foreign_keys`。
 - 已知差别：SQLite 自己在某些 UPDATE 后会留下“索引与表不符”的库（生成列读到还没存成整数的 REAL 寄存器），MiniDB 照做；
   fuzz 遇到参考库自己 `integrity_check` 不过时跳过结尾的完整性检查。
+
+## D120 SQLite 的 WAL 模式：照搬 -wal / -shm 的格式与锁协议，wal-index 用 pread / pwrite
+
+- **为什么照搬而不是转换**：目标是和 sqlite3 进程同时读写同一个文件，所以日志、wal-index 和锁都必须是 SQLite 自己的：
+  `<db>-wal`（32 字节头 + 帧，帧头含页号、提交帧的库大小、salt、贯穿整个日志的校验和）、`<db>-shm`（两份索引头、
+  checkpoint 信息与 5 个 read mark、每块 32 KB 的页号数组 + 8192 槽哈希表），锁是 `-shm` 第 120–128 字节上的 WRITE /
+  CKPT / RECOVER / READ0–4 / DMS。实现在 `minidb/sqlite_wal.py`，`SqlitePager` 在 WAL 模式下把提交改成追加帧。
+- **wal-index 不 mmap**：SQLite 把 `-shm` 映射进内存，MiniDB 用 pread / pwrite 读写同一文件——同一台机器上与 mmap 一致
+  （同一页缓存），省掉 mmap 的平台差异。数值按本机字节序（与 SQLite 相同）。读页时不去查哈希表，而是按快照把
+  “页号 → 最后一帧”的字典从页号数组增量补齐（salt 变了就重建）；写的时候照 walIndexAppend 维护哈希表（含崩溃写者
+  留下的残项清理 walCleanupHash），sqlite3 的读者靠它找帧。
+- **读写协议**照 walTryBeginRead / walBeginWriteTransaction / walRestartLog / walCheckpoint（PASSIVE）/ walIndexRecover：
+  - 读者：日志已全部回填时持 READ0 只读主文件，否则选或改一个 read mark 并持共享锁，再核对索引头没变（变了就重试）。
+  - 写者：持 WRITE，快照过期报 `database is locked`（SQLITE_BUSY_SNAPSHOT）。日志已全部回填、又没有读者用日志时，从头
+    重写日志（salt1+1、salt2 随机）。
+  - checkpoint：按 read mark 算出能回填到哪一帧，持 READ0 排他时把每页在那之前的最新一帧写回主文件；全部回填时截断
+    主文件。
+  - 恢复：索引头无效时（第一个连接拿到 DMS 排他会截断 `-shm`），持 WRITE、CKPT、RECOVER 从日志重建，只认到最后一个
+    校验和正确的提交帧。
+  - MiniDB 的“先 RESERVED 再取快照”在 WAL 下变成“先 WRITE 再取快照”，所以自动提交的写语句总拿到最新快照。
+- **文件锁与生命周期**：WAL 模式下连接打开期间一直持主文件的 SHARED。自动 checkpoint 在日志到 1000 帧（`PRAGMA
+  wal_autocheckpoint`）后于提交后做；关闭时若能拿到主文件 EXCLUSIVE（没有别的连接），全部回填并删除 `-wal` 和 `-shm`
+  （SQLite 的 sqlite3WalClose）。
+- **进入 / 离开 WAL**：`PRAGMA journal_mode = WAL` 用回滚日志把文件头 18、19 字节写成 2。离开时要独占主文件：先全部
+  回填并删掉日志，再写回 1（这一步要防止 begin_read 看见头里的 2 又把日志打开）。事务中切换照 SQLite 报错；不支持的
+  模式（memory、off……）不变；`PRAGMA wal_checkpoint(PASSIVE|FULL|RESTART|TRUNCATE)` 返回 (busy, log,
+  checkpointed)，RESTART / TRUNCATE 在没人用日志时重开（并清空）日志。
+- **同一进程里不要同时开 sqlite3 和 MiniDB**：POSIX 锁属于进程，同进程的 sqlite3 看不见 MiniDB 的锁（反之亦然）。在
+  WAL 模式下这会出事——sqlite3 关闭时以为自己是最后一个连接，回填后删掉 MiniDB 正在用的日志。所以测试里 MiniDB 开着
+  文件时，sqlite3 一律在子进程里跑（fuzz 的 `--wal` 也是）。回滚日志模式下锁只在事务期间持有，先后使用没有问题。
+- **性能取舍**：每次提交读写整块（32 KB）哈希区、Python 逐字计算校验和；读事务开始要读索引头和 read mark 并加一次锁。
+  WAL 下自动提交的插入比回滚日志快（少一次 fsync 与日志文件的创建删除），点查慢约 20%（benchmark 见 PROGRESS）。
+- **回滚日志模式也受影响的一点**：每个事务开始只在文件头的 change counter 变了时才检查 `-wal` 是否存在（转入 WAL 必然
+  写文件头），避免每条语句多一次 stat。

@@ -187,3 +187,32 @@ def test_files_the_playground_refuses(tmp_path):
     assert json.loads(bridge.info())["format"] == "minidb"  # (still the database it had)
     with pytest.raises(Exception, match="SQLite's file format"):
         bridge.export()
+
+
+def test_the_file_kinds_of_stage_25(tmp_path):
+    # 1024-byte pages, auto_vacuum, WAL mode (the file alone: what was
+    # checkpointed into it), WITHOUT ROWID and generated columns.
+    import sqlite3
+
+    path = tmp_path / "w.sqlite"
+    connection = sqlite3.connect(path)
+    connection.executescript("""
+        PRAGMA page_size = 1024; PRAGMA auto_vacuum = FULL; PRAGMA journal_mode = WAL;
+        CREATE TABLE w (k TEXT PRIMARY KEY, n INT, g AS (n * 2)) WITHOUT ROWID;
+        CREATE INDEX wg ON w (g);
+    """)
+    connection.executemany("INSERT INTO w (k, n) VALUES (?, ?)", [(f"key{i:04}", i) for i in range(500)])
+    connection.commit()
+    connection.close()
+    image = path.read_bytes()
+    info = json.loads(bridge.open_file(image, "w.sqlite"))
+    assert info["page_size"] == 1024 and info["pages"] == len(image) // 1024
+    kinds = [kind for kind, _ in json.loads(bridge.file_map())["pages"]]
+    assert "unknown" not in kinds[2:] and "index-leaf" in kinds
+    results = json.loads(bridge.run("SELECT count(*), sum(g) FROM w; DELETE FROM w WHERE n % 2 = 0"))
+    assert results[0]["rows"] == [[500, 249500]]
+    exported = bridge.export()
+    copy = sqlite3.connect(":memory:")
+    copy.deserialize(exported[:18] + b"\x01\x01" + exported[20:])  # (sqlite3 opens no WAL image in memory)
+    assert copy.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    assert copy.execute("SELECT count(*), sum(g) FROM w").fetchall() == [(250, 2 * sum(range(1, 500, 2)))]

@@ -184,6 +184,16 @@ def through_record(row: tuple) -> tuple:
     return row
 
 
+def through_sorter(row: list) -> list:
+    """A row's values as an aggregate reads them back from SQLite's GROUP BY
+    sorter (a record): text without a JSON subtype; an IntReal is stored as
+    an integer, then made REAL again by its column's affinity."""
+    for v in row:
+        if isinstance(v, (str, float)) and type(v) not in (str, float):
+            return [float(v) if type(v) is IntReal else str(v) if isinstance(v, str) else v for v in row]
+    return row
+
+
 def format_real(value: float) -> str:
     """Render a REAL as text like SQLite: printf("%!.17g"), see fp.format_real."""
     return fp_format_real(value)

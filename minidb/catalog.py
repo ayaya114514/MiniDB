@@ -367,6 +367,9 @@ class IndexInfo:
         # fills the index from the table: a whole REAL as an integer (unless
         # the column is REAL itself).  Entries INSERT / UPDATE add keep the REAL.
         self.raw_reals = [i for i, p in enumerate(self.positions) if _real_copy(table, p)]
+        # Its VIRTUAL columns: they do not make it covering (SQLite's
+        # colNotIdxed), but a SELECT that scans it reads them from it (pIdxEpr).
+        self.virtual = [i for i, p in enumerate(self.positions) if p in table.virtual]
         self.unique = unique
         self.conflict = conflict  # ON CONFLICT of its PRIMARY KEY or UNIQUE constraint
         self.origin = origin  # "c" (CREATE INDEX), "u" (UNIQUE) or "pk", as PRAGMA index_list says

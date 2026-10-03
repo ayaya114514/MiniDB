@@ -31,7 +31,8 @@
   sqlite3 互相读写（MiniDB 自己的格式里 DESC 主键按升序存）。
 - PRAGMA：`table_info` / `table_xinfo`、`index_list` / `index_info` / `index_xinfo`、`foreign_key_list`、
   `foreign_key_check`、`integrity_check` / `quick_check`、`user_version`、`application_id`、`schema_version`、
-  `page_size` / `page_count` / `freelist_count`、`journal_mode` 等，以及表值函数形式 `pragma_xxx(...)`。
+  `page_size` / `page_count` / `freelist_count`、`journal_mode`（SQLite 格式可在 DELETE 与 WAL 之间切换）、
+  `wal_checkpoint` / `wal_autocheckpoint` 等，以及表值函数形式 `pragma_xxx(...)`。
 - `ALTER TABLE ... RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN`（视图里的引用一并改写）；
   `CREATE [TEMP] VIEW` / `DROP VIEW`；临时表 `CREATE TEMP TABLE`（连接自己的 temp 库，在内存里，随事务提交
   回滚，`main.` / `temp.` 限定名，`sqlite_temp_master`，TEMP 触发器）；`CREATE [TEMP] TABLE ... AS SELECT`；`REINDEX`；`VACUUM`（重写紧凑文件、收缩文件）与 `VACUUM INTO 'file'`。
@@ -137,10 +138,14 @@ db = minidb.Database("app.sqlite", format="sqlite")   # 或 minidb.connect("app.
 或让连接换成一个从这些字节开始的内存库（原来的文件不动）。
 
 用的是 SQLite 的 rollback journal（`-journal`，崩溃后 sqlite3 和 MiniDB 都能回放对方留下的日志）和 SQLite 的文件锁，
-所以另一个进程里的 sqlite3 可以同时打开同一个文件。ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。页大小 512–65536
-（`PRAGMA page_size` 对新库立即生效、对已有的库在下一次 VACUUM 时生效）；支持 auto_vacuum（FULL / INCREMENTAL，`PRAGMA incremental_vacuum`）；只支持 UTF-8、非 WAL 模式
-（其他文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的
-对象（表达式索引、部分索引等）原样保留，用到时报 `NotSupportedError`。`WITHOUT ROWID` 表两种格式都支持（D119）。设计见 DECISIONS.md 的 D100。
+所以另一个进程里的 sqlite3 可以同时打开同一个文件。也支持 SQLite 的 **WAL 模式**（`PRAGMA journal_mode = WAL`，或
+sqlite3 留下的 WAL 库）：`-wal` / `-shm` 的格式和锁协议与 SQLite 相同，MiniDB 与 sqlite3 进程可以同时读写（读者与写者
+互不阻塞）、互相恢复对方崩溃后留下的日志；自动 checkpoint、`PRAGMA wal_checkpoint`、最后一个连接关闭时回填并删除
+日志都照 SQLite（D120）。同一个进程里不要让 sqlite3 与 MiniDB 同时打开一个 WAL 库（POSIX 锁属于进程，彼此看不见）。
+ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。页大小 512–65536（`PRAGMA page_size` 对新库立即生效、对已有的库在下一次
+VACUUM 时生效，WAL 模式下不变）；支持 auto_vacuum（FULL / INCREMENTAL，`PRAGMA incremental_vacuum`）；只支持 UTF-8
+（UTF-16 的文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的对象（表达式索引、部分索引等）
+原样保留，用到时报 `NotSupportedError`。`WITHOUT ROWID` 表两种格式都支持（D119）。设计见 DECISIONS.md 的 D100。
 SQLite 格式下查询与 MiniDB 格式相差 10–45%，逐行插入慢 1.6–2.4 倍（benchmark 见 PROGRESS.md 阶段 20）。
 
 ## 架构
@@ -162,7 +167,7 @@ SQL 文本
   ▼
   │  pager.py       4 KB 页（带 CRC32）的读写与缓存，空闲页链表，语句级 journal，WAL 提交与恢复
   │  locking.py     跨进程字节锁（fcntl / LockFileEx，进程内共享一个文件描述符）与忙等超时
-  │  sqlite_*.py    SQLite 文件格式：字节布局、B 树、rollback journal 与 SQLite 的锁
+  │  sqlite_*.py    SQLite 文件格式：字节布局、B 树、rollback journal、WAL（-wal / -shm）与 SQLite 的锁
   ▼
 数据库文件 app.db + 预写日志 app.db-wal + 读者标记与锁 app.db-shm
 ```

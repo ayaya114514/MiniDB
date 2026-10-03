@@ -287,3 +287,45 @@ def test_written_by_minidb(tmp_path):
     with Database(path) as db:
         same_results(path, db)
         assert db.execute("PRAGMA integrity_check") == [("ok",)]
+
+
+def test_self_referencing_foreign_keys(pair):
+    # When the SET assigns the PRIMARY KEY (whatever the value) or changes a
+    # child key that refers to the table itself, SQLite deletes the old row
+    # before looking up the new one's parent; a row matches itself only if
+    # the values are equal as they are (TEXT '5' is not 5).
+    run_all(pair, """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE t2 (id INTEGER PRIMARY KEY, c0 TEXT REFERENCES t2 (id), c1) WITHOUT ROWID;
+        INSERT INTO t2 (id) VALUES (5);
+        UPDATE t2 SET c0 = id WHERE id = 5;
+        CREATE TABLE t7 (id INT PRIMARY KEY, c0 INT REFERENCES t7 (id)) WITHOUT ROWID;
+        INSERT INTO t7 VALUES (1, 1);
+        UPDATE t7 SET c0 = 1 WHERE id = 1;
+        INSERT INTO t7 VALUES (2, NULL);
+        UPDATE t7 SET c0 = 2 WHERE id = 2;
+        CREATE TABLE d (id INTEGER PRIMARY KEY, c0 REFERENCES d (id) DEFERRABLE INITIALLY DEFERRED, c2) WITHOUT ROWID;
+        INSERT INTO d VALUES (1, 1, 5);
+        BEGIN;
+        INSERT INTO d VALUES (-4, 2, 7);
+        INSERT INTO d VALUES (1, 1, 0) ON CONFLICT (id) DO UPDATE SET id = 1, c2 = 9 WHERE d.c2;
+        COMMIT;
+        ROLLBACK;
+        SELECT * FROM d
+    """)
+
+
+def test_replace_gives_a_primary_key_column_its_default(pair):
+    # (The row's key must be made after REPLACE fixed the NOT NULL column.)
+    run_all(pair, """
+        CREATE TABLE t2 (c0 TEXT, c1 INT NOT NULL DEFAULT (2 * 3), PRIMARY KEY (c1 DESC)) WITHOUT ROWID;
+        INSERT INTO t2 (c1) VALUES (5), (3);
+        UPDATE OR REPLACE t2 SET c1 = NULL WHERE c1 = 3;
+        CREATE INDEX i11 ON t2 (c1);
+        SELECT * FROM t2 WHERE c1 = 6;
+        SELECT * FROM t2 INDEXED BY i11 WHERE c1 < 7;
+        INSERT OR REPLACE INTO t2 VALUES ('x', NULL);
+        UPDATE OR REPLACE t2 SET c1 = NULL WHERE c1 = 5;
+        SELECT * FROM t2;
+        PRAGMA integrity_check
+    """)

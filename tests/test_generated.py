@@ -290,3 +290,95 @@ def test_json_subtype_of_new_values(pair):
         INSERT INTO q VALUES (1, json('[1]'));
         INSERT INTO q VALUES (1, json('[2]')) ON CONFLICT (k) DO UPDATE SET v = json_quote(excluded.v) RETURNING v
         """)
+
+
+def test_values_through_the_group_by_sorter(pair):
+    # SQLite's GROUP BY sorter holds the rows as records: no JSON subtype,
+    # an IntReal made REAL again by its column (without GROUP BY, no sorter).
+    run_all(pair, """
+        CREATE TABLE t (c0, j TEXT AS (json_quote(c1)), c1 REAL, r REAL AS (c1 + 1));
+        INSERT INTO t (c0, c1) VALUES (1, 384), (2, -5), (1, 0.5);
+        SELECT c0, json_group_object(j, j) FROM t GROUP BY c0;
+        SELECT json_group_object(j, j) FROM t;
+        SELECT c0, json_group_array(r), typeof(max(r)) FROM t GROUP BY c0;
+        SELECT r, typeof(r) FROM t GROUP BY r;
+        SELECT json_group_array(r) FROM t
+    """)
+
+
+def test_indexed_virtual_columns(pair):
+    # A VIRTUAL column does not make an index covering (SQLite's
+    # colNotIdxed); a SELECT scanning the index reads it from there.
+    run_all(pair, """
+        CREATE TABLE t0 (c0 TEXT, c1 INT NOT NULL DEFAULT 0, g1 AS (json_quote(c0)) VIRTUAL, UNIQUE (g1, c1));
+        INSERT INTO t0 (c0) VALUES ('0'), ('x');
+        SELECT json_group_array(g1) FROM t0;
+        SELECT json_array(g1) FROM t0 NOT INDEXED;
+        SELECT json_group_array(g1) FROM t0 WHERE g1 > '';
+        SELECT g1, c1 FROM t0 WHERE g1 > '' ORDER BY g1
+    """)
+
+
+def test_virtual_columns_a_query_does_not_use(pair):
+    # SQLite computes a VIRTUAL column only where it is used: one added
+    # later that fails for the old rows does not fail other queries.
+    run_all(pair, """
+        CREATE TABLE t1 (c0, c1);
+        INSERT INTO t1 VALUES (-9223372036854775807 - 1, 1);
+        ALTER TABLE t1 ADD COLUMN c2 AS (abs(c0));
+        ALTER TABLE t1 ADD COLUMN c3 AS (c1 + 1) CHECK (c3 > 0);
+        SELECT c1, c3 FROM t1;
+        SELECT count(*) FROM t1;
+        SELECT c2 FROM t1;
+        INSERT INTO t1 (c0, c1) VALUES (-9223372036854775807 - 1, 2)
+    """)
+
+
+def test_an_upsert_that_updates_a_unique_generated_column(pair):
+    # DO UPDATE runs as UPDATE OR ABORT: setting c1 changes the UNIQUE g1,
+    # so the statement may abort and has a statement journal - a later row's
+    # datatype mismatch undoes the rows before it.
+    run_all(pair, """
+        CREATE TABLE t0 (id INTEGER PRIMARY KEY, c1, g1 AS (c1 || 'x') UNIQUE);
+        BEGIN;
+        INSERT OR IGNORE INTO t0 (c1, id) VALUES (1, NULL), (2, x'41') ON CONFLICT (g1) DO UPDATE SET c1 = 5;
+        SELECT * FROM t0;
+        INSERT OR IGNORE INTO t0 (c1, id) VALUES (1, NULL), (2, x'41') ON CONFLICT (g1) DO NOTHING;
+        SELECT * FROM t0;
+        COMMIT
+    """)
+
+
+def test_values_through_window_tables_and_scans_in_group_order(pair):
+    # Window functions read their rows from an ephemeral table (records);
+    # GROUP BY the row id of a full scan needs no sorter (values stay as they are).
+    run_all(pair, """
+        CREATE TABLE t (id INTEGER PRIMARY KEY, a, b, g AS (json_quote(a)));
+        INSERT INTO t (a, b) VALUES ('x', 1), ('y', 1), (3, 2);
+        SELECT json_group_array(g) OVER (ORDER BY id) FROM t;
+        SELECT id, json_group_object(g, g) FROM t GROUP BY id;
+        SELECT b, json_group_object(g, g) FROM t GROUP BY b;
+        SELECT json_array(json_group_array(a)), row_number() OVER () FROM t GROUP BY b;
+        SELECT json_array(j) FROM (SELECT json_array(a) AS j FROM t) GROUP BY j;
+        SELECT json_array(j), row_number() OVER (ORDER BY j) FROM (SELECT json_array(a) AS j FROM t)
+    """)
+
+
+def test_json_subtype_through_a_temporary_table(pair):
+    # The rows of a SELECT or of several VALUES rows lose the JSON subtype
+    # only when SQLite puts them in a temporary table first: the table has
+    # INSERT triggers (RETURNING too) or the rows read it (useTempTable).
+    run_all(pair, """
+        CREATE TABLE p (c0, c1, g AS (json_quote(c0)) STORED);
+        INSERT INTO p (c0, c1) VALUES (json('[2]'), 1), (json('[3]'), 2);
+        INSERT INTO p (c0, c1) SELECT json('[4]'), 1;
+        INSERT INTO p (c0, c1) SELECT json('[5]'), 1 RETURNING g;
+        INSERT INTO p (c0, c1) SELECT json('[6]'), 1 FROM p WHERE c1 = 2;
+        INSERT INTO p (c0, c1) VALUES (json('[7]'), (SELECT max(c1) FROM p)), (json('[8]'), 1);
+        SELECT g FROM p;
+        CREATE TABLE q (c0, g AS (json_quote(c0)) STORED);
+        CREATE TRIGGER tq AFTER INSERT ON q BEGIN SELECT 1; END;
+        INSERT INTO q (c0) VALUES (json('[1]')), (json('[2]'));
+        INSERT INTO q (c0) VALUES (json('[3]'));
+        SELECT g FROM q
+    """)
