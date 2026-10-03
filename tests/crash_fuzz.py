@@ -132,6 +132,9 @@ class Workload:
             roll = rng.random()
             if roll < 0.06:
                 self.transactions.append([("VACUUM", ())])
+            elif roll < 0.09 and not wal:  # (the whole file goes to the journal, in the old page size)
+                self.transactions.append([(f"PRAGMA page_size = {rng.choice([512, 1024, 2048, 4096])}", ()),
+                                          ("VACUUM", ())])
             elif roll < 0.12 and wal:
                 self.transactions.append([(f"PRAGMA wal_checkpoint({rng.choice(['PASSIVE', 'RESTART', 'TRUNCATE'])})", ())])
             elif roll < 0.16 and self.auto_vacuum == 2:
@@ -192,7 +195,8 @@ class Workload:
             for i, statements in enumerate(self.transactions):
                 in_flight = self.states[i + 1]
                 if statements[0][0].startswith(("VACUUM", "PRAGMA")):
-                    writer.execute(*statements[0])
+                    for sql, parameters in statements:
+                        writer.execute(sql, parameters)
                 else:
                     writer.execute("BEGIN")
                     for sql, parameters in statements:

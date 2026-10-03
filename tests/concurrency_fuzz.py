@@ -46,6 +46,7 @@ QUERIES = (
     "SELECT a.id, count(l.id) FROM accounts AS a LEFT JOIN log AS l ON l.src = a.id GROUP BY a.id ORDER BY a.id",
     "SELECT count(*) FROM log WHERE worker = 'w0' AND amount > 20",
     "SELECT k FROM kv WHERE v > 10 ORDER BY v DESC, k",
+    "SELECT type, name, tbl_name FROM sqlite_schema ORDER BY name",
 )
 
 
@@ -145,6 +146,13 @@ def work(path: str, engine: str, name: str, seed: int, operations: int, mode: st
                 if count < seen:
                     problems.append(f"{name}: the log went back from {seen} to {count} rows")
                 seen = count
+            elif roll < 0.97:  # schema changes the others must notice
+                connection.run(rng.choice(["CREATE INDEX IF NOT EXISTS log_amount ON log (amount)",
+                                           "DROP INDEX IF EXISTS log_amount",
+                                           "CREATE INDEX IF NOT EXISTS kv_v ON kv (v)", "DROP INDEX IF EXISTS kv_v"]))
+                connection.run("SELECT count(*) FROM log WHERE amount > ?", (rng.randint(1, 50),))
+            elif roll < 0.98:
+                connection.run("VACUUM")
             elif mode == "wal":
                 connection.run(f"PRAGMA wal_checkpoint({rng.choice(['PASSIVE', 'RESTART', 'TRUNCATE'])})")
             else:
