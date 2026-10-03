@@ -1209,6 +1209,7 @@ class SnapshotReader:
         if self.expected is None:
             if not main.in_transaction and rng.random() < 0.05:
                 reader.execute("BEGIN")
+                reader.execute("SELECT count(*) FROM sqlite_schema")  # (the snapshot starts at the first statement)
                 tables = sorted(reader.catalog.tables)
                 self.expected = self.dump(reader, tables)
                 if self.expected != self.dump(main, tables):
