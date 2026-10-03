@@ -682,6 +682,55 @@ def test_crash_during_an_auto_vacuum_commit(tmp_path, point, detail):
         assert connection.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
 
 
+# ---- generated columns ----------------------------------------------------------
+
+
+GENERATED_SETUP = """
+    CREATE TABLE g (id INTEGER PRIMARY KEY, a TEXT, n INT, v AS (upper(a) || n) VIRTUAL,
+                    s INT AS (n * 2) STORED, w AS (s + length(v)), tail);
+    CREATE INDEX gv ON g (v);
+    CREATE UNIQUE INDEX gs ON g (s, id);
+"""
+GENERATED_QUERIES = ["SELECT * FROM g ORDER BY id", "SELECT v, id FROM g ORDER BY v, id",
+                     "SELECT s FROM g WHERE s > 50 ORDER BY s", "SELECT count(*), sum(w) FROM g"]
+
+
+def test_generated_columns_written_by_sqlite(tmp_path):
+    path = str(tmp_path / "db")
+    with closing(lite(path)) as connection:
+        connection.executescript(GENERATED_SETUP)
+        connection.executemany("INSERT INTO g (a, n, tail) VALUES (?, ?, ?)",
+                               [(f"x{i}", i, "t" * (i % 7)) for i in range(300)])
+    with Database(path) as db:
+        same_results(path, db, GENERATED_QUERIES)
+        db.execute("INSERT INTO g (a, n) VALUES ('new', 1000)")
+        db.execute("UPDATE g SET n = n + 1 WHERE id % 3 = 0")
+        db.execute("DELETE FROM g WHERE id % 5 = 0")
+        db.execute("ALTER TABLE g ADD COLUMN extra AS (id || a)")
+        db.execute("CREATE INDEX ge ON g (extra)")
+        same_results(path, db, GENERATED_QUERIES + ["SELECT extra FROM g ORDER BY extra"])
+    assert integrity(path) == [("ok",)]
+    with closing(lite(path)) as connection:  # (sqlite3 reads the records MiniDB wrote)
+        assert connection.execute("SELECT v, s, w FROM g WHERE a = 'new'").fetchall() == [("NEW1000", 2000, 2007)]
+
+
+def test_generated_columns_written_by_minidb(tmp_path):
+    path = str(tmp_path / "db")
+    with Database(path, format="sqlite") as db:
+        for sql in GENERATED_SETUP.strip().split(";"):
+            db.execute(sql)
+        for i in range(300):
+            db.execute("INSERT INTO g (a, n, tail) VALUES (?, ?, ?)", (f"x{i}", i, "t" * (i % 7)))
+        db.execute("UPDATE g SET a = a || 'y' WHERE n > 250")
+    assert integrity(path) == [("ok",)]
+    with closing(lite(path)) as connection:
+        connection.execute("INSERT INTO g (a, n) VALUES ('lite', 7)")
+        connection.execute("DELETE FROM g WHERE n % 4 = 0")
+    with Database(path) as db:
+        same_results(path, db, GENERATED_QUERIES)
+        assert db.execute("PRAGMA integrity_check") == [("ok",)]
+
+
 # ---- what is not supported ------------------------------------------------------------
 
 

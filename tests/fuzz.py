@@ -79,6 +79,18 @@ class Table:
     def column_names(self):
         return [c[0] for c in self.columns]
 
+    def generated_unique(self):
+        """Whether a generated column is in a uniqueness constraint (an
+        UPDATE of any column may then run into it)."""
+        return any("AS (" in c[2] for c in self.columns if c[0] in self.unique_columns)
+
+    def writable_names(self, rng=None):
+        """The columns an INSERT or UPDATE may set: not the generated ones
+        (now and then those too, to see the error)."""
+        if rng is not None and rng.random() < 0.02:
+            return self.column_names()
+        return [c[0] for c in self.columns if "AS (" not in c[2]]
+
 
 class Generator:
     def __init__(self, seed):
@@ -121,6 +133,8 @@ class Generator:
             if i == 0 and rng.random() < 0.4 and self.tables:
                 constraint = (constraint + " " + self.references(name)).strip()
             columns.append((f"c{i}", col_type, constraint))
+        for i in range(rng.choice([0, 0, 0, 1, 2])):
+            columns.insert(rng.randint(1, len(columns)), self.generated_column(f"g{i}", columns))
         table = Table(name, columns, rowid_alias)
         self.tables.append(table)
         definitions = [" ".join(p for p in c if p) for c in columns]
@@ -134,6 +148,22 @@ class Generator:
         if rng.random() < 0.15:
             definitions.append(f"CHECK ({self.check(rng.choice(columns)[0])} OR c0 IS c1)")
         return f"CREATE TABLE {name} ({', '.join(definitions)})"
+
+    def generated_column(self, name, columns):
+        """A VIRTUAL or STORED generated column computed from the columns so far."""
+        rng = self.rng
+        names = [c[0] for c in columns]
+        a, b = rng.choice(names), rng.choice(names)
+        expr = rng.choice([
+            f"{a} || 'x'", f"{a} + 1", f"typeof({a})", f"coalesce({a}, {b})", f"length({b})", f"upper({a})",
+            f"{a} * 2", f"{a} IS NULL", f"abs({a})", f"{a} COLLATE nocase", f"CASE WHEN {a} > {b} THEN {a} END",
+            f"substr({a}, 2)", f"json_quote({a})", f"{a} = {b}", f"round({a}, 1)", f"{a}"])
+        col_type = rng.choice(["", "", "INTEGER", "TEXT", "REAL", "NUMERIC"])
+        kind = rng.choice(["", " VIRTUAL", " STORED"])
+        written = rng.choice(["AS", "GENERATED ALWAYS AS"])
+        constraint = rng.choice(["", "", "", " NOT NULL", " UNIQUE", f" CHECK ({self.check(name)})",
+                                 f" COLLATE {rng.choice(COLLATIONS)}"])
+        return (name, col_type, f"{written} ({expr}){kind}{constraint}")
 
     def references(self, name):
         """A foreign key to an earlier table (or this one): its row id alias
@@ -179,6 +209,10 @@ class Generator:
         """ALTER TABLE ADD COLUMN (old rows read the constant default)."""
         rng = self.rng
         table = rng.choice([t for t in self.tables if not t.derived])
+        if rng.random() < 0.15:
+            column = self.generated_column(f"c{len(table.columns)}", table.columns)
+            table.columns.append(column)
+            return f"ALTER TABLE {table.name} ADD COLUMN {' '.join(p for p in column if p)}"
         name = f"c{len(table.columns)}"
         col_type = rng.choice(["INTEGER", "TEXT", "REAL", ""])
         default = rng.choice(["", " DEFAULT 5", " DEFAULT 'y'", " DEFAULT -2.5", " NOT NULL DEFAULT 1"])
@@ -452,7 +486,7 @@ class Generator:
         excluded = Table("excluded", table.columns, None)
         excluded.derived = True  # no excluded.rowid
         scope = [(table.name, table), ("excluded", excluded)]
-        names = [c for c in table.column_names() if c != table.rowid_alias]
+        names = [c for c in table.writable_names(rng) if c != table.rowid_alias]
         assignments = [f"{c} = {self.expr(scope, 2, True)}"
                        for c in rng.sample(names, rng.randint(1, min(2, len(names))))]
         where = f" WHERE {self.expr(scope, 2)}" if rng.random() < 0.3 else ""
@@ -474,12 +508,13 @@ class Generator:
         rows = []
         verb = "REPLACE " if rng.random() < 0.05 else f"INSERT {self.conflict()}"
         if rng.random() < 0.5:
-            columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
+            writable = table.writable_names(rng)
+            columns = rng.sample(writable, rng.randint(1, len(writable)))
             if table.rowid_alias not in columns and rng.random() < 0.15:
                 columns.insert(rng.randint(0, len(columns)), "rowid")  # the row id by name
             prefix = f"{verb}INTO {table.name} ({', '.join(columns)}) VALUES "
         else:
-            columns = table.column_names()
+            columns = table.writable_names(rng)
             prefix = f"{verb}INTO {table.name} VALUES "
         for _ in range(rng.randint(1, 4)):
             values = []
@@ -502,7 +537,8 @@ class Generator:
         rng = self.rng
         source = rng.choice([t for t in self.tables if not t.derived])
         scope = [("s", source)]
-        columns = rng.sample(table.column_names(), rng.randint(1, len(table.columns)))
+        writable = table.writable_names(rng)
+        columns = rng.sample(writable, rng.randint(1, len(writable)))
         items = []
         for column in columns:
             if column == table.rowid_alias:
@@ -520,12 +556,12 @@ class Generator:
         rng = self.rng
         table = self.target()
         scope = [(table.name, table)]
-        names = [c for c in table.column_names() if c != table.rowid_alias]
+        names = [c for c in table.writable_names(rng) if c != table.rowid_alias]
         assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in rng.sample(names, rng.randint(1, len(names)))]
         where = self.condition(scope)
         if any(a.split(" = ")[0] in table.unique_columns for a in assignments) or any(
             "(SELECT" in a for a in assignments
-        ):
+        ) or table.generated_unique():
             # Which row goes first could decide a UNIQUE conflict, or what a
             # subquery over the table sees: one row only.
             where = f"rowid = {rng.randint(1, 40)}"
@@ -595,18 +631,20 @@ class Generator:
         kind = rng.random()
         target = rng.choice([t for t in self.tables if not t.derived])
         if kind < 0.45:
-            columns = rng.sample(target.column_names(), rng.randint(1, len(target.columns)))
+            writable = target.writable_names(rng)
+            columns = rng.sample(writable, rng.randint(1, len(writable)))
             values = [no_max_rowid(self.expr(rows, 2, True)) if c == target.rowid_alias else self.expr(rows, 2, True)
                       for c in columns]
             return f"INSERT {self.conflict()}INTO {target.name} ({', '.join(columns)}) VALUES ({', '.join(values)})"
         if kind < 0.65:
             scope = [(target.name, target)] + rows
-            names = [c for c in target.column_names() if c != target.rowid_alias]
+            names = [c for c in target.writable_names(rng) if c != target.rowid_alias]
             chosen = rng.sample(names, rng.randint(1, min(2, len(names))))
             assignments = [f"{c} = {self.expr(scope, 1, True)}" for c in chosen]
             where = self.condition(scope)
             conflict = self.conflict()
-            if conflict or any(c in target.unique_columns for c in chosen) or any("(SELECT" in a for a in assignments):
+            if conflict or any(c in target.unique_columns for c in chosen) or any(
+                    "(SELECT" in a for a in assignments) or target.generated_unique():
                 where = f"{target.name}.rowid = {rng.randint(1, 40)}"  # (one row: the order cannot matter)
             return f"UPDATE {conflict}{target.name} SET {', '.join(assignments)} WHERE {where}"
         if kind < 0.8:
@@ -1028,10 +1066,15 @@ class SnapshotReader:
 
 
 def parse_range(text):
-    if "-" in text:
-        start, end = text.split("-")
-        return range(int(start), int(end) + 1)
-    return [int(text)]
+    """Seeds as "N", "N-M" or a comma-separated list of those."""
+    seeds = []
+    for part in text.split(","):
+        if "-" in part:
+            start, end = part.split("-")
+            seeds.extend(range(int(start), int(end) + 1))
+        else:
+            seeds.append(int(part))
+    return seeds
 
 
 def main():

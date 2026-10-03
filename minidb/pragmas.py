@@ -110,10 +110,18 @@ def table_info(executor: Executor, name: object, extended: bool = False) -> list
     if table is not None:
         key = [ascii_lower(c.name) for c in table.primary_key.columns] if table.primary_key else []
         rows = []
-        for cid, column in enumerate(table.columns):
+        skipped = 0  # generated columns, which only table_xinfo shows (hidden 2: VIRTUAL, 3: STORED)
+        for i, column in enumerate(table.columns):
+            if column.generated is not None:
+                if not extended:
+                    skipped += 1
+                    continue
+                hidden = (3 if column.stored else 2,)
+            elif extended:
+                hidden = (0,)
             pk = key.index(ascii_lower(column.name)) + 1 if ascii_lower(column.name) in key else 0
-            rows.append((cid, column.name, declared_type(column), int(column.not_null), default_text(column), pk)
-                        + hidden)
+            rows.append((i - skipped, column.name, declared_type(column), int(column.not_null),
+                         default_text(column), pk) + hidden)
         return rows
     view = executor.catalog.find_view(name) if isinstance(name, str) else None
     if view is None:
