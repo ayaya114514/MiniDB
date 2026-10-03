@@ -146,7 +146,7 @@ ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。页大小 512–65536（`PRAGMA
 VACUUM 时生效，WAL 模式下不变）；支持 auto_vacuum（FULL / INCREMENTAL，`PRAGMA incremental_vacuum`）；只支持 UTF-8
 （UTF-16 的文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的对象（表达式索引、部分索引等）
 原样保留，用到时报 `NotSupportedError`。`WITHOUT ROWID` 表两种格式都支持（D119）。设计见 DECISIONS.md 的 D100。
-SQLite 格式下查询与 MiniDB 格式相差 10–45%，逐行插入慢 1.6–2.4 倍（benchmark 见 PROGRESS.md 阶段 20）。
+SQLite 格式下查询与 MiniDB 格式相差 20% 以内，逐行插入慢 1.1–1.3 倍，10 万行的文件 9.4 MB（sqlite3 9.3 MB；benchmark 见 PROGRESS.md 阶段 26）。
 
 ## 架构
 
@@ -251,17 +251,19 @@ sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest`
 
 | 操作 | MiniDB | sqlite3 |
 |---|---:|---:|
-| 插入 10 万行，每行一条 INSERT（`?` 参数），一个事务 | 0.98 s | 0.07 s |
-| 插入 10 万行，每行一条 INSERT（拼字面量），一个事务 | 2.7 s | 0.19 s |
-| 自动提交插入 1000 行（每行一次 commit + fsync） | 0.14 s | 0.2–0.4 s |
-| 1 万次主键点查（`?` 参数） | 0.11 s | 0.04 s |
-| 全表扫描 `count(*) WHERE age > 50` | 0.06 s | 0.002 s |
-| 全表扫描 `SELECT *` | 0.07 s | 0.04 s |
-| `GROUP BY city` 三个聚合 | 0.09 s | 0.03 s |
-| `ORDER BY age, name LIMIT 10` | 0.08 s | 0.003 s |
-| `CREATE INDEX` on age | 0.39 s | 0.02 s |
-| 10 万行与小表连接（每行一次索引查找） | 0.15 s | 0.006 s |
-| 10 万行与 200 行无索引表的等值连接（自动哈希） | 0.12 s | 0.01 s |
+| 插入 10 万行，每行一条 INSERT（`?` 参数），一个事务 | 1.1 s | 0.08 s |
+| 插入 10 万行，每行一条 INSERT（拼字面量），一个事务 | 3.5 s | 0.25 s |
+| 插入 10 万行，每条 INSERT 1000 行，一个事务 | 1.9 s | 0.07 s |
+| 自动提交插入 1000 行（每行一次 commit + fsync） | 0.15 s | 0.2 s |
+| 1 万次主键点查（`?` 参数） | 0.16 s | 0.04 s |
+| 全表扫描 `count(*) WHERE age > 50` | 0.07 s | 0.003 s |
+| 全表扫描 `SELECT *` | 0.08 s | 0.04 s |
+| `GROUP BY city` 三个聚合 | 0.11 s | 0.03 s |
+| `ORDER BY age, name LIMIT 10` | 0.09 s | 0.004 s |
+| `CREATE INDEX` on age | 0.42 s | 0.02 s |
+| 73 次索引等值计数（`count(*) WHERE age = ?`，每次约 1400 行） | 0.008 s | 0.002 s |
+| 10 万行与小表连接（自动哈希） | 0.17 s | 0.006 s |
+| 10 万行与 200 行无索引表的等值连接（自动哈希） | 0.13 s | 0.01 s |
 | 数据库文件大小 | 14.8 MB | 9.3 MB |
 
 纯 Python 实现，点查和提交接近 SQLite，扫描/聚合慢 3–25 倍（逐行求值的开销；运算符、循环和聚合已生成
