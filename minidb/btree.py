@@ -603,11 +603,12 @@ class BTree:
         if i == len(leaf.keys) or leaf.keys[i] != key:
             return False
         self.pager.write(leaf)
-        value, ref = leaf.values[i], leaf.key_refs[i]
+        # (The stored key may differ from an equal ``key``: 1 and 1.0.)
+        stored, value, ref = leaf.keys[i], leaf.values[i], leaf.key_refs[i]
         self._free_value(value)
         self._free_value(ref)
         del leaf.keys[i], leaf.values[i], leaf.key_refs[i]
-        leaf.size -= self._key_cell(key, ref) + value_cell_size(value)
+        leaf.size -= self._key_cell(stored, ref) + value_cell_size(value)
         self._rebalance(path, leaf)
         return True
 

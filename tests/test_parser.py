@@ -65,8 +65,9 @@ def test_constraints():
         KeyConstraint(True, [IndexedColumn("a")], name="x"), KeyConstraint(False, [IndexedColumn("b")])]
     with pytest.raises(OperationalError, match="expressions prohibited"):
         parse("create table t(a, unique(a + 1))")
-    with pytest.raises(NotSupportedError, match="WITHOUT ROWID"):
-        parse("create table t(a primary key) without rowid")
+    assert parse("create table t(a primary key) without rowid").without_rowid
+    with pytest.raises(NotSupportedError, match="STRICT"):
+        parse("create table t(a int primary key) without rowid, strict")
 
 
 def test_collate_operator():

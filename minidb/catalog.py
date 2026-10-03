@@ -43,6 +43,7 @@ from minidb.parser import (
     GENERATED_KEY_ERROR, CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateTrigger, CreateView, ForeignKey,
     KeyConstraint, Literal, Unary, parse,
 )
+from minidb.parser import Column as ColumnRef
 from minidb.record import decode_record, encode_record, encoded_size
 from minidb.values import SQLValue, ascii_lower
 
@@ -133,8 +134,14 @@ class TableInfo:
     temp = False  # in the connection's temp database (CREATE TEMP TABLE)
 
     def __init__(self, name: str, columns: list[ColumnDef], root: int, schema_key: int | None = None,
-                 constraints: Sequence[object] = (), sql: str | None = None) -> None:
+                 constraints: Sequence[object] = (), sql: str | None = None, without_rowid: bool = False) -> None:
         self.name = name
+        # WITHOUT ROWID: the rows are kept in the PRIMARY KEY's order, keyed
+        # by it (the "row id" of such a row is the tuple of its PRIMARY KEY
+        # sort keys); the table's tree is that of its PRIMARY KEY index.
+        self.without_rowid = without_rowid
+        self.has_rowid = not without_rowid
+        self.pk_index = None  # (WITHOUT ROWID: the IndexInfo of the PRIMARY KEY, see Catalog)
         self.columns = columns
         self.root = root
         self.schema_key = schema_key
@@ -155,10 +162,20 @@ class TableInfo:
         # is an ordinary column), and not for a column's PRIMARY KEY DESC.
         self.rowid_column = None
         key = self.primary_key
+        # (as SQLite's sqlite3AddPrimaryKey: an INTEGER PRIMARY KEY, which a
+        # WITHOUT ROWID table makes an ordinary column, its index last)
+        self.integer_key = None
         if key is not None and len(key.columns) == 1 and not (key.column_level and key.columns[0].descending):
             position = self.column_index(key.columns[0].name)
             if position is not None and columns[position].type == "INTEGER":
-                self.rowid_column = position
+                self.integer_key = position
+        if not without_rowid:
+            self.rowid_column = self.integer_key
+        elif key is not None:
+            for column in key.columns:  # (the PRIMARY KEY of a WITHOUT ROWID table is NOT NULL)
+                position = self.column_index(column.name)
+                if position is not None and not columns[position].not_null:
+                    columns[position].not_null = True
         self.autoincrement = self.rowid_column is not None and key.autoincrement
         self.compiled_checks = None  # (the executor's, see Executor.check_violation)
         self.collations = [values.collation_name(c.collation) if c.collation else "BINARY" for c in columns]
@@ -176,6 +193,7 @@ class TableInfo:
         self.virtual = [i for i in self.generated if not columns[i].stored]
         self.storage = [i for i, c in enumerate(columns) if c.generated is None or c.stored] if self.virtual else None
         self.fill_virtual = None  # (the executor's, see executor.expand_virtual)
+        self.fill_virtual_except = {}  # (likewise, with some VIRTUAL columns given)
         self.fill_generated = None  # (the executor's, see Executor.generate)
 
     def column_index(self, name: str) -> int | None:
@@ -192,7 +210,11 @@ class TableInfo:
         earlier index, and an ON CONFLICT clause goes to it).  ``check``:
         raise on conflicting ON CONFLICT clauses and unknown columns."""
         found = []
-        for key in self.keys:
+        keys = self.keys
+        if self.without_rowid and self.integer_key is not None:
+            # (SQLite makes the index of such a key last: convertToWithoutRowidTable)
+            keys = [k for k in keys if k is not self.primary_key] + [self.primary_key]
+        for key in keys:
             if key is self.primary_key and self.rowid_column is not None:
                 continue
             positions = []
@@ -203,8 +225,12 @@ class TableInfo:
                         return found  # (cannot happen in a schema SQLite wrote)
                     raise OperationalError(f"no such column: {column.name}")
                 positions.append(position)
-            collations = [values.collation_name(c.collation) if c.collation else self.collations[p]
-                          for c, p in zip(key.columns, positions)]
+            # (convertToWithoutRowidTable makes the index of an INTEGER
+            # PRIMARY KEY from the column's name: a COLLATE there is lost.)
+            written = [None] if key is self.primary_key and self.without_rowid and self.integer_key is not None \
+                else [c.collation for c in key.columns]
+            collations = [values.collation_name(c) if c else self.collations[p]
+                          for c, p in zip(written, positions)]
             for earlier in found:
                 if earlier.positions == positions and earlier.collations == collations:
                     if earlier.conflict != key.conflict and earlier.conflict is not None \
@@ -217,7 +243,7 @@ class TableInfo:
                     break
             else:
                 found.append(AutoIndex(positions, collations, [c.descending for c in key.columns],
-                                       key.conflict, key.primary, [c.collation for c in key.columns]))
+                                       key.conflict, key.primary, written))
         return found
 
     def validate(self) -> None:
@@ -232,8 +258,13 @@ class TableInfo:
             raise OperationalError(GENERATED_KEY_ERROR)
         if sum(k.primary for k in self.keys) > 1:
             raise OperationalError(f'table "{self.name}" has more than one primary key')
-        if any(k.autoincrement for k in self.keys) and not self.autoincrement:
+        if any(k.autoincrement for k in self.keys) and (self.integer_key is None or not self.primary_key.autoincrement):
             raise OperationalError("AUTOINCREMENT is only allowed on an INTEGER PRIMARY KEY")
+        if self.without_rowid:
+            if any(k.autoincrement for k in self.keys):
+                raise OperationalError("AUTOINCREMENT not allowed on WITHOUT ROWID tables")
+            if self.primary_key is None:
+                raise OperationalError(f"PRIMARY KEY missing on table {self.name}")
         self.auto_indexes(check=True)
         for key in self.foreign_keys:
             for name in key.columns:
@@ -285,8 +316,11 @@ class IndexInfo:
     def __init__(self, name: str, table: TableInfo, column_names: list[str], unique: bool, root: int,
                  schema_key: int | None = None, auto: bool = False, descending: list[bool] | None = None,
                  collations: list[str | None] | None = None, conflict: str | None = None,
-                 origin: str = "c", sql: str | None = None, declared: list[bool] | None = None) -> None:
+                 origin: str = "c", sql: str | None = None, declared: list[bool] | None = None,
+                 table_pk: bool = False) -> None:
         self.name = name
+        # The PRIMARY KEY of a WITHOUT ROWID table: its tree is the table's.
+        self.table_pk = table_pk
         self.auto = auto
         # DESC columns (kept only in SQLite-format files): the index is then
         # maintained in that order but not used for lookups or ordering.
@@ -306,7 +340,33 @@ class IndexInfo:
         # Each column's sort key function (values.collation_sort_key).
         self.key_functions = [values.collation_sort_key(c) for c in self.collations]
         self.collated = any(c != "BINARY" for c in self.collations)
-        self.codec = CollatedKeyCodec(self.key_functions) if self.collated else IndexKeyCodec
+        # A key ends with the row id - or, for a WITHOUT ROWID table, with
+        # the PRIMARY KEY columns the index does not have already (same
+        # column, same collation), in PRIMARY KEY order: ``extra`` lists their
+        # places in the table's key, ``pk_parts`` where each PRIMARY KEY
+        # column is in this index's key (SQLite's sqlite3CreateIndex).
+        self.extra, self.pk_parts = [], None
+        key_functions = self.key_functions
+        if table_pk:
+            self.pk_parts = list(range(len(self.positions)))
+        elif not table.has_rowid:
+            pk = table.pk_index
+            self.pk_parts = []
+            for j, (position, collation) in enumerate(zip(pk.positions, pk.collations)):
+                same = next((i for i, (p, c) in enumerate(zip(self.positions, self.collations))
+                             if p == position and c == collation), None)
+                if same is None:
+                    self.extra.append(j)
+                    same = len(self.positions) + len(self.extra) - 1
+                self.pk_parts.append(same)
+            key_functions = key_functions + [pk.key_functions[j] for j in self.extra]
+            self.collated = self.collated or any(pk.collations[j] != "BINARY" for j in self.extra)
+        self.codec = CollatedKeyCodec(key_functions) if self.collated else IndexKeyCodec
+        # A generated column that is just another column of REAL affinity
+        # holds that column's value as SQLite reads it when CREATE INDEX
+        # fills the index from the table: a whole REAL as an integer (unless
+        # the column is REAL itself).  Entries INSERT / UPDATE add keep the REAL.
+        self.raw_reals = [i for i, p in enumerate(self.positions) if _real_copy(table, p)]
         self.unique = unique
         self.conflict = conflict  # ON CONFLICT of its PRIMARY KEY or UNIQUE constraint
         self.origin = origin  # "c" (CREATE INDEX), "u" (UNIQUE) or "pk", as PRAGMA index_list says
@@ -325,14 +385,53 @@ class IndexInfo:
         """Whether the index tree is in the order of the keys (no DESC)."""
         return self.descending is None
 
-    def key(self, row: Sequence[SQLValue], rowid: int) -> IndexKey:
+    def build_key(self, row: Sequence[SQLValue], rowid: int | tuple) -> IndexKey:
+        """The key CREATE INDEX / REINDEX gives a row's entry (see raw_reals)."""
+        if self.raw_reals:
+            row = list(row)
+            for i in self.raw_reals:
+                value = row[self.positions[i]]
+                if isinstance(value, float) and value.is_integer() and -2**63 <= value < 2**63:
+                    row[self.positions[i]] = int(value)
+        return self.key(row, rowid)
+
+    def key(self, row: Sequence[SQLValue], rowid: int | tuple) -> IndexKey:
+        if self.pk_parts is not None:  # (WITHOUT ROWID: ``rowid`` is the PRIMARY KEY's key)
+            return self.prefix([row[p] for p in self.positions]) + tuple(rowid[j] for j in self.extra)
         if not self.collated:
             return index_key([row[p] for p in self.positions], rowid)
         return self.prefix([row[p] for p in self.positions]) + ((1, rowid),)
 
+    def row_id(self, key: IndexKey) -> int | tuple:
+        """The row id (WITHOUT ROWID: the PRIMARY KEY's key) of the row an
+        entry of this index stands for."""
+        if self.pk_parts is None:
+            return key[-1][1]
+        return tuple(key[i] for i in self.pk_parts)
+
+    @property
+    def entry_positions(self) -> list[int]:
+        """The table columns an entry holds (WITHOUT ROWID: with the PRIMARY KEY's)."""
+        if self.pk_parts is None:
+            return self.positions
+        return self.positions + [self.table.pk_index.positions[j] for j in self.extra]
+
     def prefix(self, key_values: Sequence[SQLValue]) -> IndexKey:
         """The start of the keys of entries with these values (in column order)."""
         return tuple(f(v) for f, v in zip(self.key_functions, key_values))
+
+
+def _real_copy(table: TableInfo, position: int) -> bool:
+    """Whether column ``position`` is VIRTUAL, generated as a copy of a REAL
+    column (``AS (r)`` or ``AS (+r)``) without REAL affinity of its own."""
+    expr = table.columns[position].generated
+    while isinstance(expr, Unary) and expr.op == "+":
+        expr = expr.operand
+    if (not isinstance(expr, ColumnRef) or table.affinities[position] == values.REAL
+            or table.columns[position].stored):
+        return False
+    source = table.column_index(expr.name)
+    return source is not None and table.affinities[source] == values.REAL
 
 
 def add_index(table: TableInfo, index: IndexInfo) -> None:
@@ -492,17 +591,27 @@ class Catalog:
             try:
                 if kind == "table":
                     stmt = parse(sql)
-                    self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key, stmt.constraints, sql)
+                    self.tables[ascii_lower(name)] = TableInfo(name, stmt.columns, root, key, stmt.constraints, sql,
+                                                               stmt.without_rowid)
                 elif kind == "view":
                     self.views[ascii_lower(name)] = ViewInfo(parse(sql), key)
             except Exception as exc:  # (only SQLite files can hold such SQL)
                 if not self.sqlite:
                     raise
                 self.unsupported[ascii_lower(name)] = f"{kind} {name}: {exc}"
+        # The PRIMARY KEY index of a WITHOUT ROWID table has no entry: it
+        # takes its place among the table's automatic indexes (by number).
+        pending = {table: self._make_pk_index(table) for table in self.tables.values() if not table.has_rowid}
         for kind, name, table_name, root, sql, key in entries:
             if kind not in ("index", "trigger"):
                 continue
             table = self.tables.get(ascii_lower(table_name))
+            if kind == "index" and table in pending:
+                prefix = self.auto_prefix + table.name + "_"
+                number = name[len(prefix):] if ascii_lower(name).startswith(ascii_lower(prefix)) else ""
+                if not number.isdigit() or int(number) > pending[table]:
+                    pending.pop(table)
+                    self._add_pk_index(table)
             if table is None and kind == "trigger" and (ascii_lower(table_name) in self.views or self.is_temp):
                 # (on a view; or a TEMP trigger on a table of the main database)
                 try:
@@ -543,6 +652,8 @@ class Catalog:
                 continue
             self.indexes[ascii_lower(name)] = index
             add_index(table, index)
+        for table in pending:
+            self._add_pk_index(table)
         if self.sqlite:
             self._load_sqlite_stats()
         for kind, name, _table_name, _root, sql, key in entries:
@@ -656,6 +767,15 @@ class Catalog:
             return self.temp.table_tree(table)
         if table.is_schema and not self.sqlite:
             return _SchemaRows(self)
+        if not table.has_rowid:
+            # Keyed by the PRIMARY KEY's sort keys: SQLite's format keeps the
+            # rows as the entries of that index (WithoutRowidTable); MiniDB's
+            # as the values of a tree keyed by them.
+            if self.sqlite:
+                from minidb.sqlite_btree import WithoutRowidTable
+
+                return WithoutRowidTable(self.index_tree(table.pk_index), table)
+            return BTree(self.pager, table.root, table.pk_index.codec)
         if self.sqlite:
             from minidb.sqlite_btree import SqliteTable
 
@@ -669,9 +789,24 @@ class Catalog:
         if self.sqlite:
             from minidb.sqlite_btree import SqliteIndex
 
-            return SqliteIndex(self.pager, index.root, index.descending,
-                               [index.table.affinities[p] for p in index.positions],
-                               index.key_functions if index.collated else None)
+            table = index.table
+            positions = index.entry_positions
+            descending = list(index.descending or [False] * len(index.positions))
+            if index.extra and not index.auto:
+                # CREATE INDEX keeps the order of the PRIMARY KEY's columns;
+                # a UNIQUE constraint's index has them ascending (SQLite's
+                # convertToWithoutRowidTable, its "bAscKeyBug").
+                pk = table.pk_index
+                descending += [bool(pk.descending and pk.descending[j]) for j in index.extra]
+            if index.table_pk:  # (its entries are the rows: the other stored columns follow)
+                stored = table.storage if table.storage is not None else range(len(table.columns))
+                rest = [p for p in stored if p not in positions]
+                positions, descending = positions + rest, descending + [False] * len(rest)
+            functions = index.codec.key_functions[:-1] if index.collated else None
+            return SqliteIndex(self.pager, index.root, descending if any(descending) else None,
+                               [table.affinities[p] for p in positions], functions, table.has_rowid)
+        if index.table_pk:
+            return self.table_tree(index.table)
         return BTree(self.pager, index.root, index.codec)
 
     def _new_tree(self, index: bool) -> int:
@@ -719,16 +854,20 @@ class Catalog:
         if self._exists(stmt.name, stmt.if_not_exists):
             return None
         self._check_new_name(stmt.name)
-        table = TableInfo(stmt.name, stmt.columns, 0, None, stmt.constraints, stmt.sql)
+        table = TableInfo(stmt.name, stmt.columns, 0, None, stmt.constraints, stmt.sql, stmt.without_rowid)
         table.validate()
         if check is not None:
             check(table)
         self.version += 1
-        table.root = root = self._new_tree(index=False)
+        table.root = root = self._new_tree(index=not table.has_rowid)
         table.schema_key = self._add_entry("table", table.name, table.name, root, table.sql)
         self._mark(table)
         self.tables[ascii_lower(stmt.name)] = table
+        pk_number = None if table.has_rowid else self._make_pk_index(table)
         for n, auto in enumerate(table.auto_indexes(), 1):
+            if n == pk_number:
+                self._add_pk_index(table)
+                continue
             name = f"{self.auto_prefix}{table.name}_{n}"
             columns = [table.columns[p].name for p in auto.positions]
             descending = auto.descending if self.sqlite else None
@@ -880,7 +1019,7 @@ class Catalog:
         self.check_writable(table, "dropped")
         for trigger in self.triggers_of(table):
             self._drop_trigger(trigger)
-        self._destroy_trees(list(table.indexes) + [table])
+        self._destroy_trees([i for i in table.indexes if not i.table_pk] + [table])
         for index in list(table.indexes):
             self._drop_index(index, destroy=False)
         if self.sqlite:
@@ -952,6 +1091,32 @@ class Catalog:
         add_index(table, index)
         return index
 
+    def _make_pk_index(self, table: TableInfo) -> int:
+        """Make the PRIMARY KEY index of a WITHOUT ROWID table (table.pk_index:
+        no tree or schema entry of its own - it is the table's); returns its
+        number among the table's automatic indexes, where _add_pk_index
+        puts it in the table's list (the other indexes' keys need it first)."""
+        number, auto = next((n, a) for n, a in enumerate(table.auto_indexes(), 1) if a.origin == "pk")
+        # (A column the PRIMARY KEY repeats with the same collation counts
+        # once: SQLite's convertToWithoutRowidTable.)
+        seen, kept = set(), []
+        for i, part in enumerate(zip(auto.positions, auto.collations)):
+            if part not in seen:
+                seen.add(part)
+                kept.append(i)
+        columns = [table.columns[auto.positions[i]].name for i in kept]
+        descending = [auto.descending[i] for i in kept]
+        table.pk_index = IndexInfo(f"{self.auto_prefix}{table.name}_{number}", table, columns, True, table.root,
+                                   None, True, descending if self.sqlite else None, [auto.written[i] for i in kept],
+                                   auto.conflict, auto.origin, declared=descending, table_pk=True)
+        self._mark(table.pk_index)
+        return number
+
+    def _add_pk_index(self, table: TableInfo) -> None:
+        index = table.pk_index
+        self.indexes[ascii_lower(index.name)] = index
+        add_index(table, index)
+
     def drop_index(self, name: str, if_exists: bool = False, schema: str | None = None) -> None:
         catalog = next((c for c in self.search(schema) if ascii_lower(name) in c.indexes), None)
         if catalog is None:
@@ -971,7 +1136,8 @@ class Catalog:
             self._delete_sqlite_stats(index.table.name, index.name)
         if destroy:
             self._destroy_trees([index])
-        self.schema.delete(index.schema_key)
+        if index.schema_key is not None:  # (a WITHOUT ROWID table's PRIMARY KEY has none)
+            self.schema.delete(index.schema_key)
         if index.stat_key is not None:
             self.schema.delete(index.stat_key)
         del self.indexes[ascii_lower(index.name)]
@@ -988,6 +1154,8 @@ class Catalog:
         self.schema.insert(table.schema_key, encode_record(
             ["table", table.name, table.name, table.root, table.sql]), replace=True)
         for index in table.indexes:
+            if index.schema_key is None:
+                continue
             self.schema.insert(index.schema_key, encode_record(
                 ["index", index.name, table.name, index.root, index.sql]), replace=True)
             if index.stat_key is not None:
@@ -1059,8 +1227,9 @@ class Catalog:
             for index in table.indexes:
                 distinct = [0] * len(index.positions)
                 previous = None
+                width = len(index.positions)
                 for key in self.index_tree(index).keys():
-                    values = key[:-1]  # without the row id
+                    values = key[:width]  # (not the row id, or the PRIMARY KEY's columns)
                     for depth in range(len(values)):
                         if previous is None or previous[:depth + 1] != values[:depth + 1]:
                             distinct[depth] += 1
@@ -1088,6 +1257,8 @@ class Catalog:
                 continue
             table.stat_rows = int(numbers[0])
             index = self.indexes.get(ascii_lower(str(index_name))) if index_name is not None else None
+            if index is None and not table.has_rowid and ascii_lower(str(index_name)) == ascii_lower(table.name):
+                index = table.pk_index  # (named after its table)
             if index is not None and index.table is table:
                 index.stat_average = numbers[1:]
 
@@ -1152,13 +1323,13 @@ class Catalog:
             for index in table.indexes if only is None else [only]:
                 distinct, previous = [0] * len(index.positions), None
                 for key in self.index_tree(index).keys():
-                    key = key[:-1]  # without the row id
+                    key = key[:len(index.positions)]  # (not the row id, or the PRIMARY KEY's columns)
                     for depth in range(len(key)):
                         if previous is None or previous[:depth + 1] != key[:depth + 1]:
                             distinct[depth] += 1
                     previous = key
                 averages = [(rows + d - 1) // d if d else rows for d in distinct]
-                add(table.name, index.name, [rows] + averages)
+                add(table.name, table.name if index.table_pk else index.name, [rows] + averages)
                 index.stat_average = [float(a) for a in averages]
 
     def _set_stat(self, owner: TableInfo | IndexInfo, name: str, numbers: list[int | float]) -> None:

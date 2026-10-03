@@ -439,7 +439,7 @@ class ForeignKeys:
         else:
             index, prefix = lookup
             tree = catalog.table_tree(child)
-            rowids = sorted(key[-1][1] for key, _ in catalog.index_tree(index).scan(prefix, prefix + (HIGH,)))
+            rowids = sorted(index.row_id(key) for key, _ in catalog.index_tree(index).scan(prefix, prefix + (HIGH,)))
             candidates = ((rowid, tree.get(rowid)) for rowid in rowids)
         found = []
         for rowid, record in candidates:

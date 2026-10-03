@@ -27,6 +27,8 @@
 - 排序规则 BINARY / NOCASE / RTRIM：比较、`ORDER BY`、`GROUP BY` / `DISTINCT`、索引。
 - 生成列 `[GENERATED ALWAYS] AS (...) [VIRTUAL | STORED]`：可建索引、带 NOT NULL / UNIQUE / CHECK / COLLATE，
   `ALTER TABLE ADD COLUMN` 可加 VIRTUAL 列；记录里只存 STORED 列（与 SQLite 的文件格式一致）。
+- `WITHOUT ROWID` 表：多列 / DESC 主键、二级索引、UPSERT / REPLACE、外键、触发器、ALTER TABLE；SQLite 格式里与
+  sqlite3 互相读写（MiniDB 自己的格式里 DESC 主键按升序存）。
 - PRAGMA：`table_info` / `table_xinfo`、`index_list` / `index_info` / `index_xinfo`、`foreign_key_list`、
   `foreign_key_check`、`integrity_check` / `quick_check`、`user_version`、`application_id`、`schema_version`、
   `page_size` / `page_count` / `freelist_count`、`journal_mode` 等，以及表值函数形式 `pragma_xxx(...)`。
@@ -138,7 +140,7 @@ db = minidb.Database("app.sqlite", format="sqlite")   # 或 minidb.connect("app.
 所以另一个进程里的 sqlite3 可以同时打开同一个文件。ANALYZE 写 `sqlite_stat1`，VACUUM 照 SQLite。页大小 512–65536
 （`PRAGMA page_size` 对新库立即生效、对已有的库在下一次 VACUUM 时生效）；支持 auto_vacuum（FULL / INCREMENTAL，`PRAGMA incremental_vacuum`）；只支持 UTF-8、非 WAL 模式
 （其他文件会明确拒绝并说明怎样用 sqlite3 转换）；SQLite 写下而 MiniDB 不支持的
-对象（表达式索引、部分索引、`WITHOUT ROWID` 表等）原样保留，用到时报 `NotSupportedError`。设计见 DECISIONS.md 的 D100。
+对象（表达式索引、部分索引等）原样保留，用到时报 `NotSupportedError`。`WITHOUT ROWID` 表两种格式都支持（D119）。设计见 DECISIONS.md 的 D100。
 SQLite 格式下查询与 MiniDB 格式相差 10–45%，逐行插入慢 1.6–2.4 倍（benchmark 见 PROGRESS.md 阶段 20）。
 
 ## 架构
@@ -263,7 +265,7 @@ Python 源码编译执行，见 DECISIONS.md D90）。
 
 ## 已知限制
 
-- 不支持 `ATTACH`、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`WITHOUT ROWID`、`STRICT`、
+- 不支持 `ATTACH`、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`STRICT`、
   表达式索引和部分索引、`UPDATE ... FROM`；`localtime` 修饰符只在一个时区的机器上对照过。
 - 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、

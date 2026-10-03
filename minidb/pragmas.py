@@ -171,6 +171,10 @@ def index_info(executor: Executor, name: object, extended: bool = False) -> list
     index = next((c.indexes[ascii_lower(name)] for c in executor.catalog.search(executor.pragma_schema)
                   if ascii_lower(name) in c.indexes), None) if isinstance(name, str) else None
     if index is None:
+        # (a WITHOUT ROWID table's name stands for its PRIMARY KEY index)
+        table = _table(executor, name)
+        index = table.pk_index if table is not None and not table.has_rowid else None
+    if index is None:
         return []
     rows = []
     for seq, (position, column_name) in enumerate(zip(index.positions, index.column_names)):
@@ -179,8 +183,20 @@ def index_info(executor: Executor, name: object, extended: bool = False) -> list
                          index.collation_names[seq], 1))
         else:
             rows.append((seq, position, column_name))
-    if extended:
-        rows.append((len(rows), -1, None, 0, "BINARY", 0))
+    if not extended:
+        return rows
+    table = index.table
+    if index.table_pk:  # (then the other stored columns: its entries are the rows)
+        stored = table.storage if table.storage is not None else range(len(table.columns))
+        extra = [(p, 0, table.columns[p].collation or "BINARY") for p in stored if p not in index.positions]
+    elif not table.has_rowid:  # (then the PRIMARY KEY's columns it does not have)
+        pk = table.pk_index
+        extra = [(pk.positions[j], int(pk.declared_descending[j] and not index.auto), pk.collation_names[j])
+                 for j in index.extra]  # (a UNIQUE constraint's index: ascending, see Catalog.index_tree)
+    else:
+        return rows + [(len(rows), -1, None, 0, "BINARY", 0)]
+    for position, descending, collation in extra:
+        rows.append((len(rows), position, table.columns[position].name, descending, collation, 0))
     return rows
 
 
@@ -205,7 +221,7 @@ def table_list(executor: Executor, name: object = None) -> list[tuple]:
                      key=lambda o: o.schema_key or 0, reverse=True)
     for item in objects:
         if isinstance(item, TableInfo):
-            rows.append(("main", item.name, "table", len(item.columns), 0, 0))
+            rows.append(("main", item.name, "table", len(item.columns), int(not item.has_rowid), 0))
         else:
             rows.append(("main", item.name, "view", _view_width(executor, item), 0, 0))
     rows.append(("main", "sqlite_schema", "table", 5, 0, 0))
@@ -214,7 +230,7 @@ def table_list(executor: Executor, name: object = None) -> list[tuple]:
                                              key=lambda o: o.schema_key or 0, reverse=True)
     for item in objects:
         if isinstance(item, TableInfo):
-            rows.append(("temp", item.name, "table", len(item.columns), 0, 0))
+            rows.append(("temp", item.name, "table", len(item.columns), int(not item.has_rowid), 0))
         else:
             rows.append(("temp", item.name, "view", _view_width(executor, item), 0, 0))
     rows.append(("temp", "sqlite_temp_schema", "table", 5, 0, 0))

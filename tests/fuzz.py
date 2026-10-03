@@ -76,6 +76,23 @@ class Table:
         self.unique_targets = [(c[0],) for c in columns if "UNIQUE" in c[2] or "PRIMARY KEY" in c[2]]
         self.derived = False  # a subquery in FROM (no rowid)
         self.schema = "main"  # or "temp" (CREATE TEMP TABLE)
+        self.key_columns = None  # WITHOUT ROWID: its PRIMARY KEY columns (it has no rowid)
+
+    @property
+    def has_rowid(self):
+        return self.key_columns is None and not self.derived
+
+    def key_sql(self, alias=""):
+        """What identifies a row: rowid, or the PRIMARY KEY's columns."""
+        prefix = f"{alias}." if alias else ""
+        return f"{prefix}rowid" if self.key_columns is None else ", ".join(prefix + c for c in self.key_columns)
+
+    def one_row(self, rng, alias=""):
+        """A condition that at most one row meets (by its row id or PRIMARY KEY)."""
+        prefix = f"{alias}." if alias else ""
+        if self.key_columns is None:
+            return f"{prefix}rowid = {rng.randint(1, 40)}"
+        return " AND ".join(f"{prefix}{c} = {rng.randint(-2, 6)}" for c in self.key_columns)
 
     def column_names(self):
         return [c[0] for c in self.columns]
@@ -143,6 +160,22 @@ class Generator:
             table.schema = "temp"
             temp = rng.choice(["TEMP ", "TEMPORARY ", "temp."])
         definitions = [" ".join(p for p in c if p) for c in columns]
+        options = ""
+        if rng.random() < 0.2:
+            # WITHOUT ROWID: id INTEGER PRIMARY KEY becomes an ordinary key, or
+            # a PRIMARY KEY over one or two columns (with a collation, DESC).
+            options = " WITHOUT ROWID"
+            table.rowid_alias = None
+            if rowid_alias:
+                table.key_columns = ["id"]
+            else:
+                plain = [c[0] for c in columns if "AS (" not in c[2]]
+                table.key_columns = rng.sample(plain, rng.randint(1, min(2, len(plain))))
+                written = [c + (f" COLLATE {rng.choice(COLLATIONS)}" if rng.random() < 0.2 else "")
+                           + (" DESC" if rng.random() < 0.2 else "") for c in table.key_columns]
+                definitions.append(f"PRIMARY KEY ({', '.join(written)})")
+            table.unique_columns.update(table.key_columns)
+            table.unique_targets.append(tuple(table.key_columns))
         if rng.random() < 0.15:
             pair = rng.sample([c[0] for c in columns[-2:]], 2)
             collate = f" COLLATE {rng.choice(COLLATIONS)}" if rng.random() < 0.3 else ""
@@ -153,8 +186,8 @@ class Generator:
         if rng.random() < 0.15:
             definitions.append(f"CHECK ({self.check(rng.choice(columns)[0])} OR c0 IS c1)")
         if temp == "temp.":
-            return f"CREATE TABLE temp.{name} ({', '.join(definitions)})"
-        return f"CREATE {temp}TABLE {name} ({', '.join(definitions)})"
+            return f"CREATE TABLE temp.{name} ({', '.join(definitions)}){options}"
+        return f"CREATE {temp}TABLE {name} ({', '.join(definitions)}){options}"
 
     def create_table_as(self):
         """CREATE [TEMP] TABLE ... AS SELECT some columns of a table (in row
@@ -169,7 +202,7 @@ class Generator:
             table.schema, temp = "temp", "TEMP "
         where = f" WHERE {self.condition([('s', source)])}" if rng.random() < 0.5 else ""
         return (f"CREATE {temp}TABLE {table.name} AS SELECT {', '.join(columns)} FROM {source.name} AS s{where} "
-                f"ORDER BY s.rowid")
+                f"ORDER BY {source.key_sql('s')}")
 
     def from_name(self, table):
         """A table's name in FROM, now and then with its schema."""
@@ -296,7 +329,7 @@ class Generator:
 
     def column(self, scope):
         alias, table = self.rng.choice(scope)
-        rowid = ["rowid"] if table.rowid_alias is None and not table.derived else []
+        rowid = ["rowid"] if table.rowid_alias is None and table.has_rowid else []
         name = self.rng.choice(table.column_names() + rowid)
         return f"{alias}.{name}" if len(scope) > 1 or self.qualify else name
 
@@ -538,8 +571,11 @@ class Generator:
         if rng.random() < 0.5:
             writable = table.writable_names(rng)
             columns = rng.sample(writable, rng.randint(1, len(writable)))
-            if table.rowid_alias not in columns and rng.random() < 0.15:
+            if table.rowid_alias not in columns and table.has_rowid and rng.random() < 0.15:
                 columns.insert(rng.randint(0, len(columns)), "rowid")  # the row id by name
+            for key in table.key_columns or ():
+                if key not in columns and rng.random() < 0.9:  # (a WITHOUT ROWID table's key is NOT NULL)
+                    columns.insert(rng.randint(0, len(columns)), key)
             prefix = f"{verb}INTO {table.name} ({', '.join(columns)}) VALUES "
         else:
             columns = table.writable_names(rng)
@@ -576,7 +612,7 @@ class Generator:
             else:
                 items.append(self.expr(scope, 2, True))
         where = f" WHERE {self.condition(scope)}" if rng.random() < 0.6 else ""
-        order = ", ".join([str(i + 1) for i in range(len(items))] + ["s.rowid"])
+        order = ", ".join([str(i + 1) for i in range(len(items))] + [source.key_sql("s")])
         return (f"INSERT {self.conflict()}INTO {table.name} ({', '.join(columns)}) SELECT {', '.join(items)} "
                 f"FROM {source.name} AS s{where} ORDER BY {order} LIMIT {rng.randint(0, 6)}")
 
@@ -592,7 +628,7 @@ class Generator:
         ) or table.generated_unique():
             # Which row goes first could decide a UNIQUE conflict, or what a
             # subquery over the table sees: one row only.
-            where = f"rowid = {rng.randint(1, 40)}"
+            where = table.one_row(rng)
         if table.rowid_alias and rng.random() < 0.15:
             # Changing the row id: keep it to one row so the processing order cannot matter.
             assignments = [f"id = {rng.randint(-5, 60)}"]
@@ -600,7 +636,7 @@ class Generator:
         conflict = self.conflict()
         if conflict:
             # IGNORE / REPLACE / FAIL outcomes depend on which row goes first.
-            where = f"rowid = {rng.randint(1, 40)}"
+            where = table.one_row(rng)
         return f"UPDATE {conflict}{table.name} SET {', '.join(assignments)} WHERE {where}{self.returning(table)}"
 
     def delete(self):
@@ -673,7 +709,7 @@ class Generator:
             conflict = self.conflict()
             if conflict or any(c in target.unique_columns for c in chosen) or any(
                     "(SELECT" in a for a in assignments) or target.generated_unique():
-                where = f"{target.name}.rowid = {rng.randint(1, 40)}"  # (one row: the order cannot matter)
+                where = target.one_row(rng, target.name)  # (one row: the order cannot matter)
             return f"UPDATE {conflict}{target.name} SET {', '.join(assignments)} WHERE {where}"
         if kind < 0.8:
             return f"DELETE FROM {target.name} WHERE {self.condition([(target.name, target)] + rows)}"
@@ -816,12 +852,16 @@ class Generator:
         bounds = ["UNBOUNDED PRECEDING", "1 PRECEDING", "CURRENT ROW", "2 FOLLOWING", "UNBOUNDED FOLLOWING"]
         i = rng.randrange(len(bounds) - 1)
         start, end = bounds[i], bounds[rng.randrange(max(i, 1), len(bounds))]
+        table = scope[0][1]
+        key = table.key_sql()
+        if unit == "RANGE" and ("1 " in start or "2 " in end) and not table.has_rowid:
+            unit = "ROWS"  # (an offset needs one ORDER BY term: the row id)
         if unit == "RANGE" and ("1 " in start or "2 " in end):
             parts.append(f"ORDER BY rowid{rng.choice(['', ' DESC'])}")
         elif rng.random() < 0.85:
-            parts.append(f"ORDER BY {self.expr(scope, 2)}{rng.choice(['', ' DESC'])}, rowid")
+            parts.append(f"ORDER BY {self.expr(scope, 2)}{rng.choice(['', ' DESC'])}, {key}")
         else:
-            parts.append("ORDER BY rowid")
+            parts.append(f"ORDER BY {key}")
         if unit:
             frame = f"{unit} BETWEEN {start} AND {end}"
             if rng.random() < 0.2:
@@ -962,6 +1002,11 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
                 snapshots.step(history)
         if snapshots is not None:
             snapshots.finish()
+        if pair.lite.execute("PRAGMA integrity_check").fetchall() != [("ok",)]:
+            # SQLite's own database is corrupt (an UPDATE whose generated
+            # column reads a REAL-affinity value before it is stored as an
+            # integer); MiniDB's matches it, the checks below cannot hold.
+            return None
         if format == "sqlite" and path is not None:
             check_sqlite_file(pair, path)
         if format == "sqlite":
@@ -976,6 +1021,19 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
             snapshots.reader.close()
         pair.close()
     return None
+
+
+def dump_query(connection, name):
+    """A query for every row of a table in a fixed order: by row id, or a
+    WITHOUT ROWID table's by its PRIMARY KEY."""
+    def rows(sql):
+        result = connection.execute(sql)
+        return result.fetchall() if hasattr(result, "fetchall") else result
+    without_rowid = rows(f"SELECT wr FROM pragma_table_list WHERE name = '{name}'") == [(1,)]
+    if not without_rowid:
+        return f'SELECT rowid, * FROM "{name}" ORDER BY rowid'
+    key = [r[0] for r in rows(f"SELECT name FROM pragma_table_info('{name}') WHERE pk > 0 ORDER BY pk")]
+    return f'SELECT * FROM "{name}" ORDER BY ' + ", ".join(f'"{c}"' for c in key)
 
 
 def check_sqlite_file(pair, path):
@@ -1000,7 +1058,7 @@ def check_sqlite_file(pair, path):
         if mine != tables:
             raise AssertionError(f"tables in MiniDB's file: {mine}, in sqlite3's: {tables}")
         for name in tables:
-            query = f'SELECT rowid, * FROM "{name}" ORDER BY rowid'
+            query = dump_query(pair.lite, name)
             expected, found = pair.lite.execute(query).fetchall(), other.execute(query).fetchall()
             if [sqlcompare_loose(r) for r in found] != [sqlcompare_loose(r) for r in expected]:
                 raise AssertionError(f"table {name} differs when sqlite3 reads MiniDB's file:\n"
@@ -1035,7 +1093,7 @@ def check_images(pair):
         if problems:
             raise AssertionError(f"MiniDB's integrity_check after deserialize() of sqlite3's image: {problems[:5]}")
         for name in tables:
-            query = f'SELECT rowid, * FROM "{name}" ORDER BY rowid'
+            query = dump_query(pair.lite, name)
             expected = [sqlcompare_loose(r) for r in pair.lite.execute(query).fetchall()]
             for who, rows in (("sqlite3 reading MiniDB's image", other.execute(query).fetchall()),
                               ("MiniDB reading sqlite3's image", list(copy.execute(query)))):
@@ -1069,7 +1127,7 @@ class SnapshotReader:
         self.expected = None  # the reader's snapshot, while it holds one
 
     def dump(self, db, tables):
-        return {name: db.execute(f"SELECT * FROM {name} ORDER BY rowid") for name in tables}
+        return {name: db.execute(dump_query(db, name).replace("SELECT rowid, *", "SELECT *")) for name in tables}
 
     def step(self, history):
         rng, main, reader = self.rng, self.main, self.reader
