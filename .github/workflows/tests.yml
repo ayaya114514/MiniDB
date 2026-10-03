@@ -70,6 +70,13 @@ jobs:
         run: |
           start=$((100000 + GITHUB_RUN_NUMBER * 200))
           python tests/fuzz.py --seeds "$start-$((start + 199))" --statements 400
+      - name: Power failures on SQLite-format files (lost, kept and torn writes; journal and WAL)
+        run: |
+          python tests/crash_fuzz.py --seeds 0-99
+          python tests/crash_fuzz.py --wal --seeds 0-99
+          start=$((100000 + GITHUB_RUN_NUMBER * 50))
+          python tests/crash_fuzz.py --seeds "$start-$((start + 49))"
+          python tests/crash_fuzz.py --wal --seeds "$start-$((start + 49))"
       - name: Metamorphic testing, TLP and NoREC (no reference database)
         run: |
           python tests/metamorphic.py --seeds 0-199 --queries 300

@@ -15,8 +15,9 @@ after the other, and (on POSIX) even at the same time:
   file, the original content of every page it changes (that existed) goes
   to the journal - SQLite's header (magic, page count, checksum seed,
   original size, sector and page size) and records (page number, page,
-  checksum of every 200th byte) - and is fsynced; then the pages are
-  written and fsynced, and the journal is deleted.  A journal left by a
+  checksum of every 200th byte) - and is fsynced, then its record count
+  (0 until then) is written and fsynced, as SQLite's syncJournal; then the
+  pages are written and fsynced, and the journal is deleted.  A journal left by a
   crash ("hot": present, valid, and no one holding RESERVED) is played back
   by whoever opens the database next - MiniDB or SQLite.
 * pages: of the size the header says (512-65536 bytes; 4096 for a new
@@ -987,7 +988,11 @@ class SqlitePager(PageCache):
         for pgno in pgnos:
             data = self.io.read((pgno - 1) * size, size)
             records.append(_u32.pack(pgno) + data + _u32.pack(page_checksum(seed, data)))
-        header = _journal_header.pack(JOURNAL_MAGIC, len(records), seed, self.original_pages, SECTOR_SIZE, size)
+        # As SQLite's syncJournal (synchronous=FULL): the header says 0
+        # records until the records are on the disk, so a power failure
+        # before that leaves a journal that rolls nothing back - not torn
+        # records that might pass the (sampling) checksum.
+        header = _journal_header.pack(JOURNAL_MAGIC, 0, seed, self.original_pages, SECTOR_SIZE, size)
         with open(self.journal_path, "wb", buffering=0) as journal:
             self._crash_point("journal_header")
             journal.write(header.ljust(SECTOR_SIZE, b"\x00"))
@@ -995,6 +1000,11 @@ class SqlitePager(PageCache):
                 self._crash_point("journal_page", i)
                 journal.write(data)
             self._crash_point("journal_sync")
+            os.fsync(journal.fileno())
+            journal.seek(0)
+            journal.write(_journal_header.pack(JOURNAL_MAGIC, len(records), seed, self.original_pages,
+                                               SECTOR_SIZE, size))
+            self._crash_point("journal_count")
             os.fsync(journal.fileno())
         fsync_directory(self.journal_path)
 

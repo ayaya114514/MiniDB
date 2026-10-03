@@ -307,7 +307,7 @@ def test_analyze_and_vacuum_match_sqlite(tmp_path):
 
 
 @pytest.mark.parametrize("point, detail", [
-    ("journal_header", None), ("journal_page", 1), ("journal_sync", None),
+    ("journal_header", None), ("journal_page", 1), ("journal_sync", None), ("journal_count", None),
     ("db_page", 0), ("db_page", 3), ("db_sync", None), ("journal_delete", None),
 ])
 @pytest.mark.parametrize("recovered_by", ["sqlite", "minidb"])
