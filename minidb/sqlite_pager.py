@@ -30,9 +30,15 @@ after the other, and (on POSIX) even at the same time:
   file; a FULL database moves pages from the end into free pages and
   shrinks at every commit, an INCREMENTAL one on PRAGMA incremental_vacuum.
 
-Not supported (refused when opening): WAL mode, UTF-16, reserved bytes at
-the end of pages.  Large transactions keep every changed page in memory (no
-spilling, unlike MiniDB's own format).
+* WAL mode (``PRAGMA journal_mode = WAL``, or a file sqlite3 left in it -
+  header bytes 18 and 19 are 2, or ``<db>-wal`` exists): commits append
+  frames to SQLite's ``<db>-wal`` and its wal-index ``<db>-shm`` instead
+  (``minidb.sqlite_wal``); the connection holds SHARED on the database file
+  for as long as it is open, pages come from the log as of its snapshot.
+
+Not supported (refused when opening): UTF-16, reserved bytes at the end of
+pages.  Large transactions keep every changed page in memory (no spilling,
+unlike MiniDB's own format).
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from minidb.sqlite_format import (
     PTRMAP_OVERFLOW2, PTRMAP_ROOTPAGE, TABLE_LEAF, BtreePage, DbHeader, FreePage, Geometry, OverflowPage,
     PtrmapPage, TrunkPage, corrupt, valid_page_size,
 )
+from minidb.sqlite_wal import SqliteWal
 
 PENDING, RESERVED, SHARED = 0, 1, 2  # lock numbers (see SPANS)
 SPANS = {PENDING: (PENDING_BYTE, 1), RESERVED: (PENDING_BYTE + 1, 1), SHARED: (PENDING_BYTE + 2, 510)}
@@ -116,6 +123,22 @@ class SqliteLocks:
         if not self.reserved and self.file.try_lock(self, RESERVED, True):
             self.reserved = True
         return self.reserved
+
+    def try_exclusive(self) -> bool:
+        """RESERVED, PENDING and EXCLUSIVE without waiting (we hold SHARED);
+        on failure what was taken here is let go."""
+        had_reserved = self.reserved
+        if not self.try_reserve():
+            return False
+        file = self.file
+        if file.try_lock(self, PENDING, True):
+            if file.try_lock(self, SHARED, True):
+                self.exclusive = True
+                return True
+            file.unlock(self, PENDING)
+        if not had_reserved:
+            self.release_reserved()
+        return False
 
     def reserved_by_other(self) -> bool:
         return not self.reserved and self.file.held_by_others(self, RESERVED)
@@ -193,8 +216,7 @@ class SqlitePager(PageCache):
     read transaction, like ``Pager``."""
 
     format = "sqlite"
-    committed = 0  # no log: Database's checkpoint condition never fires
-    checkpoint_frames = 1 << 62
+    autocheckpoint = 1000  # PRAGMA wal_autocheckpoint (frames)
 
     def __init__(self, path: str | None = None, timeout: float = 5.0, image: bytes = b"",
                  page_size: int = DEFAULT_PAGE_SIZE) -> None:
@@ -216,6 +238,9 @@ class SqlitePager(PageCache):
         self.fresh = False  # this connection created the database and nothing was written since
         self.resized_from = None  # the geometry before this transaction changed the page size
         self.next_auto_vacuum = None  # PRAGMA auto_vacuum on an existing database: for the next VACUUM
+        self.timeout = timeout
+        self.wal = None  # in WAL mode: the log (SqliteWal)
+        self.leaving_wal = False  # (set_wal_mode: header bytes 18-19 still say WAL)
         if path is None:
             self.locks = None
             self.io = _MemoryFile(image)
@@ -238,6 +263,15 @@ class SqlitePager(PageCache):
         return self.header.page_count
 
     @property
+    def committed(self) -> int:
+        """The frames in the log (Database checkpoints at checkpoint_frames)."""
+        return self.wal.header.max_frame if self.wal is not None and self.wal.header is not None else 0
+
+    @property
+    def checkpoint_frames(self) -> int:
+        return self.autocheckpoint if self.wal is not None and self.autocheckpoint > 0 else 1 << 62
+
+    @property
     def closed(self) -> bool:
         return self.locks is not None and self.locks.closed
 
@@ -248,14 +282,21 @@ class SqlitePager(PageCache):
     def _file_size(self) -> int:
         return self.io.size()
 
-    def _read_header(self) -> DbHeader | None:
-        data = self.io.read(0, HEADER_SIZE)
+    def _read_header(self, data: bytes | None = None) -> DbHeader | None:
+        """The database header (``data``: its bytes, read already)."""
+        if data is None and self.wal is not None:
+            data = self.wal.read_page(1)
+        if data is None:
+            data = self.io.read(0, HEADER_SIZE)
         if len(data) == 0:
             return None
         if len(data) < HEADER_SIZE:
             raise DatabaseError("file is not a database")
-        header = DbHeader(data)
-        header.check(self._file_size())
+        header = DbHeader(data[:HEADER_SIZE])
+        file_size = self._file_size()
+        if self.wal is not None and self.wal.database_pages:
+            file_size = self.wal.database_pages * header.page_size
+        header.check(file_size)
         return header
 
     def get(self, pgno: int, page_class: Any) -> Any:
@@ -265,7 +306,9 @@ class SqlitePager(PageCache):
             if not 1 <= pgno <= self.header.page_count or pgno == geometry.lock_page:
                 raise corrupt(f"page {pgno} out of range")
             size = geometry.page_size
-            data = self.io.read((pgno - 1) * size, size)
+            data = self.wal.read_page(pgno) if self.wal is not None else None
+            if data is None:
+                data = self.io.read((pgno - 1) * size, size)
             if len(data) != size:
                 raise corrupt(f"short read of page {pgno}")
             try:
@@ -651,6 +694,10 @@ class SqlitePager(PageCache):
 
     def note_schema_change(self) -> None:
         self.schema_changed = True
+        if self.header.schema_format == 0:  # (an empty database: as sqlite3StartTable, format 4 and UTF-8)
+            self.write(self.header)
+            self.header.schema_format = 4
+            self.header.encoding = self.header.encoding or 1
 
     # ---- transactions ---------------------------------------------------------------
 
@@ -659,11 +706,19 @@ class SqlitePager(PageCache):
         if the cache was dropped because the database changed."""
         if self.dirty - {0} and not self.is_new:  # (a new database: header and page 1)
             raise AssertionError("begin_read() inside a transaction with changes")
+        log_changed = False
+        raw = None  # (the header's bytes, when read from the file already)
         if self.locks is not None:
             self.locks.shared()
-            self._recover()
+            if self.wal is None:
+                self._recover()
+                raw = self.io.read(0, HEADER_SIZE)
+                if not self.leaving_wal and self._in_wal_mode(raw):
+                    self._open_wal()
+            if self.wal is not None:
+                log_changed = self.wal.begin_read()
         self.reading = True
-        header = self._read_header()
+        header = self._read_header(raw if self.wal is None else None)
         if header is None:  # an empty file: a new database
             header = DbHeader(page_size=self.new_page_size)
             self.geometry = Geometry(header.page_size)
@@ -673,7 +728,8 @@ class SqlitePager(PageCache):
             self.original_pages = 0
             return True
         self.original_pages = header.page_count
-        if self.header is not None and not self.dirty and header.change_counter == self.read_counter:
+        if self.header is not None and not self.dirty and header.change_counter == self.read_counter \
+                and not log_changed:
             return False
         self.cache = {0: header}
         self.header = header
@@ -684,20 +740,124 @@ class SqlitePager(PageCache):
         return True
 
     def begin_write(self, wait: bool = True) -> None:
-        if self.locks is not None:
+        if self.wal is not None:
+            self.wal.begin_write(wait)
+        elif self.locks is not None:
             self.locks.reserve(wait)
 
     def end_transaction(self) -> None:
         self.reading = False
-        if self.locks is not None:
+        if self.wal is not None:
+            self.wal.end_read()
+            self.wal.end_write()
+        elif self.locks is not None:
             self.locks.release_all()
+
+    # ---- WAL mode -------------------------------------------------------------------
+
+    def _in_wal_mode(self, data: bytes) -> bool:
+        """Whether the database (header bytes ``data``) is in WAL mode: bytes
+        18-19, or a log that exists (SQLite's pagerOpenWalIfPresent; looked
+        for only when the header changed - going into WAL mode writes it).  A
+        log next to an empty file is deleted."""
+        log = self.path + "-wal"
+        if len(data) < HEADER_SIZE:
+            if not data and os.path.exists(log):
+                os.unlink(log)
+            return False
+        if data[18] == 2 or data[19] == 2:
+            return True
+        unchanged = self.header is not None and int.from_bytes(data[24:28], "big") == self.read_counter
+        return not unchanged and os.path.exists(log)
+
+    def _open_wal(self) -> None:
+        """Switch to WAL mode (in a read transaction; holding RESERVED for
+        a write, which becomes the log's WRITE lock)."""
+        page_size = int.from_bytes(self.io.read(16, 2), "big")
+        wal = SqliteWal(self.path, 65536 if page_size == 1 else page_size, self.timeout)
+        wal.crash_hook = self._crash_point
+        writing = self.locks.reserved
+        if writing:
+            try:
+                wal.begin_write()
+            except BaseException:
+                wal.close()
+                raise
+            self.locks.release_reserved()
+        self.wal = wal
+        self.cache = {}
+        self.header = None
+
+    def set_wal_mode(self, on: bool) -> None:
+        """PRAGMA journal_mode = WAL / DELETE outside a transaction.  Into WAL:
+        header bytes 18-19 become 2 (written through the rollback journal).
+        Out of it: needs the database to itself (else "database is locked"),
+        copies and deletes the log, then writes 1 there."""
+        if on == (self.wal is not None) or self.locks is None:
+            return
+        if on:
+            self.begin_write()
+            try:
+                self.begin_read()
+                self.write(self.header)
+                self.header.write_version = self.header.read_version = 2
+                self.commit()
+            finally:
+                self.end_transaction()
+            self.begin_read()  # (opens the log)
+            self.end_transaction()
+            return
+        self.locks.shared()
+        if not self.locks.try_exclusive():
+            raise LockTimeout("database is locked")
+        try:
+            result = self._wal_checkpoint()
+            if result is None or result[0] != result[1]:
+                raise LockTimeout("database is locked")
+            self.wal.close(delete=True)
+            self.wal = None
+            self.cache = {}
+            self.header = None
+            self.leaving_wal = True
+            self.begin_read()
+            self.write(self.header)
+            self.header.write_version = self.header.read_version = 1
+            self.commit()
+        finally:
+            self.leaving_wal = False
+            self.end_transaction()
+
+    def _wal_checkpoint(self) -> tuple[int, int] | None:
+        size = self.geometry.page_size
+        io = self.io
+        return self.wal.checkpoint(lambda pgno, data: io.write((pgno - 1) * size, data),
+                                   lambda length: io.truncate(length) if io.size() > length else None,
+                                   io.sync)
+
+    def wal_checkpoint(self, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        """PRAGMA wal_checkpoint(mode): (busy, frames in the log, frames
+        copied).  Every mode copies what readers allow without waiting;
+        RESTART and TRUNCATE then start the log over (TRUNCATE also empties
+        the file) if no one uses it."""
+        if self.wal is None:
+            return 0, -1, -1
+        result = self._wal_checkpoint()
+        if result is None:
+            return 1, -1, -1
+        frames, copied = result
+        busy = int(copied < frames)
+        if mode in ("RESTART", "TRUNCATE") and not busy:
+            busy = int(not self.wal.restart_log(mode == "TRUNCATE"))
+            if not busy and mode == "TRUNCATE":
+                frames = copied = 0
+        return busy, frames, copied
 
     def set_page_size(self, size: int) -> None:
         """PRAGMA page_size = ``size``: at once for a database nothing was
         written to yet (as SQLite, whose file is still empty then), at the
         next VACUUM otherwise; anything but a power of two from 512 to 65536
-        is ignored."""
-        if not valid_page_size(size):
+        is ignored, and so is any in WAL mode (as SQLite)."""
+        if not valid_page_size(size) or self.wal is not None:
             return
         self.next_page_size = size
         if self.fresh and self.header.page_count == 1 and size != self.geometry.page_size:
@@ -728,6 +888,9 @@ class SqlitePager(PageCache):
         if self.auto_vacuum == 1 and header.freelist_count:
             self.vacuum_pages()  # (SQLite's autoVacuumCommit)
         self.sync_ptrmap()
+        if self.wal is not None:
+            self._commit_to_log()
+            return
         if self.locks is not None:
             self.locks.reserve()
             self.locks.lock_exclusive()
@@ -772,12 +935,43 @@ class SqlitePager(PageCache):
         if self.locks is not None:
             self.locks.downgrade()
 
+    def _commit_to_log(self) -> None:
+        """A commit in WAL mode: the changed pages (those the database still
+        has) as frames.  Page 1 goes only if it changed - and then its
+        change counter goes up, as SQLite's pager_write_changecounter."""
+        header = self.header
+        self.wal.begin_write()
+        if self.schema_changed:
+            self.write(header)
+            header.schema_cookie = (header.schema_cookie + 1) & 0xFFFFFFFF
+        if 0 in self.dirty or 1 in self.dirty:
+            self.write(header)
+            header.change_counter = (header.change_counter + 1) & 0xFFFFFFFF
+            self.write(self.get(1, BtreePage))
+        frames = []
+        for pgno in sorted(self.dirty - {0}):
+            if pgno <= header.page_count:
+                image = self.cache[pgno].to_bytes()
+                if pgno == 1:
+                    image = header.to_bytes() + image[HEADER_SIZE:]
+                frames.append((pgno, image))
+        self.wal.write_frames(frames, header.page_count)
+        self.dirty.clear()
+        self.schema_changed = False
+        self.fresh = False
+        self.original_pages = header.page_count
+        self.read_counter = header.change_counter
+
     def serialize(self) -> bytes:
         """The database file as this connection sees it, uncommitted changes
         included (sqlite3_serialize)."""
         page_size = self.geometry.page_size
         size = self.header.page_count * page_size
         image = bytearray(self.io.read(0, size).ljust(size, b"\x00"))
+        if self.wal is not None:
+            for pgno in self.wal.logged_pages():
+                if pgno <= self.header.page_count:
+                    image[(pgno - 1) * page_size:pgno * page_size] = self.wal.read_page(pgno)
         for pgno in self.dirty - {0}:
             if pgno <= self.header.page_count:
                 image[(pgno - 1) * page_size:pgno * page_size] = self.cache[pgno].to_bytes()
@@ -890,14 +1084,39 @@ class SqlitePager(PageCache):
 
     # ---- the end ------------------------------------------------------------------
 
-    def checkpoint(self) -> bool:
-        return True  # no log
+    def checkpoint(self, closing: bool = False) -> bool:
+        """In WAL mode: copy the log into the database file as far as
+        readers allow (outside a transaction or right after our commit).
+        ``closing``: if no other connection has the database open, copy all
+        of it and delete the log and the wal-index (as SQLite's
+        sqlite3WalClose)."""
+        if self.wal is None:
+            return True
+        if closing:
+            self.wal.end_read()
+            self.wal.end_write()
+            if not self.locks.try_exclusive():
+                return False
+            try:
+                result = self._wal_checkpoint()
+                if result is not None and result[0] == result[1]:
+                    self.wal.close(delete=True)
+                    self.wal = None
+                    return True
+                return False
+            finally:
+                self.locks.downgrade()
+        result = self._wal_checkpoint()
+        return result is not None and result[0] == result[1]
 
     def spill(self) -> None:
         pass  # changed pages stay in memory until the commit
 
     def close_files(self) -> None:
         """Close without committing (also used after a crash)."""
+        if self.wal is not None:
+            self.wal.close()
+            self.wal = None
         if self.locks is not None:
             self.locks.close()
 
@@ -907,5 +1126,6 @@ class SqlitePager(PageCache):
         try:
             self.commit()
             self.end_transaction()
+            self.checkpoint(closing=True)
         finally:
             self.close_files()

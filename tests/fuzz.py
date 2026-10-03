@@ -972,12 +972,13 @@ class Generator:
 STEP_LIMIT = 5_000_000  # (see Pair; about 0.05 s of sqlite3 time)
 
 
-def run_seed(seed, statements, path=None, verbose=False, format=None):
+def run_seed(seed, statements, path=None, verbose=False, format=None, wal=False):
     """Run one fuzzing session; returns None or a failure description.
 
     With ``format="sqlite"`` MiniDB keeps the database in SQLite's file
     format; at the end sqlite3 opens that file, checks it and compares its
-    content with sqlite3's own database."""
+    content with sqlite3's own database.  ``wal``: that file is in WAL mode
+    (a checkpoint every 50 frames; sqlite3 checks it from another process)."""
     from sqlcompare import SKIPPED, Pair  # only here: the generator itself (metamorphic.py) needs no sqlite3
 
     generator = Generator(seed)
@@ -992,6 +993,10 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
             setup.insert(1, (f"PRAGMA auto_vacuum = {seed // 7 % 3}", None))
         setup += [(generator.create_table(), None) for _ in range(2)]
         setup.append((generator.create_index(), None))
+        if wal:  # (MiniDB only: sqlite3's database is in memory)
+            pair.mini.execute("PRAGMA journal_mode = WAL")
+            pair.mini.execute("PRAGMA wal_autocheckpoint = 50")
+            history.append("PRAGMA journal_mode = WAL  -- MiniDB only")
         for sql, parameters in setup + [generator.statement_with_parameters() for _ in range(statements)]:
             history.append(sql if parameters is None else f"{sql}  -- parameters: {parameters!r}")
             if verbose:
@@ -1008,7 +1013,7 @@ def run_seed(seed, statements, path=None, verbose=False, format=None):
             # integer); MiniDB's matches it, the checks below cannot hold.
             return None
         if format == "sqlite" and path is not None:
-            check_sqlite_file(pair, path)
+            check_sqlite_file(pair, path, wal)
         if format == "sqlite":
             check_images(pair)
         problems = pair.mini.integrity_check()
@@ -1036,7 +1041,42 @@ def dump_query(connection, name):
     return f'SELECT * FROM "{name}" ORDER BY ' + ", ".join(f'"{c}"' for c in key)
 
 
-def check_sqlite_file(pair, path):
+CHECK_CHILD = """
+import base64, pickle, sqlite3, sys
+other = sqlite3.connect(sys.argv[1], timeout=10)
+other.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
+print(base64.b64encode(pickle.dumps([other.execute(sql).fetchall() for sql in sys.argv[2:]])).decode())
+"""
+
+
+class _Rows(list):
+    def fetchall(self):
+        return list(self)
+
+
+class ChildConnection:
+    """sqlite3 in another process (a WAL file MiniDB has open: in this
+    process sqlite3 could not see MiniDB's locks).  Runs a query at a time."""
+
+    def __init__(self, path):
+        self.path = path
+
+    def execute(self, sql):
+        import base64
+        import pickle
+        import subprocess
+
+        done = subprocess.run([sys.executable, "-c", CHECK_CHILD, self.path, sql], capture_output=True,
+                              text=True, timeout=120)
+        if done.returncode:
+            raise AssertionError(f"sqlite3 in another process: {done.stderr[-2000:]}")
+        return _Rows(pickle.loads(base64.b64decode(done.stdout))[0])
+
+    def close(self):
+        pass
+
+
+def check_sqlite_file(pair, path, wal=False):
     """sqlite3 must find MiniDB's SQLite-format file intact, with the same
     rows as sqlite3's own database (MiniDB holds no locks between statements)."""
     import sqlite3
@@ -1045,26 +1085,37 @@ def check_sqlite_file(pair, path):
         pair.run("COMMIT")
     if pair.mini.in_transaction:
         pair.run("ROLLBACK")  # (COMMIT failed: deferred foreign key violations)
+    if wal:
+        other = ChildConnection(path)
+        if pair.mini.execute("PRAGMA journal_mode") != [("wal",)]:
+            raise AssertionError("the file left WAL mode")
+        check_sqlite_rows(pair, other)
+        return
     other = sqlite3.connect(path)
     other.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
     try:
-        result = other.execute("PRAGMA integrity_check").fetchall()
-        if result != [("ok",)]:
-            raise AssertionError(f"sqlite3's integrity_check on MiniDB's file: {result[:5]}")
-        tables = [row[0] for row in pair.lite.execute(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-        mine = [row[0] for row in other.execute(
-            "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
-        if mine != tables:
-            raise AssertionError(f"tables in MiniDB's file: {mine}, in sqlite3's: {tables}")
-        for name in tables:
-            query = dump_query(pair.lite, name)
-            expected, found = pair.lite.execute(query).fetchall(), other.execute(query).fetchall()
-            if [sqlcompare_loose(r) for r in found] != [sqlcompare_loose(r) for r in expected]:
-                raise AssertionError(f"table {name} differs when sqlite3 reads MiniDB's file:\n"
-                                     f"  sqlite3's: {expected[:5]}\n  MiniDB's file: {found[:5]}")
+        check_sqlite_rows(pair, other)
     finally:
         other.close()
+
+
+def check_sqlite_rows(pair, other):
+    """``other`` (sqlite3 on MiniDB's file) finds it intact and with sqlite3's rows."""
+    result = other.execute("PRAGMA integrity_check").fetchall()
+    if result != [("ok",)]:
+        raise AssertionError(f"sqlite3's integrity_check on MiniDB's file: {result[:5]}")
+    tables = [row[0] for row in pair.lite.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    mine = [row[0] for row in other.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+    if mine != tables:
+        raise AssertionError(f"tables in MiniDB's file: {mine}, in sqlite3's: {tables}")
+    for name in tables:
+        query = dump_query(pair.lite, name)
+        expected, found = pair.lite.execute(query).fetchall(), other.execute(query).fetchall()
+        if [sqlcompare_loose(r) for r in found] != [sqlcompare_loose(r) for r in expected]:
+            raise AssertionError(f"table {name} differs when sqlite3 reads MiniDB's file:\n"
+                                 f"  sqlite3's: {expected[:5]}\n  MiniDB's file: {found[:5]}")
 
 
 def check_images(pair):
@@ -1082,7 +1133,9 @@ def check_images(pair):
         "SELECT name FROM sqlite_schema WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
     other = sqlite3.connect(":memory:")
     other.text_factory = lambda data: data.decode("utf-8", "surrogateescape")
-    other.deserialize(pair.mini.serialize())
+    image = bytearray(pair.mini.serialize())
+    image[18:20] = b"\x01\x01"  # (a WAL file's image: sqlite3 cannot open that in memory, nor its own)
+    other.deserialize(bytes(image))
     copy = Database()
     copy.deserialize(pair.lite.serialize())
     try:
@@ -1171,8 +1224,11 @@ def main():
     parser.add_argument("--statements", type=int, default=400)
     parser.add_argument("--file", action="store_true", help="use database files instead of memory")
     parser.add_argument("--sqlite-format", action="store_true", help="MiniDB uses SQLite's file format")
+    parser.add_argument("--wal", action="store_true", help="a SQLite-format file in WAL mode (implies both)")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
+    if args.wal:
+        args.file = args.sqlite_format = True
     import tempfile
 
     failures = 0
@@ -1180,7 +1236,8 @@ def main():
     with tempfile.TemporaryDirectory() as directory:
         for seed in seeds:
             path = os.path.join(directory, f"fuzz{seed}.db") if args.file else None
-            failure = run_seed(seed, args.statements, path, args.verbose, "sqlite" if args.sqlite_format else None)
+            failure = run_seed(seed, args.statements, path, args.verbose, "sqlite" if args.sqlite_format else None,
+                               args.wal)
             if failure:
                 failures += 1
                 print(failure[:4000])

@@ -186,6 +186,10 @@ class Database:
             self.rollback()
             pager.end_transaction()
             return Result()
+        if isinstance(stmt, Pragma) and stmt.name == "journal_mode" and stmt.value is not None \
+                and isinstance(pager, SqlitePager) and pager.path is not None \
+                and (stmt.schema is None or ascii_lower(stmt.schema) == "main"):
+            return self._set_journal_mode(ascii_lower(str(stmt.value)))
         writes = isinstance(stmt, WRITE_STATEMENTS) or (
             isinstance(stmt, Pragma) and pragmas.is_write(stmt.name, stmt.value))
         if isinstance(stmt, Vacuum):
@@ -297,6 +301,18 @@ class Database:
         if self.pager.begin_read():
             self.catalog.load()  # another connection committed: the schema may differ
             self.executor.data_version += 1
+
+    def _set_journal_mode(self, mode: str) -> Result:
+        """PRAGMA journal_mode = ``mode`` on a file in SQLite's format: into
+        or out of WAL mode (outside a transaction, as SQLite); MiniDB's
+        rollback journal is always "delete", other modes are ignored."""
+        pager = self.pager
+        if mode in ("wal", "delete", "truncate", "persist") and (mode == "wal") != (pager.wal is not None):
+            if self.in_transaction:
+                raise OperationalError(
+                    f"cannot change {'into' if mode == 'wal' else 'out of'} wal mode from within a transaction")
+            pager.set_wal_mode(mode == "wal")
+        return Result([("wal" if pager.wal is not None else "delete",)], ["journal_mode"])
 
     def _temp_pager(self) -> Pager | SqlitePager | None:
         """The pager of the temp database (in memory), if there is one: its
@@ -440,7 +456,7 @@ class Database:
             self.rollback()
             self.pager.end_transaction()
         try:
-            self.pager.checkpoint()  # only if nobody else is using the database
+            self.pager.checkpoint(closing=True)  # only if nobody else is using the database
         finally:
             self.pager.close_files()
 

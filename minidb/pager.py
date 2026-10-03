@@ -767,10 +767,11 @@ class Pager(PageCache):
         self.header = header
         self.cache[0] = header
 
-    def checkpoint(self) -> bool:
+    def checkpoint(self, closing: bool = False) -> bool:
         """Copy the log into the database file as far as readers allow, and
         empty it once everything is copied and no other connection reads.
         Never waits.  Returns whether the whole log is in the database file.
+        (``closing``: the same here.)
 
         Called outside a transaction or right after our own commit (our
         snapshot is then the newest, and we read nothing more)."""

@@ -1598,15 +1598,16 @@ class IndexScan:
         self.table_rows = table_rows
         self.covering = False  # rows are built from index keys alone
         self.index_values = True  # a SELECT's: indexed VIRTUAL columns come from the index (candidates)
+        self.unused = {}  # VIRTUAL columns the query does not use (left NULL)
 
     @property
     def yields_rows(self) -> bool:
-        return self.covering or (self.index_values and bool(self.index.raw_reals))
+        return self.covering or (self.index_values and bool(self.index.virtual))
 
     def cover_if_possible(self, scope: Scope, table_index: int) -> None:
         """Use the index alone if it holds every column the query uses."""
         table = self.index.table
-        available = set(self.index.entry_positions) | {len(table.columns)}  # plus the row id
+        available = set(self.index.entry_positions) - set(table.virtual) | {len(table.columns)}  # plus the row id
         if table.rowid_column is not None:
             available.add(table.rowid_column)
         used = {position for index, position in scope.used if index == table_index}
@@ -1672,18 +1673,19 @@ class IndexScan:
                 yield rowid, built
             return
         get = self.table_tree.get
-        if self.index_values and self.index.raw_reals:
+        if self.index_values and self.index.virtual:
             # SQLite reads an indexed VIRTUAL column from the index entry
             # (where.c's pIdxEpr), also where another generated column uses
-            # it: CREATE INDEX may have stored a whole REAL as an integer.
+            # it: CREATE INDEX may have stored a whole REAL as an integer,
+            # and an entry has no JSON subtype.
             table, positions = self.index.table, self.index.positions
-            fixed = [positions[i] for i in self.index.raw_reals]
+            fixed = [positions[i] for i in self.index.virtual]
             plain_value = values.plain_value
             for rowid, key in keys:
                 record = get(rowid)
                 stored = record if type(record) is list else decode_row(record)
-                yield rowid, expand_virtual(table, stored, rowid,
-                                            {p: plain_value(key[i]) for i, p in zip(self.index.raw_reals, fixed)})
+                yield rowid, expand_virtual(table, stored, rowid, {
+                    **self.unused, **{p: plain_value(key[i]) for i, p in zip(self.index.virtual, fixed)}})
             return
         for rowid, _ in keys:
             yield rowid, get(rowid)
@@ -2917,6 +2919,13 @@ class Executor:
             if join.kind in ("RIGHT", "FULL"):
                 scan = plan_access(scope, index, self.catalog, [], compiler)
                 levels[-1].unmatched = JoinLevel(entry.table, entry.offset, scan, False, None, [])
+            if covering and isinstance(entry.table, TableInfo) and entry.table.virtual:
+                # (A SELECT computes only the VIRTUAL columns it uses, as SQLite.)
+                unused = unused_virtual(entry.table, {p for i, p in scope.used if i == index})
+                if unused:
+                    for level in (levels[-1], levels[-1].unmatched):
+                        if level is not None:
+                            level.skip_virtual(unused)
             levels[-1].merges = [(m.slot, m.parts) for m in scope.merged.values() if m.index == index]
         return levels, constants
 
@@ -3693,6 +3702,8 @@ class Executor:
             if violation[1] == "IGNORE":
                 return None
             raise self.constraint_error(*violation)
+        if keyed:
+            new_rowid = self.row_key(table, row)  # (REPLACE may have given a PRIMARY KEY column its default)
         if table.checks and not self.settings["ignore_check_constraints"]:
             if changed is not None and table.rowid_column in changed:
                 changed = changed | {width}
@@ -3764,7 +3775,12 @@ class Executor:
         self.remove_index_entries(table, current, rowid)
         if involved:
             keys.convert_old(table, old, changed)
-        if new_rowid != rowid:
+        if new_rowid != rowid or (keyed and involved and (
+                changed is None or keys.every_index(table, changed) or changed & set(table.pk_index.positions))):
+            # (SQLite deletes the old row first when the SET assigns the
+            # PRIMARY KEY - chngPk, whatever the value - or a foreign key
+            # needs it - hasFK>1: a WITHOUT ROWID table's row is then gone
+            # while its new foreign keys are looked up)
             tree.delete(rowid)
         if involved:
             keys.row_adding(table, row + [new_rowid], changed)
@@ -4109,8 +4125,11 @@ class Executor:
             # constraints now (the first problem PRAGMA quick_check finds).
             checks = self.compile_checks(added)
             not_null = [i for i, c in enumerate(added.columns) if c.not_null and i != added.rowid_column]
+            # (Only the VIRTUAL columns those constraints use are computed.)
+            unused = unused_virtual(added, set(not_null).union(*(check_positions(added, c) for c in added.checks)))
             for rowid, record in tree.scan():
-                row = self.load_row(added, rowid, record)
+                stored = record if type(record) is list else decode_row(record)
+                row = expand_virtual(added, stored, rowid, unused) if added.virtual else self.load_row(added, rowid, record)
                 if any(row[i] is None for i in not_null):
                     raise OperationalError("NOT NULL constraint failed")  # (SQLite's raise() in a nested statement)
                 if any(failed(row) for _, failed, _ in checks):
@@ -4305,7 +4324,6 @@ class Executor:
 
         source = self.catalog
         pager = source.pager
-        schema = SqliteTable(target, 1)
         rows = [(key, decode_record(value)[0]) for key, value in list(source.schema.scan())]
         roots = {}  # schema key -> root page made beforehand (auto_vacuum)
         if target.auto_vacuum:
@@ -4345,7 +4363,8 @@ class Executor:
                 if key in roots:  # (into the root made for it)
                     (TableTree if kind == "table" else IndexTree)(target, roots[key]).adopt(row[3])
                     row[3] = roots[key]
-            schema.insert(key, encode_record(row))
+        # The schema last, built rather than inserted into (no balancing that frees pages).
+        TableTree.build_into(target, 1, ((key, SqliteTable._payload(row)) for key, row in rows))
         if target.auto_vacuum and target.header.freelist_count:
             target.vacuum_pages()  # (the pages adopt() freed: the copy has none)
         target.header.user_version = pager.header.user_version
@@ -4456,6 +4475,15 @@ class JoinLevel:
             load_row = Executor.load_row
             self.load = lambda rowid, record: load_row(table, rowid, record)
 
+    def skip_virtual(self, unused: dict[int, None]) -> None:
+        """Leave the VIRTUAL columns ``unused`` NULL instead of computing them."""
+        table, access = self.table, self.access
+        if isinstance(access, IndexScan):
+            access.unused = unused
+        if not getattr(access, "yields_rows", False):
+            self.load = lambda rowid, record: expand_virtual(
+                table, record if type(record) is list else decode_row(record), rowid, unused)
+
 
 class CompiledSelect:
     """A SELECT compiled once; ``run()`` evaluates it (again) and returns its rows."""
@@ -4536,6 +4564,14 @@ class CompiledSelect:
             self.levels and self.levels[0].offset == scope.entries[0].offset
             and getattr(self.levels[0].access, "grouping", None) == "all"
         )
+        # Else SQLite's sorter carries the rows to the groups as records: JSON
+        # subtypes go and IntReals become integers.  (Only sources other than
+        # a table's stored columns can have them.)
+        special = any(not isinstance(entry.table, TableInfo) or entry.table.virtual for entry in scope.entries)
+        self.group_sorter = special and bool(self.group_functions) and not self.groups_in_order \
+            and not self.scan_groups(stmt)
+        # (Window functions read their rows back from an ephemeral table.)
+        self.window_sorter = self.windows is not None and (special or self.is_aggregate)
         # True when the first table's access path already yields ORDER BY order.
         self.presorted = bool(
             self.levels and order_columns and not self.is_aggregate and self.windows is None
@@ -4663,6 +4699,34 @@ class CompiledSelect:
                 columns.append(column)
         return columns
 
+    def scan_groups(self, stmt: Select) -> bool:
+        """Whether the first table's scan delivers the rows in GROUP BY order
+        (then SQLite needs no sorter): e.g. GROUP BY the row id of a full scan."""
+        if not stmt.group_by or not self.levels or self.levels[0].offset != self.scope.entries[0].offset:
+            return False
+        entry = self.scope.entries[0]
+        if not isinstance(entry.table, TableInfo):
+            return False
+        compiler = Compiler(self.scope, executor=self.executor)
+        rowid_slot = self.scope.rowid_slot(0)
+        wanted = []
+        for term in stmt.group_by:
+            expr = strip_collate(term)
+            if not isinstance(expr, Column):
+                return False
+            try:
+                slot, _, table_index, depth = self.scope.resolve(expr)
+            except (AliasReference, OperationalError):
+                return False
+            if depth or table_index != 0:
+                return False
+            position = slot - entry.offset
+            if slot == rowid_slot or position == entry.table.rowid_column:
+                wanted.append(ROWID)
+            else:
+                wanted.append((position, compiler.collation(term) or "BINARY"))
+        return follows_order(wanted, self.levels[0].access.order())
+
     def order_columns(self, stmt: Select) -> list[int] | None:
         """ORDER BY as positions of the first table's columns (ROWID for the row
         id), or None unless every term is an ascending, NULLS FIRST plain
@@ -4721,6 +4785,8 @@ class CompiledSelect:
             if self.first_row_only:
                 rows = itertools.islice(rows, 1)
             truth, having = values.truth, self.having
+            if self.group_sorter:
+                rows = (values.through_sorter(row) for row in rows)
             rows = (
                 group_row
                 for group_row in self.executor.group_rows(
@@ -4729,6 +4795,8 @@ class CompiledSelect:
                 if having is None or truth(having(group_row))
             )
         if self.windows is not None:
+            if self.window_sorter:
+                rows = (values.through_sorter(row) for row in rows)
             rows = self.windows.apply(rows)
         records = ((output_row(row), order_key(row)) for row in rows)
         if self.distinct:
@@ -4919,12 +4987,30 @@ class PreparedInsert:
         if table.generated:
             executor.generator(table)
         multi_write = self.multi_write = self.query is not None or len(self.rows) > 1
+        # SQLite puts the rows of a SELECT or of several VALUES rows in a
+        # temporary table first (records: the values lose the JSON subtype)
+        # when the table has INSERT triggers - RETURNING is one - or the rows
+        # read the table (sqlite3Insert's useTempTable); else its co-routine's
+        # registers keep the subtype (for the generated columns too).
+        self.temp_table = multi_write and (
+            self.returning is not None or bool(executor.catalog.any_triggers and executor.triggers.exist(
+                table.name, "INSERT")) or reads_table(
+                [stmt.query] + [e for exprs in stmt.rows for e in exprs if type(e) not in (Literal, Parameter)],
+                table))
         self.prepare_programs()
         # SQLite keeps a statement journal for a multi-row write (a SELECT,
         # several rows, triggers) that may abort: a constraint checked as
         # ABORT, a function call, a trigger program that may abort.
         triggers = executor.triggers
-        multi = multi_write or bool(executor.catalog.any_triggers and triggers.exist(table.name, "INSERT"))
+        # (A REPLACE that may delete a row with foreign keys or DELETE triggers
+        # to run is a multi-row write too: sqlite3MultiWrite in
+        # sqlite3GenerateConstraintChecks.)
+        replace_deletes = replace_possible(table, self.conflict, self.rowid_given,
+                                           handled=[u.constraint for u in self.upserts]) and (
+            (executor.foreign_keys.enabled and executor.foreign_keys.involved(table))
+            or (bool(executor.settings["recursive_triggers"]) and triggers.exist(table.name, "DELETE")))
+        multi = multi_write or replace_deletes or bool(
+            executor.catalog.any_triggers and triggers.exist(table.name, "INSERT"))
         # (Only a multi-row write needs it, or a statement of a trigger program: Program.may_abort.)
         self.aborts = (multi or bool(executor.compiling_trigger)) and (self.may_abort() or calls_function(stmt) or (
             table.generated and calls_function([c.generated for c in table.columns])) or triggers.may_abort(
@@ -5018,7 +5104,12 @@ class PreparedInsert:
         checked.update(p for index in table.indexes if index.unique for p in index.positions)
         checked.update(p for check in table.checks for p in check_positions(table, check))
         checked.update((table.rowid_column, len(table.columns)))
-        return any(u.assignments and any(p in checked for p, _ in u.assignments) for u in self.upserts)
+
+        def changes(upsert):  # (with the generated columns that follow them)
+            positions = {p for p, _ in upsert.assignments}
+            return positions | generated_dependents(table, positions)
+
+        return any(u.assignments and changes(u) & checked for u in self.upserts)
 
     def check_count(self, stmt: Insert, count: int) -> None:
         if count != len(self.positions):
@@ -5038,9 +5129,7 @@ class PreparedInsert:
         sources = self.query.run() if self.query is not None else (
             [function([]) for function in functions] for functions in self.rows
         )
-        if self.query is not None or len(self.rows) > 1:
-            # (SQLite's co-routine for a SELECT or several VALUES rows leaves
-            # the values without their JSON subtype; one VALUES row keeps it.)
+        if self.temp_table:
             sources = ([values.record_value(v) if type(v) in SUBTYPED else v for v in source] for source in sources)
         assign, positions = self.assign, self.positions
         for source in sources:
@@ -5667,6 +5756,12 @@ def bare_columns(query: object, width: int) -> frozenset[int]:
     return frozenset(i for i, item in enumerate(query.items) if isinstance(item.expr, Column))
 
 
+def reads_table(node: object, table: TableInfo) -> bool:
+    """Whether a statement part names ``table`` in a FROM clause (SQLite's readsTable)."""
+    name = ascii_lower(table.name)
+    return any(isinstance(n, TableRef) and ascii_lower(n.name) == name for n in walk_nodes(node))
+
+
 def lost_subtypes(query: object, width: int, bare: frozenset[int]) -> tuple[int, ...]:
     """The columns of a subquery in FROM whose values lose the JSON subtype
     on the way out: all but its bare_columns, if it may return JSON at all."""
@@ -5981,6 +6076,18 @@ def expand_virtual(table: TableInfo, stored: list, rowid: int, fixed: dict[int, 
     fill(row)
     row.append(rowid)
     return row
+
+
+def unused_virtual(table: TableInfo, used: set[int]) -> dict[int, None]:
+    """The VIRTUAL columns that neither the columns ``used`` are nor need."""
+    needed = set(used)
+    while True:
+        more = {table.column_index(n.name) for p in needed if p in table.virtual
+                for n in walk(table.columns[p].generated) if isinstance(n, Column)} - needed
+        if not more:
+            break
+        needed |= more
+    return {p: None for p in table.virtual if p not in needed}
 
 
 def new_columns_used(table: TableInfo, triggers: list[TriggerInfo]) -> set[int] | None:

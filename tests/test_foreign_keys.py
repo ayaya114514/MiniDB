@@ -354,3 +354,28 @@ def test_replace_with_foreign_keys_may_abort(pair):
         "BEGIN", "INSERT OR ROLLBACK INTO q VALUES (1, 1), (-3.75, 2)", "SELECT * FROM q", "ROLLBACK",
     ]:
         pair.run(sql)
+
+
+def test_a_replace_that_may_delete_a_parent_row(pair):
+    # A REPLACE that may delete a row of a table with foreign keys is a
+    # multi-row write (sqlite3MultiWrite): when RESTRICT stops it inside a
+    # transaction, the statement journal brings the deleted row back.
+    for sql in """
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE t1 (id INTEGER PRIMARY KEY, c0 REFERENCES t1 (id) ON DELETE RESTRICT, c1);
+        INSERT INTO t1 VALUES (1, NULL, 0), (2, 1, 0);
+        BEGIN;
+        INSERT INTO t1 VALUES (3, NULL, 0);
+        REPLACE INTO t1 (id, c1) VALUES (1, 5);
+        SELECT * FROM t1;
+        COMMIT;
+        CREATE TABLE p (id INTEGER PRIMARY KEY, u UNIQUE);
+        CREATE TABLE c (x REFERENCES p (u) ON DELETE RESTRICT);
+        INSERT INTO p VALUES (1, 'a'), (2, 'b');
+        INSERT INTO c VALUES ('a');
+        BEGIN;
+        INSERT OR REPLACE INTO p VALUES (3, 'a');
+        SELECT * FROM p;
+        ROLLBACK
+    """.strip().split(";\n"):
+        pair.run(sql)

@@ -236,11 +236,46 @@ class _Tree:
         order (it is not checked: VACUUM copies trees as they are).  Pages
         are filled up, as SQLite's VACUUM leaves them; returns the root."""
         tree = cls(pager, 0)
+        children, dividers = tree._build_leaves(tree._cell(payload, rowid) for rowid, payload in entries)
+        while len(children) > 1:
+            children, dividers = tree._build_level(children, dividers)
+        return children[0].pgno
+
+    @classmethod
+    def build_into(cls, pager: Any, root: int, entries: Iterable[tuple[int, bytes]]) -> None:
+        """``build``, with the root on page ``root`` (an empty leaf - page 1,
+        with less room, for sqlite_schema): the levels below it are built
+        until theirs fits there.  Nothing is freed (unlike inserting the
+        entries one by one, whose balancing may leave a free page)."""
+        tree = cls(pager, root)
+        page = tree.page(root)
+        pager.write(page)
+        cells = [tree._cell(payload, rowid) for rowid, payload in entries]
+        page.kind, page.right = (TABLE_LEAF if cls.table else INDEX_LEAF), 0
+        if sum(cell.byte_size(page.kind) for cell in cells) <= page.capacity:
+            page.cells = cells
+            return
+        children, dividers = tree._build_leaves(cells)
+        page.kind = TABLE_INTERIOR if cls.table else INDEX_INTERIOR
+        while True:
+            top = []
+            for child, divider in zip(children, dividers):
+                divider = divider.copy()
+                divider.child = child.pgno
+                top.append(divider)
+            if sum(cell.byte_size(page.kind) for cell in top) <= page.capacity:
+                page.cells, page.right = top, children[-1].pgno
+                return
+            children, dividers = tree._build_level(children, dividers)
+
+    def _build_leaves(self, cells: Iterable[Cell]) -> tuple[list[BtreePage], list[Cell]]:
+        """Leaf pages filled with ``cells`` in order, and the dividers between them."""
+        cls = type(self)
+        tree, pager = self, self.pager
         leaf_kind = TABLE_LEAF if cls.table else INDEX_LEAF
         level, dividers, page, used = [], [], [], 0
         capacity = pager.geometry.usable - _HEADER[leaf_kind]
-        for rowid, payload in entries:
-            cell = tree._cell(payload, rowid)
+        for cell in cells:
             size = cell.byte_size(leaf_kind)
             if page and used + size > capacity:
                 level.append(page)
@@ -260,9 +295,7 @@ class _Tree:
         children = [tree._new_page(leaf_kind, cells, 0) for cells in level]
         if cls.table:
             dividers = [Cell(child=child.pgno, rowid=child.cells[-1].rowid) for child in children[:-1]]
-        while len(children) > 1:
-            children, dividers = tree._build_level(children, dividers)
-        return children[0].pgno
+        return children, dividers
 
     def _new_page(self, kind: int, cells: list[Cell], right: int) -> BtreePage:
         page = self.pager.allocate(BtreePage, kind)

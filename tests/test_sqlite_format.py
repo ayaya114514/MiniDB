@@ -735,8 +735,7 @@ def test_generated_columns_written_by_minidb(tmp_path):
 
 
 @pytest.mark.parametrize("setting, message", [
-    ("PRAGMA journal_mode = WAL", "WAL mode"),
-    ("PRAGMA encoding = 'UTF-16le'", "UTF-16"),
+    ("PRAGMA encoding = 'UTF-16le'", "UTF-16"),  # (WAL mode is supported now: test_sqlite_wal)
 ])
 def test_files_minidb_refuses(tmp_path, setting, message):
     path = str(tmp_path / "db")
@@ -959,3 +958,40 @@ def test_deep_index_deletes():
             assert pager.check_pages([1, index.root]) == []
     assert index.last_key() is None
     pager.rollback()
+
+
+def test_vacuum_builds_a_schema_of_many_pages(tmp_path):
+    # sqlite_schema over several 512-byte pages: built, not inserted into
+    # (inserting, its balancing once left a page that nothing used).
+    path = str(tmp_path / "db")
+    with Database(path, format="sqlite") as db:
+        db.execute("PRAGMA page_size = 512")
+        db.execute("CREATE TABLE t (a CHECK (a NOT IN (0, 'x')), b UNIQUE, c DEFAULT (2 * 3), CHECK (c != 'b' OR a IS b))")
+        for i in range(40):
+            db.execute(f"CREATE VIEW v{i} AS SELECT a AS x, '{'pad' * (i % 30)}' AS y FROM t")
+            if i % 5 == 0:
+                db.execute(f"CREATE INDEX i{i} ON t (a, c)")
+        db.execute("INSERT INTO t VALUES (1, 2, 3)")
+        db.execute("VACUUM")
+        assert db.integrity_check() == []
+        assert db.execute("PRAGMA freelist_count") == [(0,)]
+    assert integrity(path) == [("ok",)]
+    with closing(lite(path)) as connection:
+        assert connection.execute("SELECT count(*) FROM sqlite_schema").fetchall() == [(50,)]
+
+
+def test_an_empty_database_sqlite3_made():
+    # Its header says schema format 0 (nothing created yet); the first table
+    # makes it 4 (then sqlite3 keeps DESC indexes as such).
+    connection = sqlite3.connect(":memory:")
+    db = Database()
+    db.deserialize(connection.serialize())
+    db.execute("CREATE TABLE t (a, b)")
+    db.execute("CREATE INDEX i ON t (a DESC)")
+    db.execute("INSERT INTO t VALUES (1, 2), (3, 4)")
+    image = db.serialize()
+    assert image[44:48] == (4).to_bytes(4, "big")
+    other = sqlite3.connect(":memory:")
+    other.deserialize(image)
+    assert other.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+    assert other.execute("SELECT a FROM t INDEXED BY i WHERE a > 0").fetchall() == [(3,), (1,)]

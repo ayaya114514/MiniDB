@@ -22,10 +22,11 @@ CITIES = ["beijing", "shanghai", "tokyo", "paris", "london", "berlin", "rome", "
 
 
 class Engine:
-    def __init__(self, name, path, format=None):
+    def __init__(self, name, path, format=None, wal=False):
         self.name = name
         self.path = path
         self.format = format
+        self.wal = wal
         self.open()
 
     def open(self):
@@ -35,6 +36,8 @@ class Engine:
         else:
             self.db = sqlite3.connect(self.path, isolation_level=None)
             self.run = lambda sql, parameters=(): self.db.execute(sql, parameters).fetchall()
+        if self.wal:
+            self.run("PRAGMA journal_mode = WAL")
 
     def close(self):
         self.db.close()
@@ -156,12 +159,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--rows", type=int, default=100_000)
     parser.add_argument("--sqlite-format", action="store_true", help="MiniDB uses SQLite's file format")
+    parser.add_argument("--wal", action="store_true", help="both in SQLite's WAL mode (implies --sqlite-format)")
     args = parser.parse_args()
+    if args.wal:
+        args.sqlite_format = True
     results = {}
     with tempfile.TemporaryDirectory() as directory:
         for name in ("minidb", "sqlite3"):
             format = "sqlite" if args.sqlite_format and name == "minidb" else None
-            engine = Engine(name, os.path.join(directory, f"{name}.db"), format)
+            engine = Engine(name, os.path.join(directory, f"{name}.db"), format, args.wal)
             benchmark(engine, args.rows, results)
     print(f"| operation ({args.rows:,} rows) | MiniDB | sqlite3 | ratio |")
     print("|---|---:|---:|---:|")

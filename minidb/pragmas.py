@@ -373,9 +373,31 @@ def _set_number(name: str) -> Callable[[Executor, object], None]:
 
 
 def _journal_mode(executor: Executor) -> str:
+    pager = executor.catalog.pager
+    if pager.path is None:
+        return "memory"
     if executor.catalog.sqlite:
-        return "memory" if executor.catalog.pager.path is None else "delete"
-    return "memory" if executor.catalog.pager.path is None else "wal"
+        return "wal" if pager.wal is not None else "delete"
+    return "wal"
+
+
+def wal_checkpoint(executor: Executor, mode: object) -> list[tuple]:
+    """PRAGMA wal_checkpoint[(PASSIVE | FULL | RESTART | TRUNCATE)]: (busy,
+    frames in the log, frames copied) - see SqlitePager.wal_checkpoint.
+    MiniDB's own format checkpoints its log (sizes not reported)."""
+    if executor.in_transaction():
+        raise OperationalError("database table is locked")
+    pager = executor.catalog.pager
+    mode = "PASSIVE" if mode is None else str(mode).upper()
+    if executor.catalog.sqlite:
+        return [pager.wal_checkpoint(mode if mode in ("FULL", "RESTART", "TRUNCATE") else "PASSIVE")]
+    return [(0 if pager.checkpoint() else 1, -1, -1)]
+
+
+def _set_autocheckpoint(executor: Executor, value: object) -> None:
+    pager = executor.catalog.pager
+    if hasattr(pager, "autocheckpoint"):
+        pager.autocheckpoint = int32(value)
 
 
 def _page_count(executor: Executor) -> int:
@@ -448,6 +470,9 @@ PRAGMAS = {
     "page_count": _value("page_count", _page_count),
     "freelist_count": _value("freelist_count", _freelist_count),
     "journal_mode": _value("journal_mode", _journal_mode, lambda e, v: None, returns_on_set=True),
+    "wal_checkpoint": Spec(["busy", "log", "checkpointed"], wal_checkpoint, "optional"),
+    "wal_autocheckpoint": _value("wal_autocheckpoint", lambda e: getattr(e.catalog.pager, "autocheckpoint", 1000),
+                                 _set_autocheckpoint, returns_on_set=True),
     "encoding": _value("encoding", lambda e: "UTF-8", lambda e, v: None),
     "foreign_keys": _value("foreign_keys", _setting("foreign_keys"), _set_flag("foreign_keys")),
     "defer_foreign_keys": _value("defer_foreign_keys", _setting("defer_foreign_keys"), _set_flag("defer_foreign_keys")),

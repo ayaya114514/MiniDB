@@ -224,16 +224,13 @@ class DbHeader:
         if not valid_page_size(self.page_size):
             raise DatabaseError("file is not a database")
         file_pages = file_size // self.page_size
-        if self.write_version == 2 or self.read_version == 2:
-            raise DatabaseError("SQLite databases in WAL mode are not supported: "
-                                "PRAGMA journal_mode = DELETE with sqlite3 first")
         if self.write_version > 2 or self.read_version > 2:
             raise DatabaseError("unsupported file format")
         if self.reserved:
             raise DatabaseError("SQLite databases with reserved bytes per page are not supported")
         if self.encoding not in (0, 1):
             raise DatabaseError("SQLite databases in UTF-16 are not supported")
-        if not 1 <= self.schema_format <= 4:
+        if not 0 <= self.schema_format <= 4:  # (0: nothing was ever created in it)
             raise DatabaseError("unsupported schema format")
         if self.version_valid_for != self.change_counter or self.page_count == 0:
             self.page_count = file_pages  # written by a version that did not keep it (as SQLite)
