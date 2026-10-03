@@ -1215,3 +1215,32 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   WAL 下自动提交的插入比回滚日志快（少一次 fsync 与日志文件的创建删除），点查慢约 20%（benchmark 见 PROGRESS）。
 - **回滚日志模式也受影响的一点**：每个事务开始只在文件头的 change counter 变了时才检查 `-wal` 是否存在（转入 WAL 必然
   写文件头），避免每条语句多一次 stat。
+
+## D121 执行性能第二轮：数键不读行、去掉索引已保证的等值项、只在溢出时 balance
+
+- **count(*) 数键**：`SELECT count(*) ... WHERE <索引前缀等值 / 范围>`（聚合全是不带 FILTER 的 count(*)、没有 GROUP BY、
+  单表、除索引条件外没有别的条件）不再逐行经过 join 循环和分组循环，而是让 B 树数区间里的键：MiniDB 格式每个叶子一次
+  二分；SQLite 格式的索引 B 树内部页也存条目，所以沿区间两条边界二分，边界之间的整棵子树按单元格数累加，中间不解码任何
+  键（`count_range`）。组的“代表行”（裸列读它）仍是第一行，所以先读一行再数，结果与逐行聚合完全相同。73 次各约 1,400
+  行的等值计数从 0.083 s 降到 0.010 s（sqlite3 0.002 s）。
+- **索引已保证的等值项不再复查**（SQLite 的 disableTerm）：以前所有 WHERE 合取项都留作 filter，索引只用来缩小候选，
+  每个候选行都把 `age = 30` 再算一遍。现在 IndexScan 记下它用作等值键的合取项（`Constraint.source`），内连接这一层的
+  filter 里去掉它们。只对 `=`（不含 BETWEEN / OR 推出的虚拟项、IN、范围）、非 VIRTUAL 列（UPDATE / DELETE 从表里重算
+  VIRTUAL 列，可能与索引里存的值形式不同）、INNER JOIN（RIGHT / FULL JOIN 的未匹配行用全表扫描，要靠 filter）。
+  等值查找本来就按比较的排序规则选索引、按比较亲和性转换键，与逐行比较等价；fuzz 与 sqlite3 对照 3000+ 种子没有差异。
+  hash join（自动索引）没有这样做：它对表一侧的值做键的亲和性转换，与比较语义是否处处等价没有把握，保留 filter。
+- **SQLite 格式插入只在页溢出时 balance**（照 sqlite3BtreeInsert）：原来 `_fix` 对“不足 1/3”的页也做 balance，
+  于是顺序追加时新开的最右叶子在填到 1/3 之前每插一行都与兄弟页重新分配一次（3 万行 1383 次），页面也常年半空——
+  10 万行的文件 13.4 MB，现在 9.4 MB（sqlite3 9.3 MB）。删除仍按原规则合并不足的页。
+- **页面用量增量维护**：`BtreePage.used()` 记住结果和当时的 cells 列表对象、长度、页类型，插入时 `cell_added` 加上新
+  单元格的字节数；原地替换单元格的地方（REPLACE 同 rowid、删除内部条目时前驱顶上、搬页改指针）调 `forget_used()`。
+  用“同一个列表对象 + 长度”校验，不用 id()（列表回收后 id 会被复用）。缓存若偏大只会多做一次 balance，偏小会在写页时
+  触发 `to_bytes` 的 overfull 断言，不会写出坏页；测试在随机操作后逐页核对缓存与重算值，并验证删掉一处 forget_used 时会失败。
+- **SQLite 格式的表树直接收值列表**：以前执行器先编码成 MiniDB record，SQLite 的表树再解码、编码成 SQLite record；
+  `Executor.encode` 现在对接受行的树（`rows` 属性）直接给值列表（两条路径对各种边界值产生的字节相同）。
+- 其余是常数级的：tokenizer 的快速正则把前导空白并进同一次匹配（每个 token 一次 match）；语句种类用 `type(stmt) is X`
+  分派（parser 的语句类没有子类）；参数绑定、record 编码先按 `type()` 判断常见类型；多行 VALUES 的“解析期常量”判断
+  对字面量和参数直接返回；insert_row 在没有触发器 / 外键 / 索引时跳过对应的函数调用。
+- **没有做的**：autocommit 下每条语句的读快照（MiniDB 格式约 9 次系统调用：加解锁、fstat、pread 日志头与 -shm）占点查
+  时间的四成左右，减少它要么放松多进程协议（用 mtime / size 判断日志没变，在粗粒度时间戳的文件系统上不可靠），要么
+  mmap -shm（平台差异），这一轮都没有做。
