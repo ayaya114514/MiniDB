@@ -206,8 +206,10 @@ python tools/build_playground.py && python -m http.server -d site    # http://lo
 
 ```sh
 eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启用参考 SQLite（见下）
-.venv/bin/python -m pytest                                        # 全部测试（860+ 个）
-.venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照
+.venv/bin/python -m pytest                                        # 全部测试（1570+ 个）
+.venv/bin/python tests/fuzz.py --seeds 0-999 --statements 600     # 大规模模糊对照（--file / --sqlite-format / --wal）
+.venv/bin/python tests/crash_fuzz.py --seeds 0-199 [--wal]        # SQLite 格式文件的随机断电
+.venv/bin/python tests/concurrency_fuzz.py --mode wal --seeds 0-9 # MiniDB 与 sqlite3 多进程同时读写
 .venv/bin/python tests/metamorphic.py --seeds 0-399 --queries 300 # 变形测试（不需要 sqlite3）
 .venv/bin/python tools/sqllogictest.py --fetch                    # 下载 SQLite 官方 sqllogictest 语料
 .venv/bin/python tools/sqllogictest.py --jobs 8                   # 跑语料，输出通过率与失败根因
@@ -216,8 +218,8 @@ eval "$(.venv/bin/python tools/reference_sqlite.py)"              # 编译并启
 ```
 
 GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全部测试（警告视为错误），并跑三段 fuzz：
-固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）；另外跑变形测试和
-sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest` 上跑存储、并发与崩溃测试（Python 3.13，不跑与参考 SQLite 的版本对照）。
+固定种子、数据库文件模式、以及每次运行都换一批的新种子（每周定时运行一次）；另外跑 SQLite 格式的随机断电
+（回滚日志与 WAL，固定种子加每次新种子）、三种模式的多进程并发、变形测试和 sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest` 上跑存储、并发与崩溃测试（Python 3.13，不跑与参考 SQLite 的版本对照）。
 
 - **与 sqlite3 对照**（`tests/sqlcompare.py`）：同一条 SQL 在 MiniDB 和 sqlite3 上执行，要求都成功
   且结果相同（区分 1 和 1.0），或者都失败且异常类别相同，部分用例逐字比较报错。
@@ -243,6 +245,11 @@ sqllogictest 全量语料（通过数低于基线即失败）。`windows-latest`
   （拷页、fsync、截断日志）模拟崩溃，包括子进程里真实的 `os._exit`，以及截断/损坏的 WAL，
   重开后数据必须是事务前或事务后的完整状态。`tests/test_crash_model.py` 模拟断电：未 fsync 的写入
   可能丢失、乱序或按 512 字节扇区撕裂，截断也可能丢失，重开后必须完整且是已确认的提交或进行中的那个。
+  SQLite 格式（回滚日志与 WAL）由 `tests/crash_fuzz.py` 做同样的断电，sqlite3 和 MiniDB 各自恢复一份拷贝，
+  必须得到同一个状态（D122）。
+- **多进程并发**（`tests/concurrency_fuzz.py`）：MiniDB 与 sqlite3 进程同时转账、自增、建删索引、VACUUM，
+  读事务核对快照里的不变量；结束后两边都要认为文件完整、内容恰好是所有已确认提交之和、同样的查询答案相同，
+  且整个过程不应出现 busy（D122）。
 
 ## 性能
 

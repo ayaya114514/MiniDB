@@ -683,3 +683,40 @@ SQLite 格式与 MiniDB 格式的差距：插入 1.1–1.3 倍（原 1.6–2.4 �
 - hash join（自动索引）仍对每个候选行复查等值条件，建 hash 时解码整行。
 - 种子 7487 / 2496（惰性 VIRTUAL 列）、1234（计划相关的 GROUP BY 代表值）照旧；内存模式种子 6079 跑了 263 秒，
   原因没有查。
+
+## 阶段 27：测试深度（完成，2026-10-03）
+- **SQLite 格式的断电 fuzz**（`tests/crash_fuzz.py`，D122）：MiniDB 在 SQLite 格式文件上跑随机事务（插入含溢出页的
+  BLOB、更新、删除、WITHOUT ROWID 的 REPLACE、回滚的事务、VACUUM、改页大小的 VACUUM、incremental_vacuum、WAL 的
+  三种 checkpoint，另一个连接时而持有读快照），在随机的一次 fsync 或 unlink 处断电：每个文件自上次 fsync 以来的写入
+  按 512 字节扇区任意丢失或保留，变长 / 截断也可能没生效，`-shm` 随机删掉或保留。sqlite3（子进程）和 MiniDB 各恢复
+  一份拷贝，必须得到同一个完整状态（已确认的提交或进行中的那个），并能继续写。页大小 512 / 1024 / 4096、auto_vacuum
+  0 / 1 / 2 随种子变化。验证 harness：让它忽略日志的 fsync，两种模式下大多数种子立即失败。
+  - **找到并修好**：日志头的记录数原来在记录落盘前就写了（只 fsync 一次）；断电后撕裂的记录可能通过 SQLite 的抽样
+    校验和，被 sqlite3 回放进数据库（`malformed database schema`，种子 38 / 64 / 120）。现照 SQLite 的 syncJournal：
+    头部先写 0 条，记录 fsync 后再写记录数并 fsync（新崩溃点 `journal_count`）。
+- **跨进程并发差分**（`tests/concurrency_fuzz.py`，D122）：6–8 个进程（MiniDB 与 sqlite3 交替；MiniDB 格式时全是
+  MiniDB）同时对一个文件做转账、计数器 upsert、读事务（快照内总额不变、自己的提交恰好可见、不倒退）、并发的
+  CREATE / DROP INDEX、VACUUM、checkpoint；事务内随机停顿让它们真正交错。结束后 sqlite3 与 MiniDB 都要认为文件完整、
+  内容恰好等于所有已确认提交之和、同一组查询（含 `sqlite_schema`）答案相同；整个过程不允许出现 busy。
+  - **找到并修好**：`BEGIN`（DEFERRED）原来当场取读快照（回滚日志模式下还持有 SHARED），别的进程在它和第一条 UPDATE
+    之间提交时，UPDATE 报 “database is locked”，而 SQLite 不会。现在照 SQLite 在第一条语句才开始事务；新测试
+    `test_deferred_transactions_start_at_their_first_statement` 在三种存储下与 sqlite3 的行为逐条对照。
+- CI（fuzz job）：断电 fuzz 两种模式各 100 个固定种子 + 50 个每次新种子；并发 fuzz 三种模式各 10 个种子 × 6 进程 ×
+  300 操作。pytest 里各有几个种子的快速版本（`test_crash_fuzz.py`、`test_concurrency_fuzz.py`）。
+- fuzz harness：文件模式的快照读者在 BEGIN 后先执行一条语句再列表（快照从第一条语句开始）。
+
+**验证**：测试 1574 个通过、8 个跳过。断电 fuzz：回滚日志与 WAL 各 600 个种子 × 8–10 次断电（0–599），修复后 0 失败；
+加入改页大小的 VACUUM 后回滚日志模式再跑 150 × 10，0 失败。并发 fuzz：三种模式各 50 个种子 × 8 进程 × 400 操作
+（100–149）+ 各 10 个种子 × 6 × 300，0 失败。改动事务语义后复跑：内存 400、MiniDB 文件 300、SQLite 格式文件 300、
+WAL 200 个种子，变形测试文件模式 200 × 300，0 失败。
+
+**benchmark**：本阶段的产品代码改动只有日志多一次 fsync 和 DEFERRED 事务懒开始，没有碰查询 / 插入热路径；两种格式
+全表复跑，各项与阶段 26 末在噪声内（SQLite 格式自动提交插入 1000 行 0.408 → 0.404 s；一次测得带参数点查 0.240 s，
+重测新旧代码都是 0.15 s）。macOS 上 fsync 不含 F_FULLFSYNC，多一次 fsync 的真实代价在别的系统上可能更明显（未测）。
+
+**已知问题 / 做得不扎实的地方**：
+- 断电模型把文件的创建与删除视为立即持久（MiniDB 删日志后会 fsync 目录；SQLite 在 synchronous=FULL 下不会，
+  那种情形下 SQLite 自己也可能把已提交的事务回滚）；只模拟 MiniDB 作为写者断电，sqlite3 写者只有已有的“进程被杀”测试。
+- 并发 fuzz 的负载是可交换、可核对的操作，不是任意随机 SQL；结果只核对最终状态和快照不变量，不核对每条语句的结果。
+- MiniDB 的任何语句都会开始 DEFERRED 事务，SQLite 里不访问数据库的语句（如 `SELECT 1`）不会。
+- Windows 上没有运行（CI 的 windows job 跳过了 SQLite WAL 的那组新测试）。

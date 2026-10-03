@@ -1244,3 +1244,29 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
 - **没有做的**：autocommit 下每条语句的读快照（MiniDB 格式约 9 次系统调用：加解锁、fstat、pread 日志头与 -shm）占点查
   时间的四成左右，减少它要么放松多进程协议（用 mtime / size 判断日志没变，在粗粒度时间戳的文件系统上不可靠），要么
   mmap -shm（平台差异），这一轮都没有做。
+
+## D122 测试深度：断电模型按扇区组合，多进程负载用不变量对照
+
+- **断电 fuzz 不拦截每次写入，只记 fsync**（`tests/crash_fuzz.py`）：拦截 `os.fsync` / `os.unlink`，记下每个文件上次
+  fsync 时的内容；断电时，对每个文件在“上次 fsync 的内容”和“当前内容”之间按 512 字节扇区任意组合（每个变化的扇区
+  独立地保留新值或旧值），文件变长或截断也可能没生效，创建与删除文件视为立即生效（MiniDB 删除日志后 fsync 目录）。
+  这覆盖了丢失、乱序和撕裂的写入，而不必区分一次次 write；断电点取在某一次 fsync 或 unlink 之前，两次 fsync 之间的
+  所有中间状态都被这个组合覆盖。`-shm` 不持久：随机删掉或保留。之后 sqlite3（子进程）和 MiniDB 各自恢复一份拷贝，
+  两者必须得到同一个完整的状态，且是最后确认的提交或进行中的那个，并能继续写。验证 harness 本身：让它“忘记”日志的
+  fsync，两种模式下大多数种子立刻失败。
+- **它找到的问题：日志头的记录数要在记录落盘之后才写**。MiniDB 原来把记录数随日志头一起写、只 fsync 一次；fsync 前断电，
+  头部已落盘而部分记录被撕裂（扇区为零），SQLite 的记录校验和只抽样每 200 个字节，可能通过，sqlite3 就把零字节写回了
+  数据库（`malformed database schema`）。照 SQLite 的 syncJournal（synchronous=FULL）：头部先写 0 条，记录写完 fsync，
+  再写真实记录数并 fsync——热日志的记录数为 0 时不回放任何页。数据库文件在第二次 fsync 之前一个字节都没动。
+- **多进程并发差分用不变量而不是逐步对照**（`tests/concurrency_fuzz.py`）：结果取决于交错，没法与单个参考库逐语句比较，
+  所以负载由可交换、可核对的操作组成——账户间转账（总额不变，并记一行日志）、计数器自增 upsert、读事务（同一快照里两次
+  求和相等、等于总额，自己提交过的转账恰好都看得见，日志行数不倒退），再加上并发的 CREATE / DROP INDEX、VACUUM、
+  checkpoint。每个进程只记它确认提交了的操作；结束后 sqlite3 与 MiniDB 分别打开文件，都要完整、内容恰好等于所有已确认
+  提交之和，且同一组查询（含 `sqlite_schema`）答案相同。负载按 SQLite 的语义不应出现任何 busy（写事务以写开始或
+  BEGIN IMMEDIATE，读事务不升级，超时 20 秒），所以任何 “database is locked” 都算失败。
+- **它找到的问题：DEFERRED 事务应在第一条语句才开始**。MiniDB 的 `BEGIN` 原来当场取读快照（回滚日志模式下还持有
+  SHARED 锁），于是 `BEGIN; UPDATE ...` 若在两者之间有别的进程提交，UPDATE 因快照过期报 locked；SQLite 的 DEFERRED
+  事务到第一条语句才开始，第一条是写时先等写锁再取快照（sqlite3BtreeBeginTrans 在还没有事务时会经 busy handler 重试），
+  不会失败，只执行了 BEGIN 的连接也不挡别人提交。现在照做（`Database.snapshot_pending`）；已经读过的事务再写仍然
+  立即报 locked（SQLite 的 BUSY_SNAPSHOT / 防死锁）。已知差别：MiniDB 的任何语句都会开始事务，SQLite 里不访问数据库的
+  语句（如 `SELECT 1`）不会。
