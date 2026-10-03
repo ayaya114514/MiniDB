@@ -135,6 +135,55 @@ def comparison_affinity(left: str | None, right: str | None) -> str | None:
 # ---- conversions -----------------------------------------------------------
 
 
+class IntReal(float):
+    """A whole REAL as SQLite keeps it after OP_Affinity applies REAL
+    affinity (MEM_IntReal: a generated column's value): a real number,
+    except in a record, which holds it as an integer (one without REAL
+    affinity reads back an integer)."""
+
+    __slots__ = ()
+
+
+# Whether any IntReal was ever made (only then do sorts look for them).
+int_reals_made = [False]
+
+
+def int_real(value: SQLValue) -> SQLValue:
+    """``value`` (with REAL affinity applied) as OP_Affinity leaves it: an
+    IntReal when it is whole and fits in 48 bits."""
+    if type(value) is float and value.is_integer() and -140737488355328.0 <= value <= 140737488355327.0:
+        int_reals_made[0] = True
+        return IntReal(int(value))
+    return value
+
+
+_PLAIN_TYPES = frozenset((type(None), int, float, str, bytes))
+
+
+def record_value(value: SQLValue, affinity: str | None = None) -> SQLValue:
+    """A value as a record holds it (in a column of ``affinity``): a JSON
+    value without its subtype, an IntReal as an integer (as a REAL in a
+    REAL column)."""
+    kind = type(value)
+    if kind in _PLAIN_TYPES:
+        return value
+    if kind is IntReal:
+        return float(value) if affinity == REAL else int(value)
+    if isinstance(value, str):
+        return str.__str__(value)
+    if isinstance(value, bytes):
+        return bytes(value)
+    return value
+
+
+def through_record(row: tuple) -> tuple:
+    """A result row as it comes out of SQLite's sorter or a temporary table
+    (a record): IntReals become integers."""
+    if any(type(v) is IntReal for v in row):
+        return tuple(int(v) if type(v) is IntReal else v for v in row)
+    return row
+
+
 def format_real(value: float) -> str:
     """Render a REAL as text like SQLite: printf("%!.17g"), see fp.format_real."""
     return fp_format_real(value)
@@ -333,8 +382,8 @@ def collation_compare(collation: str | None) -> Callable[[SQLValue, SQLValue], i
         return compare
 
     def collated_compare(a: SQLValue, b: SQLValue) -> int:
-        if type(a) is str and type(b) is str:
-            a, b = text_key(a), text_key(b)
+        if isinstance(a, str) and isinstance(b, str):  # (text with the JSON subtype too)
+            a, b = text_key(str.__str__(a)), text_key(str.__str__(b))
             return (a > b) - (a < b)
         return compare(a, b)
     return collated_compare

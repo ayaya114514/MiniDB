@@ -105,8 +105,9 @@ class Program:
                 scope.entries[-1].hidden.update(ascii_lower(c.name) for c in source.columns)
                 scope.entries[-1].hidden.update(ROWID_NAMES)
         self.changes = 0
-        saved = executor.outer_scope
+        saved, schema = executor.outer_scope, executor.default_schema
         executor.outer_scope = scope
+        executor.default_schema = None if trigger.temp else "main"  # (its names: see Executor.default_schema)
         executor.compiling_trigger += 1
         try:
             self.when = None
@@ -125,14 +126,8 @@ class Program:
                 trigger.when) or any(
                 isinstance(node, Raise) and node.kind == "ABORT"
                 for node in walk_tree([trigger.when, trigger.body]))
-        except OperationalError as exc:
-            message = str(exc)
-            if message.startswith("no such table: ") and "." not in message:
-                # A trigger's tables are looked up in the main schema.
-                raise OperationalError(message.replace(": ", ": main.", 1)) from None
-            raise
         finally:
-            executor.outer_scope = saved
+            executor.outer_scope, executor.default_schema = saved, schema
             executor.compiling_trigger -= 1
 
     def run(self, new: list | None, old: list | None) -> None:
@@ -180,7 +175,7 @@ class Triggers:
         newest first; an UPDATE OF fires if the UPDATE sets one of its
         columns (``changed``: the names set; None: any)."""
         catalog = self.executor.catalog
-        if not catalog.triggers or self.disabled:
+        if not catalog.any_triggers or self.disabled:
             return []
         if self._version != catalog.version:
             self._version, self._by_table = catalog.version, {}
@@ -203,7 +198,7 @@ class Triggers:
         the order of the table's trigger list (newest first), as SQLite's
         sqlite3TriggerColmask does before the rest of the statement."""
         executor = self.executor
-        if not executor.catalog.triggers or self.disabled:
+        if not executor.catalog.any_triggers or self.disabled:
             return
         for trigger in executor.catalog.triggers_on(name):
             if trigger.event == event and trigger.timing in ("BEFORE", "AFTER") and trigger in self.matching(
@@ -235,9 +230,10 @@ class Triggers:
                 return program
         if program is None:
             trigger.programs = {k: p for k, p in trigger.programs.items() if k[0] == key[0]}
-            source = executor.catalog.tables.get(ascii_lower(trigger.table_name))
+            catalog = executor.catalog.temp if trigger.on_temp else executor.catalog
+            source = catalog.tables.get(ascii_lower(trigger.table_name))
             if source is None:
-                source = executor.view_source(executor.catalog.find_view(trigger.table_name))
+                source = executor.view_source(catalog.views[ascii_lower(trigger.table_name)])
             program = Program.__new__(Program)
             trigger.programs[key] = program  # (a program that fires itself finds it)
             program.compiled = []  # the programs compiling it asked for, in order

@@ -262,6 +262,7 @@ class AlterTable:
     definition: object = None  # ColumnDef of ADD COLUMN
     definition_text: str = ""  # its SQL text
     new_quoted: bool = False  # whether the new name was written quoted
+    schema: str | None = None
 
 
 @dataclass
@@ -273,6 +274,8 @@ class CreateTable:
     sql: str = field(default="", compare=False)  # what the schema stores, as SQLite does
     name_pos: int = field(default=-1, compare=False)
     columns_end: int = field(default=-1, compare=False)  # where ADD COLUMN inserts (see Catalog)
+    temp: bool = False  # CREATE TEMP TABLE / CREATE TABLE temp.name: in the connection's temp database
+    query: object = None  # CREATE TABLE ... AS SELECT (no columns: the executor makes them)
 
 
 @dataclass
@@ -287,6 +290,7 @@ class CreateIndex:
     sql: str = field(default="", compare=False)  # what the schema stores, as SQLite does
     table_pos: int = field(default=-1, compare=False)
     column_pos: list = field(default_factory=list, compare=False)
+    schema: str | None = None  # CREATE INDEX temp.name / main.name
 
 
 @dataclass
@@ -296,25 +300,28 @@ class CreateView:
     query: object  # Select or Compound
     if_not_exists: bool = False
     sql: str = ""  # the statement's text, stored in the schema as SQLite does
-    temp: bool = False  # CREATE TEMP VIEW: kept in memory by this connection only
+    temp: bool = False  # CREATE TEMP VIEW: in the connection's temp database
 
 
 @dataclass
 class DropView:
     name: str
     if_exists: bool = False
+    schema: str | None = None  # "main" or "temp" when the name is qualified
 
 
 @dataclass
 class DropIndex:
     name: str
     if_exists: bool = False
+    schema: str | None = None
 
 
 @dataclass
 class DropTable:
     name: str
     if_exists: bool = False
+    schema: str | None = None
 
 
 @dataclass
@@ -341,6 +348,7 @@ class Insert:
     # Where the table name and the column names are in the SQL text (for ALTER TABLE in triggers).
     table_pos: int = field(default=-1, compare=False)
     column_pos: list | None = field(default=None, compare=False)
+    schema: str | None = None  # INSERT INTO main.t / temp.t
 
 
 @dataclass
@@ -357,6 +365,7 @@ class TableRef:
     indexed_by: str | None = None  # INDEXED BY <index>: the only index the planner may use
     pos: int = field(default=-1, compare=False)  # of the name in the SQL text
     not_indexed: bool = False  # NOT INDEXED: the planner uses no index
+    schema: str | None = None  # "main" or "temp" for main.name / temp.name
 
 
 @dataclass
@@ -471,6 +480,7 @@ class Update:
     not_indexed: bool = False
     table_pos: int = field(default=-1, compare=False)
     assignment_pos: list | None = field(default=None, compare=False)  # of the names SET assigns
+    schema: str | None = None
 
 
 @dataclass
@@ -482,6 +492,7 @@ class Delete:
     ctes: list | None = None
     not_indexed: bool = False
     table_pos: int = field(default=-1, compare=False)
+    schema: str | None = None
 
 
 @dataclass
@@ -525,12 +536,16 @@ class CreateTrigger:
     sql: str = ""  # as SQLite stores it: "CREATE TRIGGER " and the text from the name to END
     table_pos: int = field(default=-1, compare=False)  # of the table name in ``sql``
     column_pos: list | None = field(default=None, compare=False)  # of the UPDATE OF columns, in ``sql``
+    temp: bool = False  # CREATE TEMP TRIGGER
+    schema: str | None = None  # of the trigger's name: CREATE TRIGGER main.name / temp.name
+    table_schema: str | None = None  # ON main.t / temp.t
 
 
 @dataclass
 class DropTrigger:
     name: str
     if_exists: bool = False
+    schema: str | None = None
 
 
 @dataclass
@@ -772,24 +787,22 @@ class Parser:
         raise self.error("pragma value")
 
     def create(self) -> CreateTable | CreateIndex | CreateView:
-        create = self.expect_keyword("CREATE")
+        self.expect_keyword("CREATE")
         if self.at_keyword("UNIQUE", "INDEX"):
             return self.create_index()
         temp = self.at_word("TEMP") or self.at_word("TEMPORARY")
         if temp:
             self.advance()
         if self.at_word("VIEW"):
-            return self.create_view(create.pos, temp)
+            return self.create_view(temp)
         if self.at_word("TRIGGER"):
-            if temp:
-                raise NotSupportedError("temporary triggers are not supported")
-            return self.create_trigger()
-        if temp:
-            raise NotSupportedError("temporary tables are not supported")
+            return self.create_trigger(temp)
         self.expect_keyword("TABLE")
         if_not_exists = self.if_not_exists()
-        name_pos = self.tok.pos
-        name = self.identifier("table name")
+        temp = self.temp_name(temp)
+        name, name_pos = self.object_name, self.object_pos
+        if self.accept_keyword("AS"):
+            return CreateTable(name, [], if_not_exists, temp=temp, query=self.query())
         self.expect_op("(")
         columns = [self.column_def()]
         constraints = []
@@ -815,10 +828,19 @@ class Parser:
                 break
         if options:
             raise NotSupportedError(f"{options[0]} tables are not supported")
-        stmt = CreateTable(name, columns, if_not_exists, constraints)
+        stmt = CreateTable(name, columns, if_not_exists, constraints, temp=temp)
         stmt.sql = "CREATE TABLE " + self.text[name_pos:self.end_of_previous()]
         stmt.name_pos, stmt.columns_end = name_pos, columns_end
         return stmt
+
+    def temp_name(self, temp: bool) -> bool:
+        """The ``[schema.]name`` of a new table or view (in self.object_name,
+        its position in self.object_pos): whether it goes in the temp
+        database - TEMP, or the schema temp."""
+        schema, self.object_name, self.object_pos = self.qualified_name("name", create=True)
+        if temp and schema == "main":
+            raise OperationalError("temporary table name must be unqualified")
+        return temp or schema == "temp"
 
     def end_of_previous(self) -> int:
         """Where the token before the current one ends in the SQL text."""
@@ -977,7 +999,12 @@ class Parser:
     def alter_table(self) -> AlterTable:
         self.advance()  # ALTER
         self.expect_keyword("TABLE")
-        table = self.identifier("table name")
+        schema, table, _ = self.qualified_name("table name")
+        stmt = self.alter_action(table)
+        stmt.schema = schema
+        return stmt
+
+    def alter_action(self, table: str) -> AlterTable:
         if self.at_word("RENAME"):
             self.advance()
             if self.at_word("TO"):
@@ -1002,10 +1029,11 @@ class Parser:
             return AlterTable(table, "drop", self.identifier("column name"))
         raise self.error("RENAME, ADD or DROP")
 
-    def create_view(self, start: int, temp: bool = False) -> CreateView:
+    def create_view(self, temp: bool = False) -> CreateView:
         self.advance()  # VIEW
         if_not_exists = self.if_not_exists()
-        name = self.identifier("view name")
+        temp = self.temp_name(temp)
+        name, start = self.object_name, self.object_pos
         columns = None
         if self.accept_op("("):
             columns = [self.identifier("column name")]
@@ -1018,18 +1046,15 @@ class Parser:
         if self.param_count != parameters:
             raise OperationalError("parameters are not allowed in views")
         last = self.tokens[self.i - 1]
-        sql = self.text[start:last.pos + len(last.text)]
+        sql = "CREATE VIEW " + self.text[start:last.pos + len(last.text)]  # (from the name, as SQLite keeps it)
         return CreateView(name, columns, query, if_not_exists, sql, temp)
 
-    def create_trigger(self) -> CreateTrigger:
+    def create_trigger(self, temp: bool = False) -> CreateTrigger:
         self.advance()  # TRIGGER
         if_not_exists = self.if_not_exists()
-        name_pos = self.tok.pos
-        name = self.identifier("trigger name")
-        if self.accept_op("."):
-            self.check_schema(name)
-            name_pos = self.tok.pos
-            name = self.identifier("trigger name")
+        schema, name, name_pos = self.qualified_name("trigger name", create=True)
+        if temp and schema is not None:
+            raise OperationalError("temporary trigger may not have qualified name")
         timing = "BEFORE"  # (SQLite's default)
         column_pos = None
         if self.at_word("BEFORE", "AFTER"):
@@ -1055,12 +1080,7 @@ class Parser:
         else:
             raise self.error("DELETE, INSERT or UPDATE")
         self.expect_keyword("ON")
-        table_pos = self.tok.pos
-        table = self.identifier("table name")
-        if self.accept_op("."):
-            self.check_schema(table)
-            table_pos = self.tok.pos
-            table = self.identifier("table name")
+        table_schema, table, table_pos = self.qualified_name("table name")
         if self.at_word("FOR"):
             self.advance()
             self.expect_word("EACH")
@@ -1085,7 +1105,8 @@ class Parser:
         sql = "CREATE TRIGGER " + self.text[name_pos:end.pos + len(end.text)]
         shift = len("CREATE TRIGGER ") - name_pos
         return CreateTrigger(name, table, timing, event, columns, when, body, if_not_exists, sql, table_pos + shift,
-                             None if column_pos is None else [p + shift for p in column_pos])
+                             None if column_pos is None else [p + shift for p in column_pos],
+                             temp=temp, schema=schema, table_schema=table_schema)
 
     def trigger_statement(self) -> Statement:
         """One statement of a trigger program, with SQLite's restrictions."""
@@ -1110,21 +1131,35 @@ class Parser:
         if ascii_lower(name) not in ("main", "temp"):
             raise OperationalError(f"unknown database {name}")
 
+    def qualified_name(self, what: str, create: bool = False) -> tuple[str | None, str, int]:
+        """``[schema.]name``: (schema, name, position of the name); the schema
+        "main" or "temp" (None if not given).  Another schema is kept as
+        written: no object is found in it (or, ``create``, an error now)."""
+        pos = self.tok.pos
+        name = self.identifier(what)
+        if not self.at_op("."):
+            return None, name, pos
+        self.advance()
+        if create:
+            self.check_schema(name)
+        schema = ascii_lower(name) if ascii_lower(name) in ("main", "temp") else name
+        pos = self.tok.pos
+        return schema, self.identifier(what), pos
+
     def target_table(self) -> str:
-        """The table an INSERT, UPDATE or DELETE writes (its position: self.target_pos)."""
-        self.target_pos = self.tok.pos
-        name = self.identifier("table name")
-        if self.in_trigger and self.at_op("."):
+        """The table an INSERT, UPDATE or DELETE writes (its position:
+        self.target_pos, its schema: self.target_schema)."""
+        if self.in_trigger and self.tokens[self.i + 1].kind == "OP" and self.tokens[self.i + 1].value == ".":
             raise OperationalError(
                 "qualified table names are not allowed on INSERT, UPDATE, and DELETE statements within triggers")
+        self.target_schema, name, self.target_pos = self.qualified_name("table name")
         return name
 
     def create_index(self) -> CreateIndex:
         unique = bool(self.accept_keyword("UNIQUE"))
         self.expect_keyword("INDEX")
         if_not_exists = self.if_not_exists()
-        name_pos = self.tok.pos
-        name = self.identifier("index name")
+        schema, name, name_pos = self.qualified_name("index name", create=True)
         self.expect_keyword("ON")
         table_pos = self.tok.pos
         table = self.identifier("table name")
@@ -1149,7 +1184,7 @@ class Parser:
         stmt = CreateIndex(name, table, [c.name for c in columns], unique, if_not_exists,
                            [c.descending for c in columns], [c.collation for c in columns])
         stmt.sql = f"CREATE{' UNIQUE' if unique else ''} INDEX " + self.text[name_pos:self.end_of_previous()]
-        stmt.table_pos, stmt.column_pos = table_pos, [c.pos for c in columns]
+        stmt.table_pos, stmt.column_pos, stmt.schema = table_pos, [c.pos for c in columns], schema
         return stmt
 
     def indexed_column(self) -> tuple[str, str | None]:
@@ -1284,11 +1319,8 @@ class Parser:
             if self.accept_keyword("IF"):
                 self.expect_keyword("EXISTS")
                 if_exists = True
-            name = self.identifier("trigger name")
-            if self.accept_op("."):
-                self.check_schema(name)
-                name = self.identifier("trigger name")
-            return DropTrigger(name, if_exists)
+            schema, name, _ = self.qualified_name("trigger name")
+            return DropTrigger(name, if_exists, schema)
         if self.accept_keyword("INDEX"):
             kind = DropIndex
         elif self.at_word("VIEW"):
@@ -1302,7 +1334,8 @@ class Parser:
             self.expect_keyword("EXISTS")
             if_exists = True
         what = {DropIndex: "index name", DropView: "view name", DropTable: "table name"}[kind]
-        return kind(self.identifier(what), if_exists)
+        schema, name, _ = self.qualified_name(what)
+        return kind(name, if_exists, schema)
 
     def conflict_clause(self) -> str | None:
         """``OR <resolution>`` after INSERT or UPDATE (None if absent: each
@@ -1318,7 +1351,7 @@ class Parser:
         raise self.error("ROLLBACK, ABORT, FAIL, IGNORE or REPLACE")
 
     def returning(self) -> list[SelectItem] | None:
-        if not self.at_word("RETURNING"):
+        if not self.at_keyword("RETURNING"):
             return None
         self.advance()
         items = [self.select_item()]
@@ -1366,7 +1399,7 @@ class Parser:
             conflict = self.conflict_clause()
         self.expect_keyword("INTO")
         table = self.target_table()
-        table_pos = self.target_pos
+        table_pos, schema = self.target_pos, self.target_schema
         columns = None
         column_pos = None
         if self.accept_op("("):
@@ -1385,6 +1418,7 @@ class Parser:
         else:
             self.expect_keyword("VALUES")
             stmt = Insert(table, columns, self.value_rows(), None, conflict)
+        stmt.schema = schema
         stmt.upsert = self.upsert_clauses()
         stmt.returning = self.returning()
         stmt.table_pos, stmt.column_pos = table_pos, column_pos
@@ -1735,10 +1769,9 @@ class Parser:
             elif self.tok.kind == "IDENT" and not self.at_word("RIGHT", "FULL", "WINDOW"):
                 alias = self.advance().value
             return DerivedTable(query, alias)
-        pos = self.tok.pos
-        name = self.identifier("table name")
+        schema, name, pos = self.qualified_name("table name")
         function = None
-        if self.accept_op("("):  # a table-valued function
+        if schema is None and self.accept_op("("):  # a table-valued function
             function = TableFunction(ascii_lower(name), [] if self.at_op(")") else self.expr_list(), pos=pos)
             self.expect_op(")")
         alias = None
@@ -1750,7 +1783,7 @@ class Parser:
             function.alias = alias
             return function
         indexed_by, not_indexed = self.index_hint()
-        return TableRef(name, alias, indexed_by, pos, not_indexed)
+        return TableRef(name, alias, indexed_by, pos, not_indexed, schema)
 
     def index_hint(self) -> tuple[str | None, bool]:
         """(index name, False) for ``INDEXED BY <index>``, (None, True) for
@@ -1770,7 +1803,7 @@ class Parser:
         self.expect_keyword("UPDATE")
         conflict = self.conflict_clause()
         table = self.target_table()
-        table_pos = self.target_pos
+        table_pos, schema = self.target_pos, self.target_schema
         indexed_by, not_indexed = self.index_hint()
         self.expect_keyword("SET")
         assignment_pos = [self.tok.pos]
@@ -1780,7 +1813,7 @@ class Parser:
             assignments.append(self.assignment())
         where = self.expr() if self.accept_keyword("WHERE") else None
         return Update(table, assignments, where, conflict, self.returning(), indexed_by, not_indexed=not_indexed,
-                      table_pos=table_pos, assignment_pos=assignment_pos)
+                      table_pos=table_pos, assignment_pos=assignment_pos, schema=schema)
 
     def assignment(self) -> tuple[str, Expr]:
         name = self.identifier("column name")
@@ -1791,10 +1824,11 @@ class Parser:
         self.expect_keyword("DELETE")
         self.expect_keyword("FROM")
         table = self.target_table()
-        table_pos = self.target_pos
+        table_pos, schema = self.target_pos, self.target_schema
         indexed_by, not_indexed = self.index_hint()
         where = self.expr() if self.accept_keyword("WHERE") else None
-        return Delete(table, where, self.returning(), indexed_by, not_indexed=not_indexed, table_pos=table_pos)
+        return Delete(table, where, self.returning(), indexed_by, not_indexed=not_indexed, table_pos=table_pos,
+                      schema=schema)
 
     # ---- expressions --------------------------------------------------
 

@@ -31,7 +31,8 @@
   `foreign_key_check`、`integrity_check` / `quick_check`、`user_version`、`application_id`、`schema_version`、
   `page_size` / `page_count` / `freelist_count`、`journal_mode` 等，以及表值函数形式 `pragma_xxx(...)`。
 - `ALTER TABLE ... RENAME TO / RENAME COLUMN / ADD COLUMN / DROP COLUMN`（视图里的引用一并改写）；
-  `CREATE [TEMP] VIEW` / `DROP VIEW`；`REINDEX`；`VACUUM`（重写紧凑文件、收缩文件）与 `VACUUM INTO 'file'`。
+  `CREATE [TEMP] VIEW` / `DROP VIEW`；临时表 `CREATE TEMP TABLE`（连接自己的 temp 库，在内存里，随事务提交
+  回滚，`main.` / `temp.` 限定名，`sqlite_temp_master`，TEMP 触发器）；`CREATE [TEMP] TABLE ... AS SELECT`；`REINDEX`；`VACUUM`（重写紧凑文件、收缩文件）与 `VACUUM INTO 'file'`。
 - `INSERT`（多行 `VALUES`、`DEFAULT VALUES`、`INSERT ... SELECT`、`(rowid, ...)` 列）、`UPDATE`、`DELETE`；
   冲突处理 `INSERT OR REPLACE/IGNORE/ABORT/FAIL/ROLLBACK`、`REPLACE`、UPSERT
   （`ON CONFLICT (...) DO UPDATE SET ... WHERE / DO NOTHING`，多个子句）、`RETURNING`。
@@ -262,7 +263,7 @@ Python 源码编译执行，见 DECISIONS.md D90）。
 
 ## 已知限制
 
-- 不支持临时表和 TEMP 触发器、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`WITHOUT ROWID`、`STRICT`、
+- 不支持 `ATTACH`、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`WITHOUT ROWID`、`STRICT`、
   表达式索引和部分索引、`UPDATE ... FROM`；`localtime` 修饰符只在一个时区的机器上对照过。
 - 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、

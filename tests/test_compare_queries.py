@@ -6,7 +6,7 @@ import random
 import pytest
 
 from minidb import Database
-from minidb.errors import NotSupportedError, OperationalError
+from minidb.errors import OperationalError
 from sqlcompare import Pair
 
 SETUP = [
@@ -554,15 +554,15 @@ def test_temporary_views():
 def test_temporary_views_are_not_stored(tmp_path):
     path = str(tmp_path / "temp.db")
     db = Database(path)
-    db.execute("CREATE TABLE t (a); CREATE TEMP VIEW v AS SELECT a FROM t")
+    db.execute("CREATE TABLE t (a); CREATE TEMP VIEW v AS SELECT a FROM t; CREATE TEMP TABLE x (a)")
+    db.execute("INSERT INTO x VALUES (1)")
     assert db.execute("SELECT * FROM v") == []
     db.close()
     db = Database(path)
-    with pytest.raises(OperationalError, match="no such table: v"):
-        db.execute("SELECT * FROM v")
+    for name in ("v", "x"):
+        with pytest.raises(OperationalError, match=f"no such table: {name}"):
+            db.execute(f"SELECT * FROM {name}")
     db.close()
-    with pytest.raises(NotSupportedError):
-        Database(None).execute("CREATE TEMP TABLE x (a)")
 
 
 @pytest.mark.parametrize("table", [

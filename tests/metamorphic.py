@@ -43,8 +43,17 @@ class LiteralGenerator(Generator):
 
 
 def typed(row):
-    """A row as a hashable key that tells 1 from 1.0."""
-    return tuple((type(v).__name__, v) for v in row)
+    """A row as a hashable key that tells 1 from 1.0 (not a JSON text from
+    a plain one, nor SQLite's IntReal from a REAL: which one a query gives
+    may depend on its plan, as in SQLite)."""
+    return tuple((_kind(v), v) for v in row)
+
+
+def _kind(value):
+    for base in (str, bytes, float):
+        if isinstance(value, base):
+            return base.__name__
+    return type(value).__name__
 
 
 def loose(row):

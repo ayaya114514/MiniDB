@@ -431,3 +431,53 @@ def test_excluded_has_no_collation(pair):
         'SELECT * FROM t',
     ]:
         pair.run(sql)
+
+
+def test_a_column_named_twice_in_insert(pair):
+    """The first value wins, except for the row id (sqlite3Insert)."""
+    run_all(pair, """
+        CREATE TABLE t (a, b UNIQUE);
+        INSERT INTO t (b, b) VALUES (1, 2);
+        INSERT INTO t (b, a, b) VALUES (3, 4, 5) RETURNING *;
+        INSERT INTO t (a, a) SELECT 7, 8;
+        UPDATE t SET a = 1, a = 2 WHERE b = 3;
+        SELECT * FROM t;
+        CREATE TABLE u (id INTEGER PRIMARY KEY, x);
+        INSERT INTO u (id, x, id) VALUES (5, 'q', 6);
+        INSERT INTO u (rowid, x, id) VALUES (8, 'r', 9);
+        INSERT INTO u (id, rowid, x) VALUES (10, 11, 's');
+        CREATE TABLE w (x, y);
+        INSERT INTO w (rowid, x, rowid) VALUES (3, 1, 4);
+        INSERT INTO w (oid, y, _rowid_) VALUES (5, 1, 6);
+        SELECT rowid, * FROM w;
+        SELECT * FROM u
+        """)
+
+
+def test_alter_table_checks_the_schema_first(pair):
+    """RENAME and DROP COLUMN first check that every view and trigger still
+    compiles (SQLite's renameTestSchema); ADD COLUMN does not."""
+    run_all(pair, """
+        CREATE TABLE t (a);
+        CREATE TABLE x (b);
+        CREATE VIEW v AS SELECT * FROM x;
+        DROP TABLE x;
+        ALTER TABLE t RENAME TO t2;
+        ALTER TABLE t RENAME COLUMN a TO b;
+        ALTER TABLE t ADD COLUMN c;
+        ALTER TABLE t DROP COLUMN a;
+        DROP VIEW v;
+        CREATE TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO nosuch VALUES (1); END;
+        ALTER TABLE t RENAME TO t3;
+        DROP TRIGGER tr;
+        CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT zz FROM t; END;
+        ALTER TABLE t RENAME TO t4;
+        DROP TRIGGER tr;
+        CREATE TEMP VIEW tv AS SELECT * FROM nosuch;
+        ALTER TABLE t RENAME TO t5;
+        CREATE TEMP TABLE tt (a);
+        ALTER TABLE tt RENAME TO tt2;
+        DROP VIEW tv;
+        ALTER TABLE t RENAME TO t6;
+        SELECT name FROM sqlite_master
+        """)

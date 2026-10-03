@@ -58,13 +58,12 @@ class Shell:
         if command == ".help":
             self.write(HELP)
         elif command == ".tables":
-            names = sorted([t.name for t in catalog.tables.values()] + [v.name for v in catalog.views.values()]
-                           + [f"temp.{v.name}" for v in catalog.temp_views.values()])
+            names = sorted([("temp." if t.temp else "") + t.name for t in catalog.all_tables() + catalog.all_views()])
             if names:
                 self.write(" ".join(names))
         elif command == ".schema":
-            tables = sorted(catalog.tables.values(), key=lambda t: t.name)
-            views = sorted([*catalog.views.values(), *catalog.temp_views.values()], key=lambda v: v.name)
+            tables = sorted(catalog.all_tables(), key=lambda t: t.name)
+            views = sorted(catalog.all_views(), key=lambda v: v.name)
             if args:
                 view = catalog.find_view(args[0])
                 tables, views = ([], [view]) if view else ([catalog.get_table(args[0])], [])

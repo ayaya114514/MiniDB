@@ -203,6 +203,9 @@ class Database:
         elif writes:
             pager.begin_write(wait=False)
         pager.begin_statement()
+        temp = self._temp_pager()
+        if temp is not None:
+            temp.begin_statement()
         saved = keys.deferred, keys.deferred_immediate
         keys.extra_changes = 0
         jsonfuncs.CACHE.clear()  # (SQLite's JSON cache lives as long as one statement's execution)
@@ -239,6 +242,9 @@ class Database:
                 raise
             keys.deferred, keys.deferred_immediate = saved  # (SQLite's statement journal keeps them too)
             pager.rollback_statement()
+            temp = self._temp_pager()
+            if temp is not None:
+                temp.rollback_statement()
             self.catalog.load()
             if resolution == "ROLLBACK" and self.in_transaction:
                 self.in_transaction = False
@@ -270,6 +276,9 @@ class Database:
         """Keep a statement's changes; outside a transaction, commit them."""
         pager = self.pager
         pager.end_statement()
+        temp = self._temp_pager()
+        if temp is not None:
+            temp.end_statement()
         if self.in_transaction and len(pager.dirty) > SPILL_PAGES:
             # Keep big transactions out of memory: move their pages to the log.
             pager.spill()
@@ -289,9 +298,18 @@ class Database:
             self.catalog.load()  # another connection committed: the schema may differ
             self.executor.data_version += 1
 
+    def _temp_pager(self) -> Pager | SqlitePager | None:
+        """The pager of the temp database (in memory), if there is one: its
+        statements and transactions go with the main database's."""
+        temp = self.catalog.temp
+        return None if temp is None else temp.pager
+
     def _commit(self) -> None:
         try:
             self.pager.commit()
+            temp = self._temp_pager()
+            if temp is not None:
+                temp.commit()
             if self.pager.committed >= self.pager.checkpoint_frames:
                 self.pager.checkpoint()  # keeps the log short; skipped while others read
         except LockTimeout:
@@ -308,6 +326,9 @@ class Database:
     def rollback(self) -> None:
         """Discard all uncommitted changes."""
         self.pager.rollback()
+        temp = self._temp_pager()
+        if temp is not None:
+            temp.rollback()
         self.catalog.load()
         self._transaction_ended()
 
@@ -361,8 +382,8 @@ class Database:
             if problems:
                 return problems
         catalog = self.catalog
-        trees = [("schema", catalog.schema)]
-        for table in catalog.tables.values():
+        trees = [("schema", catalog.schema)] + ([] if catalog.temp is None else [("temp schema", catalog.temp.schema)])
+        for table in catalog.all_tables():
             trees.append((f"table {table.name}", catalog.table_tree(table)))
             for index in table.indexes:
                 trees.append((f"index {index.name}", catalog.index_tree(index)))
@@ -373,7 +394,7 @@ class Database:
                 problems.append(f"{name}: {exc}")
         if problems:
             return problems
-        for table in catalog.tables.values():
+        for table in catalog.all_tables():
             rows = [
                 (rowid, self.executor.load_row(table, rowid, record))
                 for rowid, record in catalog.table_tree(table).scan()

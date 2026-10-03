@@ -310,3 +310,17 @@ def test_parse_cache(pair):
         'SELECT json_set(\'{a:0x10}\',\'$.b\',1) FROM t WHERE hex(jsonb(\'{"a":16,"b":1}\')) LIKE \'BC%\'',
         'SELECT hex(jsonb(\'{"a":16,"b":1}\')) FROM t WHERE json_set(\'{a:0x10}\',\'$.b\',1) IS NOT NULL',
     ])
+
+
+def test_json_text_compared_under_a_collation(pair):
+    """Text with the JSON subtype is text for NOCASE and RTRIM too."""
+    for sql in [
+        "CREATE TABLE c (n BLOB COLLATE NOCASE, r COLLATE RTRIM)",
+        "INSERT INTO c VALUES ('B0', '[1]  ')",
+        "SELECT '[' < n, json('[1]') < n, json_extract('[1]', '$') < n, json_extract('[1]', '$', '$') < n, "
+        "json_array(1) < n FROM c",
+        "SELECT n > json_extract('[1]', '$', '$'), json('[1]') = r, json('[1]') IN (r), r = json_array(1) FROM c",
+        "SELECT * FROM c WHERE json('[1]') = r",
+        "SELECT max(json_array('A') COLLATE nocase, '[\"a\"]'), json_array('A') COLLATE nocase IN ('[\"a\"]')",
+    ]:
+        pair.run(sql)

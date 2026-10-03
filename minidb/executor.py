@@ -53,7 +53,8 @@ from minidb.parser import (
 )
 from minidb.tokenizer import tokenize
 from minidb.jsonb import JSONBlob, JSONText
-from minidb.values import SQLValue, ascii_lower
+from minidb.values import IntReal
+from minidb.values import SQLValue, ascii_lower, ascii_upper
 from minidb.record import decode_record, decode_row, encode_record
 from minidb.pager import Pager
 from minidb.sqlite_pager import SqlitePager
@@ -2189,6 +2190,11 @@ class Executor:
         self.triggers = Triggers(self)
         self.outer_scope = None  # the NEW / OLD scope while a trigger's statements are compiled
         self.compiling_trigger = 0  # > 0: RAISE() is allowed
+        # "main" while a view or trigger of the main database is compiled: its
+        # names mean main's tables (SQLite's sqlite3FixSrcList); a temporary
+        # object's search the temp database first.
+        self.default_schema = None
+        self.pragma_schema = None  # the schema of the PRAGMA being run ("main", "temp" or None)
         self.frame_depth = 0  # trigger programs and foreign key actions running (SQLite's nFrame)
         self.pinned = {}  # table name -> frame depth of an UPDATE whose REPLACE runs DELETE triggers (check_pinned)
         self.compile_depth = 0  # prepare() calls in progress
@@ -2228,6 +2234,8 @@ class Executor:
             self.check_foreign_keys()
             return result
         if isinstance(stmt, CreateTable):
+            if stmt.query is not None:
+                return self.create_table_as(stmt)
             self.catalog.create_table(stmt, self.check_new_table)
             return Result()
         if isinstance(stmt, DropTable):
@@ -2236,7 +2244,7 @@ class Executor:
         if isinstance(stmt, CreateIndex):
             return self.create_index(stmt)
         if isinstance(stmt, DropIndex):
-            self.catalog.drop_index(stmt.name, stmt.if_exists)
+            self.catalog.drop_index(stmt.name, stmt.if_exists, stmt.schema)
             return Result()
         if isinstance(stmt, CreateView):
             self.catalog.create_view(stmt)
@@ -2248,7 +2256,7 @@ class Executor:
         if isinstance(stmt, AlterTable):
             return self.alter_table(stmt)
         if isinstance(stmt, DropView):
-            self.catalog.drop_view(stmt.name, stmt.if_exists)
+            self.catalog.drop_view(stmt.name, stmt.if_exists, stmt.schema)
             return Result()
         if isinstance(stmt, Explain):
             return self.explain(stmt.statement)
@@ -2259,7 +2267,7 @@ class Executor:
             self.catalog.create_trigger(stmt)
             return Result()
         if isinstance(stmt, DropTrigger):
-            self.catalog.drop_trigger(stmt.name, stmt.if_exists)
+            self.catalog.drop_trigger(stmt.name, stmt.if_exists, stmt.schema)
             return Result()
         if isinstance(stmt, Pragma):
             self.ran = True
@@ -2345,7 +2353,9 @@ class Executor:
         """DROP TABLE; with foreign keys on, a parent table is emptied first
         (its children's actions run, violations count), as SQLite does."""
         keys = self.foreign_keys
-        table = self.catalog.tables.get(ascii_lower(stmt.name))
+        lowered = ascii_lower(stmt.name)
+        owner = next((c for c in self.catalog.search(stmt.schema) if lowered in c.tables or lowered in c.views), None)
+        table = None if owner is None else owner.tables.get(lowered)  # (None: a view, DROP TABLE refuses it)
         if keys.enabled and table is not None and ascii_lower(table.name) != "sqlite_sequence":
             self.catalog.check_writable(table, "dropped")
             deferred_child = any(link.deferred or keys.defer_all() for link in keys.children_of(table))
@@ -2357,7 +2367,7 @@ class Executor:
                         keys.extra_changes += 1  # (total_changes() counts them, as in SQLite)
                 if not keys.defer_all() and keys.statement_failed():
                     raise self.constraint_error("FOREIGN KEY constraint failed", "ABORT")
-        self.catalog.drop_table(stmt.name, stmt.if_exists)
+        self.catalog.drop_table(stmt.name, stmt.if_exists, stmt.schema)
 
     def constant(self, expr: Expr) -> SQLValue:
         """The value of a constant expression (a DEFAULT)."""
@@ -2369,27 +2379,29 @@ class Executor:
         keys = self.foreign_keys
         catalog = self.catalog
         if table_name is not None:
-            table = catalog.tables.get(ascii_lower(str(table_name)))
+            table = next((c.tables[ascii_lower(str(table_name))] for c in catalog.search()
+                          if ascii_lower(str(table_name)) in c.tables), None)
             if table is None:
                 raise OperationalError(f"no such table: {table_name}")
             tables = [table]
-        else:
+        else:  # (the main database's, as SQLite's pragma without a schema)
             tables = sorted(catalog.tables.values(), key=lambda t: t.schema_key or 0, reverse=True)
         found = []
         for table in tables:
             links = keys.children_of(table)
             if not links:
                 continue
+            parents = catalog.owner(table).tables  # (a parent is in its child's database)
             for link in links:
-                if ascii_lower(link.key.parent) in catalog.tables:
+                if ascii_lower(link.key.parent) in parents:
                     try:
-                        link.locate(catalog.tables)
+                        link.locate(parents)
                     except Exception as exc:  # (a mismatch)
                         raise OperationalError(str(exc)) from None
             for rowid, record in catalog.table_tree(table).scan():
                 row = self.load_row(table, rowid, record)
                 for link in links:
-                    if ascii_lower(link.key.parent) not in catalog.tables:
+                    if ascii_lower(link.key.parent) not in parents:
                         missing = all(row[table.column_index(n)] is not None for n in link.key.columns)
                     else:
                         missing = keys.parent_exists(link, row) is False
@@ -2418,7 +2430,7 @@ class Executor:
             plan.aborts = bool(self.compiling_trigger) and calls_function(stmt)  # (see Program.may_abort)
         else:
             with self.cte_scope(stmt.ctes or []):
-                view = self.catalog.find_view(stmt.table)
+                view = self.catalog.find_view(stmt.table, stmt.schema or self.default_schema)
                 event = "INSERT" if isinstance(stmt, Insert) else "UPDATE" if isinstance(stmt, Update) else "DELETE"
                 names = [name for name, _ in stmt.assignments] if isinstance(stmt, Update) else None
                 # (With RETURNING any trigger on the view will do: SQLite's own
@@ -2565,15 +2577,11 @@ class Executor:
         self.expanding.append(view)
         saved, self.cte_scopes = self.cte_scopes, []  # a view sees no CTE of the query using it
         outer, self.outer_scope = self.outer_scope, None  # (nor a trigger's NEW / OLD)
+        schema, self.default_schema = self.default_schema, None if view.temp else "main"
         try:
             compiled = self.compile_query(view.query)
-        except OperationalError as exc:
-            message = str(exc)
-            if message.startswith("no such table: ") and "." not in message:
-                # The view's tables are looked up in the main schema.
-                raise OperationalError(message.replace(": ", ": main.", 1)) from None
-            raise
         finally:
+            self.default_schema = schema
             self.outer_scope = outer
             self.expanding.pop()
             self.cte_scopes = saved
@@ -2598,6 +2606,8 @@ class Executor:
                 source = DerivedSource(ref.alias or "", compiled, query=ref.query)
                 derived.append(source)
                 scope.add(source, ref.alias or "")
+            elif isinstance(ref, TableRef) and ref.schema is not None:
+                derived += self.add_table(ref, scope, ref.schema)
             elif ascii_lower(ref.name) in ("json_each", "json_tree", "jsonb_each", "jsonb_tree") and (
                     isinstance(ref, TableFunction) or self.find_cte(ref.name) is None
                     and not self.catalog.has_table(ref.name) and self.catalog.find_view(ref.name) is None):
@@ -2622,22 +2632,29 @@ class Executor:
                     if source.correlated:
                         scope.uses_outer = True
                 scope.add(source, ref.alias)
-            elif self.catalog.find_view(ref.name) is not None:
-                source = self.view_source(self.catalog.find_view(ref.name))
-                derived.append(source)
-                scope.add(source, ref.alias)
             else:
-                table = self.catalog.get_table(ref.name)
-                self.catalog.check_index_hint(table, ref.indexed_by)
-                scope.add(table, ref.alias)
-                if ref.not_indexed:
-                    scope.entries[-1].hint = NOT_INDEXED
-                elif ref.indexed_by is not None:
-                    scope.entries[-1].hint = self.catalog.indexes[ascii_lower(ref.indexed_by)]
+                derived += self.add_table(ref, scope, self.default_schema)
             if join.natural or join.using is not None:
                 join = self.using_condition(scope, index, join)
             normalized.append(join)
         return normalized, derived
+
+    def add_table(self, ref: TableRef, scope: Scope, schema: str | None) -> list[DerivedSource]:
+        """Add the table or view ``ref`` names (in ``schema``; None: temp
+        first, then main) to ``scope``; returns the view's source, if a view."""
+        view = self.catalog.find_view(ref.name, schema)
+        if view is not None:
+            source = self.view_source(view)
+            scope.add(source, ref.alias)
+            return [source]
+        table = self.catalog.get_table(ref.name, schema)
+        self.catalog.check_index_hint(table, ref.indexed_by)
+        scope.add(table, ref.alias)
+        if ref.not_indexed:
+            scope.entries[-1].hint = NOT_INDEXED
+        elif ref.indexed_by is not None:
+            scope.entries[-1].hint = self.catalog.owner(table).indexes[ascii_lower(ref.indexed_by)]
+        return []
 
     def json_each_source(self, ref: TableFunction | TableRef, scope: Scope) -> None:
         """Add json_each() / json_tree() to ``scope``.  Its arguments see it
@@ -3007,7 +3024,7 @@ class Executor:
                     names.append(column_name)
                 continue
             exprs.append(item.expr)
-            if item.alias:
+            if item.alias is not None:
                 names.append(item.alias)
             elif isinstance(item.expr, Column):
                 names.append(item.expr.name)
@@ -3162,19 +3179,25 @@ class Executor:
     # ---- INSERT --------------------------------------------------------------
 
     def prepare_row(self, table: TableInfo, row: Row) -> int | None:
-        """Apply column affinities (and drop the JSON subtype: a stored
-        value has none); returns the requested row id."""
+        """Apply column affinities; returns the requested row id.  The row
+        is SQLite's registers: JSON values keep their subtype (triggers,
+        RETURNING and generated columns see it) until stored_row."""
         for i, affinity in enumerate(table.affinities):
-            value = row[i]
-            if type(value) in SUBTYPED:
-                value = str.__str__(value) if type(value) is JSONText else bytes(value)
-            row[i] = values.apply_affinity(value, affinity)
+            row[i] = values.apply_affinity(row[i], affinity)
         if table.rowid_column is None:
             return None
         rowid = row[table.rowid_column]
         if rowid is not None and not isinstance(rowid, int):
             raise IntegrityError("datatype mismatch")
         return rowid
+
+    @staticmethod
+    def stored_row(table: TableInfo, row: Row) -> Row:
+        """A new row's values as its record and index entries hold them
+        (values.record_value): no JSON subtype, no IntReal."""
+        if RECORD_CONVERTED.isdisjoint(map(type, row)):
+            return row
+        return [values.record_value(v, a) for v, a in zip(row, table.affinities)]
 
     @staticmethod
     def generator(table: TableInfo) -> Callable[[Row], None]:
@@ -3529,8 +3552,9 @@ class Executor:
             self.foreign_keys.row_inserted(table, row + [rowid], single)
         if self.pinned:
             self.check_pinned(table)
-        tree.insert(rowid, self.encode(table, row))
-        self.add_index_entries(table, row, rowid)
+        stored = self.stored_row(table, row)
+        tree.insert(rowid, self.encode(table, stored))
+        self.add_index_entries(table, stored, rowid)
         if triggers.matching(table.name, "AFTER", "INSERT"):
             self.last_insert_rowid = rowid  # (the trigger sees it)
             try:
@@ -3564,9 +3588,20 @@ class Executor:
         triggers = self.triggers
         names = None if changed is None else trigger_names(table, changed)
         current = old
-        if triggers.matching(table.name, "BEFORE", "UPDATE", names):
+        before = triggers.matching(table.name, "BEFORE", "UPDATE", names)
+        if before:
+            new = row
+            if table.generated and changed is not None:
+                # SQLite loads only the columns the UPDATE sets or the BEFORE
+                # triggers name as new.x (sqlite3TriggerColmask): NEW's
+                # generated columns see NULL for the others.
+                used = new_columns_used(table, before)
+                new = [None if (c.generated is None and i not in changed and i != table.rowid_column and i < 32
+                                and used is not None and i not in used) else v
+                       for i, (c, v) in enumerate(zip(table.columns, row))]
+                self.generator(table)(new)
             try:
-                triggers.fire(table.name, "BEFORE", "UPDATE", old, row + [new_rowid], names, conflict)
+                triggers.fire(table.name, "BEFORE", "UPDATE", old, new + [new_rowid], names, conflict)
             except TriggerIgnore:
                 return None
             if rowid not in tree:
@@ -3655,8 +3690,9 @@ class Executor:
             tree.delete(rowid)
         if involved:
             keys.row_adding(table, row + [new_rowid], changed)
-        tree.insert(new_rowid, self.encode(table, row), replace=True)
-        self.add_index_entries(table, row, new_rowid)
+        stored = self.stored_row(table, row)
+        tree.insert(new_rowid, self.encode(table, stored), replace=True)
+        self.add_index_entries(table, stored, new_rowid)
         if involved:
             keys.actions(table, old, row + [new_rowid], changed)
         if triggers.matching(table.name, "AFTER", "UPDATE", names):
@@ -3702,7 +3738,7 @@ class Executor:
 
     def sequence_value(self, table: TableInfo) -> int | None:
         """The AUTOINCREMENT counter of ``table`` in sqlite_sequence, if any."""
-        sequence = self.catalog.tables.get("sqlite_sequence")
+        sequence = self.catalog.owner(table).tables.get("sqlite_sequence")
         if sequence is None:
             return None
         for rowid, record in self.catalog.table_tree(sequence).scan():
@@ -3712,7 +3748,7 @@ class Executor:
         return None
 
     def set_sequence_value(self, table: TableInfo, value: int) -> None:
-        sequence = self.catalog.tables.get("sqlite_sequence")
+        sequence = self.catalog.owner(table).tables.get("sqlite_sequence")
         if sequence is None:
             return
         tree = self.catalog.table_tree(sequence)
@@ -3737,8 +3773,10 @@ class Executor:
         """ALTER TABLE edits the stored SQL text the way SQLite does (so
         whatever MiniDB does not model in it survives)."""
         catalog = self.catalog
-        table = catalog.get_table(stmt.table)
+        table = catalog.get_table(stmt.table, stmt.schema)
         catalog.check_writable(table, "altered")
+        if stmt.action != "add":
+            self.check_schema_resolves(table)
         if stmt.action == "rename":
             self.rename_table(table, stmt.new_name)
         elif stmt.action == "rename column":
@@ -3750,8 +3788,36 @@ class Executor:
         catalog.load()
         return Result()
 
+    def check_schema_resolves(self, table: TableInfo) -> None:
+        """SQLite's check before RENAME and DROP COLUMN (renameTestSchema,
+        sqlite_rename_table): every view and trigger of the table's database
+        (in schema order) and, for a main table, of the temp database too
+        must still compile."""
+        catalogs = [self.catalog.temp] if table.temp else list(reversed(self.catalog.search()))
+        for catalog in catalogs:
+            items = sorted([*catalog.views.values(), *catalog.triggers.values()], key=lambda o: o.schema_key or 0)
+            for item in items:
+                saved = self.cte_scopes
+                self.cte_scopes = []
+                self.triggers.disabled += 1
+                try:
+                    if isinstance(item, ViewInfo):
+                        self.view_source(item)
+                    else:
+                        owner = self.catalog.temp if item.on_temp else self.catalog
+                        source = owner.tables.get(ascii_lower(item.table_name))
+                        if source is None:
+                            source = self.view_source(owner.views[ascii_lower(item.table_name)])
+                        Program(self, item, source, None)
+                except OperationalError as exc:
+                    kind = "view" if isinstance(item, ViewInfo) else "trigger"
+                    raise OperationalError(f"error in {kind} {item.name}: {exc.args[0]}") from None
+                finally:
+                    self.triggers.disabled -= 1
+                    self.cte_scopes = saved
+
     def _views(self) -> list[ViewInfo]:
-        return [*self.catalog.views.values(), *self.catalog.temp_views.values()]
+        return self.catalog.all_views()
 
     def _view_references(self, view: ViewInfo, table: TableInfo) -> list[Column] | None:
         """The column references of a view that resolve to ``table`` (None if
@@ -3773,9 +3839,10 @@ class Executor:
         """The column references of a trigger's program that resolve to
         ``table`` (None if the program does not compile)."""
         found = []
-        source = self.catalog.tables.get(ascii_lower(trigger.table_name))
+        catalog = self.catalog.temp if trigger.on_temp else self.catalog
+        source = catalog.tables.get(ascii_lower(trigger.table_name))
         if source is None:
-            view = self.catalog.find_view(trigger.table_name)
+            view = catalog.views.get(ascii_lower(trigger.table_name))
             if view is None:
                 return None
         self.column_hook = lambda expr, owner: found.append(expr) if owner is table else None
@@ -3797,7 +3864,7 @@ class Executor:
     def _referencing_tables(self, table: TableInfo) -> list[tuple[TableInfo, CreateTable]]:
         """The tables (``table`` too) with a foreign key to ``table``, and their parsed SQL."""
         found = []
-        for other in self.catalog.tables.values():
+        for other in self.catalog.owner(table).tables.values():  # (a parent is in its child's database)
             if any(ascii_lower(key.parent) == ascii_lower(table.name) for key in other.foreign_keys):
                 found.append((other, parse(other.sql)))
         return found
@@ -3805,7 +3872,8 @@ class Executor:
     def rename_table(self, table: TableInfo, new: str) -> None:
         catalog = self.catalog
         lowered = ascii_lower(new)
-        if lowered in catalog.tables or lowered in catalog.views or lowered in catalog.indexes:
+        own = catalog.owner(table)
+        if lowered in own.tables or lowered in own.views or lowered in own.indexes:
             raise OperationalError(f"there is already another table or index with this name: {new}")
         if lowered.startswith(catalog.reserved_prefixes):
             raise OperationalError(f"object name reserved for internal use: {new}")
@@ -3820,7 +3888,7 @@ class Executor:
             if edits:
                 catalog.rewrite_view(view, apply_edits(view.sql, edits))
         # Triggers: their table, and the table in their statements (as alter.c does).
-        for trigger in list(catalog.triggers.values()):
+        for trigger in catalog.all_triggers():
             changes, target = [], trigger.table_name
             if ascii_lower(trigger.table_name) == ascii_lower(old):
                 changes.append((trigger.stmt.table_pos, quote(new)))
@@ -3853,7 +3921,7 @@ class Executor:
                 index.sql = None
             else:
                 index.sql = apply_edits(index.sql, [(parse(index.sql).table_pos, quote(new))])
-        sequence = catalog.tables.get("sqlite_sequence")
+        sequence = own.tables.get("sqlite_sequence")
         if sequence is not None:
             tree = catalog.table_tree(sequence)
             for rowid, record in list(tree.scan()):
@@ -3882,7 +3950,7 @@ class Executor:
                      if node.pos >= 0 and ascii_lower(node.name) == old]
             if edits:
                 catalog.rewrite_view(view, apply_edits(view.sql, edits))
-        for trigger in list(catalog.triggers.values()):
+        for trigger in catalog.all_triggers():
             on_table = ascii_lower(trigger.table_name) == ascii_lower(table.name)
             stmt, positions = trigger.stmt, []
             if on_table and stmt.columns:
@@ -4007,7 +4075,7 @@ class Executor:
             if any(ascii_lower(node.name) == ascii_lower(column.name) for node in references or ()):
                 raise OperationalError(
                     f"error in view {view.name} after drop column: no such column: {column.name}")
-        for trigger in self.catalog.triggers.values():
+        for trigger in self.catalog.all_triggers():
             dropped_name = ascii_lower(column.name)
             used = [node for node in self._trigger_references(trigger, table) or ()
                     if ascii_lower(node.name) == dropped_name]
@@ -4032,12 +4100,13 @@ class Executor:
         collation BINARY), or all of them."""
         catalog = self.catalog
         lowered = None if name is None else ascii_lower(name)
+        named = next((c for c in catalog.search() if lowered in c.indexes or lowered in c.tables), None)
         if lowered is None or lowered == "binary":
-            indexes = list(catalog.indexes.values())
-        elif lowered in catalog.indexes:
-            indexes = [catalog.indexes[lowered]]
-        elif lowered in catalog.tables:
-            indexes = list(catalog.tables[lowered].indexes)
+            indexes = catalog.all_indexes()
+        elif named is not None and lowered in named.indexes:
+            indexes = [named.indexes[lowered]]
+        elif named is not None:
+            indexes = list(named.tables[lowered].indexes)
         elif lowered in ("nocase", "rtrim"):
             indexes = []  # no index uses these collations
         else:
@@ -4196,6 +4265,33 @@ class Executor:
             target.vacuum_pages()  # (the pages adopt() freed: the copy has none)
         target.header.user_version = pager.header.user_version
         target.header.application_id = pager.header.application_id
+
+    def create_table_as(self, stmt: CreateTable) -> Result:
+        """CREATE TABLE ... AS SELECT, as SQLite's sqlite3EndTable: the
+        table's columns are the query's (unique names, the type names of
+        their affinities), its SQL is made up (createTableStmt), and the rows
+        go in with row ids 1, 2, ... (changing neither changes() nor
+        last_insert_rowid())."""
+        catalog = self.catalog
+        database = catalog.temp_catalog() if stmt.temp else catalog
+        database._check_reserved(stmt.name)
+        if database._exists(stmt.name, stmt.if_not_exists):
+            return Result()
+        database._check_new_name(stmt.name)
+        compiled = self.compile_query(stmt.query)
+        names = [f"column{i}" if ascii_lower(n) in ("true", "false") else n
+                 for i, n in enumerate(compiled.names, 1)]
+        source = DerivedSource(stmt.name, compiled, unique_names(names), stmt.query)
+        sql = create_table_sql(stmt.name, [c.name for c in source.columns], source.affinities)
+        created = parse(sql)
+        created.temp = stmt.temp
+        table = catalog.create_table(created)
+        tree = catalog.table_tree(table)
+        for rowid, row in enumerate(list(compiled.run()), 1):
+            row = list(row)
+            self.prepare_row(table, row)
+            tree.insert(rowid, self.encode(table, self.stored_row(table, row)))
+        return Result()
 
     def create_index(self, stmt: CreateIndex) -> Result:
         index = self.catalog.create_index(stmt)
@@ -4556,6 +4652,8 @@ class CompiledSelect:
             records = itertools.islice(records, start, end)
         else:
             records = order_records(records, self.order_terms, start, end)
+            if values.int_reals_made[0]:
+                return [values.through_record(output) for output, _ in records]  # (SQLite's sorter)
         return [output for output, _ in records]
 
 
@@ -4601,8 +4699,11 @@ class CompiledCompound:
         self.operators = stmt.operators
         self.names = self.parts[0].names
         self.exprs = self.parts[0].exprs
-        # SQLite takes a compound's affinity from its last SELECT.
+        # SQLite takes a compound's affinity from its last SELECT (as a
+        # scalar subquery or IN's right side); as a table (in FROM, a view, a
+        # CTE) its columns get the affinity sqlite3SubqueryColType gives them.
         self.affinities = self.parts[-1].affinities
+        self.table_affinities = compound_table_affinities(self.parts)
         # Rows compare by each column's collation in the leftmost SELECT that
         # has one (SQLite's multiSelectCollSeq) - where they compare at all.
         self.key_collations = None
@@ -4633,6 +4734,8 @@ class CompiledCompound:
         for operator, part in zip(self.operators, self.parts[1:]):
             rows = combine(operator, rows, part.run(), self.key_collations)
         records = order_records([(row, ()) for row in rows], self.order_terms, start, end)
+        if values.int_reals_made[0] and (self.order_terms or self.operators != ["UNION ALL"] * len(self.operators)):
+            return [values.through_record(row) for row, _ in records]  # (a sorter or a temporary table)
         return [row for row, _ in records]
 
 
@@ -4676,10 +4779,11 @@ class PreparedSelect:
 class PreparedInsert:
     def __init__(self, executor: Executor, stmt: Insert) -> None:
         self.executor = executor
-        table = self.table = executor.catalog.table_to_modify(stmt.table)
+        table = self.table = executor.catalog.table_to_modify(stmt.table, stmt.schema or executor.default_schema)
         width = len(table.columns)
         if stmt.columns is None:
-            self.positions = [p for p in range(width) if table.columns[p].generated is None]
+            self.positions = [p for p in range(width) if table.columns[p].generated is None] if table.generated \
+                else list(range(width))
         else:
             self.positions = []
             for name in stmt.columns:
@@ -4692,7 +4796,16 @@ class PreparedInsert:
                 elif table.columns[position].generated is not None:
                     raise OperationalError(f'cannot INSERT into generated column "{table.columns[position].name}"')
                 self.positions.append(position)
-        self.rowid_given = (width if table.rowid_column is None else table.rowid_column) in self.positions
+        rowid_position = width if table.rowid_column is None else table.rowid_column
+        self.rowid_given = rowid_position in self.positions
+        # A column named twice takes its first value; the row id its last (sqlite3Insert).
+        self.assign = None
+        if len(set(self.positions)) < len(self.positions):
+            self.assign, seen = [], set()
+            for i, position in enumerate(self.positions):
+                if position == rowid_position or position not in seen:
+                    self.assign.append((i, position))
+                    seen.add(position)
         compiler = Compiler(Scope(executor.outer_scope), executor=executor)
         self.defaults = [(p, compiler.compile(c.default)) for p, c in enumerate(table.columns)
                          if p not in self.positions and c.default is not None]
@@ -4725,7 +4838,7 @@ class PreparedInsert:
         # several rows, triggers) that may abort: a constraint checked as
         # ABORT, a function call, a trigger program that may abort.
         triggers = executor.triggers
-        multi = multi_write or bool(executor.catalog.triggers and triggers.exist(table.name, "INSERT"))
+        multi = multi_write or bool(executor.catalog.any_triggers and triggers.exist(table.name, "INSERT"))
         # (Only a multi-row write needs it, or a statement of a trigger program: Program.may_abort.)
         self.aborts = (multi or bool(executor.compiling_trigger)) and (self.may_abort() or calls_function(stmt) or (
             table.generated and calls_function([c.generated for c in table.columns])) or triggers.may_abort(
@@ -4748,7 +4861,7 @@ class PreparedInsert:
         executor, table = self.executor, self.table
         triggers, keys = executor.triggers, executor.foreign_keys
         self.unchecked = None
-        if not executor.catalog.triggers and not keys.enabled:
+        if not executor.catalog.any_triggers and not keys.enabled:
             self.fk_multi = True  # (nothing to compile; used only with foreign keys)
             return
         triggers.prepare(table.name, "INSERT", None, self.conflict, ("BEFORE",))
@@ -4839,10 +4952,19 @@ class PreparedInsert:
         sources = self.query.run() if self.query is not None else (
             [function([]) for function in functions] for functions in self.rows
         )
+        if self.query is not None or len(self.rows) > 1:
+            # (SQLite's co-routine for a SELECT or several VALUES rows leaves
+            # the values without their JSON subtype; one VALUES row keeps it.)
+            sources = ([values.record_value(v) if type(v) in SUBTYPED else v for v in source] for source in sources)
+        assign, positions = self.assign, self.positions
         for source in sources:
             row = [None] * (width + 1)  # the last: a row id given by name
-            for position, value in zip(self.positions, source):
-                row[position] = value
+            if assign is None:
+                for position, value in zip(positions, source):
+                    row[position] = value
+            else:
+                for i, position in assign:
+                    row[position] = source[i]
             for position, default in self.defaults:
                 row[position] = default([])
             rows.append(row)
@@ -4890,13 +5012,14 @@ class PreparedSingleTable:
     """The part of UPDATE / DELETE that finds the rows matching WHERE."""
 
     def __init__(self, executor: Executor, table_name: str, where: Expr | None, indexed_by: str | None = None,
-                 not_indexed: bool = False) -> None:
+                 not_indexed: bool = False, schema: str | None = None) -> None:
         self.executor = executor
-        self.table = executor.catalog.table_to_modify(table_name)
+        self.table = executor.catalog.table_to_modify(table_name, schema or executor.default_schema)
         executor.catalog.check_index_hint(self.table, indexed_by)
         self.tree = executor.catalog.table_tree(self.table)
         self.scope = Scope(executor.outer_scope)
-        ref = TableRef(self.table.name, indexed_by=indexed_by, not_indexed=not_indexed)
+        ref = TableRef(self.table.name, indexed_by=indexed_by, not_indexed=not_indexed,
+                       schema="temp" if self.table.temp else "main")
         joins, _ = executor.build_from([Join(ref)], self.scope)
         self.levels, self.constants = executor.plan_joins(self.scope, joins, where)
         self.rowid_slot = self.scope.rowid_slot(0)
@@ -4918,7 +5041,7 @@ class PreparedSingleTable:
 
 class PreparedUpdate(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Update) -> None:
-        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
+        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed, stmt.schema)
         table, width = self.table, len(self.table.columns)
         compiler = Compiler(self.scope, executor=executor)
         self.assignments = []
@@ -4994,7 +5117,7 @@ class PreparedUpdate(PreparedSingleTable):
 
 class PreparedDelete(PreparedSingleTable):
     def __init__(self, executor: Executor, stmt: Delete) -> None:
-        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed)
+        super().__init__(executor, stmt.table, stmt.where, stmt.indexed_by, stmt.not_indexed, stmt.schema)
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         self.delete_all = stmt.where is None and self.returning is None
         executor.compile_delete(self.table, None)  # (what SQLite compiles with it, in its order)
@@ -5399,7 +5522,7 @@ class DerivedSource:
                 f"expected {len(names)} columns for '{name}' but got {len(compiled.names)}"
             )
         self.columns = [ColumnName(n) for n in names]
-        self.affinities = list(compiled.affinities)
+        self.affinities = list(getattr(compiled, "table_affinities", compiled.affinities))
         self.collations = list(compiled.collations)
         self.positions = {}
         for i, n in enumerate(names):
@@ -5422,6 +5545,7 @@ class DerivedSource:
 
 _EACH_FUNCTIONS = frozenset({"json_each", "json_tree", "jsonb_each", "jsonb_tree"})
 SUBTYPED = (JSONText, JSONBlob)  # the types of values with the JSON subtype
+RECORD_CONVERTED = frozenset((JSONText, JSONBlob, IntReal))  # (see values.record_value)
 
 
 def carries_json(query: object) -> bool:
@@ -5513,9 +5637,13 @@ class PragmaSource(DerivedSource):
         else:
             arguments = [None]
         rows = []
-        for argument in arguments:
-            for result in spec.rows(executor, argument):
-                rows.append(list(result) + ([argument] if spec.arg is not None else []) + [schema])
+        saved, executor.pragma_schema = executor.pragma_schema, None if schema is None else ascii_lower(str(schema))
+        try:
+            for argument in arguments:
+                for result in spec.rows(executor, argument):
+                    rows.append(list(result) + ([argument] if spec.arg is not None else []) + [schema])
+        finally:
+            executor.pragma_schema = saved
         self.rows = [row + [i] for i, row in enumerate(rows, 1)]
 
 
@@ -5705,22 +5833,19 @@ def generated_order(table: TableInfo, pending: list[int]) -> list[int]:
 
 def compile_generated(table: TableInfo, positions: list[int]) -> Callable[[Row], None]:
     """A function computing the generated columns at ``positions`` (in that
-    order) of a row in place, each with its column's affinity.  A STORED
-    value loses the JSON subtype, as a value read back from a record has
-    none; a VIRTUAL one keeps it (SQLite computes it whenever it is read)."""
+    order) of a row in place, each with its column's affinity, as SQLite's
+    registers hold them: with the JSON subtype, a whole REAL as an IntReal
+    (Executor.stored_row makes the record's values)."""
     scope = Scope()
     scope.add(table)
     compiler = Compiler(scope)
-    steps = [(p, compiler.compile(table.columns[p].generated), table.affinities[p], table.columns[p].stored)
-             for p in positions]
-    apply = values.apply_affinity
+    steps = [(p, compiler.compile(table.columns[p].generated), table.affinities[p]) for p in positions]
+    apply, int_real, real = values.apply_affinity, values.int_real, values.REAL
 
     def fill(row):
-        for position, function, affinity, stored in steps:
-            value = function(row)
-            if stored and type(value) in SUBTYPED:
-                value = str.__str__(value) if type(value) is JSONText else bytes(value)
-            row[position] = apply(value, affinity)
+        for position, function, affinity in steps:
+            value = apply(function(row), affinity)
+            row[position] = int_real(value) if affinity == real else value  # (SQLite's OP_Affinity)
 
     if not any(isinstance(n, Call) and n.name in dates.DATE_FUNCTIONS
                for p in positions for n in walk(table.columns[p].generated)):
@@ -5753,6 +5878,21 @@ def expand_virtual(table: TableInfo, stored: list, rowid: int) -> Row:
     fill(row)
     row.append(rowid)
     return row
+
+
+def new_columns_used(table: TableInfo, triggers: list[TriggerInfo]) -> set[int] | None:
+    """The columns the triggers' programs name as new.x (None: all, a
+    column past the 32nd among them, as SQLite's mask)."""
+    used = set()
+    for trigger in triggers:
+        for node in walk_nodes([trigger.stmt.when, trigger.stmt.body]):
+            if isinstance(node, Column) and node.table is not None and ascii_lower(node.table) == "new":
+                position = table.column_index(node.name)
+                if position is not None:
+                    if position >= 32:
+                        return None
+                    used.add(position)
+    return used
 
 
 def trigger_names(table: TableInfo, changed: Iterable[int]) -> list[str]:
@@ -5920,19 +6060,129 @@ class RecursiveSource(DerivedSource):
         self.rows = [list(row) + [i] for i, row in enumerate(out, 1)]
 
 
+def compound_table_affinities(parts: list[CompiledQuery]) -> list[str | None]:
+    """The affinities of a compound SELECT's columns as a table (SQLite's
+    sqlite3SubqueryColType): the first SELECT's, or the first one after it
+    that has one; then none (BLOB) if another SELECT's column may hold text
+    where it is numeric, or a number where it is TEXT
+    (sqlite3ExprDataType)."""
+    result = []
+    for i in range(len(parts[0].names)):
+        mask, k = 0, 0
+        affinity = parts[0].affinities[i]
+        while affinity is None and k + 1 < len(parts):
+            mask |= expr_data_type(parts[k], i)
+            k += 1
+            affinity = parts[k].affinities[i]
+        if affinity is not None and affinity != values.BLOB and (k + 1 < len(parts) or k > 0):
+            for part in parts[k + 1:]:
+                mask |= expr_data_type(part, i)
+            if affinity == values.TEXT and mask & 0x01:
+                affinity = values.BLOB
+            elif affinity in values.NUMERIC_AFFINITIES and mask & 0x02:
+                affinity = values.BLOB
+            elif affinity in values.NUMERIC_AFFINITIES and isinstance(parts[0].exprs[i], Cast):
+                affinity = values.NUMERIC  # (SQLite's SQLITE_AFF_FLEXNUM)
+        result.append(affinity)
+    return result
+
+
+def expr_data_type(part: CompiledQuery, i: int) -> int:
+    """SQLite's sqlite3ExprDataType of result column ``i`` of a compound's
+    SELECT: what it may hold - 1 a number, 2 text, 4 a blob (NULL aside)."""
+    expr = part.exprs[i]
+    affinity = part.affinities[i]
+    while True:
+        if isinstance(expr, Collate) or (isinstance(expr, Unary) and expr.op == "+"):
+            expr = expr.expr if isinstance(expr, Collate) else expr.operand
+            affinity = part.collation_compiler.compile_with_affinity(expr)[1]
+            continue
+        if isinstance(expr, Literal):
+            value = expr.value
+            return 0 if value is None else 0x02 if isinstance(value, str) else 0x04 if isinstance(
+                value, bytes) else 0x01
+        if isinstance(expr, Binary) and expr.op == "||":
+            return 0x06
+        if isinstance(expr, (Parameter, Call)):
+            return 0x07
+        if isinstance(expr, Column) and is_true_false_name(expr):
+            return 0x01
+        if isinstance(expr, (Column, Subquery, Cast)):
+            return 0x05 if affinity in values.NUMERIC_AFFINITIES else 0x06 if affinity == values.TEXT else 0x07
+        if isinstance(expr, Case):
+            compiler = part.collation_compiler
+            results = [result for _, result in expr.whens] + ([expr.else_] if expr.else_ is not None else [])
+            mask = 0
+            for result in results:
+                fake = _DataTypePart([result], [compiler.compile_with_affinity(result)[1]], compiler)
+                mask |= expr_data_type(fake, 0)
+            return mask
+        return 0x01
+
+
+class _DataTypePart:
+    """One expression with its affinity, to ask expr_data_type about."""
+
+    def __init__(self, exprs: list, affinities: list, compiler: Compiler) -> None:
+        self.exprs, self.affinities, self.collation_compiler = exprs, affinities, compiler
+
+
 def unique_names(names: list[str]) -> list[str]:
-    """Column names of a subquery or view as SQLite makes them unique: a
-    repeated name gets ":1", ":2", ... (ignoring case)."""
+    """Column names of a subquery or view as SQLite makes them unique
+    (sqlite3ColumnsFromExprList): a repeated name gets ":1", ":2", ... in
+    place of a ":<digits>" ending it has (ignoring case)."""
     seen = set()
     result = []
     for name in names:
-        base, count = name, 0
+        count = 0
         while ascii_lower(name) in seen:
+            base = name
+            end = len(base) - 1
+            while end > 0 and base[end].isdigit() and base[end].isascii():
+                end -= 1
+            if end > 0 and base[end] == ":":
+                base = base[:end]
             count += 1
             name = f"{base}:{count}"
         seen.add(ascii_lower(name))
         result.append(name)
     return result
+
+
+# Every word SQLite's tokenizer takes as a keyword (sqlite3KeywordCode): a
+# name it writes into SQL it makes up is quoted if it is one of them.
+SQLITE_KEYWORDS = frozenset("""
+    ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE AND AS ASC ATTACH AUTOINCREMENT BEFORE BEGIN BETWEEN BY
+    CASCADE CASE CAST CHECK COLLATE COLUMN COMMIT CONFLICT CONSTRAINT CREATE CROSS CURRENT CURRENT_DATE
+    CURRENT_TIME CURRENT_TIMESTAMP DATABASE DEFAULT DEFERRABLE DEFERRED DELETE DESC DETACH DISTINCT DO DROP
+    EACH ELSE END ESCAPE EXCEPT EXCLUDE EXCLUSIVE EXISTS EXPLAIN FAIL FILTER FIRST FOLLOWING FOR FOREIGN FROM
+    FULL GENERATED GLOB GROUP GROUPS HAVING IF IGNORE IMMEDIATE IN INDEX INDEXED INITIALLY INNER INSERT
+    INSTEAD INTERSECT INTO IS ISNULL JOIN KEY LAST LEFT LIKE LIMIT MATCH MATERIALIZED NATURAL NO NOT NOTHING
+    NOTNULL NULL NULLS OF OFFSET ON OR ORDER OTHERS OUTER OVER PARTITION PLAN PRAGMA PRECEDING PRIMARY QUERY
+    RAISE RANGE RECURSIVE REFERENCES REGEXP REINDEX RELEASE RENAME REPLACE RESTRICT RETURNING RIGHT ROLLBACK
+    ROW ROWS SAVEPOINT SELECT SET TABLE TEMP TEMPORARY THEN TIES TO TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE
+    UPDATE USING VACUUM VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHOUT
+""".split())
+# The type each affinity gets in the SQL SQLite makes up for CREATE TABLE ... AS.
+AFFINITY_TYPE_NAMES = {values.TEXT: " TEXT", values.NUMERIC: " NUM", values.INTEGER: " INT", values.REAL: " REAL"}
+
+
+def ident_put(name: str) -> str:
+    """A name as SQLite's identPut writes it: bare when it is letters,
+    digits and _ (not starting with a digit, not a keyword), else quoted."""
+    plain = all((c.isascii() and c.isalnum()) or c == "_" for c in name)
+    if not plain or not name or name[0].isdigit() or ascii_upper(name) in SQLITE_KEYWORDS:
+        return quote(name)
+    return name
+
+
+def create_table_sql(name: str, columns: list[str], affinities: list[str | None]) -> str:
+    """SQLite's createTableStmt: the CREATE TABLE of CREATE TABLE ... AS,
+    on one line when short, else one column per line."""
+    size = sum(len(c) + c.count('"') + 2 + 5 for c in columns) + len(name) + name.count('"') + 2
+    separator, between, end = ("", ",", ")") if size < 50 else ("\n  ", ",\n  ", "\n)")
+    parts = [ident_put(c) + AFFINITY_TYPE_NAMES.get(a, "") for c, a in zip(columns, affinities)]
+    return f"CREATE TABLE {ident_put(name)}({separator}{between.join(parts)}{end}"
 
 
 def folded_literal(expr: Expr) -> Literal | None:
