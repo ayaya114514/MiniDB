@@ -537,10 +537,28 @@ def shift_right(a: SQLValue, b: SQLValue) -> int | None:
     return shift(a, b, False)
 
 
+LENGTH_LIMIT = 1_000_000_000  # SQLITE_LIMIT_LENGTH's default, in bytes
+
+
+def byte_length(value: str | bytes) -> int:
+    return len(value) if isinstance(value, bytes) else len(value.encode("utf-8", "surrogatepass"))
+
+
+def check_length(value: str | bytes) -> str | bytes:
+    """``value``, a string or BLOB a function made, unless it is longer than
+    SQLite allows (sqlite3_result_text's SQLITE_TOOBIG)."""
+    if len(value) > LENGTH_LIMIT // 4 and byte_length(value) > LENGTH_LIMIT:
+        raise OperationalError("string or blob too big")
+    return value
+
+
 def concat(a: SQLValue, b: SQLValue) -> SQLValue:
     if a is None or b is None:
         return None
-    return to_text(a) + to_text(b)
+    a, b = to_text(a), to_text(b)
+    if len(a) + len(b) > LENGTH_LIMIT // 4 and byte_length(a) + byte_length(b) > LENGTH_LIMIT:
+        raise OperationalError("string or blob too big")  # (OP_Concat checks before it allocates)
+    return a + b
 
 
 def logical_not(a: SQLValue) -> int | None:
@@ -868,6 +886,8 @@ class GroupConcatAggregate:
             self.text = value
         else:
             self.text += ("" if separator is None else to_text(separator)) + value
+        if len(self.text) > LENGTH_LIMIT // 4:
+            check_length(self.text)
 
     def result(self) -> SQLValue:
         return self.text

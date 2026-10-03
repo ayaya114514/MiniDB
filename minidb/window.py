@@ -23,7 +23,7 @@ from typing import Any
 from minidb import jsonfuncs
 from minidb.errors import OperationalError
 from minidb.values import (
-    INT_MAX, INT_MIN, SQLValue, SumAccumulator, add, collation_compare, collation_sort_key, compare,
+    INT_MAX, INT_MIN, LENGTH_LIMIT, SQLValue, SumAccumulator, add, collation_compare, collation_sort_key, compare,
     numeric_affinity, numeric_type_value, sort_key,
     subtract, to_int64, to_number, to_text, truth,
 )
@@ -235,6 +235,8 @@ class WindowGroupConcat:
             self.first_separator_length = 0 if args[1] is None else len(_utf8(args[1]))
         self.accumulated += 1
         self.text += _utf8(value)
+        if len(self.text) > LENGTH_LIMIT:
+            raise OperationalError("string or blob too big")
 
     def inverse(self, args: tuple) -> None:
         value = args[0]

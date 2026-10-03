@@ -228,3 +228,35 @@ def test_numbers_in_text_with_nul(pair, value):
                      "typeof(ceil({t}))", "avg({t})", "total({t})", "mod({t}, 3)", "pow({t}, 2)"]:
         pair.run("SELECT " + template.format(t=t))
     pair.run("SELECT replace('ab', x'0061', 'z'), replace('a' || x'00', x'00', 'z')")
+
+
+def test_string_or_blob_too_big(monkeypatch):
+    # SQLITE_LIMIT_LENGTH (a billion bytes) made small on both sides: what
+    # would grow past it fails, as in SQLite (a recursive trigger or CTE
+    # doubling a string stops there instead of filling the memory).
+    import sqlite3
+
+    from minidb import functions, values, window
+
+    for module in (values, functions, window):
+        monkeypatch.setattr(module, "LENGTH_LIMIT", 1000)
+    pair = Pair()
+    pair.lite.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 1000)
+    for sql in [
+        "SELECT length(printf('%.*c', 600, 'x') || printf('%.*c', 400, 'y'))",
+        "SELECT length(printf('%.*c', 600, 'x') || printf('%.*c', 401, 'y'))",
+        "SELECT length(printf('%.*c', 500, 'é') || 'x')",
+        "SELECT length(concat(printf('%.*c', 999, 'x'), 'ab'))",
+        "SELECT length(concat_ws('-', printf('%.*c', 600, 'x'), printf('%.*c', 600, 'x')))",
+        "SELECT length(replace(printf('%.*c', 400, 'x'), 'x', 'xyz'))",
+        "SELECT length(hex(zeroblob(501)))",
+        "SELECT length(randomblob(1001))",
+        "WITH RECURSIVE c(x) AS (SELECT 'abcdefgh' UNION ALL SELECT x || x FROM c WHERE length(x) < 5000) "
+        "SELECT max(length(x)) FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 400) "
+        "SELECT length(group_concat(printf('%03d', n))) FROM c",
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 300) "
+        "SELECT max(length(group_concat(printf('%03d', n)) OVER (ORDER BY n))) FROM c",
+    ]:
+        pair.run(sql)
+    pair.close()
