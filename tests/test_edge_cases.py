@@ -95,7 +95,8 @@ def test_integrity_check_reports_damage():
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)")
     db.execute("CREATE INDEX t_a ON t (a)")
     db.execute("INSERT INTO t VALUES " + ", ".join(f"({i}, {i})" for i in range(200)))
-    db.execute("BEGIN")  # damage the trees in memory, inside a transaction
+    db.execute("BEGIN")  # damage the trees in memory, inside a transaction (that has read)
+    db.execute("SELECT count(*) FROM t")
     index = db.catalog.indexes["t_a"]
     db.catalog.index_tree(index).delete(index.key([None, 5], 5))  # an entry goes missing
     assert db.integrity_check() == ["index t_a does not match table t"]

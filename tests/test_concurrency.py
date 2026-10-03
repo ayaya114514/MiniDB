@@ -306,3 +306,73 @@ def test_log_is_checkpointed_automatically(path):
         assert db.pager.committed < 1100  # never far beyond the threshold
     assert db.execute("SELECT count(*) FROM t") == [(1499,)]
     db.close()
+
+
+# ---- deferred transactions, as SQLite starts them ------------------------------------
+
+
+def deferred_scenarios(connect):
+    """What happens to deferred transactions next to another writer: the
+    first statement starts the transaction (a write waits for the lock
+    first, so its snapshot is the newest), and BEGIN alone holds nothing."""
+    import sqlite3
+
+    errors = (OperationalError, sqlite3.OperationalError)
+    outcome = []
+    a, b = connect(), connect()
+    a("BEGIN")
+    b("INSERT INTO t (v) VALUES ('b1')")  # (BEGIN alone holds no lock, also with a rollback journal)
+    a("UPDATE t SET v = v || '!' WHERE id = 1")  # first statement: a write, so the newest snapshot
+    outcome.append(a("SELECT count(*), max(v) FROM t"))
+    a("COMMIT")
+    a("BEGIN")
+    outcome.append(a("SELECT count(*) FROM t"))  # the snapshot starts here
+    try:
+        b("INSERT INTO t (v) VALUES ('b2')")
+        outcome.append("b committed")
+        a("UPDATE t SET v = 'a' WHERE id = 1")
+        outcome.append("a wrote")
+    except errors as exc:
+        outcome.append(str(exc))
+    a("ROLLBACK")
+    outcome.append(b("SELECT count(*) FROM t"))
+    return outcome
+
+
+@pytest.mark.parametrize("kind", ["minidb", "sqlite-journal", pytest.param("sqlite-wal", marks=pytest.mark.skipif(
+    sys.platform == "win32", reason="SQLite's WAL mode has not been run on Windows"))])
+def test_deferred_transactions_start_at_their_first_statement(tmp_path, kind):
+    import sqlite3
+
+    def make(path):
+        with Database(path, format=None if kind == "minidb" else "sqlite") as db:
+            db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+            db.execute("INSERT INTO t VALUES (1, 'one')")
+            if kind == "sqlite-wal":
+                db.execute("PRAGMA journal_mode = WAL")
+
+    mini_path, lite_path = str(tmp_path / "mini"), str(tmp_path / "lite")
+    make(mini_path)
+    make(lite_path)
+    opened = []
+
+    def mini():
+        db = Database(mini_path, timeout=0.3)
+        opened.append(db)
+        return lambda sql: db.execute(sql)
+
+    def lite():
+        connection = sqlite3.connect(lite_path, isolation_level=None, timeout=0.3)
+        opened.append(connection)
+        return lambda sql: connection.execute(sql).fetchall()
+
+    try:
+        got = deferred_scenarios(mini)
+        expected = ([[(2, "one!")], [(2,)], "b committed", "database is locked", [(3,)]] if kind != "sqlite-journal"
+                    else [[(2, "one!")], [(2,)], "database is locked", [(2,)]])
+        assert got == expected
+        if kind != "minidb":
+            assert deferred_scenarios(lite) == expected
+    finally:
+        for connection in opened:
+            connection.close()
