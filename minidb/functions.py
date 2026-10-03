@@ -21,7 +21,7 @@ from minidb.dates import DATE_FUNCTIONS
 from minidb.fp import atof
 from minidb.values import INT_MAX, INT_MIN, SQLValue, numeric_type_value, to_int64, to_text
 
-LENGTH_LIMIT = 1_000_000_000  # SQLITE_LIMIT_LENGTH's default
+LENGTH_LIMIT = values.LENGTH_LIMIT  # SQLITE_LIMIT_LENGTH's default
 
 
 def _text(value: SQLValue) -> str:
@@ -86,7 +86,7 @@ def replace(value: SQLValue, pattern: SQLValue, replacement: SQLValue) -> SQLVal
         return to_text(value)
     if replacement is None:
         return None
-    return to_text(value).replace(pattern_text, to_text(replacement))
+    return values.check_length(to_text(value).replace(pattern_text, to_text(replacement)))
 
 
 def _utf8_chunks(data: bytes) -> list[bytes]:
@@ -161,13 +161,13 @@ def instr(haystack: SQLValue, needle: SQLValue) -> int | None:
 
 
 def concat(*args: SQLValue) -> str:
-    return "".join(to_text(a) for a in args if a is not None)
+    return values.check_length("".join(to_text(a) for a in args if a is not None))
 
 
 def concat_ws(separator: SQLValue, *args: SQLValue) -> str | None:
     if separator is None:
         return None
-    return to_text(separator).join(to_text(a) for a in args if a is not None)
+    return values.check_length(to_text(separator).join(to_text(a) for a in args if a is not None))
 
 
 def _utf8(code: int) -> bytes:
@@ -287,7 +287,7 @@ def octet_length(value: SQLValue) -> int | None:
 def hex_(value: SQLValue) -> str:
     if value is None:
         return ""
-    return values.to_blob(value).hex().upper()
+    return values.check_length(values.to_blob(value).hex().upper())
 
 
 def unhex(value: SQLValue, ignore: SQLValue = "") -> bytes | None:
@@ -337,6 +337,8 @@ def zeroblob(size: SQLValue) -> bytes:
 
 def randomblob(size: SQLValue) -> bytes:
     n = to_int64(size) if size is not None else 1
+    if n > LENGTH_LIMIT:
+        raise OperationalError("string or blob too big")
     return random.randbytes(max(n, 1))
 
 
