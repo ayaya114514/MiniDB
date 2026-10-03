@@ -25,6 +25,8 @@
 - 触发器：`CREATE TRIGGER` / `DROP TRIGGER`，`BEFORE` / `AFTER` / `INSTEAD OF`（视图上）、
   `INSERT` / `UPDATE [OF ...]` / `DELETE`、`WHEN`、`NEW` / `OLD`、`RAISE(...)`、`PRAGMA recursive_triggers`。
 - 排序规则 BINARY / NOCASE / RTRIM：比较、`ORDER BY`、`GROUP BY` / `DISTINCT`、索引。
+- 生成列 `[GENERATED ALWAYS] AS (...) [VIRTUAL | STORED]`：可建索引、带 NOT NULL / UNIQUE / CHECK / COLLATE，
+  `ALTER TABLE ADD COLUMN` 可加 VIRTUAL 列；记录里只存 STORED 列（与 SQLite 的文件格式一致）。
 - PRAGMA：`table_info` / `table_xinfo`、`index_list` / `index_info` / `index_xinfo`、`foreign_key_list`、
   `foreign_key_check`、`integrity_check` / `quick_check`、`user_version`、`application_id`、`schema_version`、
   `page_size` / `page_count` / `freelist_count`、`journal_mode` 等，以及表值函数形式 `pragma_xxx(...)`。
@@ -260,7 +262,7 @@ Python 源码编译执行，见 DECISIONS.md D90）。
 
 ## 已知限制
 
-- 不支持临时表和 TEMP 触发器、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`WITHOUT ROWID`、`STRICT`、生成列、
+- 不支持临时表和 TEMP 触发器、虚表（表值函数只有 `pragma_xxx()`、`json_each()` / `json_tree()`）、`WITHOUT ROWID`、`STRICT`、
   表达式索引和部分索引、`UPDATE ... FROM`；`localtime` 修饰符只在一个时区的机器上对照过。
 - 大小写转换和比较只认 ASCII 字母（与不带 ICU 扩展的 SQLite 相同）：`upper('é')` 仍是 `'é'`。
 - 当 SQLite 的结果取决于它的查询计划时（相等的 1 和 1.0 中 DISTINCT/GROUP BY 保留哪一个、

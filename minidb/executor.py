@@ -48,7 +48,9 @@ from minidb.parser import (
     InSelect, Insert, Join, Like, Literal, Parameter, Pragma, Reindex, Select, SelectItem, Star, Subquery,
     TableFunction, TableRef, Unary, Update, Upsert, Vacuum, Values, Frame, WindowDef,
 )
-from minidb.parser import CheckConstraint, ColumnDef, Expr, ForeignKey, KeyConstraint, Statement, parse
+from minidb.parser import (
+    CheckConstraint, ColumnDef, Expr, ForeignKey, KeyConstraint, Statement, is_true_false_name, parse,
+)
 from minidb.tokenizer import tokenize
 from minidb.jsonb import JSONBlob, JSONText
 from minidb.values import SQLValue, ascii_lower
@@ -2226,7 +2228,7 @@ class Executor:
             self.check_foreign_keys()
             return result
         if isinstance(stmt, CreateTable):
-            self.catalog.create_table(stmt, self.check_constraints_compile)
+            self.catalog.create_table(stmt, self.check_new_table)
             return Result()
         if isinstance(stmt, DropTable):
             self.drop_table(stmt)
@@ -2306,8 +2308,7 @@ class Executor:
         masks); the constraint checks (REPLACE's DELETE); the foreign keys of
         the old and the new row; their actions.  Returns the foreign key whose
         new-row check it leaves out."""
-        width = len(table.columns)
-        names = [table.columns[p].name if p < width else "rowid" for p in changed]
+        names = trigger_names(table, changed)
         triggers, keys = self.triggers, self.foreign_keys
         triggers.prepare_listed(table.name, "UPDATE", names, orconf)
         if replace and replace_possible(table, orconf, rowid_changed, changed):
@@ -2441,6 +2442,8 @@ class Executor:
     @staticmethod
     def load_row(table: TableInfo, rowid: int, record: bytes | list) -> Row:
         row = record if type(record) is list else decode_row(record)  # (SQLite files: a row)
+        if table.virtual:
+            return expand_virtual(table, row, rowid)
         if len(row) < len(table.columns):  # written before ALTER TABLE ADD COLUMN
             row.extend(table.padding[len(row):])
         if table.rowid_column is not None:
@@ -3173,6 +3176,16 @@ class Executor:
             raise IntegrityError("datatype mismatch")
         return rowid
 
+    @staticmethod
+    def generator(table: TableInfo) -> Callable[[Row], None]:
+        """The function computing the generated columns of a new row (an
+        error at once when they make a loop, as SQLite reports it when it
+        compiles the statement)."""
+        fill = table.fill_generated
+        if fill is None:
+            fill = table.fill_generated = compile_generated(table, generated_order(table, table.generated))
+        return fill
+
     def not_null_violation(self, table: TableInfo, row: Row, conflict: str | None = None,
                            raw: Row | None = None) -> tuple[str, str] | None:
         """The NOT NULL constraint ``row`` violates, if any, and how to
@@ -3182,10 +3195,12 @@ class Executor:
         # As SQLite, in two passes: in column order, a REPLACE column with a
         # default gets it, the others are checked; then the REPLACE columns
         # that are still NULL fail as ABORT.
+        # Generated columns are checked in the second pass, computed again
+        # first if a REPLACE column could have taken its default.
         replaced = []
         for i, column in enumerate(table.columns):
-            if not column.not_null or i == table.rowid_column:  # (a NULL there: a new row id)
-                continue
+            if not column.not_null or i == table.rowid_column or column.generated is not None:
+                continue  # (a NULL row id alias: a new row id)
             how = conflict or column.not_null_conflict or "ABORT"
             if how == "REPLACE":
                 if column.default is not None:
@@ -3200,9 +3215,16 @@ class Executor:
                 how = "ABORT"
             if row[i] is None:
                 return f"NOT NULL constraint failed: {table.name}.{column.name}", how
-        for i in replaced:
-            if row[i] is None:
-                return f"NOT NULL constraint failed: {table.name}.{table.columns[i].name}", "ABORT"
+        if replaced and table.generated:
+            self.generator(table)(row)
+            if raw is not None:
+                for i in table.generated:
+                    raw[i] = row[i]
+        for i, column in enumerate(table.columns):
+            if row[i] is not None or not (i in replaced or (column.not_null and column.generated is not None)):
+                continue
+            how = "ABORT" if i in replaced else conflict or column.not_null_conflict or "ABORT"
+            return f"NOT NULL constraint failed: {table.name}.{column.name}", "ABORT" if how == "REPLACE" else how
         return None
 
     def check_violation(self, table: TableInfo, row: Row, conflict: str | None,
@@ -3221,6 +3243,11 @@ class Executor:
                 how = conflict or "ABORT"
                 return message, "ABORT" if how == "REPLACE" else how
         return None
+
+    def check_new_table(self, table: TableInfo) -> None:
+        """The errors CREATE TABLE reports for its expressions."""
+        self.check_constraints_compile(table)
+        check_generated(table)
 
     def check_constraints_compile(self, table: TableInfo) -> None:
         """The errors CREATE TABLE reports for its CHECK constraints."""
@@ -3383,6 +3410,8 @@ class Executor:
         stored = list(row)
         if table.rowid_column is not None:
             stored[table.rowid_column] = None  # kept in the key, not the record
+        if table.storage is not None:
+            stored = [stored[p] for p in table.storage]  # (not the VIRTUAL columns)
         return encode_record(stored)
 
     def insert_row(self, table: TableInfo, tree: BTree, row: Row, conflict: str | None = None,
@@ -3419,19 +3448,30 @@ class Executor:
             new = row + [-1 if rowid is None else rowid]
             if table.rowid_column is not None:
                 new[table.rowid_column] = new[-1]
+            if table.generated:
+                self.generator(table)(new)
             try:
                 triggers.fire(table.name, "BEFORE", "INSERT", None, new, None, conflict)
             except TriggerIgnore:
                 return None
         if sequence is not None and rowid is not None:
             sequence[0] = max(sequence[0], rowid)
+        fresh = rowid is None  # (a new row id is never taken)
+        if table.generated:
+            # SQLite computes them once the row id is known, before the constraints.
+            if fresh:
+                rowid = self.new_rowid(tree, sequence)
+            if table.rowid_column is not None:
+                row[table.rowid_column] = raw[table.rowid_column] = rowid
+            self.generator(table)(row)
+            for position in table.generated:
+                raw[position] = row[position]
         violation = self.not_null_violation(table, row, conflict, raw)
         if violation is not None:
             if violation[1] == "IGNORE":
                 return None
             raise self.constraint_error(*violation)
-        fresh = rowid is None  # (a new row id is never taken)
-        if fresh:
+        if fresh and not table.generated:
             rowid = self.new_rowid(tree, sequence)
         if table.rowid_column is not None:
             row[table.rowid_column] = raw[table.rowid_column] = rowid
@@ -3519,8 +3559,10 @@ class Executor:
             new_rowid = self.prepare_row(table, row)
             if new_rowid is None:
                 raise IntegrityError("datatype mismatch")
+        if table.generated:
+            self.generator(table)(row)
         triggers = self.triggers
-        names = None if changed is None else [table.columns[p].name if p < width else "rowid" for p in changed]
+        names = None if changed is None else trigger_names(table, changed)
         current = old
         if triggers.matching(table.name, "BEFORE", "UPDATE", names):
             try:
@@ -3535,6 +3577,8 @@ class Executor:
             for i in range(width):
                 if (changed is None or i not in changed) and i != table.rowid_column:
                     row[i] = current[i]
+            if table.generated:
+                self.generator(table)(row)
         violation = self.not_null_violation(table, row, conflict)
         if violation is not None:
             if violation[1] == "IGNORE":
@@ -3860,8 +3904,10 @@ class Executor:
                                                                            for p in positions]), trigger.table_name)
         own = parse(table.sql)
         edits = {table: [c.pos for c in own.columns if ascii_lower(c.name) == old]}
-        for check in [c for c in all_constraints(own) if isinstance(c, CheckConstraint)]:
-            edits[table] += [node.pos for node in walk_nodes(check.expr)
+        expressions = [c.expr for c in all_constraints(own) if isinstance(c, CheckConstraint)]
+        expressions += [c.generated for c in own.columns if c.generated is not None]
+        for expr in expressions:
+            edits[table] += [node.pos for node in walk_nodes(expr)
                              if isinstance(node, Column) and ascii_lower(node.name) == old and node.pos >= 0
                              and (node.table is None or ascii_lower(node.table) == ascii_lower(table.name))]
         for key in [c for c in all_constraints(own) if isinstance(c, KeyConstraint)]:
@@ -3892,10 +3938,14 @@ class Executor:
             raise OperationalError("Cannot add a PRIMARY KEY column")
         if column.unique:
             raise OperationalError("Cannot add a UNIQUE column")
-        if not is_constant_default(column.default):
-            raise OperationalError("Cannot add a column with non-constant default")
-        if column.not_null and constant_default(column.default) is None:
-            raise OperationalError("Cannot add a NOT NULL column with default value NULL")
+        tree = self.catalog.table_tree(table)
+        if column.generated is None:
+            if not is_constant_default(column.default):
+                raise OperationalError("Cannot add a column with non-constant default")
+            if column.not_null and constant_default(column.default) is None:
+                raise OperationalError("Cannot add a NOT NULL column with default value NULL")
+        elif column.stored and next(iter(tree.scan()), None) is not None:
+            raise OperationalError("cannot add a STORED column")  # (to a table with rows)
         if column.collation is not None:
             values.collation_name(column.collation)
         stmt = parse(table.sql)
@@ -3904,14 +3954,21 @@ class Executor:
                           table.table_constraints, sql)
         added.validate()
         self.check_constraints_compile(added)
-        if added.checks:
-            # As SQLite: the rows must pass the table's CHECK constraints now.
+        try:
+            check_generated(added, loops=False)
+        except OperationalError as exc:
+            raise OperationalError(f"error in table {table.name} after add column: {exc.args[0]}") from None
+        if added.checks or (column.not_null and column.generated is not None):
+            # As SQLite: the rows must pass the table's CHECK and NOT NULL
+            # constraints now (the first problem PRAGMA quick_check finds).
             checks = self.compile_checks(added)
-            for rowid, record in self.catalog.table_tree(table).scan():
-                row = self.load_row(table, rowid, record)
-                row.insert(len(table.columns), added.padding[-1])
+            not_null = [i for i, c in enumerate(added.columns) if c.not_null and i != added.rowid_column]
+            for rowid, record in tree.scan():
+                row = self.load_row(added, rowid, record)
+                if any(row[i] is None for i in not_null):
+                    raise OperationalError("NOT NULL constraint failed")  # (SQLite's raise() in a nested statement)
                 if any(failed(row) for _, failed, _ in checks):
-                    raise OperationalError("CHECK constraint failed")  # (SQLite's raise() in a nested statement)
+                    raise OperationalError("CHECK constraint failed")
         table.sql = sql
         self.catalog.rewrite_table_entries(table)
 
@@ -3938,7 +3995,7 @@ class Executor:
             changed = parse(sql)
             dropped = TableInfo(table.name, changed.columns, table.root, None, changed.constraints, sql)
             dropped.validate()
-            self.check_constraints_compile(dropped)
+            self.check_new_table(dropped)
         except Error as exc:
             raise OperationalError(f"error in table {table.name} after drop column: {exc.args[0]}") from None
         for index in table.indexes:
@@ -3962,14 +4019,11 @@ class Executor:
                 first = min(used, key=lambda node: node.pos)  # (SQLite reports the first, as written)
                 name = first.name if first.table is None else f"{first.table}.{first.name}"
                 raise OperationalError(f"error in trigger {trigger.name} after drop column: no such column: {name}")
-        tree = self.catalog.table_tree(table)
-        rows = [(rowid, self.load_row(table, rowid, record)) for rowid, record in tree.scan()]
-        alias = dropped.rowid_column
-        for rowid, row in rows:
-            stored = row[:position] + row[position + 1:-1]
-            if alias is not None:
-                stored[alias] = None  # kept in the key
-            tree.insert(rowid, encode_record(stored), replace=True)
+        if position not in table.virtual:  # (a VIRTUAL column is in no record)
+            tree = self.catalog.table_tree(table)
+            rows = [(rowid, self.load_row(table, rowid, record)) for rowid, record in tree.scan()]
+            for rowid, row in rows:
+                tree.insert(rowid, self.encode(dropped, row[:position] + row[position + 1:-1]), replace=True)
         table.sql = sql
         self.catalog.rewrite_table_entries(table)
 
@@ -4625,7 +4679,7 @@ class PreparedInsert:
         table = self.table = executor.catalog.table_to_modify(stmt.table)
         width = len(table.columns)
         if stmt.columns is None:
-            self.positions = list(range(width))
+            self.positions = [p for p in range(width) if table.columns[p].generated is None]
         else:
             self.positions = []
             for name in stmt.columns:
@@ -4635,6 +4689,8 @@ class PreparedInsert:
                         raise OperationalError(f"table {table.name} has no column named {name}")
                     # The row id by name; "width" when it is not a column.
                     position = width if table.rowid_column is None else table.rowid_column
+                elif table.columns[position].generated is not None:
+                    raise OperationalError(f'cannot INSERT into generated column "{table.columns[position].name}"')
                 self.positions.append(position)
         self.rowid_given = (width if table.rowid_column is None else table.rowid_column) in self.positions
         compiler = Compiler(Scope(executor.outer_scope), executor=executor)
@@ -4661,6 +4717,8 @@ class PreparedInsert:
             self.check_count(stmt, len(exprs))
             self.rows.append([compiler.compile(e) for e in exprs])
         self.tree = executor.catalog.table_tree(table)
+        if table.generated:
+            executor.generator(table)
         multi_write = self.multi_write = self.query is not None or len(self.rows) > 1
         self.prepare_programs()
         # SQLite keeps a statement journal for a multi-row write (a SELECT,
@@ -4669,7 +4727,8 @@ class PreparedInsert:
         triggers = executor.triggers
         multi = multi_write or bool(executor.catalog.triggers and triggers.exist(table.name, "INSERT"))
         # (Only a multi-row write needs it, or a statement of a trigger program: Program.may_abort.)
-        self.aborts = (multi or bool(executor.compiling_trigger)) and (self.may_abort() or calls_function(stmt) or triggers.may_abort(
+        self.aborts = (multi or bool(executor.compiling_trigger)) and (self.may_abort() or calls_function(stmt) or (
+            table.generated and calls_function([c.generated for c in table.columns])) or triggers.may_abort(
             table.name, "INSERT", None, self.conflict) or any(
             # (an upsert's UPDATE runs its triggers' programs as OR ABORT)
             upsert.assignments and triggers.may_abort(table.name, "UPDATE", [
@@ -4704,7 +4763,7 @@ class PreparedInsert:
             if upsert.assignments:
                 positions = {position for position, _ in upsert.assignments}
                 upsert.unchecked = executor.compile_update(table, positions, "ABORT")
-                names = [table.columns[p].name if p < width else "rowid" for p in positions]
+                names = trigger_names(table, positions)
                 multi = multi or triggers.exist(table.name, "UPDATE", names) or (
                     keys.enabled and keys.required(table, positions))
         replaces = replace_possible(table, self.conflict, self.rowid_given, handled=[u.constraint for u in self.upserts])
@@ -4766,7 +4825,7 @@ class PreparedInsert:
         if count != len(self.positions):
             if stmt.columns is None:
                 raise OperationalError(
-                    f"table {self.table.name} has {len(self.table.columns)} columns "
+                    f"table {self.table.name} has {len(self.positions)} columns "
                     f"but {count} values were supplied"
                 )
             raise OperationalError(f"{count} values for {len(self.positions)} columns")
@@ -4869,16 +4928,24 @@ class PreparedUpdate(PreparedSingleTable):
                 if ascii_lower(name) not in ROWID_NAMES:
                     raise OperationalError(f"no such column: {name}")
                 position = width if table.rowid_column is None else table.rowid_column
+            elif table.columns[position].generated is not None:
+                raise OperationalError(f'cannot UPDATE generated column "{table.columns[position].name}"')
             self.assignments.append((position, compiler.compile(expr)))
         self.conflict = stmt.conflict
         self.returning = executor.compile_returning(stmt.returning, self.scope)
         # Like PreparedInsert.may_abort: the constraints the changed columns
-        # take part in, under ABORT (REPLACE, for NOT NULL).
+        # take part in, under ABORT (REPLACE, for NOT NULL); with the
+        # generated columns that use them.
         changed = self.changed = {p for p, _ in self.assignments}
+        if table.generated:
+            executor.generator(table)
+            changed |= generated_dependents(table, changed)
         width = len(table.columns)
         rowid_changed = self.rowid_changed = bool(changed & {width, table.rowid_column})
         conflict = stmt.conflict
-        self.statement_journal = calls_function(stmt) or any(
+        # (A function in a generated column counts too: it is computed with the statement.)
+        self.statement_journal = calls_function(stmt) or bool(
+            table.generated and calls_function([c.generated for c in table.columns])) or any(
             (conflict or table.columns[p].not_null_conflict or "ABORT") in ("ABORT", "REPLACE")
             for p in changed if p < width and table.columns[p].not_null
         ) or any(conflict in (None, "ABORT", "REPLACE") or calls_function(check.expr)
@@ -4889,7 +4956,7 @@ class PreparedUpdate(PreparedSingleTable):
                  for index in table.indexes)
         # Whether a REPLACE may delete a row the statement has yet to update.
         self.may_replace = "REPLACE" in (conflict, table.rowid_conflict(), *(i.conflict for i in table.indexes))
-        self.names = [table.columns[p].name if p < width else "rowid" for p in changed]
+        self.names = trigger_names(table, changed)
         # What SQLite compiles with the statement, in its order (Executor.compile_update).
         self.unchecked = executor.compile_update(table, self.changed, conflict, True, rowid_changed)
         self.aborts = self.statement_journal or executor.triggers.may_abort(table.name, "UPDATE", self.names, conflict)
@@ -5154,6 +5221,8 @@ class PreparedUpsert:
                 if ascii_lower(name) not in ROWID_NAMES:
                     raise OperationalError(f"no such column: {name}")
                 position = width if table.rowid_column is None else table.rowid_column
+            elif table.columns[position].generated is not None:
+                raise OperationalError(f'cannot UPDATE generated column "{table.columns[position].name}"')
             assignments.append((position, compiler.compile(expr)))
         self.where = compiler.compile(clause.where) if clause.where is not None else None
         self.assignments = assignments
@@ -5208,9 +5277,11 @@ class PreparedUpsert:
         # (SQLite runs DO UPDATE as an UPDATE OR ABORT: the constraints' own ON CONFLICT does not apply.)
         keys = executor.foreign_keys
         saved, keys.unchecked = keys.unchecked, self.unchecked  # (its UPDATE's own, see compile_update)
+        changed = {position for position, _ in self.assignments}
+        if table.generated:
+            changed |= generated_dependents(table, changed)
         try:
-            stored = executor.update_row(table, tree, rowid, old, new, "ABORT",
-                                         {position for position, _ in self.assignments})
+            stored = executor.update_row(table, tree, rowid, old, new, "ABORT", changed)
         finally:
             keys.unchecked = saved
         return None if stored is None else ("update", stored)  # (None: a trigger deleted or kept the row)
@@ -5567,6 +5638,147 @@ def sqlite_dequote(text: str) -> str:
         result.append(text[i])
         i += 1
     return "".join(result)
+
+
+# What SQLite's resolver refuses in a generated column as non-deterministic
+# (the date and time functions are refused only when they read the clock:
+# dates.pure_context).
+GENERATED_NONDETERMINISTIC = functions.NONDETERMINISTIC | {"CURRENT_DATE", "CURRENT_TIME", "CURRENT_TIMESTAMP"}
+
+
+def check_generated(table: TableInfo, loops: bool = True) -> None:
+    """The errors CREATE TABLE reports for generated columns (SQLite's
+    sqlite3EndTable, each expression as its resolver walks it); ``loops``:
+    also a loop among VIRTUAL columns (ADD COLUMN does not look)."""
+    if not table.generated:
+        return
+    if len(table.generated) == len(table.columns):
+        raise OperationalError("must have at least one non-generated column")  # (SQLite's last word)
+    scope = Scope()
+    scope.add(table)
+    compiler = Compiler(scope)
+    for position in table.generated:
+        expr = table.columns[position].generated
+        for node in walk(expr):
+            if isinstance(node, (Subquery, InSelect, Exists)):
+                raise OperationalError("subqueries prohibited in generated columns")
+            if isinstance(node, Parameter):
+                raise OperationalError("parameters prohibited in generated columns")
+            if isinstance(node, Column):
+                if node.table is not None:
+                    if ascii_lower(node.table) != ascii_lower(table.name):
+                        raise OperationalError(f"no such column: {node.table}.{node.name}")
+                    raise OperationalError('the "." operator prohibited in generated columns')
+                if table.column_index(node.name) is None and not is_true_false_name(node):
+                    raise OperationalError(f"no such column: {node.name}")
+            if isinstance(node, Call) and node.name in GENERATED_NONDETERMINISTIC:
+                raise OperationalError("non-deterministic functions prohibited in generated columns")
+        compiler.compile(expr)  # (aggregates and window functions)
+    if loops:
+        generated_order(table, table.virtual)
+
+
+def generated_order(table: TableInfo, pending: list[int]) -> list[int]:
+    """The order to compute the generated columns ``pending`` in, as SQLite's
+    sqlite3ComputeGeneratedColumns finds it: passes over the columns, each
+    computing those whose expression uses no column still to be computed; a
+    pass that computes none is a loop, reported on the last it put off."""
+    uses = {p: {table.column_index(n.name) for n in walk(table.columns[p].generated) if isinstance(n, Column)}
+            for p in pending}
+    waiting = set(pending)
+    order = []
+    while waiting:
+        last, progress = None, False
+        for position in pending:
+            if position not in waiting:
+                continue
+            if uses[position] & waiting:
+                last = position
+            else:
+                order.append(position)
+                waiting.discard(position)
+                progress = True
+        if not progress:
+            raise OperationalError(f'generated column loop on "{table.columns[last].name}"')
+    return order
+
+
+def compile_generated(table: TableInfo, positions: list[int]) -> Callable[[Row], None]:
+    """A function computing the generated columns at ``positions`` (in that
+    order) of a row in place, each with its column's affinity.  A STORED
+    value loses the JSON subtype, as a value read back from a record has
+    none; a VIRTUAL one keeps it (SQLite computes it whenever it is read)."""
+    scope = Scope()
+    scope.add(table)
+    compiler = Compiler(scope)
+    steps = [(p, compiler.compile(table.columns[p].generated), table.affinities[p], table.columns[p].stored)
+             for p in positions]
+    apply = values.apply_affinity
+
+    def fill(row):
+        for position, function, affinity, stored in steps:
+            value = function(row)
+            if stored and type(value) in SUBTYPED:
+                value = str.__str__(value) if type(value) is JSONText else bytes(value)
+            row[position] = apply(value, affinity)
+
+    if not any(isinstance(n, Call) and n.name in dates.DATE_FUNCTIONS
+               for p in positions for n in walk(table.columns[p].generated)):
+        return fill
+
+    def checked(row):
+        context = dates.pure_context
+        saved, context[0] = context[0], "a generated column"
+        try:
+            fill(row)
+        finally:
+            context[0] = saved
+    return checked
+
+
+def expand_virtual(table: TableInfo, stored: list, rowid: int) -> Row:
+    """The row (with its row id) of a record of a table with VIRTUAL
+    columns: the stored values in their places, the others computed."""
+    storage = table.storage
+    if len(stored) < len(storage):  # written before ALTER TABLE ADD COLUMN
+        stored.extend(table.padding[p] for p in storage[len(stored):])
+    row = [None] * len(table.columns)
+    for position, value in zip(storage, stored):
+        row[position] = value
+    if table.rowid_column is not None:
+        row[table.rowid_column] = rowid
+    fill = table.fill_virtual
+    if fill is None:
+        fill = table.fill_virtual = compile_generated(table, generated_order(table, table.virtual))
+    fill(row)
+    row.append(rowid)
+    return row
+
+
+def trigger_names(table: TableInfo, changed: Iterable[int]) -> list[str]:
+    """The names an UPDATE setting ``changed`` (the row id as len(columns))
+    matches UPDATE OF triggers by: not those of the generated columns that
+    change with them."""
+    width = len(table.columns)
+    return [table.columns[p].name if p < width else "rowid" for p in changed
+            if p >= width or table.columns[p].generated is None]
+
+
+def generated_dependents(table: TableInfo, changed: set[int]) -> set[int]:
+    """The generated columns whose value changes when the columns ``changed``
+    do, directly or through other generated columns (update.c's aXRef)."""
+    found = set()
+    progress = True
+    while progress:
+        progress = False
+        for position in table.generated:
+            if position in found or position in changed:
+                continue
+            if any(isinstance(n, Column) and table.column_index(n.name) in changed | found
+                   for n in walk(table.columns[position].generated)):
+                found.add(position)
+                progress = True
+    return found
 
 
 def check_positions(table: TableInfo, check: CheckConstraint) -> set[int]:

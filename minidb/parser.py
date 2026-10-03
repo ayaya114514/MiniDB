@@ -245,6 +245,8 @@ class ColumnDef:
     default_text: str | None = None  # its SQL text
     collation: str | None = None  # COLLATE <name>
     not_null_conflict: str | None = None  # NOT NULL ON CONFLICT <resolution>
+    generated: object = None  # the expression of GENERATED ALWAYS AS (...), or None
+    stored: bool = False  # a STORED generated column (else VIRTUAL)
     constraints: list = field(default_factory=list)  # its KeyConstraints, CheckConstraints and ForeignKeys
     declared: str = field(default="", compare=False)  # the type as written
     pos: int = field(default=-1, compare=False)  # of the name in the SQL text
@@ -554,6 +556,9 @@ Statement = Union[
 
 # Words that start a column constraint and so end a type name.
 CONSTRAINT_WORDS = {"CONSTRAINT", "CHECK", "DEFAULT", "REFERENCES", "COLLATE", "GENERATED"}
+GENERATED_KEY_ERROR = "generated columns cannot be part of the PRIMARY KEY"
+# The words that may follow AS (...) without being its STORED / VIRTUAL.
+GENERATED_FOLLOWERS = (CONSTRAINT_WORDS - {"GENERATED"}) | {"DEFERRABLE"}
 MAX_PARAMETER_INDEX = 32_766  # SQLITE_MAX_VARIABLE_NUMBER's default
 
 
@@ -1171,6 +1176,8 @@ class Parser:
                 continue
             if self.accept_keyword("PRIMARY"):
                 self.expect_word("KEY")
+                if column.generated is not None:
+                    raise OperationalError(GENERATED_KEY_ERROR)
                 column.primary_key = True
                 descending = not self.accept_keyword("ASC") and bool(self.accept_keyword("DESC"))
                 conflict = self.on_conflict()
@@ -1189,6 +1196,8 @@ class Parser:
                     False, [IndexedColumn(column.name, None, False, pos)], self.on_conflict(), name=name,
                     column_level=True))
             elif self.at_word("DEFAULT"):
+                if column.generated is not None:
+                    raise OperationalError("cannot use DEFAULT on a generated column")
                 self.advance()
                 start = self.tok.pos
                 column.default = self.default_value(column.name)
@@ -1209,11 +1218,35 @@ class Parser:
                 if key is not None:
                     key.deferred = deferred
             elif self.at_word("GENERATED") or self.at_keyword("AS"):
-                raise NotSupportedError("generated columns are not supported")
+                self.generated_clause(column)
             else:
                 column.end = self.end_of_previous()
                 return column
             name = None
+
+    def generated_clause(self, column: ColumnDef) -> None:
+        """[GENERATED ALWAYS] AS (<expr>) [STORED | VIRTUAL] (SQLite's
+        sqlite3AddGenerated: the word after it may be any name)."""
+        if self.accept_word("GENERATED"):
+            self.expect_word("ALWAYS")
+        self.expect_keyword("AS")
+        self.expect_op("(")
+        expr = self.expr()
+        self.expect_op(")")
+        if any(isinstance(node, Parameter) for node in walk_expr(expr)):
+            raise OperationalError("parameters prohibited in generated columns")  # (before they are counted)
+        error = column.generated is not None or column.default is not None
+        if self.tok.kind == "IDENT" and ascii_upper(self.tok.text) not in GENERATED_FOLLOWERS:
+            word = ascii_upper(self.advance().text)
+            if word == "STORED":
+                column.stored = True
+            elif word != "VIRTUAL":
+                error = True
+        if error:
+            raise OperationalError(f'error in generated column "{column.name}"')
+        if column.primary_key:
+            raise OperationalError(GENERATED_KEY_ERROR)
+        column.generated = expr
 
     def default_value(self, column: str) -> Expr:
         """DEFAULT <literal>, <signed number>, <identifier> (as text),

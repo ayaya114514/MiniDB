@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import struct
 import time
+from collections.abc import Callable
 
 from minidb import values
 from minidb.errors import OperationalError
@@ -29,6 +30,19 @@ UNIX_EPOCH_JD_MS = 210866760000000  # 1970-01-01 as julian day * 86400000
 
 # The current time for "now": fixed for the length of a statement (Executor.execute resets it).
 statement_time: list[int | None] = [None]
+# Where a value being computed must not depend on the time ("a generated
+# column", "a CHECK constraint"), or None: "now", "localtime" and "utc" are
+# then an error (SQLite's sqlite3NotPureFunc).
+pure_context: list[str | None] = [None]
+
+
+class _NotPure(Exception):
+    pass
+
+
+def _check_pure() -> None:
+    if pure_context[0] is not None:
+        raise _NotPure
 
 
 def _div(a: int, b: int) -> int:
@@ -247,6 +261,7 @@ def current_time_ms() -> int:
 
 
 def _set_now(p: DateTime) -> bool:
+    _check_pure()
     p.iJD = current_time_ms()
     p.validJD = True
     p.isUtc, p.isLocal = True, False
@@ -407,6 +422,7 @@ def _parse_modifier(z: str, p: DateTime, idx: int) -> bool:
         return True
     if first == "l":
         if lowered == "localtime":
+            _check_pure()
             if not p.isLocal:
                 _to_localtime(p)
             p.isUtc, p.isLocal = False, True
@@ -425,6 +441,7 @@ def _parse_modifier(z: str, p: DateTime, idx: int) -> bool:
                 return False
             return True
         if lowered == "utc":
+            _check_pure()
             if not p.isUtc:
                 _compute_jd(p)
                 guess = original = p.iJD
@@ -847,14 +864,24 @@ def timediff(a: SQLValue, b: SQLValue) -> str | None:
     return sql_printf("%c%04d-%02d-%02d %02d:%02d:%06.3f", [sign, Y, M, d1.D - 1, d1.h, d1.m, d1.s])
 
 
+def _pure_checked(name: str, function: Callable[..., SQLValue]) -> Callable[..., SQLValue]:
+    """``function`` reporting a use of the time where it must not be used."""
+    def checked(*args: SQLValue) -> SQLValue:
+        try:
+            return function(*args)
+        except _NotPure:
+            raise OperationalError(f"non-deterministic use of {name}() in {pure_context[0]}") from None
+    return checked
+
+
 DATE_FUNCTIONS = {
-    "JULIANDAY": (julianday, 0, None),
-    "UNIXEPOCH": (unixepoch, 0, None),
-    "DATE": (date, 0, None),
-    "TIME": (time_, 0, None),
-    "DATETIME": (datetime_, 0, None),
-    "STRFTIME": (strftime, 0, None),
-    "TIMEDIFF": (timediff, 2, 2),
+    "JULIANDAY": (_pure_checked("julianday", julianday), 0, None),
+    "UNIXEPOCH": (_pure_checked("unixepoch", unixepoch), 0, None),
+    "DATE": (_pure_checked("date", date), 0, None),
+    "TIME": (_pure_checked("time", time_), 0, None),
+    "DATETIME": (_pure_checked("datetime", datetime_), 0, None),
+    "STRFTIME": (_pure_checked("strftime", strftime), 0, None),
+    "TIMEDIFF": (_pure_checked("timediff", timediff), 2, 2),
     "CURRENT_DATE": (date, 0, 0),
     "CURRENT_TIME": (time_, 0, 0),
     "CURRENT_TIMESTAMP": (datetime_, 0, 0),

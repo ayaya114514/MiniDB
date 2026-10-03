@@ -1083,3 +1083,29 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   CommitPhaseOne 这样做），否则崩溃回滚后它们是零——以前 VACUUM 缩小文件时就有这个风险，只是没有在“截断之后、sync
   之前”的崩溃点测过；(2) SQLite 格式批量建索引时，最后一个条目恰好放不下而上升为分隔键、又被放回去单独成叶时，少了一个
   分隔键，前一个叶子丢失（与页大小无关，512 字节页上更容易碰到；种子 2184）。
+
+## D116 生成列：读时算 VIRTUAL，写时算全部，次序照 sqlite3ComputeGeneratedColumns
+
+- **存储**：记录里只放非 VIRTUAL 的列（普通列和 STORED 列，按列序），即 SQLite 的 sqlite3TableColumnToStorage；
+  两种文件格式一样，SQLite 格式因此能直接读写 sqlite3 建的表。`TableInfo.storage` 记下记录里各值对应的列，
+  `Executor.load_row` 把它们放回原位再算 VIRTUAL 列，执行器其余部分看到的仍是“每列一个值 + 行号”的完整行，
+  查询、索引、触发器、外键、RETURNING 的代码都不用改。SQLite 格式的表树按存储位置给 REAL 亲和性（整数形式存的
+  REAL 读回成 REAL），这一点 fuzz 第一轮就查出来了。
+- **计算次序**：照 sqlite3ComputeGeneratedColumns 的多趟扫描——每趟按列序算出“表达式里没有还没算的列”的列，
+  一趟什么都没算出来就是循环，报这一趟最后推迟的那一列（所以 `b AS (c), c AS (b)` 报 c）。CREATE TABLE 只在
+  VIRTUAL 列之间找循环（STORED 列读时有值）；经过 STORED 列的循环到写行时（编译语句时）才报，与 SQLite 相同。
+  计算结果照列的亲和性转换；STORED 值去掉 JSON 子类型，VIRTUAL 值保留（SQLite 每次读都重算，`json_array(c)`
+  里能看出来）。
+- **写**：INSERT 在行号确定之后、NOT NULL 之前算（INTEGER PRIMARY KEY 自动分配的值能被生成列看到，所以有生成列的
+  表提前分配行号）；BEFORE 触发器的 NEW 里也是算好的值（行号未知时按 -1 算）。NOT NULL 照 SQLite 的两趟：先查普通
+  列（REPLACE 填默认值），有 REPLACE 列就重算生成列，再查生成列。UPDATE 把依赖被改列的生成列也算作“改了”
+  （update.c 的 aXRef），用于 CHECK 和索引检查，但不用于 `UPDATE OF` 触发器的匹配（实测 SQLite 如此）。生成列
+  表达式里的函数调用也让 SQLite 认为语句可能中止（决定要不要语句日志），一并计入。
+- **CREATE TABLE 的报错**照 sqlite3EndTable 和 resolve.c 实测：子查询、参数、`.` 限定、非确定函数（random()、
+  changes()、CURRENT_TIMESTAMP 等）、聚合 / 窗口函数、未知列；日期函数只有真用到时钟（'now'、无参数、localtime、
+  utc）时才在写行时报 `non-deterministic use of date() in a generated column`（dates.pure_context，SQLite 的
+  sqlite3NotPureFunc）；“至少要有一个非生成列”覆盖其他错误（SQLite 最后写这条）。多个错误同时出现时 SQLite 的
+  选择并不总是第一个，MiniDB 报遍历时遇到的第一个。
+- **ALTER TABLE**：ADD COLUMN 可加 VIRTUAL 列，STORED 列只能加到空表（sqlite3ErrorIfNotEmpty）；新列带 NOT NULL
+  或表有 CHECK 时按 quick_check 的顺序验证已有的行；RENAME COLUMN 改写生成列表达式里的引用；DROP COLUMN 删
+  VIRTUAL 列不重写记录。ADD COLUMN 不查循环（SQLite 也不查，之后读表时才报）。

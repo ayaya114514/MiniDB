@@ -40,8 +40,8 @@ from minidb.btree import BTree
 from minidb.errors import DatabaseError, NotSupportedError, OperationalError
 from minidb.pager import Pager
 from minidb.parser import (
-    CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateTrigger, CreateView, ForeignKey, KeyConstraint,
-    Literal, Unary, parse,
+    GENERATED_KEY_ERROR, CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateTrigger, CreateView, ForeignKey,
+    KeyConstraint, Literal, Unary, parse,
 )
 from minidb.record import decode_record, encode_record, encoded_size
 from minidb.values import SQLValue, ascii_lower
@@ -166,6 +166,14 @@ class TableInfo:
         # COLUMN after the row was written): their constant defaults.
         self.padding = [values.apply_affinity(constant_default(c.default), a)
                         for c, a in zip(columns, self.affinities)]
+        # Generated columns: a record holds the others and the STORED ones,
+        # in column order (SQLite's sqlite3TableColumnToStorage); a VIRTUAL
+        # column is computed when the row is read (Executor.load_row).
+        self.generated = [i for i, c in enumerate(columns) if c.generated is not None]
+        self.virtual = [i for i in self.generated if not columns[i].stored]
+        self.storage = [i for i, c in enumerate(columns) if c.generated is None or c.stored] if self.virtual else None
+        self.fill_virtual = None  # (the executor's, see executor.expand_virtual)
+        self.fill_generated = None  # (the executor's, see Executor.generate)
 
     def column_index(self, name: str) -> int | None:
         return self.positions.get(ascii_lower(name))
@@ -216,6 +224,9 @@ class TableInfo:
             if ascii_lower(column.name) in seen:
                 raise OperationalError(f"duplicate column name: {column.name}")
             seen.add(ascii_lower(column.name))
+        if self.primary_key is not None and any(
+                self.column_index(c.name) in self.generated for c in self.primary_key.columns):
+            raise OperationalError(GENERATED_KEY_ERROR)
         if sum(k.primary for k in self.keys) > 1:
             raise OperationalError(f'table "{self.name}" has more than one primary key')
         if any(k.autoincrement for k in self.keys) and not self.autoincrement:
@@ -512,7 +523,8 @@ class Catalog:
         if self.sqlite:
             from minidb.sqlite_btree import SqliteTable
 
-            return SqliteTable(self.pager, table.root, table.affinities, rows=True)
+            affinities = table.affinities if table.storage is None else [table.affinities[p] for p in table.storage]
+            return SqliteTable(self.pager, table.root, affinities, rows=True)
         return BTree(self.pager, table.root)
 
     def index_tree(self, index: IndexInfo) -> BTree:
