@@ -16,7 +16,7 @@ from minidb.parser import Delete, Insert, Join, Literal, Parameter, TableRef, Up
 from minidb.parser import Expr
 from minidb.values import ascii_lower
 from minidb.expressions import Compiler, ROWID_NAMES, Result, Row, RowFunction, SUBTYPED, Scope, calls_function
-from minidb.generated import check_positions, generated_dependents, replace_possible, trigger_names
+from minidb.generated import check_positions, generated_dependents, reads_generated_call, replace_possible, trigger_names
 from minidb.ordering import Descending
 from minidb.sources import reads_table
 from minidb.queries import passes_constants
@@ -110,7 +110,8 @@ class PreparedInsert:
             executor.catalog.any_triggers and triggers.exist(table.name, "INSERT"))
         # (Only a multi-row write needs it, or a statement of a trigger program: Program.may_abort.)
         self.aborts = (multi or bool(executor.compiling_trigger)) and (self.may_abort() or calls_function(stmt) or (
-            table.generated and calls_function([c.generated for c in table.columns])) or triggers.may_abort(
+            table.generated and calls_function([c.generated for c in table.columns])) or reads_generated_call(
+            executor.catalog, stmt) or triggers.may_abort(
             table.name, "INSERT", None, self.conflict) or any(
             # (an upsert's UPDATE runs its triggers' programs as OR ABORT)
             upsert.assignments and triggers.may_abort(table.name, "UPDATE", [
@@ -346,7 +347,8 @@ class PreparedUpdate(PreparedSingleTable):
         conflict = stmt.conflict
         # (A function in a generated column counts too: it is computed with the statement.)
         self.statement_journal = calls_function(stmt) or bool(
-            table.generated and calls_function([c.generated for c in table.columns])) or any(
+            table.generated and calls_function([c.generated for c in table.columns])) or reads_generated_call(
+            executor.catalog, stmt) or any(
             (conflict or table.columns[p].not_null_conflict or "ABORT") in ("ABORT", "REPLACE")
             for p in changed if p < width and table.columns[p].not_null
         ) or any(conflict in (None, "ABORT", "REPLACE") or calls_function(check.expr)
@@ -405,7 +407,8 @@ class PreparedDelete(PreparedSingleTable):
         multi = executor.triggers.exist(self.table.name, "DELETE") or keys.involved(self.table) or (
             self.returning is not None)
         self.aborts = (multi or bool(executor.compiling_trigger)) and (
-            calls_function(stmt) or executor.triggers.may_abort(self.table.name, "DELETE", None, None) or (
+            calls_function(stmt) or reads_generated_call(executor.catalog, stmt)
+            or executor.triggers.may_abort(self.table.name, "DELETE", None, None) or (
                 keys.enabled and keys.involved(self.table) and keys.may_abort(self.table, "delete")))
         self.statement_journal = multi and self.aborts
 
