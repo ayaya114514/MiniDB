@@ -9,13 +9,13 @@ import dataclasses
 from collections.abc import Callable, Iterable, Iterator
 
 from minidb import dates, functions, values
-from minidb.catalog import TableInfo, TriggerInfo
-from minidb.errors import OperationalError
-from minidb.parser import Call, Column, Exists, InSelect, Parameter, Subquery
+from minidb.catalog import Catalog, TableInfo, TriggerInfo
+from minidb.errors import Error, OperationalError
+from minidb.parser import Call, Column, Exists, InSelect, Parameter, Select, SelectItem, Star, Subquery, TableRef
 from minidb.parser import CheckConstraint, is_true_false_name
 from minidb.values import SQLValue, ascii_lower
 from minidb.record import decode_row
-from minidb.expressions import Compiler, Row, Scope, walk
+from minidb.expressions import Compiler, Row, Scope, calls_function, walk
 
 
 # ---- statements ------------------------------------------------------------------
@@ -45,6 +45,42 @@ def walk_nodes(node: object) -> Iterator[object]:
         for f in dataclasses.fields(node):
             if f.compare:
                 yield from walk_nodes(getattr(node, f.name))
+
+
+def reads_generated_call(catalog: Catalog, node: object) -> bool:
+    """Whether a statement reads a VIRTUAL column - of a table in one of its
+    FROM clauses, by name or through ``*`` - whose expression (or a VIRTUAL
+    column it uses) calls a function.  SQLite codes that expression where
+    the column is read (sqlite3ExprCodeGeneratedColumn), so the call makes
+    the statement one that may abort (sqlite3MayAbort in OP_Function)."""
+    nodes = list(walk_nodes(node))
+    tables = [n for n in nodes if isinstance(n, TableRef)]
+    if not tables:
+        return False
+    names = {ascii_lower(n.name) for n in nodes if isinstance(n, Column)}
+    starred = {id(join.table) for n in nodes if isinstance(n, Select)  # (a SELECT's * reads its own FROM tables)
+               if any(isinstance(item, SelectItem) and isinstance(item.expr, Star) for item in n.items)
+               for join in n.source}
+    for ref in tables:
+        star = id(ref) in starred
+        try:
+            table = catalog.get_table(ref.name, ref.schema)
+        except Error:
+            continue  # (a view, a CTE or a table-valued function)
+        if not table.virtual:
+            continue
+        virtual = {ascii_lower(table.columns[p].name): p for p in table.virtual}
+
+        def calls(position: int, seen: frozenset[int] = frozenset()) -> bool:
+            expr = table.columns[position].generated
+            return calls_function(expr) or any(
+                isinstance(n, Column) and ascii_lower(n.name) in virtual
+                and virtual[ascii_lower(n.name)] not in seen and calls(virtual[ascii_lower(n.name)], seen | {position})
+                for n in walk_nodes(expr))
+
+        if any((star or name in names) and calls(p) for name, p in virtual.items()):
+            return True
+    return False
 
 
 def replace_possible(table: TableInfo, conflict: str | None, rowid_checked: bool,

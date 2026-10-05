@@ -416,3 +416,29 @@ def test_intreal_through_window_tables(pair):
         SELECT typeof(max(g) OVER ()), typeof(max(g) OVER (ORDER BY id)), typeof(max(g) OVER (PARTITION BY c)) FROM t;
         SELECT count(*), typeof(sum(g) OVER ()) FROM t GROUP BY c
     """)
+
+
+def test_reading_a_virtual_column_with_a_function_makes_a_statement_journal(pair):
+    # SQLite computes a VIRTUAL column where it is read; a function call in
+    # it (OP_Function) makes the statement one that may abort, so a
+    # multi-row write keeps a statement journal and a datatype mismatch half
+    # way undoes the rows it already wrote.  Without a call they stay
+    # (fuzz seed 7043).
+    for sql in [
+        "CREATE TABLE s(id INTEGER PRIMARY KEY, k, f AS (typeof(k)), p AS (k + 0), q AS (f || ''))",
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, v)",
+        "INSERT INTO s(id, k) VALUES (1, 1), (2, 2), (3, 'x')",
+        "BEGIN",
+        "INSERT OR REPLACE INTO t SELECT k, 'a' FROM s WHERE f IS NOT NULL ORDER BY id",
+        "SELECT * FROM t",
+        "INSERT OR REPLACE INTO t SELECT k, 'b' FROM s WHERE p IS NOT NULL ORDER BY id",
+        "SELECT * FROM t",
+        "DELETE FROM t",
+        "INSERT OR REPLACE INTO t SELECT k, 'c' FROM s WHERE q IS NOT NULL ORDER BY id",
+        "SELECT * FROM t",
+        "DELETE FROM t",
+        "INSERT OR REPLACE INTO t SELECT * FROM (SELECT k, 'd' FROM s ORDER BY id)",
+        "SELECT * FROM t",
+        "COMMIT",
+    ]:
+        pair.run(sql)
