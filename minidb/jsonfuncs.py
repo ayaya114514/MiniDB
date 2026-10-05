@@ -235,6 +235,8 @@ def from_blob(blob: bytes | bytearray, i: int, text_only: bool = False, binary: 
         raise malformed()
     kind = blob[i] & 0x0F
     payload = bytes(blob[i + n:i + n + sz])
+    if kind <= FALSE and sz:
+        raise malformed()
     if kind == NULL:
         return None
     if kind == TRUE:
@@ -332,11 +334,17 @@ def jsonb_(value: SQLValue) -> SQLValue:
     return None if parsed is None else result_parse(parsed[0], True)
 
 
+def append_separator(out: bytearray) -> None:
+    """SQLite's jsonAppendSeparator: a comma unless the text so far ends in
+    '[' or '{' (which an element of damaged JSONB can, too)."""
+    if out and out[-1] not in b"[{":
+        out.append(0x2C)
+
+
 def json_array(*args: SQLValue) -> JSONText:
     out = bytearray(b"[")
-    for i, arg in enumerate(args):
-        if i:
-            out.append(0x2C)
+    for arg in args:
+        append_separator(out)
         append_sql_value(out, arg)
     out.append(0x5D)
     return _json(out)
@@ -354,8 +362,7 @@ def json_object(*args: SQLValue) -> JSONText:
         label = args[i]
         if not isinstance(label, str):
             raise OperationalError("json_object() labels must be TEXT")
-        if i:
-            out.append(0x2C)
+        append_separator(out)
         out += jsonb.quote_string(_bytes(label))
         out.append(0x3A)
         append_sql_value(out, args[i + 1])
@@ -471,7 +478,7 @@ def extract(value: SQLValue, paths: tuple, mode: str) -> SQLValue:
     abbreviated = mode in ("arrow", "arrow2")
     many = len(paths) > 1
     out = bytearray(b"[") if many else None
-    for k, path in enumerate(paths):
+    for path in paths:
         if path is None:
             return None
         text = path_bytes(path)
@@ -491,8 +498,7 @@ def extract(value: SQLValue, paths: tuple, mode: str) -> SQLValue:
                 if mode == "arrow2" and isinstance(result, JSONText):
                     return str.__str__(result)
                 return result
-            if k:
-                out.append(0x2C)
+            append_separator(out)
             renderer = jsonb.Renderer(blob)
             renderer.element(j)
             if renderer.error:
@@ -501,8 +507,7 @@ def extract(value: SQLValue, paths: tuple, mode: str) -> SQLValue:
         elif j == LOOKUP_NOTFOUND:
             if not many:
                 return None
-            if k:
-                out.append(0x2C)
+            append_separator(out)
             out += b"null"
         else:
             raise path_error(j, path)
@@ -874,7 +879,9 @@ class EachCursor:
         else:
             key = self.parents[-1][0]
         i = self.skip_label()
-        element = blob[i] & 0x0F
+        # (Damaged JSONB may put the value past the end: SQLite reads a byte
+        # there - undefined - and then fails to decode it: malformed JSON.)
+        element = blob[i] & 0x0F if i < len(blob) else 0
         if element >= ARRAY and self.binary:
             n, sz = payload_size(blob, i)
             value = JSONBlob(blob[i:i + n + sz])
@@ -898,7 +905,7 @@ class EachCursor:
         if self.recursive:
             level_change = False
             i = self.skip_label()
-            x = blob[i] & 0x0F
+            x = blob[i] & 0x0F if i < len(blob) else 0  # (see row)
             n, sz = payload_size(blob, i)
             if x in (OBJECT, ARRAY):
                 level_change = True

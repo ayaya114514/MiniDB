@@ -324,3 +324,120 @@ def test_json_text_compared_under_a_collation(pair):
         "SELECT max(json_array('A') COLLATE nocase, '[\"a\"]'), json_array('A') COLLATE nocase IN ('[\"a\"]')",
     ]:
         pair.run(sql)
+
+
+def test_damaged_jsonb_agrees_with_sqlite(pair):
+    # Random damage to valid JSONB (bytes changed, cut, inserted): what
+    # json_valid(x, 8) - the deep check - and the functions reading it say.
+    import random
+
+    rng = random.Random(42)
+    import json
+
+    documents = [json.dumps(d, ensure_ascii=False) for d in (
+        {"a": [1, 2.5, -3e10, "x\u00e9\n\"q\"", True, False, None], "b": {"c": {}}},
+        [1, [2, [3, [4, [5]]]], "a longer string, long enough for a 2-byte size", {"k": 0.0001}],
+        "plain", 123456789012345678901234567890, {"": [], "z": {"y": 0}},
+    )] + ["[1e400,-1e400,0x1F,'s',Infinity]"]
+    blobs = [pair.lite.execute("SELECT jsonb(?)", (d,)).fetchone()[0] for d in documents]
+    for blob in blobs:
+        for _ in range(60):
+            damaged = bytearray(blob)
+            roll = rng.random()
+            if roll < 0.5:
+                for _ in range(rng.randint(1, 3)):
+                    damaged[rng.randrange(len(damaged))] = rng.randrange(256)
+            elif roll < 0.75:
+                del damaged[rng.randrange(len(damaged)):]
+            else:
+                damaged.insert(rng.randrange(len(damaged) + 1), rng.randrange(256))
+            for sql in ("SELECT json_valid(?, 8), json_valid(?, 4), json_valid(?, 12)",
+                        "SELECT json(?)", "SELECT json_type(?)", "SELECT json_array_length(?)",
+                        "SELECT json_type(?, '$.a'), ? -> '$[1]', json_extract(?, '$.a[3]')",
+                        "SELECT json_patch(?, '{\"a\":null,\"q\":{\"r\":1}}')", "SELECT json_patch('{\"a\":{}}', ?)"):
+                pair.run(sql, parameters=(bytes(damaged),) * sql.count("?"))
+
+
+def test_json5_inputs_agree_with_sqlite(pair):
+    import random
+
+    rng = random.Random(7)
+    pieces = ["{", "}", "[", "]", ",", ":", " ", "\t", "\n", "\r", "\u00a0", "\u2028", "\ufeff", "/* c */", "// c\n",
+              "1", "-2.5", "+3", ".5", "5.", "0x1f", "0XAB", "-0x10", "1e5", "Infinity", "-Infinity", "NaN", "null",
+              "true", "false", "'s'", "\"t\"", "'a\\'b'", "\"\\x41\"", "\"\\v\\0\"", "'\\\n'", "key", "$k_1", "\"k\""]
+    for _ in range(400):
+        text = "".join(rng.choice(pieces) for _ in range(rng.randint(1, 10)))
+        pair.run("SELECT json_valid(?, 2), json_valid(?, 1), json_valid(?)", parameters=(text,) * 3)
+        pair.run("SELECT json(?)", parameters=(text,))
+        pair.run("SELECT hex(jsonb(?))", parameters=(text,))
+
+
+def test_damaged_jsonb_fails_cleanly():
+    # On damaged JSONB, SQLite's json_each, json_tree and the editing
+    # functions may read past the value (undefined); MiniDB must at least
+    # fail with an SQL error - no internal exception, no endless loop (as
+    # json_patch once had: a target label with a broken header).
+    import random
+    import signal
+
+    from minidb.database import Database
+    from minidb.errors import OperationalError
+
+    db = Database()
+    rng = random.Random(3)
+    blob = db.execute("""SELECT jsonb('{"a":[1,2.5,"x",true,null],"b":{"c":{},"d":[1,{"e":"f"}]}}')""")[0][0]
+    alarm = getattr(signal, "SIGALRM", None)
+
+    def timeout(*_):
+        raise TimeoutError("endless loop")
+
+    if alarm is not None:
+        signal.signal(alarm, timeout)
+    try:
+        for _ in range(400):
+            damaged = bytearray(blob)
+            for _ in range(rng.randint(1, 3)):
+                damaged[rng.randrange(len(damaged))] = rng.randrange(256)
+            for sql in ("SELECT * FROM json_each(?)", "SELECT * FROM json_tree(?)", "SELECT json_remove(?, '$[0]', '$.a')",
+                        "SELECT json_set(?, '$.new', 1)", "SELECT jsonb_insert(?, '$.a[#]', 2)",
+                        "SELECT json_patch(?, '{\"a\":null}')", "SELECT json_replace(?, '$.b.d', 0)"):
+                if alarm is not None:
+                    signal.alarm(10)
+                try:
+                    db.execute(sql, (bytes(damaged),))
+                except OperationalError:
+                    pass
+                finally:
+                    if alarm is not None:
+                        signal.alarm(0)
+    finally:
+        if alarm is not None:
+            signal.signal(alarm, signal.SIG_DFL)
+
+
+def test_damaged_jsonb_corner_cases(pair):
+    # Found by the damaged-JSONB comparison above, each a detail of json.c.
+    for sql, blob in [
+        # jsonReturnFromBlob: null / true / false with a payload are malformed
+        ("SELECT json_extract(?, '$.a[3]')", b'\xcc.\x17a\xcb$\x13152.5b\x0e-70000000000.0\xa8x\xc3\xa9\\n\\"q\\"'
+                                              b'\x01\x02\x00\x17b<\x17c\x0c'),
+        # the pretty printer checks only a label for running past the end
+        ("SELECT json_pretty(?)", b'\xcc\x1d\x17a\xcc\x12\x17b\xcb\x0e\x01\xab\x00\xac\x17nxd\\u0H41\x17eE-0.0'),
+        # a FLOAT5 of just "-" is malformed
+        ("SELECT ? -> '$[1]', json_extract(?, '$[1]')", b'\xcb\x1aU1e400\x16-1e400D0x1F\x17eU9e949'),
+        # jsonHexToInt does not check its digit: \u00H1 is U+0011
+        ("SELECT ? ->> '$.a.b[2]'", b'\xcc\x1d\x17a\xcc\x12\x17b\xcb\x0e6\x02\x00\xac\x17cxd\\u00H1\x17eE-\xb2.0'),
+        # jsonAppendSeparator: no comma after '[' or '{'
+        ("SELECT json_extract(?, '$.a', '$[0]', '$.b.c')", b'\xcb\x1aU1e40{e-\te430D0x1F\x17sU9e999'),
+        ("SELECT json_array(?, 1)", b'U1e40{'),
+        # labels compare as sqlite3Utf8ReadLimited code points: a lone 0xE0 is 0, the end
+        ("SELECT json_patch('{\"a\":{}}', ?)", b'\x9c\x07\x0b\x19\xe0L\x17y\x130'),
+    ]:
+        pair.run(sql, parameters=(blob,) * sql.count("?"))
+    for sql in [
+        "SELECT json_extract('{\"a\\u0000b\":1}', '$.\"a\\u0000c\"')",
+        "SELECT json_set('{\"a\\u0000x\":1}', '$.\"a\\u0000y\"', 2)",
+        "SELECT json_extract('{\"\\u00e9\\u0080\":1}', '$.\"\u00e9\\u0080\"')",
+        "SELECT json('\"\\x4g\"'), json('{\"\\x41\":1}') -> '$.A'",
+    ]:
+        pair.run(sql)
