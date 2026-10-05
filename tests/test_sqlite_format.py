@@ -222,14 +222,14 @@ def test_serialize_and_deserialize(tmp_path):
     for sql in queries:
         assert [typed(r) for r in db.execute(sql)] == [typed(r) for r in source.execute(sql).fetchall()]
 
-    def same_as_sqlite(data, statements):
-        check = sqlite3.connect(":memory:")
-        check.deserialize(data)
-        assert check.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
-        for sql in statements:
-            source.execute(sql)
-        for sql in queries:
-            assert check.execute(sql).fetchall() == source.execute(sql).fetchall(), sql
+    def same_as_sqlite(data: bytes, statements: list[str]) -> None:
+        with closing(sqlite3.connect(":memory:")) as check:
+            check.deserialize(data)
+            assert check.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
+            for sql in statements:
+                source.execute(sql)
+            for sql in queries:
+                assert check.execute(sql).fetchall() == source.execute(sql).fetchall(), sql
 
     changes = ["DELETE FROM t WHERE a % 3 = 0", "UPDATE t SET b = upper(b) WHERE a % 5 = 0",
                "INSERT INTO t (b, c) VALUES ('new', zeroblob(9000))"]
@@ -261,7 +261,8 @@ def test_serialize_and_deserialize(tmp_path):
     fresh = Database()
     fresh.deserialize(b"")
     fresh.execute("CREATE TABLE z (w)")
-    assert sqlite3.connect(":memory:").deserialize(fresh.serialize()) is None
+    with closing(sqlite3.connect(":memory:")) as check:
+        assert check.deserialize(fresh.serialize()) is None
     with pytest.raises(NotSupportedError):
         Database().serialize()
 
@@ -274,6 +275,7 @@ def test_serialize_and_deserialize(tmp_path):
         connection.deserialize(image)
     connection.commit()
     assert len(connection.serialize()) % 4096 == 0
+    source.close()
 
 
 def test_analyze_and_vacuum_match_sqlite(tmp_path):
@@ -995,6 +997,8 @@ def test_an_empty_database_sqlite3_made():
     other.deserialize(image)
     assert other.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
     assert other.execute("SELECT a FROM t INDEXED BY i WHERE a > 0").fetchall() == [(3,), (1,)]
+    connection.close()
+    other.close()
 
 
 def test_page_usage_kept_up_to_date():
