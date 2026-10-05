@@ -260,3 +260,14 @@ def test_string_or_blob_too_big(monkeypatch):
     ]:
         pair.run(sql)
     pair.close()
+
+
+def test_date_functions_read_numbers_as_sqlite3_atof(pair):
+    # Numeric text in date functions goes through sqlite3AtoF (fp.sql_atof):
+    # exponents, signs, trailing text, overflow and white space.
+    for value in ["2.4e6", "2.4E+6", "24e5", "1e9", "-1e3", "+2460000.5", "1e", "1e+", "1e-x", " 2460000 ", "2460000x",
+                  "1e400", "1e-400", "99999999999999999999", "0.000000000000000000002460000e27", "+", "-", ".", ".5e7",
+                  "2460000.", "1_0", "  -0.0e0", "12345678901234567890123e-15", "2.4e6\t", "\v2.4e6"]:
+        for sql in ["SELECT julianday(?), datetime(?, 'unixepoch'), date(?, 'auto'), time(?, 'julianday')",
+                    "SELECT datetime('2000-01-01', ? || ' days'), datetime(0, 'unixepoch', ? || ' seconds')"]:
+            pair.run(sql, parameters=(value,) * sql.count("?"))
