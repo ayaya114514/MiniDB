@@ -12,4 +12,5 @@
 7. [断电与多进程：两个新 fuzzer 和它们找到的三个 bug](07-power-failures-and-processes.md)
 8. [照着代码生成器写：约束、外键、触发器与 JSON](08-copying-the-code-generator.md)
 
-状态：草稿，未发布。数字都是本机（Apple Silicon，Python 3.12）上实测的，发布前若代码有变化需要重跑核对。
+状态：已发布到 blog（https://ayaya114514.github.io/blog/minidb/01-pages-and-btrees/ 起）。数字都是本机（Apple Silicon，
+Python 3.12）上实测的，是写作时那个阶段的数据。

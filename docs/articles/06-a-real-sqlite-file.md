@@ -27,7 +27,7 @@ SQLite 格式有自己的一套存储层，与 MiniDB 的格式并列，按文�
   读出来是 REAL，一经过记录就变成整数。生成列、窗口函数的临时表、GROUP BY 的排序器，各自在不同的地方经过记录。
   MiniDB 用 `values.IntReal` 表示它，在每个“经过记录”的地方转换。
 - **WITHOUT ROWID 表就是一棵索引 B 树**，二级索引的条目要接上缺的主键列，而主键列在二级索引里的升降序：`CREATE INDEX`
-  照抄主键的 DESC，表定义里 UNIQUE 约束的自动索引一律升序。这是 SQLite 源码里明说的 “bAscKeyBug”，为了兼容旧文件而保留。
+  照抄主键的 DESC，表定义里 UNIQUE 约束的自动索引一律升序。这是 SQLite 源码里明说的“bAscKeyBug”，为了兼容旧文件而保留。
 - **页大小与 auto_vacuum**：512 到 65536 字节都要能读写；auto_vacuum 的根页必须集中在文件前部，否则 sqlite3 的 incremental
   vacuum 搬页时会报损坏。指针图（ptrmap）没有在 B 树代码里逐处维护，而是在提交前从脏页推出来。
 - **只在溢出时平衡**：sqlite3BtreeInsert 只有页溢出才调用 balance()。MiniDB 原来对“不足 1/3”的页也做平衡，于是顺序追加时
