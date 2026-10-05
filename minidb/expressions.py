@@ -48,9 +48,9 @@ RowFunction = Callable[[Row], Any]  # a compiled expression
 Record = tuple[tuple, tuple]  # (result row, extra ORDER BY values)
 OrderTerm = tuple[str, int, bool, bool, Union[str, None]]  # (source, index, descending, NULLs first, collation)
 Bound = Union[tuple[RowFunction, bool], None]  # (key function, inclusive)
-Source = Union[TableInfo, "DerivedSource"]  # a table or a subquery in FROM
-CompiledQuery = Union["CompiledSelect", "CompiledCompound"]
-PreparedStatement = Union["PreparedSelect", "PreparedInsert", "PreparedUpdate", "PreparedDelete"]
+Source = Union[TableInfo, DerivedSource]  # a table or a subquery in FROM
+CompiledQuery = Union[CompiledSelect, CompiledCompound]
+PreparedStatement = Union[PreparedSelect, PreparedInsert, PreparedUpdate, PreparedDelete]
 
 
 class AccessPath(Protocol):
