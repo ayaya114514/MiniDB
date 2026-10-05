@@ -170,6 +170,8 @@ def test_sqlite_files_pages_and_export(tmp_path):
     assert check.execute("SELECT * FROM t ORDER BY id").fetchall() == reference.execute("SELECT * FROM t ORDER BY id").fetchall()
     assert check.execute("SELECT length(v) FROM u").fetchall() == [(20000,)]
     assert json.loads(bridge.info())["pages"] == len(exported) // 4096
+    check.close()
+    reference.close()
 
 
 def test_files_the_playground_refuses(tmp_path):
@@ -216,3 +218,4 @@ def test_the_file_kinds_of_stage_25(tmp_path):
     copy.deserialize(exported[:18] + b"\x01\x01" + exported[20:])  # (sqlite3 opens no WAL image in memory)
     assert copy.execute("PRAGMA integrity_check").fetchall() == [("ok",)]
     assert copy.execute("SELECT count(*), sum(g) FROM w").fetchall() == [(250, 2 * sum(range(1, 500, 2)))]
+    copy.close()

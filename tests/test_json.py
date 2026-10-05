@@ -135,7 +135,7 @@ def test_nesting_limits(pair):
         f"SELECT length(json_set('{{}}', '$' || '{'.a' * 1000}', 1))", f"SELECT json_set('{{}}', '$' || '{'.a' * 1001}', 1)",
         f"SELECT json_set('[1]', '$' || '{'[0]' * 1001}', 1)",
         f"SELECT json(json_set(jsonb('{nested(600)}'), '$' || '{'[0]' * 599}', jsonb('{nested(500)}')))",
-        f"SELECT length(json_patch('{{}}', '{'{"a":' * 1000 + '1' + '}' * 1000}'))",
+        "SELECT length(json_patch('{}', '" + '{"a":' * 1000 + "1" + "}" * 1000 + "'))",
         f"SELECT count(*) FROM json_tree('{nested(1000)}')",
     ])
 
