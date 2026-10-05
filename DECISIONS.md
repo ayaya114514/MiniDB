@@ -1295,3 +1295,32 @@ SQLite 的函数结果超过 `SQLITE_LIMIT_LENGTH`（默认 1,000,000,000 字节
 `zeroblob()`、`group_concat()`（聚合与窗口）照 SQLite 检查（`values.check_length`：先比字符数的四分之一，过了再算 UTF-8
 字节数，平常不多花时间）。差分 fuzz 两边都把上限设为 10 MB（sqlite3 的 `setlimit`），否则同一进程里两边各造一个十亿字节
 的字符串（种子 6079 峰值 6 GB，CI 机器只有 7 GB）。MiniDB 不支持 `sqlite3_limit`，上限只能由测试改模块常量。
+
+## D125 词法照 SQLite 的字符类：ASCII 空白、U+0080 以上都是标识符字符、数字分隔符
+
+覆盖率补测试时发现 tokenizer 用的是 Python 的 Unicode 字符类（`\s`、`isdigit()`、`isalnum()`），与 SQLite 的
+sqlite3GetToken 不同：
+- **空白**只有 `" \t\n\f\r"`（`\v` 在 SQLite 里是非法字符）；Python 的 `\s` 还收了 `\v`、`\x1c`–`\x1f`、NBSP、U+3000 等。
+- **标识符字符**是 ASCII 字母数字、`_`、`$`，以及**所有 ≥ 0x80 的字节**（SQLite 按 UTF-8 字节判断）。于是 `€`、emoji、
+  U+2028、NBSP 都可以出现在名字里：`SELECT 1 AS €` 合法，`SELECT 1 AS  x` 的列名是 `" x"`，`1 ` 是一个
+  非法记号。参数名（`:name`、`$name`）同样。
+- **数字只认 ASCII 数字**：`1²` 是非法记号（以前 `int()` 抛 Python 的 ValueError）。
+- **数字分隔符**（SQLite 3.46 起）：数字里的 `_` 让记号成为 TK_QNUMBER，由 sqlite3DequoteNumber 检查每个 `_` 两边都是
+  数字（十六进制里是十六进制数字），否则 “unrecognized token”。语法里只有 `term` 接受它，所以类型的长度
+  （`VARCHAR(1_0)`）和 PRAGMA 的值（`plus_num`）里是语法错误；`-9_223_372_036_854_775_808` 照样是 INT64_MIN。
+- 选择项的列名取原文时去掉的首尾空白、`sqlite3GetBoolean` 的数字判断也改用 ASCII（`sqlite3Isspace` / `sqlite3Isdigit`）。
+
+## D126 ORDER BY 的第一项有索引就走索引；经过 sorter 的值没有 JSON subtype
+
+fuzz 种子 2030：`INSERT INTO t(c) SELECT j FROM s ORDER BY 1`，`t` 有 STORED 列 `json_quote(c)`，`s.j` 是 `json_array()`
+的 VIRTUAL 列——SQLite 存的是带引号的文本。原因：值经过 sorter（或 UNION / INTERSECT / EXCEPT 的临时表）时是从 record
+读回来的，record 不带 subtype。MiniDB 的 `values.through_record` 原来只在造过 IntReal 时才跑、只转 IntReal，现在每次
+真的排过序或做过集合运算都跑，并去掉 subtype。DISTINCT、LIMIT、UNION ALL（无 ORDER BY）不经过 record，保留 subtype。
+
+于是“哪种 ORDER BY 真的要排序”必须与 SQLite 一致。SQLite 没有统计信息时：只要没有更好的访问路径，第一张表上有以
+ORDER BY 第一项（同一排序规则）开头的索引，就扫这个索引——不论有没有 LIMIT、WHERE 是否还要过滤、后面是否还有连接；
+其余各项用 sorter 在块内排（“USE TEMP B-TREE FOR LAST TERM OF ORDER BY”）。MiniDB 原来只在有 LIMIT 时这样做，现在对
+非聚合、无窗口函数的查询照此选索引（聚合仍按 D109 的 GROUP BY 规则）。顺带，相等键的行序也与 SQLite 相同了。
+代价：WHERE 只留下少数行时，扫整个索引再回表比全表扫描加排序慢（10 万行留 12.5%：0.097 → 0.175 s，SQLite 同一计划
+0.027 s）；没有过滤时反而快一些（0.169 → 0.147 s）。第一项是 DESC 时 SQLite 倒着扫索引，MiniDB 没有反向索引扫描，
+仍然排序（记为已知差异）。
