@@ -39,6 +39,10 @@ JSON_DOCS = ['{"a":1,"b":[2,3.5,"x"],"c":{"d":null}}', '[1,[2,{"a":3}],"s",true]
              '{a:1,b:0x10,"c":[.5,],}', '[1e5,-0,1.50,"\\u00e9\\n"]', '"str"', '3', 'null', '[]', '{}',
              '{"a":[{"b":1},{"b":[1,2]}],"b":false}', "['x', +1, Infinity]"]
 JSON_TEXTS = JSON_DOCS + ['[1,2', '{"a":}', '', 'x', '[1] 2', '{"a":1,}', '01']
+# jsonb() of some of JSON_DOCS, which damaged_jsonb() changes, cuts or extends.
+JSONB_HEX = ["CC151761133117628B133235332E35177817633C176400", "CB0D13317B13324C17611333177301",
+             "CC11176113311762443078313017633B262E35", "CB1535316535232D3045312E3530885C75303065395C6E",
+             "AB17781331553965393939"]
 JSON_PATHS = ["'$'", "'$.a'", "'$.b[0]'", "'$[1]'", "'$[#-1]'", "'$.a.b'", "'$.\"x y\"'", "'$[0].a'", "'$.c.d'",
               "'$.b[#]'", "'$.a[1].b'", "'$.z'"]
 PAGE_SIZES = [512, 1024, 2048, 4096, 8192, 16384, 65536]
@@ -463,6 +467,19 @@ class Generator:
                     f"{self.json_value(scope, depth + 1)})")
         return f"json_patch({self.json_doc(scope, depth + 1)}, {self.json_doc(scope, depth + 1)})"
 
+    def damaged_jsonb(self):
+        """A BLOB literal: valid JSONB with a byte changed, cut short or inserted."""
+        rng = self.rng
+        blob = bytearray.fromhex(rng.choice(JSONB_HEX))
+        roll = rng.random()
+        if roll < 0.5:
+            blob[rng.randrange(len(blob))] = rng.randrange(256)
+        elif roll < 0.75:
+            del blob[rng.randrange(len(blob)):]
+        else:
+            blob.insert(rng.randrange(len(blob) + 1), rng.randrange(256))
+        return f"x'{blob.hex()}'"
+
     def json_expr(self, scope, depth):
         """A JSON function call (of well-formed JSON and paths: a malformed
         argument raises an error, and whether SQLite evaluates it for a row
@@ -480,6 +497,9 @@ class Generator:
         if kind == 3:
             return f"json_type({doc()}{', ' + rng.choice(JSON_PATHS) if rng.random() < 0.6 else ''})"
         if kind == 4:
+            if rng.random() < 0.3:  # (the JSONB checks never raise an error)
+                blob = self.damaged_jsonb()
+                return rng.choice([f"json_valid({blob}, {rng.choice([4, 8, 12])})", f"json_error_position({blob})"])
             text = "'" + rng.choice(JSON_TEXTS).replace("'", "''") + "'"
             return f"json_valid({rng.choice([text, self.expr(scope, depth + 1)])}, {rng.choice([1, 2, 3, 6, 8])})"
         if kind == 5:
