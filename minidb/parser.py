@@ -777,7 +777,7 @@ class Parser:
         if self.at_op("+", "-"):
             sign = self.advance().value
         token = self.tok
-        if token.kind in ("INTEGER", "FLOAT"):
+        if token.kind in ("INTEGER", "FLOAT") and "_" not in token.text:  # (no digit separators: plus_num)
             self.advance()
             return ("-" if sign == "-" else "") + token.text
         if sign:
@@ -1685,7 +1685,7 @@ class Parser:
             return SelectItem(Star(table))
         start = self.tok.pos
         expr = self.expr()
-        text = self.text[start:self.tok.pos].strip()
+        text = self.text[start:self.tok.pos].strip(" \t\n\v\f\r")  # (sqlite3Isspace)
         alias = None
         if self.accept_keyword("AS"):
             alias = self.identifier("alias")
@@ -1985,7 +1985,7 @@ class Parser:
         if self.at_op("-", "+", "~"):
             op = self.advance().value
             token = self.tok
-            if op == "-" and token.kind == "FLOAT" and token.text == "9223372036854775808":
+            if op == "-" and token.kind == "FLOAT" and token.text.replace("_", "") == "9223372036854775808":
                 self.advance()
                 return Literal(-(2**63))
             return Unary(op, self.unary())
@@ -2082,7 +2082,7 @@ class Parser:
         if self.accept_op("("):
             for _ in range(2):
                 self.accept_op("-") or self.accept_op("+")
-                if self.tok.kind not in ("INTEGER", "FLOAT"):
+                if self.tok.kind not in ("INTEGER", "FLOAT") or "_" in self.tok.text:  # (SQLite's plus_num)
                     raise self.error("number")
                 self.advance()
                 if not self.accept_op(","):

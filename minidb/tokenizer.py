@@ -54,10 +54,15 @@ class Token:
 # The common tokens, matched by one regular expression; anything else
 # (REAL and hex numbers, strings with doubled quotes, comments, parameters,
 # quoted identifiers, BLOBs, errors) goes through the code below it.
+# As SQLite's tokenizer: white space is ASCII only, and every character from
+# U+0080 up may be part of an identifier (SQLite looks at UTF-8 bytes >= 0x80).
+SPACES = " \t\n\f\r"
+DIGITS = "0123456789"
+HEX_DIGITS = "0123456789abcdefABCDEF"
 _FAST = re.compile(
-    r"\s*(?:"  # white space before the token
-    r"((?![xX]')[^\W\d][\w$]*)"  # 1: a word (not the x of x'...')
-    r"|([0-9]+)(?![\w$.])"  # 2: an integer
+    r"[ \t\n\f\r]*(?:"  # white space before the token
+    r"((?![xX]')[A-Za-z_\x80-\U0010ffff][A-Za-z0-9_$\x80-\U0010ffff]*)"  # 1: a word (not the x of x'...')
+    r"|([0-9]+)(?![A-Za-z0-9_$.\x80-\U0010ffff])"  # 2: an integer
     r"|'([^']*)'(?!')"  # 3: a string without doubled quotes
     r"|(->>|->|<<|>>|<>|<=|>=|==|!=|\|\||(?!--)-|(?!/\*)/|\.(?![0-9])|[<>=+*%&|~(),;])"  # 4: an operator
     r")"
@@ -101,7 +106,7 @@ def tokenize(text: str) -> list[Token]:
             i = end
             continue
         ch = text[i]
-        if ch.isspace():
+        if ch in SPACES:
             i += 1
             continue
         if text.startswith("--", i):
@@ -124,16 +129,7 @@ def tokenize(text: str) -> list[Token]:
             i = end + 1
             tokens.append(Token("BLOB", bytes.fromhex(digits), start, text[start:i]))
             continue
-        if ch.isalpha() or ch == "_":
-            while i < n and (text[i].isalnum() or text[i] in "_$"):
-                i += 1
-            word = text[start:i]
-            if ascii_upper(word) in KEYWORDS:
-                tokens.append(Token("KEYWORD", ascii_upper(word), start, word))
-            else:
-                tokens.append(Token("IDENT", word, start, word))
-            continue
-        if ch.isdigit() or (ch == "." and i + 1 < n and text[i + 1].isdigit()):
+        if ch in DIGITS or (ch == "." and i + 1 < n and text[i + 1] in DIGITS):
             tokens.append(_number(text, i))
             i += len(tokens[-1].text)
             continue
@@ -143,13 +139,13 @@ def tokenize(text: str) -> list[Token]:
             continue
         if ch == "?":
             i += 1
-            while i < n and text[i].isdigit():
+            while i < n and text[i] in DIGITS:
                 i += 1
             tokens.append(Token("PARAM", text[start:i], start, text[start:i]))
             continue
-        if ch in ":@$" and i + 1 < n and (text[i + 1].isalnum() or text[i + 1] == "_"):
+        if ch in ":@$" and i + 1 < n and is_id_char(text[i + 1]):
             i += 1
-            while i < n and (text[i].isalnum() or text[i] in "_$"):
+            while i < n and is_id_char(text[i]):
                 i += 1
             tokens.append(Token("PARAM", text[start:i], start, text[start:i]))
             continue
@@ -168,54 +164,63 @@ def tokenize(text: str) -> list[Token]:
     return tokens
 
 
+def is_id_char(c: str) -> bool:
+    """SQLite's IdChar: a letter, digit, '_', '$' or any character from U+0080 up."""
+    return c >= "\x80" or c.isascii() and (c.isalnum() or c in "_$")
+
+
 def _unrecognized(text: str, start: int, i: int) -> None:
     """A number run into letters (12abc, 1e, 0xg): SQLite's error names the
     whole run."""
-    while i < len(text) and (text[i].isalnum() or text[i] in "_$"):
+    while i < len(text) and is_id_char(text[i]):
         i += 1
     raise SQLSyntaxError(f'unrecognized token: "{text[start:i]}"', text, start)
 
 
 def _number(text: str, start: int) -> Token:
-    i = start
+    """A numeric literal as SQLite's sqlite3GetToken reads it, '_' digit
+    separators included (sqlite3DequoteNumber: each between two digits)."""
     n = len(text)
-    if text.startswith(("0x", "0X"), start):
-        i = start + 2
-        while i < n and text[i] in "0123456789abcdefABCDEF":
+
+    def run(i: int, digits: str) -> int:
+        while i < n and (text[i] in digits or text[i] == "_"):
             i += 1
-        literal = text[start:i]
-        if i == start + 2 or (i < n and (text[i].isalnum() or text[i] in "_$")):
-            _unrecognized(text, start, i)
-        if len(literal[2:].lstrip("0")) > 16:
-            raise SQLSyntaxError(f"hex literal too big: {literal}", text, start)
-        value = int(literal[2:], 16)
-        return Token("INTEGER", value - (1 << 64) if value >= 1 << 63 else value, start, literal)
-    while i < n and text[i].isdigit():
-        i += 1
+        return i
+
+    is_hex = text.startswith(("0x", "0X"), start) and start + 2 < n and text[start + 2] in HEX_DIGITS
     is_float = False
-    if i < n and text[i] == ".":
-        is_float = True
-        i += 1
-        while i < n and text[i].isdigit():
-            i += 1
-    if i < n and text[i] in "eE":
-        j = i + 1
-        if j < n and text[j] in "+-":
-            j += 1
-        if j < n and text[j].isdigit():
+    if is_hex:
+        i = run(start + 3, HEX_DIGITS)
+    else:
+        i = run(start, DIGITS)
+        if i < n and text[i] == ".":
             is_float = True
-            i = j
-            while i < n and text[i].isdigit():
-                i += 1
-    if i < n and (text[i].isalpha() or text[i] == "_"):
+            i = run(i + 1, DIGITS)
+        if i < n and text[i] in "eE" and (
+                i + 1 < n and text[i + 1] in DIGITS
+                or i + 2 < n and text[i + 1] in "+-" and text[i + 2] in DIGITS):
+            is_float = True
+            i = run(i + 2, DIGITS)
+    if i < n and is_id_char(text[i]):
         _unrecognized(text, start, i)
     literal = text[start:i]
+    if "_" in literal:
+        digits = HEX_DIGITS if is_hex else DIGITS
+        if any(c == "_" and (literal[k - 1] not in digits or literal[k + 1:k + 2] not in tuple(digits))
+               for k, c in enumerate(literal)):
+            raise SQLSyntaxError(f'unrecognized token: "{literal}"', text, start)
+    number = literal.replace("_", "")
+    if is_hex:
+        if len(number[2:].lstrip("0")) > 16:
+            raise SQLSyntaxError(f"hex literal too big: {literal}", text, start)
+        value = int(number[2:], 16)
+        return Token("INTEGER", value - (1 << 64) if value >= 1 << 63 else value, start, literal)
     if is_float:
-        return Token("FLOAT", atof(literal), start, literal)
-    value = int(literal)
+        return Token("FLOAT", atof(number), start, literal)
+    value = int(number)
     if value >= 2**63:
         # Like SQLite, integer literals too large for 64 bits become REAL.
-        return Token("FLOAT", atof(literal), start, literal)
+        return Token("FLOAT", atof(number), start, literal)
     return Token("INTEGER", value, start, literal)
 
 

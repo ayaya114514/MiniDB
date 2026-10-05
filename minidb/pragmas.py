@@ -69,7 +69,7 @@ def int32(text: object) -> int:
 def boolean(text: object) -> int:
     """sqlite3GetBoolean: on / yes / true / a non-zero number."""
     text = str(text) if text is not None else ""
-    if text[:1].isdigit():
+    if text[:1] in tuple("0123456789"):
         return int(int32(text) != 0)
     return int(ascii_lower(text) in ("on", "yes", "true"))
 
