@@ -317,7 +317,12 @@ class Generator:
         if kind < 0.14:
             return rng.choice(["TRUE", "FALSE"])  # names that are 1 and 0 unless a column
         if kind < 0.55:
-            return str(rng.choice([0, 1, 2, 3, 5, 7, 10, -1, -4, rng.randint(-20, 40)]))
+            text = str(rng.choice([0, 1, 2, 3, 5, 7, 10, -1, -4, rng.randint(-20, 40), rng.randint(100, 99999)]))
+            digits = text.lstrip("-")
+            if len(digits) >= 2 and rng.random() < 0.1:  # a digit separator (SQLite 3.46+)
+                k = len(text) - len(digits) + rng.randrange(1, len(digits))
+                text = text[:k] + "_" + text[k:]
+            return text
         if kind < 0.61:
             return repr(rng.randint(-40, 40) / 4)
         if kind < 0.65:
