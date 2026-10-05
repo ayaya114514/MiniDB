@@ -17,6 +17,7 @@ from minidb.parser import Expr
 from minidb.values import ascii_lower
 from minidb.expressions import Compiler, ROWID_NAMES, Result, Row, RowFunction, SUBTYPED, Scope, calls_function
 from minidb.generated import check_positions, generated_dependents, replace_possible, trigger_names
+from minidb.ordering import Descending
 from minidb.sources import reads_table
 from minidb.queries import passes_constants
 
@@ -306,7 +307,13 @@ class PreparedSingleTable:
             return []
         rows = [(row[slot], list(row)) for row in self.executor.join_rows(self.scope, self.levels)]
         if two_pass:
-            rows.sort(key=itemgetter(0))
+            descending = None if self.table.has_rowid else self.table.pk_index.declared_descending
+            if descending and any(descending):
+                # (a WITHOUT ROWID table: SQLite collects the keys in an index
+                # ordered as the PRIMARY KEY, DESC columns included)
+                rows.sort(key=lambda r: tuple(Descending(k) if d else k for k, d in zip(r[0], descending)))
+            else:
+                rows.sort(key=itemgetter(0))
         return rows
 
 
