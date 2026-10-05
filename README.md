@@ -244,9 +244,10 @@ GitHub Actions 在 Linux 上编译参考 SQLite，用 Python 3.11–3.14 跑全�
   不依赖 sqlite3，专找优化器 bug；条件里用表中实际存在的值，打在 rowid 和索引范围的边界上。
 - **B+ 树**：上万次随机插入删除后校验不变量（有序、分隔键边界、同深度、填充率、兄弟链）。
 - **类型注解**：`tests/test_annotations.py` 要求每个函数和方法的参数与返回值都有注解，
-  并用 `typing.get_type_hints` 解析一遍（写错的名字会失败）。
-- **覆盖率**：`tools/coverage.py` 只用标准库 `trace` + `ast` 统计语句覆盖率，目前 99.2%；
-  没覆盖的主要是防御性分支（Windows 无 `fcntl`、不可能的内部状态）。
+  并用 `typing.get_type_hints` 解析一遍（写错的名字会失败）；嵌套函数和闭包的注解用 `ast` 检查，
+  其中的名字必须在模块里存在。
+- **覆盖率**：`tools/coverage.py` 只用标准库 `trace` + `ast` 统计语句覆盖率，目前 96.7%（18,384 条语句）；
+  没覆盖的主要是 Windows 的锁分支、只在子进程里运行的代码（多进程测试）和防御性分支。
 - **崩溃恢复**：在提交的每一步（写 WAL 帧、写提交帧、fsync 日志）和 checkpoint 的每一步
   （拷页、fsync、截断日志）模拟崩溃，包括子进程里真实的 `os._exit`，以及截断/损坏的 WAL，
   重开后数据必须是事务前或事务后的完整状态。`tests/test_crash_model.py` 模拟断电：未 fsync 的写入
