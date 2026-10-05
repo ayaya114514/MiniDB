@@ -91,7 +91,14 @@ class CompiledSelect:
         self.constants = []  # conditions tested once, before the loop
         order_columns = self.order_columns(stmt)
         if stmt.source:
-            hint = order_columns[0] if order_columns and stmt.limit is not None else None
+            if self.is_aggregate or self.windows.groups:
+                hint = order_columns[0] if order_columns and stmt.limit is not None else None
+            else:
+                # As SQLite without statistics: when nothing narrows the scan,
+                # an index on the first ORDER BY term saves sorting by it (the
+                # rows then come in index order; later terms are sorted).
+                leading = self.order_columns(stmt, leading=True)
+                hint = leading[0] if leading else None
             self.levels, self.constants = executor.plan_joins(
                 scope, joins, stmt.where, hint, covering=True, aggregate=self.is_aggregate,
                 group_hint=self.group_columns(stmt)
@@ -284,10 +291,10 @@ class CompiledSelect:
                 wanted.append((position, compiler.collation(term) or "BINARY"))
         return follows_order(wanted, self.levels[0].access.order())
 
-    def order_columns(self, stmt: Select) -> list[int] | None:
+    def order_columns(self, stmt: Select, leading: bool = False) -> list[int] | None:
         """ORDER BY as positions of the first table's columns (ROWID for the row
         id), or None unless every term is an ascending, NULLS FIRST plain
-        column of that table."""
+        column of that table.  ``leading``: only the first term."""
         if not self.order_terms or not self.scope.entries:
             return None
         entry = self.scope.entries[0]
@@ -314,6 +321,8 @@ class CompiledSelect:
             else:
                 position = (position, collation or "BINARY")  # (an index must sort by the same collation)
             columns.append(position)
+            if leading:
+                break
         return columns
 
     @property
@@ -386,8 +395,7 @@ class CompiledSelect:
             records = itertools.islice(records, start, end)
         else:
             records = order_records(records, self.order_terms, start, end)
-            if values.int_reals_made[0]:
-                return [values.through_record(output) for output, _ in records]  # (SQLite's sorter)
+            return [values.through_record(output) for output, _ in records]  # (SQLite's sorter)
         return [output for output, _ in records]
 
 
@@ -471,7 +479,7 @@ class CompiledCompound:
         for operator, part in zip(self.operators, self.parts[1:]):
             rows = combine(operator, rows, part.run(), self.key_collations)
         records = order_records([(row, ()) for row in rows], self.order_terms, start, end)
-        if values.int_reals_made[0] and (self.order_terms or self.operators != ["UNION ALL"] * len(self.operators)):
+        if self.order_terms or self.operators != ["UNION ALL"] * len(self.operators):
             return [values.through_record(row) for row, _ in records]  # (a sorter or a temporary table)
         return [row for row, _ in records]
 
