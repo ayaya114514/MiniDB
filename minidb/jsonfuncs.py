@@ -279,11 +279,17 @@ def _dec_or_hex(digits: bytes) -> int | float | str | None:
     """SQLite's sqlite3DecOrHexToI64 for a JSON integer: an int, a float for
     hexadecimal with the high bit set, "big" when too large, None if not a number."""
     if digits[:2] in (b"0x", b"0X"):
-        hex_digits = digits[2:]
-        if not hex_digits or any(c not in b"0123456789abcdefABCDEF" for c in hex_digits):
+        i = 2
+        while i < len(digits) and digits[i] == 0x30:
+            i += 1
+        k = i
+        while k < len(digits) and digits[k] in b"0123456789abcdefABCDEF":
+            k += 1
+        if k - i > 16:
+            return "big"  # (then read as a REAL, which "0x..." is not: malformed)
+        if k < len(digits):
             return None
-        value = int(hex_digits, 16) if len(hex_digits.lstrip(b"0")) <= 16 else int(hex_digits[-16:], 16)
-        value &= (1 << 64) - 1
+        value = int(digits[i:k] or b"0", 16)
         if value >> 63:
             return float(value)
         return value
@@ -449,7 +455,7 @@ def json_valid(value: SQLValue, flags: SQLValue = 1) -> SQLValue:
 
 
 def json_error_position(value: SQLValue) -> SQLValue:
-    if might_be_binary(value):
+    if isinstance(value, bytes) and jsonb.is_jsonb(value):
         return jsonb.validity_check(value, 0, len(value))
     if value is None:
         return None
