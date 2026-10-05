@@ -46,7 +46,7 @@ jobs:
           python -m pytest tests/test_locking.py tests/test_read_marks.py
           tests/test_concurrency.py tests/test_transactions.py tests/test_crash_model.py
           tests/test_vacuum.py tests/test_pager.py tests/test_btree.py tests/test_corruption.py
-          tests/test_sqlite_format.py
+          tests/test_sqlite_format.py tests/test_sqlite_wal.py
 
   fuzz:
     runs-on: ubuntu-latest

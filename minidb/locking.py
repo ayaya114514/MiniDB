@@ -25,6 +25,7 @@ locked")`` is raised, like SQLite's busy timeout.
 from __future__ import annotations
 
 import errno
+import mmap
 import os
 import threading
 import time
@@ -218,9 +219,21 @@ class _LockFile:
                 del self._open[self.key]
                 os.close(self.fd)
 
+    # On Windows the locks are mandatory: a locked byte cannot be read or
+    # written through the handle, not even by the process holding the lock.
+    # SQLite's -shm has its lock bytes amid its data (``spans``: the DMS byte
+    # is nBackfillAttempted), so, as SQLite's win32 VFS, read and write it
+    # through a mapping, which the locks do not apply to.
+
     def read(self, offset: int, size: int) -> bytes:
         if hasattr(os, "pread"):
             return os.pread(self.fd, size, offset)
+        if self.spans is not None:  # pragma: no cover - Windows
+            length = os.fstat(self.fd).st_size
+            if offset >= length:
+                return b""
+            with mmap.mmap(self.fd, length, access=mmap.ACCESS_READ) as view:
+                return view[offset:offset + size]
         with self._mutex:  # pragma: no cover - Windows
             os.lseek(self.fd, offset, os.SEEK_SET)
             return os.read(self.fd, size)
@@ -228,6 +241,12 @@ class _LockFile:
     def write(self, offset: int, data: bytes) -> None:
         if hasattr(os, "pwrite"):
             os.pwrite(self.fd, data, offset)
+            return
+        if self.spans is not None:  # pragma: no cover - Windows
+            # (A mapping longer than the file extends it, as winShmMap does.)
+            length = max(os.fstat(self.fd).st_size, offset + len(data))
+            with mmap.mmap(self.fd, length, access=mmap.ACCESS_WRITE) as view:
+                view[offset:offset + len(data)] = data
             return
         with self._mutex:  # pragma: no cover - Windows
             os.lseek(self.fd, offset, os.SEEK_SET)
