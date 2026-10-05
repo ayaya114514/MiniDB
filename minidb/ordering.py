@@ -102,7 +102,7 @@ def order_key(terms: list[OrderTerm]) -> Callable[[Record], list]:
         parts.append((0 if source == "output" else 1, index, descending,
                       (0,) if nulls_first else (2,), values.collation_sort_key(collation)))
 
-    def key(record):
+    def key(record: Record) -> tuple:
         result = []
         for column, index, descending, null_key, sort_key in parts:
             value = record[column][index]

@@ -144,7 +144,7 @@ def compile_generated(table: TableInfo, positions: list[int]) -> Callable[[Row],
     steps = [(p, compiler.compile(table.columns[p].generated), table.affinities[p]) for p in positions]
     apply, int_real, real = values.apply_affinity, values.int_real, values.REAL
 
-    def fill(row):
+    def fill(row: Row) -> None:
         for position, function, affinity in steps:
             value = apply(function(row), affinity)
             row[position] = int_real(value) if affinity == real else value  # (SQLite's OP_Affinity)
@@ -153,7 +153,7 @@ def compile_generated(table: TableInfo, positions: list[int]) -> Callable[[Row],
                for p in positions for n in walk(table.columns[p].generated)):
         return fill
 
-    def checked(row):
+    def checked(row: Row) -> None:
         context = dates.pure_context
         saved, context[0] = context[0], "a generated column"
         try:

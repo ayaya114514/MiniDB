@@ -4,6 +4,8 @@ MiniDB uses only the standard library, so there is no type checker in the
 test suite; this at least guarantees the annotations exist and refer to
 real types (``typing.get_type_hints`` evaluates them)."""
 
+import ast
+import builtins
 import importlib
 import inspect
 import pkgutil
@@ -52,3 +54,36 @@ def test_annotations_are_complete_and_resolve(module):
         if any(p.name not in hints for p in parameters) or "return" not in hints:
             missing.append(qualified)
     assert not missing, "missing annotations: " + ", ".join(missing)
+
+
+def nested_functions(module):
+    """(line, function node) of every def in the module's source, nested
+    functions and closures included."""
+    tree = ast.parse(inspect.getsource(module))
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node.lineno, node
+
+
+@pytest.mark.parametrize("module", MODULES, ids=lambda m: m.__name__)
+def test_nested_functions_are_annotated_with_known_names(module):
+    # Annotations are strings (from __future__ import annotations) and a
+    # closure's are never evaluated: check that every name in them exists.
+    problems = []
+    for line, node in nested_functions(module):
+        arguments = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+        arguments += [a for a in (node.args.vararg, node.args.kwarg) if a is not None]
+        arguments = [a for a in arguments if a.arg not in ("self", "cls")]
+        annotations = [a.annotation for a in arguments]
+        if node.name != "__init__" or node.returns is not None:
+            annotations.append(node.returns)
+        if any(a is None for a in annotations):
+            problems.append(f"line {line}: {node.name} is missing annotations")
+            continue
+        for annotation in annotations:
+            quoted = isinstance(annotation, ast.Constant) and isinstance(annotation.value, str)
+            expr = ast.parse(annotation.value, mode="eval") if quoted else annotation
+            for name in ast.walk(expr):
+                if isinstance(name, ast.Name) and name.id not in vars(module) and not hasattr(builtins, name.id):
+                    problems.append(f"line {line}: {node.name} names unknown {name.id}")
+    assert not problems, "\n".join(problems)

@@ -6,14 +6,15 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 from minidb import values
 from minidb.catalog import TableInfo
 from minidb.errors import OperationalError
 from minidb.parser import (
-    Binary, Call, Column, Compound, Delete, Exists, InSelect, Insert, Join, Select, SelectItem, Star, Subquery,
-    Update, Values,
+    Binary, Call, Column, Compound, Delete, Exists, Expr, InSelect, Insert, Join, Select, SelectItem, Star,
+    Subquery, Update, Values,
 )
 from minidb.values import ascii_lower
 from minidb.expressions import (
@@ -156,7 +157,7 @@ class CompiledSelect:
             return False
         compiler = Compiler(scope, executor=self.executor)
 
-        def local_slot(expr):
+        def local_slot(expr: Column) -> int | None:
             try:
                 slot, _, _, depth = scope.resolve(expr)
             except (AliasReference, OperationalError):
@@ -203,8 +204,8 @@ class CompiledSelect:
         ORDER BY term that is an alias is left to group_term/order_terms.)"""
         scope = self.scope
 
-        def replacer(windows_allowed):
-            def replace(column):
+        def replacer(windows_allowed: bool) -> Callable[[Column], Expr | None]:
+            def replace(column: Column) -> Expr | None:
                 key = ascii_lower(column.name)
                 if column.table is not None or key not in aliases or scope._matches(column):
                     return None
@@ -216,7 +217,7 @@ class CompiledSelect:
 
         restricted, ordering = replacer(False), replacer(True)
 
-        def term(expr, replace):
+        def term(expr: Expr, replace: Callable[[Column], Expr | None]) -> Expr:
             return expr if isinstance(expr, Column) else substitute_columns(expr, replace)
 
         # (SQLite's parser has already folded "X AND 0": an alias there is never resolved.)

@@ -561,7 +561,7 @@ class BTree:
             size += cost
         groups.append((start, len(sizes)))
 
-        def total(begin, end):
+        def total(begin: int, end: int) -> int:
             first = begin + 1 if free_first else begin
             return HEADER_SIZE + sum(sizes[first:end])
 
@@ -766,11 +766,11 @@ class BTree:
         """Return the tree structure as indented text lines (the ``.btree`` command)."""
         lines = []
 
-        def show(keys):
+        def show(keys: list) -> str:
             text = ", ".join(repr(k) for k in keys[:max_keys])
             return text + (f", ... ({len(keys)} keys)" if len(keys) > max_keys else "")
 
-        def visit(pgno, indent):
+        def visit(pgno: int, indent: int) -> None:
             node = self.node(pgno)
             pad = "  " * indent
             if node.is_leaf:
@@ -794,7 +794,7 @@ class BTree:
         leaves = []
         leaf_depths = set()
 
-        def visit(pgno, low, high, depth, is_root):
+        def visit(pgno: int, low: Any, high: Any, depth: int, is_root: bool) -> None:
             node = self.node(pgno)
             node_size = node.size
             node.recompute_size()
