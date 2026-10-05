@@ -441,3 +441,109 @@ def test_damaged_jsonb_corner_cases(pair):
         "SELECT json('\"\\x4g\"'), json('{\"\\x41\":1}') -> '$.A'",
     ]:
         pair.run(sql)
+
+
+def _jsonb(kind, payload):
+    """A JSONB element: the smallest header for the payload, then the payload."""
+    n = len(payload)
+    if n <= 11:
+        return bytes((n << 4 | kind,)) + payload
+    if n <= 0xFF:
+        return bytes((0xC0 | kind, n)) + payload
+    if n <= 0xFFFF:
+        return bytes((0xD0 | kind,)) + n.to_bytes(2, "big") + payload
+    return bytes((0xE0 | kind,)) + n.to_bytes(4, "big") + payload
+
+
+def test_json_corner_inputs_agree_with_sqlite(pair):
+    # Hand-picked inputs for the branches random documents rarely reach.
+    texts = [
+        # JSON5 white space: U+1680, U+2000-200A, U+2028/9, U+202F, U+205F, U+3000, U+FEFF, and near misses
+        "[1,\u1680 2]", "[\u2000\u200a1]", "[1\u202f]", "[\u205f1]", "[\u30001]", "\ufeff[1]", "[\u2028\u20291]",
+        "[\u16811]", "[\u200b1]", "[\u2060 1]", "[\u3001]", "[1\ufeff]", "[\uffef1]",
+        # comments
+        "[1 /* unterminated", "[1 // to the end", "[1 //c\u2028 ]", "[1 //c\u2029, 2]", "[1 /** a **/ ]", "[1 /",
+        # white space before separators, and missing or doubled ones
+        '{"a":1 ,"b":2 }', '{"a" : 1 , }', "[1 , 2 ]", "[1 ,]", "[ 1 ]", "{ }", "[ ]", '{"a":1 x}', "[1 x]",
+        '{"a":1,,}', "[1,,2]", "{a:1 /*c*/ ,b:2}", '{"a"\t:\n1\r}', "[1\n,\n]",
+        # identifiers with escapes
+        "{\\u0061b:1}", "{a\\u0062:1}", "{\\u00e9:1}", "{a\\u00:1}", "{$:1,_x:2}",
+        # string escapes and line continuations
+        "'a\\\r\nb'", "'a\\\rb'", "'a\\\nb'", "'a\\\u2028b'", "'a\\\u2029b'", "'a\\\u2027b'", '"a\\x41"', '"\\x4"',
+        '"\\0"', '"\\01"', "'it\"s'", '"\\u12"', '"a\rb"', "'\\v'", '"\\\'"', '"\\u00e9\\ud83d\\ude00"', '"\\ud83d"',
+        '"\\uDC00x"', '"tab\there"', "'\\\r\n\\\nx'", '"\\', '"abc',
+        # numbers
+        "-01", "00", "01.5", "1.e5", "1.", "1.x", "1e5e5", "1e+5", "1e-", "1e", ".e5", "-.5", "+.5", "+1", "-+1", "0x",
+        "0xG", "-0x1f", "+0x1f", "1.5x", "1ee5", "1.5.5", "-Infinity", "+Infinity", "-NaN", "NaN", "Infinityx",
+        "1E400", "-", "+", ".", "-0", "-0.0e-0", "0X7FFFFFFFFFFFFFFF", "0x10000000000000000", "[.5,5.,-.5e3]",
+        # NUL ends the text
+        "[1]\x00junk", "[1,\x002]",
+        # nesting
+        "[" * 1000 + "]" * 1000, "[" * 1001 + "]" * 1001, '{"a":' * 999 + "1" + "}" * 999,
+    ]
+    for text in texts:
+        pair.run("SELECT json_valid(?, 1), json_valid(?, 2), json_error_position(?)", parameters=(text,) * 3)
+        pair.run("SELECT json(?)", parameters=(text,))
+        pair.run("SELECT hex(jsonb(?))", parameters=(text,))
+        pair.run("SELECT json_pretty(?)", parameters=(text,))
+        pair.run("SELECT json_extract(?, '$'), json_extract(?, '$[0]')", parameters=(text,) * 2)
+    INT, INT5, FLOAT, FLOAT5, TEXT, TEXTJ, TEXT5, TEXTRAW, ARRAY, OBJECT = 3, 4, 5, 6, 7, 8, 9, 10, 11, 12
+    deep = _jsonb(ARRAY, b"")
+    for _ in range(1001):
+        deep = _jsonb(ARRAY, deep)
+    blobs = [
+        b"\x03", b"\x13-", b"\x131", b"\x23-1", b"\x23-x", b"\x240x", b"\x34-0x", b"\x341x1", b"\x340y1", b"\x340x1",
+        b"\x44-0x1", b"\x340xg", b"\x151", b"\x25.5", b"\x26.5", b"\x16.", b"\x36-.5", b"\x25-1", b"\x261.",
+        b"\x251e", b"\x351e+", b"\x451e5e", b"\x551.5.5", b"\x361e+", b"\x461.e5", b"\x45-1e5", b"\x46Inf",
+        _jsonb(TEXTJ, b'a\\"b'), _jsonb(TEXTJ, b"a\\"), _jsonb(TEXTJ, b"\\u12"), _jsonb(TEXTJ, b"\\u00e9"),
+        _jsonb(TEXTJ, b"\\x41"), _jsonb(TEXTJ, b'a"b'), _jsonb(TEXTJ, b"a\x01b"), _jsonb(TEXT, b'a"b\\'),
+        _jsonb(TEXT5, b"\\x41"), _jsonb(TEXT5, b"\\x4"), _jsonb(TEXT5, b"a\\\r\nb"), _jsonb(TEXT5, b"a\\\rb"),
+        _jsonb(TEXT5, b"a\\\nb"), _jsonb(TEXT5, "a\\\u2028b".encode()), _jsonb(TEXT5, b"a\\\xe2\x80"),
+        _jsonb(TEXT5, b"a\\\xe2\x80\xa7b"), _jsonb(TEXT5, b"\\'\\v\\0"), _jsonb(TEXT5, b"\\01"), _jsonb(TEXT5, b'a"b'),
+        _jsonb(TEXT5, b"a\x01\x1fb"), _jsonb(TEXT5, b"a\\"), _jsonb(TEXT5, b"\\q"), _jsonb(TEXT5, b"\\\\\\/"),
+        _jsonb(TEXT5, b"\\\r\n\\\nx"), _jsonb(TEXTRAW, b'a"\\\x01'),
+        _jsonb(OBJECT, _jsonb(TEXT, b"a")), _jsonb(OBJECT, _jsonb(INT, b"1") + _jsonb(INT, b"2")),
+        _jsonb(OBJECT, _jsonb(TEXT, b"a") + b"\x13"), _jsonb(ARRAY, b"\x13"), _jsonb(ARRAY, b"\x131\x00\x00"),
+        b"\xf3\x00\x00\x00\x00\x00\x00\x00\x011", b"\x240x", b"\x34-0x", b"\xc4\x130x10000000000000000",
+        b"\xc4\x130x00000000000000001", b"\xc4\x13-0x8000000000000000", b"\xc4\x120xffffffffffffffff", b"\xf3\x00\x00\x00\x01\x00\x00\x00\x011", deep,
+    ]
+    for blob in blobs:
+        pair.run("SELECT json_valid(?, 4), json_valid(?, 8), json_error_position(?)", parameters=(blob,) * 3)
+        pair.run("SELECT json(?)", parameters=(blob,))
+        pair.run("SELECT json_pretty(?)", parameters=(blob,))
+        pair.run("SELECT json_extract(?, '$')", parameters=(blob,))
+    for sql in [
+        "SELECT json_extract('{\"a\":1}', '$.\"a')", "SELECT json_extract('[1,2]', '$[#-1x]')",
+        "SELECT json_extract('[1,2]', '$[#-3]')", "SELECT json_array_insert('{\"a\":[1]}', '$.a', 2)",
+        "SELECT json_array_insert('{\"a\":[1]}', '$.b[0]', 2)", "SELECT json_array_insert('[1]', '$[#]', 2)",
+        "SELECT json_extract(?, '" + "$" + ".a" * 1000 + "')",
+        "SELECT json_set('{}', '$" + ".a" * 1000 + "', 1)",
+        "SELECT json_patch(?, ?)",
+    ]:
+        doc = '{"a":' * 999 + "1" + "}" * 999
+        pair.run(sql, parameters=(doc,) * sql.count("?"))
+    for patch in [_jsonb(OBJECT, _jsonb(TEXT, b"a")), _jsonb(OBJECT, _jsonb(TEXT, b"a") + b"\x0c\x00"),
+                  _jsonb(OBJECT, _jsonb(INT, b"1") + _jsonb(INT, b"2")), _jsonb(OBJECT, b"\x17a\x13")]:
+        pair.run("SELECT json_patch('{\"a\":1}', ?), json_patch(?, '{\"a\":1}')", parameters=(patch, patch))
+
+
+def test_json_function_corners_agree_with_sqlite(pair):
+    for sql in [
+        "SELECT json_array(x'01')", "SELECT json_array(jsonb('[1]'), x'')", "SELECT json_quote(x'01')",
+        "SELECT json_quote(jsonb('{\"a\":1}'))", "SELECT json_object('a', x'0102')", "SELECT json_array(9e999, -9e999, 1e15, 2.0)",
+        "SELECT json_quote(9e999), json_quote(-0.0), json_quote(1e300)", "SELECT json_array(json('1'), jsonb('2'))",
+        "SELECT json_group_object(char(97, 0, 98), 1)", "SELECT json_group_object(NULL, 1), json_group_object('a', x'01')",
+        "SELECT json_group_array(x) FROM (SELECT x'01' AS x)",
+        "SELECT json_group_array(json(x)) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+        " FROM (VALUES ('[1,[2,\"]\"]]'), ('{\"a\":\"x,y\",\"b\":[{}]}'), ('3'), ('\"[\"'))",
+        "SELECT json_group_object(k, json(v)) OVER (ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)"
+        " FROM (VALUES ('a', '{\"x\":[1,2]}'), ('b', '\"}\"'), ('c', '[]'))",
+        "SELECT * FROM json_each('[1]', '$.a[')", "SELECT * FROM json_each('{\"a\":1}', 'x')",
+        "SELECT * FROM json_tree('{\"a\":{\"b\\\\u0041\":1,\"c d\":[2]}}')",
+        "SELECT key, fullpath, path FROM json_tree('{\"a\\\"b\":{\"\":1}, \"$\":[{\"x.y\":2}]}')",
+        "SELECT json_valid(1), json_valid(1.5), json_valid(x'00'), json_type(1.5), json_type(x'')",
+        "SELECT json_extract('[1,{\"a\":2}]', '$[0]', '$[1].a', '$[9]')",
+        "SELECT json_array_length('[1,2]', NULL), json_array_length('{}', '$'), json_type('[]', NULL)",
+        "SELECT json_pretty('[1,{\"a\":[]}]', ''), json_pretty('{}', NULL), json_pretty(NULL)",
+    ]:
+        pair.run(sql)
