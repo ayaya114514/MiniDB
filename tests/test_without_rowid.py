@@ -149,6 +149,22 @@ def test_descending_primary_keys(pair):
         pair.run("PRAGMA index_xinfo(sqlite_autoindex_t1_1)")
 
 
+def test_two_pass_writes_follow_the_primary_key_order(pair):
+    # A trigger makes DELETE / UPDATE collect the keys first; SQLite keeps
+    # them in an index ordered as the PRIMARY KEY, DESC included (fuzz seed
+    # 5010: MiniDB's own format went through them ascending).
+    run_all(pair, """
+        CREATE TABLE t (a, b, c, PRIMARY KEY (a DESC, b)) WITHOUT ROWID;
+        CREATE TABLE log (x);
+        CREATE TRIGGER td BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (old.a || ',' || old.b); END;
+        CREATE TRIGGER tu AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('u' || old.a || ',' || old.b); END;
+        INSERT INTO t VALUES (1, 1, 1), (2, 1, 1), (2, 2, 0), (3, 0, 1), ('x', 5, 1), (0.5, 3, 1);
+        UPDATE t SET c = c + 1 WHERE c;
+        DELETE FROM t WHERE c;
+        SELECT rowid, x FROM log
+    """)
+
+
 def test_alter_and_drop(pair):
     run_all(pair, """
         CREATE TABLE w (a, b, c UNIQUE, d, PRIMARY KEY (b, a)) WITHOUT ROWID;
