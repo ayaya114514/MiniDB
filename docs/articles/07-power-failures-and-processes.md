@@ -60,7 +60,7 @@ SQLite 自己的做法（pager.c 的 syncJournal，synchronous=FULL）是两段�
 
 ## Bug 2：BEGIN 不该马上开始
 
-刚跑起来就看到：sqlite3 进程从不 busy，MiniDB 进程却时常报 “database is locked”，而且全都发生在 `BEGIN` 之后的第一条
+刚跑起来就看到：sqlite3 进程从不 busy，MiniDB 进程却时常报“database is locked”，而且全都发生在 `BEGIN` 之后的第一条
 UPDATE 上。
 
 原因是 MiniDB 的 `BEGIN`（DEFERRED）当场就取了读快照，回滚日志模式下还会持有 SHARED 锁。如果别的进程恰好在 BEGIN
@@ -74,7 +74,7 @@ MiniDB 照这个语义改了。之后三种存储模式各 50 个种子 × 8 进
 下一阶段拆分 executor 时照例跑了一轮 WAL fuzz，有两个种子失败：
 
 - 一个查询少返回一行；
-- 另一个种子里，sqlite3 对 MiniDB 的文件报 “2nd reference to page 2”，也就是一页被两棵树引用。
+- 另一个种子里，sqlite3 对 MiniDB 的文件报“2nd reference to page 2”，也就是一页被两棵树引用。
 
 二分到上一阶段的改动之后，缩小出来的序列只有两条：`BEGIN; ROLLBACK;`。
 

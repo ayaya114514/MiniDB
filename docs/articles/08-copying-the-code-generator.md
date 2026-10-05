@@ -14,7 +14,7 @@ AUTOINCREMENT、NOCASE 索引、视图），每条结果都要相同；最后让
 这个测试一跑起来就找到两个随机 fuzz 从没碰到的问题：
 
 - Chinook 的每张表都写成 `INTEGER PRIMARY KEY NOT NULL`。往这种列插 NULL 不违反 NOT NULL，它的意思是“分配一个新 rowid”。
-- Northwind 有一条未命名的 `CHECK ([UnitPrice]>=(0))`，SQLite 报错时用 sqlite3Dequote 处理原文，报成 “UnitPrice”。
+- Northwind 有一条未命名的 `CHECK ([UnitPrice]>=(0))`，SQLite 报错时用 sqlite3Dequote 处理原文，报成“UnitPrice”。
 
 schema 也改成了存原文。以前 MiniDB 把表定义重新打印成规范化的 SQL，约束一多就容易丢东西。现在 `sqlite_schema.sql`
 和 sqlite3 存的逐字相同，ALTER TABLE 也照 alter.c 改文本里的记号。SQLite 写的、MiniDB 并不完全理解的表，经过 ALTER
