@@ -1270,3 +1270,28 @@ SQLite 让 WHERE 循环按 GROUP BY 的顺序出行以省掉排序：没有统�
   不会失败，只执行了 BEGIN 的连接也不挡别人提交。现在照做（`Database.snapshot_pending`）；已经读过的事务再写仍然
   立即报 locked（SQLite 的 BUSY_SNAPSHOT / 防死锁）。已知差别：MiniDB 的任何语句都会开始事务，SQLite 里不访问数据库的
   语句（如 `SELECT 1`）不会。
+
+## D123 拆分 executor.py：按依赖分层，整段搬移，不改行为
+
+阶段 28 时 `executor.py` 有约 6600 行。拆成八个模块，每个只 import 排在它前面的（后面的只出现在注解里，经
+`TYPE_CHECKING` 引入，运行时不循环 import）：`expressions`（名字解析、表达式编译、聚合与窗口的收集器）→ `generated`
+（生成列、按查询看到的样子读行的 `load_row`）→ `ordering`（ORDER BY 键、DISTINCT、复合查询的集合运算）→ `sources`
+（FROM 里的子查询、视图、CTE、`pragma_xxx()`、`json_each()`）→ `planner`（访问路径、连接顺序、生成的嵌套循环）→
+`queries`（编译好的 SELECT / VALUES / 复合查询）→ `dml`（INSERT / UPDATE / DELETE、upsert、RETURNING）→ `executor`
+（语句分派、DDL、约束、触发器与外键的调度）。
+- **只搬不改**：顶层定义原样移动——旧文件与新模块去掉 import 行后是同一个行的多重集合（拆分时用脚本核对过）；唯一的
+  改动是 `load_row` 变成模块级函数（`Executor.load_row` 保留为 staticmethod）。`pragmas`、`triggers`、`foreign_keys`、
+  `database` 改为从定义它的模块 import。这样 diff 可以机械核对，行为不变由同一套测试、fuzz 和 benchmark 证明。
+- **为什么不顺手重构**：拆分的目的是让每个文件能单独读懂；同时改逻辑会让“行为不变”无法由 diff 核对。类之间的方法
+  （`Executor` 上被各层回调的 `compile_query` 等）保留在原处，没有为了更“干净”的边界而改接口。
+- 嵌套函数也补了类型注解。模块都用 `from __future__ import annotations`，注解是字符串，闭包的注解从不求值、也不花
+  运行时间；所以 `test_annotations.py` 用 `ast` 读出每个 `def`（含闭包）的注解，检查齐全且其中的名字在模块里存在。
+
+## D124 SQLITE_LIMIT_LENGTH：超过十亿字节的字符串与 BLOB 报错
+
+SQLite 的函数结果超过 `SQLITE_LIMIT_LENGTH`（默认 1,000,000,000 字节）时报 “string or blob too big”；`||`（OP_Concat）
+在拼接之前就检查。MiniDB 原来没有上限：fuzz 种子 6079 里一个递归的 BEFORE INSERT 触发器每层把字符串加倍，SQLite 0.6 秒后
+报错停下，MiniDB 一直分配到被系统杀掉。现在 `||`、`concat()` / `concat_ws()`、`replace()`、`hex()`、`randomblob()` /
+`zeroblob()`、`group_concat()`（聚合与窗口）照 SQLite 检查（`values.check_length`：先比字符数的四分之一，过了再算 UTF-8
+字节数，平常不多花时间）。差分 fuzz 两边都把上限设为 10 MB（sqlite3 的 `setlimit`），否则同一进程里两边各造一个十亿字节
+的字符串（种子 6079 峰值 6 GB，CI 机器只有 7 GB）。MiniDB 不支持 `sqlite3_limit`，上限只能由测试改模块常量。
