@@ -727,8 +727,11 @@ class Renderer:
             k = 0
             if p[0] == 0x2D:
                 out.append(0x2D)
+                if sz <= 1:
+                    self.error = True
+                    return i + n + sz
                 k = 1
-            if k < sz and p[k] == 0x2E:
+            if p[k] == 0x2E:
                 out.append(0x30)
             while k < sz:
                 out.append(p[k])
@@ -786,6 +789,9 @@ class Renderer:
             raise error("JSON nested too deep")
 
     def pretty_container(self, j: int, end: int, is_object: bool) -> None:
+        """As jsonTranslateBlobToPrettyText: object labels are rendered
+        compactly, and only a label (not an element) running past the end
+        is an error."""
         out = self.out
         if j >= end:
             return
@@ -793,16 +799,22 @@ class Renderer:
         self.level += 1
         if self.level >= MAX_DEPTH:
             raise error("JSON nested too deep")
-        while j < end and not self.error:
+        if is_object:
+            self.depth = self.level
+        while not self.error:
             out += self.indent * self.level
-            j = self.element(j)
             if is_object:
-                out += b": "
+                indent, self.indent = self.indent, None
                 j = self.element(j)
+                self.indent = indent
+                if j > end:
+                    self.error = True
+                    break
+                out += b": "
+            j = self.element(j)
+            if j >= end:
+                break
             out += b",\n"
-        if j > end:
-            self.error = True
-        del out[-2:]
         out.append(0x0A)
         self.level -= 1
         out += self.indent * self.level
@@ -928,25 +940,30 @@ def unescape_one(z: bytes, i: int, n: int) -> tuple[int, int]:
 
 
 def _hex_digit(c: int) -> int:
-    return int(chr(c), 16) if c in _XDIGITS else 0
+    """SQLite's jsonHexToInt, which does not check the digit."""
+    return (c + 9 * ((c >> 6) & 1)) & 0x0F
 
 
 def _hex4(z: bytes, i: int) -> int:
     return (_hex_digit(z[i]) << 12) | (_hex_digit(z[i + 1]) << 8) | (_hex_digit(z[i + 2]) << 4) | _hex_digit(z[i + 3])
 
 
+# sqlite3Utf8Trans1: the bits a UTF-8 lead byte (0xC0 and up) contributes.
+_UTF8_TRANS1 = bytes(list(range(32)) + list(range(16)) + list(range(8)) + [0, 1, 2, 3, 0, 1, 0, 0])
+
+
 def _read_utf8(z: bytes, i: int, n: int) -> tuple[int, int]:
+    """SQLite's sqlite3Utf8ReadLimited: (code point, bytes used); it takes up
+    to four bytes of continuation, whatever the lead byte says."""
     c = z[i]
     if c < 0xC0:
         return c, 1
-    size = 2 if c < 0xE0 else 3 if c < 0xF0 else 4
-    size = min(size, n)
-    value = c & (0x1F if size == 2 else 0x0F if size == 3 else 0x07)
+    c = _UTF8_TRANS1[c - 0xC0]
     k = 1
-    while k < size and (z[i + k] & 0xC0) == 0x80:
-        value = (value << 6) | (z[i + k] & 0x3F)
+    while k < min(n, 4) and (z[i + k] & 0xC0) == 0x80:
+        c = (c << 6) + (z[i + k] & 0x3F)
         k += 1
-    return value, k
+    return c, k
 
 
 def _utf8(v: int) -> bytes:
@@ -978,19 +995,22 @@ def unescape(p: bytes) -> bytes:
 
 
 def _label_chars(z: bytes, raw: bool) -> list[int]:
-    if raw:
-        return list(z)
+    """The code points jsonLabelCompareEscaped compares: UTF-8 read as
+    sqlite3Utf8ReadLimited does, escapes resolved, up to the first 0."""
     out = []
-    i = 0
-    while i < len(z):
+    i, size = 0, len(z)
+    while i < size:
         c = z[i]
-        if c == 0x5C:
-            v, used = unescape_one(z, i, len(z) - i)
-            out.extend(_utf8(v))
-            i += used
+        if c == 0x5C and not raw:
+            c, used = unescape_one(z, i, size - i)
+        elif c >= 0xC0:
+            c, used = _read_utf8(z, i, size - i)
         else:
-            out.append(c)
-            i += 1
+            used = 1
+        if c == 0:
+            break
+        out.append(c)
+        i += used
     return out
 
 
@@ -1112,7 +1132,7 @@ def validity_check(z: bytes, i: int, end: int, depth: int = 1) -> int:
                         return j + 1
                 elif c != 0x5C or j + 1 >= k:
                     return j + 1
-                elif z[j + 1] in b'"\\/bfnrt':
+                elif z[j + 1] in b'"\\/bfnrt\x00':  # (strchr finds a NUL too: its terminator)
                     j += 1
                 elif z[j + 1] == 0x75:
                     if j + 5 >= k or not _is_hex4(z + b"\x00\x00\x00\x00", j + 2):
@@ -1207,13 +1227,13 @@ class Editor:
         self.delta += len(insert) - remove
 
     def array_count(self, root: int) -> int:
+        """As jsonbArrayCount: an element whose header is damaged still
+        counts (the loop counts before it tests the size)."""
         n, sz = payload_size(self.blob, root)
-        j, end, count = root + n, root + n + sz, 0
-        while j < end:
-            n2, sz2 = payload_size(self.blob, j)
-            if n2 == 0:
-                break
-            j += n2 + sz2
+        i, end, count = root + n, root + n + sz, 0
+        while n > 0 and i < end:
+            n, sz = payload_size(self.blob, i)
+            i += sz + n
             count += 1
         return count
 
@@ -1441,10 +1461,16 @@ def merge_patch(target: Editor, i_target: int, patch: bytes, i_patch: int, depth
             t_label = t_cursor
             et = blob[t_cursor] & 0x0F
             if et < TEXT or et > TEXTRAW:
-                raise BadPatch()
+                raise BadPatch()  # (SQLite's JSON_MERGE_BADTARGET: the same "malformed JSON")
             nt_label, st_label = payload_size(blob, t_cursor)
+            if nt_label == 0:
+                raise BadPatch()
             t_value = t_label + nt_label + st_label
+            if t_value >= t_end:
+                raise BadPatch()
             nt_value, st_value = payload_size(blob, t_value)
+            if nt_value == 0 or t_value + nt_value + st_value > t_end:
+                raise BadPatch()
             if label_equal(bytes(patch[p_label + n_label:p_label + n_label + size_label]), e_label in (TEXT, TEXTRAW),
                            bytes(blob[t_label + nt_label:t_label + nt_label + st_label]), et in (TEXT, TEXTRAW)):
                 break
