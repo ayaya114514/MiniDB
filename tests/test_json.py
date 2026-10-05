@@ -547,3 +547,24 @@ def test_json_function_corners_agree_with_sqlite(pair):
         "SELECT json_pretty('[1,{\"a\":[]}]', ''), json_pretty('{}', NULL), json_pretty(NULL)",
     ]:
         pair.run(sql)
+
+
+def test_json_subtype_lost_in_a_sorter(pair):
+    # Values that pass through SQLite's sorter or the temporary table of
+    # UNION / INTERSECT / EXCEPT are read back from records, without the
+    # JSON subtype; an ORDER BY an index gives (no sorter) keeps it.  Seen
+    # through a STORED json_quote() of the inserted value (fuzz seed 2030).
+    pair.run("CREATE TABLE s(a, j AS (json_array(a)))")
+    pair.run("CREATE INDEX sa ON s(a)")
+    pair.run("INSERT INTO s(a) VALUES (1), (2)")
+    pair.run("CREATE TABLE t(c, g AS (json_quote(c)) STORED)")
+    for query in ["SELECT j FROM s", "SELECT j FROM s ORDER BY 1", "SELECT j FROM s ORDER BY rowid", "SELECT j FROM s ORDER BY a",
+                  "SELECT j FROM s ORDER BY a, j", "SELECT j FROM s WHERE j > 1 ORDER BY a", "SELECT DISTINCT j FROM s ORDER BY a",
+                  "SELECT j FROM s UNION SELECT j FROM s", "SELECT j FROM s UNION ALL SELECT j FROM s",
+                  "SELECT j FROM s UNION ALL SELECT j FROM s ORDER BY 1", "SELECT j FROM s INTERSECT SELECT j FROM s",
+                  "SELECT j FROM (SELECT j FROM s ORDER BY 1)", "WITH c AS (SELECT j FROM s) SELECT j FROM c ORDER BY 1",
+                  "SELECT jsonb_array(a) FROM s ORDER BY 1", "SELECT j FROM s, s AS s2 ORDER BY s.a"]:
+        pair.run("DELETE FROM t")
+        pair.run(f"INSERT INTO t(c) {query}")
+        pair.run("SELECT rowid, g FROM t")
+    pair.run("SELECT json_array((SELECT j FROM s ORDER BY 1 LIMIT 1)), json_array((SELECT j FROM s ORDER BY a LIMIT 1))")

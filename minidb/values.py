@@ -178,9 +178,11 @@ def record_value(value: SQLValue, affinity: str | None = None) -> SQLValue:
 
 def through_record(row: tuple) -> tuple:
     """A result row as it comes out of SQLite's sorter or a temporary table
-    (a record): IntReals become integers."""
-    if any(type(v) is IntReal for v in row):
-        return tuple(int(v) if type(v) is IntReal else v for v in row)
+    (a record): IntReals become integers, and values lose the JSON subtype."""
+    for v in row:
+        if type(v) not in _PLAIN_TYPES:
+            return tuple(int(v) if type(v) is IntReal else str.__str__(v) if isinstance(v, str)
+                         else bytes(v) if isinstance(v, bytes) else v for v in row)
     return row
 
 
