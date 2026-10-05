@@ -721,7 +721,7 @@ WAL 200 个种子，变形测试文件模式 200 × 300，0 失败。
 - MiniDB 的任何语句都会开始 DEFERRED 事务，SQLite 里不访问数据库的语句（如 `SELECT 1`）不会。
 - Windows 上没有运行（CI 的 windows job 跳过了 SQLite WAL 的那组新测试）。
 
-## 阶段 28：工程化与发布（本地完成，2026-10-05；push、Pages 部署与 blog 发布待确认）
+## 阶段 28：工程化与发布（完成，2026-10-05）
 - **拆分 `executor.py`**（D123）：约 6600 行拆成按依赖分层的八个模块（expressions → generated → ordering → sources →
   planner → queries → dml → executor），顶层定义整段搬移（去掉 import 行后与旧文件是同一个行的多重集合，脚本核对），
   行为不变：测试、fuzz、benchmark 均无变化（见下）。README 的架构图随之更新。
@@ -784,8 +784,6 @@ D126 的计划改动另测（10 万行、`age` 上有索引、无 LIMIT，各 3 
 `WHERE city = 'a' ORDER BY age`（留 12.5%）0.097 → **0.175 s**（与 SQLite 同一计划：扫整个索引再回表；SQLite 0.027 s）。
 
 **已知问题 / 做得不扎实的地方**：
-- **未发布**：本地领先 origin 70 余个提交（线上 GitHub 与 Pages 仍是 10-01 的版本，阶段 24 的 Playground 打开本地文件也
-  没部署）；系列文章没有发到 blog。都等确认。
 - 种子 8247：VIRTUAL REAL 列上有索引时，SQLite 从索引读出的整数值在窗口函数参数里是 IntReal（窗口临时表读回成整数，
   显示 `127`），在其它位置是 REAL（`127.0`）；MiniDB 一律 REAL。试过在索引读路径产生 IntReal，窗口对了但 UNION / sorter
   的结果又错了，要照搬得让窗口参数的编译知道访问路径，没有做。
@@ -795,4 +793,21 @@ D126 的计划改动另测（10 万行、`age` 上有索引、无 LIMIT，各 3 
 - `reads_generated_call` 判断“读到了某个 VIRTUAL 列”是按列名（不分表）和 `*` 近似的，视图里的表不展开。
 - 覆盖率剩下的 612 条主要是 locking.py 的 Windows 分支（48 条）、子进程里才跑的代码（WAL / 锁协议、`__main__.py`）和
   防御性分支；没有追到 99%。
-- Python 3.11 / 3.13 / 3.14、Linux、Windows 只在 CI 上跑，本机只有 3.12；本阶段的改动还没推送，所以 CI 也还没跑过。
+- 本机日常用 3.12；3.11 / 3.13 / 3.14 这次在 scratch 环境里各跑过一次全量，Linux 与 Windows 只在 CI 上跑。
+
+**发布**（经确认后，2026-10-05）：
+- push 到 GitHub（阶段 24–28 的 70 余个提交第一次进 CI），Pages 部署新版 Playground。线上实测（Chrome，isolated context）：
+  示例 7 条语句正常；“打开文件”打开 sqlite3 生成的 500 行库（含索引、JSON），文件图与页面布局正常；带 `1_000`、`AS 总数€`、
+  `->>`、`json_set` 的查询与本机 sqlite3 逐条相同；console 无报错；390×844 无横向溢出（scrollWidth = 390）。
+- 系列文章 01–08 发到 blog 的新分组 “MiniDB”（`/blog/minidb/`）：中文软换行合并成连续段落（否则渲染成空格）、文末附仓库与
+  Playground 链接；02 的 sqllogictest 数字更新到第四轮。blog `npm run verify` 通过，本地 build 在桌面与 390×844 下检查过，
+  部署后 9 个页面线上 200、内容为新版。
+- **CI 第一次跑阶段 24–28 的代码时发现并修好**：
+  - Python 3.11：一个嵌套同种引号的 f-string（3.12 语法），`test_json.py` 整个收集失败。
+  - Python 3.13+：几个阶段 24–25 的测试没关 sqlite3 连接，GC 时的 ResourceWarning 被当作错误（本机 3.12 不报）。
+  - Python 3.14：`Union["CompiledSelect", ...]` 这类字符串前向引用在别的模块里能解析，只是因为 3.13 及以前缓存了
+    求值过的 ForwardRef（取决于测试顺序）；改用运行时就有的名字。
+  - **Windows**：SQLite 的 `-shm` 里 DMS 锁字节就是 nBackfillAttempted，LockFileEx 的锁是强制的，连持锁者也不能经句柄写它
+    （WAL 恢复时 PermissionError；`test_not_a_database` 因前一轮留下的 `-wal` 走进了 WAL 恢复）。照 SQLite 的 win32 VFS 改为
+    经映射读写这类文件；Windows job 从此也跑 SQLite WAL 的测试组（原来跳过），通过。
+- CI 最终（4f41e5e）：3.11–3.14 与 Windows 的测试、fuzz、sqllogictest 全部通过。
