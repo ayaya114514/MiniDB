@@ -188,7 +188,7 @@ class PreparedInsert:
                              or any(calls_function(check.expr) for check in table.checks)):
             return True  # (a function call in a CHECK may raise an error, like one in the statement)
 
-        def handled(constraint, own):
+        def handled(constraint: IndexInfo | str, own: str | None) -> bool:
             return (conflict or own or "ABORT") != "ABORT" or any(
                 u.constraint in (constraint, None) for u in self.upserts)
 
@@ -201,7 +201,7 @@ class PreparedInsert:
         checked.update(p for check in table.checks for p in check_positions(table, check))
         checked.update((table.rowid_column, len(table.columns)))
 
-        def changes(upsert):  # (with the generated columns that follow them)
+        def changes(upsert: PreparedUpsert) -> set[int]:  # (with the generated columns that follow them)
             positions = {p for p, _ in upsert.assignments}
             return positions | generated_dependents(table, positions)
 

@@ -459,7 +459,7 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
     rowid_slot = scope.rowid_slot(index)
     constraints = []
 
-    def column_position(expr):
+    def column_position(expr: Expr) -> int | None:
         expr = strip_collate(expr)  # (as SQLite's sqlite3ExprSkipCollate)
         if not isinstance(expr, Column):
             return None
@@ -479,7 +479,7 @@ def find_constraints(scope: Scope, index: int, conjuncts: list[Expr], compiler: 
 
     conversions = {}  # key function -> the conversion it applies
 
-    def key_function(position, expr, key_affinity=None):
+    def key_function(position: int, expr: Expr, key_affinity: str | None = None) -> RowFunction | None:
         if tables_referenced(expr, scope) - bound:
             return None
         function, affinity = compiler.compile_with_affinity(expr)

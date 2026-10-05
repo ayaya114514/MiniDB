@@ -436,7 +436,7 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
     if affinity in values.NUMERIC_AFFINITIES:
         numeric = values.numeric_affinity
 
-        def order(a, b):
+        def order(a: SQLValue, b: SQLValue) -> int:
             if isinstance(a, str):
                 a = numeric(a)
             if isinstance(b, str):
@@ -445,7 +445,7 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
     elif affinity == values.TEXT:
         text = values.text_affinity
 
-        def order(a, b):
+        def order(a: SQLValue, b: SQLValue) -> int:
             if isinstance(a, str) or isinstance(b, str):
                 return compare(text(a), text(b))
             return compare(a, b)
@@ -454,7 +454,7 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
     if op in ("IS", "IS NOT"):
         want = op == "IS"
 
-        def is_test(a, b):
+        def is_test(a: SQLValue, b: SQLValue) -> int:
             if a is None or b is None:
                 return int((a is None and b is None) == want)
             return int((order(a, b) == 0) == want)
@@ -462,7 +462,7 @@ def value_comparator(op: str, left_affinity: str | None, right_affinity: str | N
         return is_test
     test = _TESTS[op]
 
-    def comparator(a, b):
+    def comparator(a: SQLValue, b: SQLValue) -> int | None:
         if a is None or b is None:
             return None
         return int(test(order(a, b)))
@@ -810,7 +810,7 @@ class Compiler:
         if_null = int(not is_true)
         truth = values.truth
 
-        def test(row):
+        def test(row: Row) -> int:
             value = truth(operand(row))
             return (if_null if value is None else int(value)) ^ invert
         return test
@@ -828,7 +828,7 @@ class Compiler:
         right, right_affinity = self.compile_with_affinity(expr.right)
         truth = values.truth
         if op == "AND":
-            def and_(row):
+            def and_(row: Row) -> int | None:
                 a = truth(left(row))
                 if a is False:
                     return 0
@@ -838,7 +838,7 @@ class Compiler:
                 return None if a is None or b is None else 1
             return and_
         if op == "OR":
-            def or_(row):
+            def or_(row: Row) -> int | None:
                 a = truth(left(row))
                 if a:
                     return 1
@@ -863,7 +863,7 @@ class Compiler:
         logical_and, logical_not = values.logical_and, values.logical_not
         negated = expr.negated
 
-        def between(row):
+        def between(row: Row) -> int | None:
             v = value(row)
             result = logical_and(at_least(v, low(row)), at_most(v, high(row)))
             return logical_not(result) if negated else result
@@ -886,7 +886,7 @@ class Compiler:
         equal = value_comparator("=", affinity, None, collation)
         found, missing = (0, 1) if expr.negated else (1, 0)
 
-        def in_list(row):
+        def in_list(row: Row) -> int | None:
             v = value(row)
             if v is None:
                 return None
@@ -940,14 +940,14 @@ class Compiler:
                               self.compile(result)))
         otherwise = self.compile(expr.else_) if expr.else_ is not None else (lambda row: None)
         if expr.base is None:
-            def searched_case(row):
+            def searched_case(row: Row) -> SQLValue:
                 for condition, result in whens:
                     if truth(condition(row)):
                         return result(row)
                 return otherwise(row)
             return searched_case
 
-        def simple_case(row):
+        def simple_case(row: Row) -> SQLValue:
             b = base(row)
             for (value, equal), result in whens:
                 if equal(b, value(row)) == 1:
@@ -974,14 +974,14 @@ class Compiler:
         """A function outer_row -> transform(rows of the subquery)."""
         cell = self.scope.cell
         if compiled.correlated:
-            def run_correlated(row):
+            def run_correlated(row: Row) -> Any:
                 cell[0] = row
                 return transform(compiled.run(max_rows))
             return run_correlated
         cache = []
         self.executor.once_caches.append(cache)  # emptied before every execution
 
-        def run_once(row):
+        def run_once(row: Row) -> Any:
             if not cache:
                 cache.append(transform(compiled.run(max_rows)))
             return cache[0]
@@ -1012,7 +1012,7 @@ class Compiler:
             collation = self.collation(expr.expr) or right
         sort_key = values.collation_sort_key(collation)
 
-        def summarize(rows):
+        def summarize(rows: list[tuple]) -> tuple[set, bool, bool]:
             keys, has_null = set(), False
             for (candidate,) in rows:
                 if candidate is None:
@@ -1024,7 +1024,7 @@ class Compiler:
         members = self._runner(compiled, summarize)
         found, missing = (0, 1) if expr.negated else (1, 0)
 
-        def in_select(row):
+        def in_select(row: Row) -> int | None:
             keys, has_null, nonempty = members(row)
             if not nonempty:
                 return missing  # x IN (empty) is false even for NULL x
@@ -1041,12 +1041,12 @@ class Compiler:
             raise OperationalError("RAISE() may only be used within a trigger-program")
         kind = expr.kind
         if kind == "IGNORE":
-            def ignore(row):
+            def ignore(row: Row) -> SQLValue:
                 raise TriggerIgnore()
             return ignore
         message = self.compile(expr.message)
 
-        def raise_(row):
+        def raise_(row: Row) -> SQLValue:
             text = message(row)
             raise raise_error(kind, "" if text is None else values.to_text(text))
         return raise_
@@ -1501,7 +1501,7 @@ def folded_literal(expr: Expr) -> Literal | None:
     if isinstance(expr, Literal):
         return expr
     if isinstance(expr, Binary) and expr.op == "AND":
-        def is_zero(literal):  # an INTEGER 0; Literal(0.0) == Literal(0) in Python
+        def is_zero(literal: Literal | None) -> bool:  # an INTEGER 0; Literal(0.0) == Literal(0) in Python
             return literal is not None and type(literal.value) is int and literal.value == 0
 
         zero = Literal(0)

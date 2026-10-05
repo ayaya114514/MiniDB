@@ -48,7 +48,7 @@ from minidb.pager import Pager
 from minidb.sqlite_pager import SqlitePager
 from minidb.expressions import (
     AggregateCollector, CompiledQuery, Compiler, NOT_INDEXED, OrderTerm, PreparedStatement,
-    RECORD_CONVERTED, Result, Row, RowFunction, Scope, calls_function, constant_integer, contains_aggregate,
+    RECORD_CONVERTED, Result, Row, RowFunction, Scope, ScopeEntry, calls_function, constant_integer, contains_aggregate,
     fold_and, split_conjuncts, strip_collate, tables_referenced, walk,
 )
 from minidb.generated import (
@@ -602,7 +602,7 @@ class Executor:
         right = scope.entries[index]
         left_entries = scope.entries[:index]
 
-        def having(name):
+        def having(name: str) -> list[ScopeEntry]:
             return [e for e in left_entries if e.table.column_index(name) is not None]
 
         if join.natural:
@@ -686,7 +686,7 @@ class Executor:
                 if any(index > j for index in used):
                     raise OperationalError("ON clause references tables to its right")
 
-        def floor(j):
+        def floor(j: int) -> int:
             """The lowest level for a condition of join j (len(joins): WHERE)."""
             return max((i for i in rights if i < j), default=0)
 
@@ -782,7 +782,7 @@ class Executor:
         pool = [conjunct for conjunct, _ in referenced]
         accesses = {}
 
-        def access(table, bound):
+        def access(table: int, bound: frozenset[int]) -> tuple[float, float]:
             key = (table, bound)
             if not getattr(scope.entries[table].table, "depends", set()) <= bound:
                 return math.inf, math.inf  # (json_each() after the tables its arguments use)
@@ -796,7 +796,7 @@ class Executor:
                 accesses[key] = rows, cost
             return accesses[key]
 
-        def total(order):
+        def total(order: Sequence[int]) -> float:
             cost, outer, bound = 0, 1, frozenset()
             for table in order:
                 rows, probe = access(table, bound)
@@ -834,7 +834,7 @@ class Executor:
                 loop = levels[0].loop = inner_join_loop(levels)
             return loop(row)
 
-        def passes(conditions):
+        def passes(conditions: list[RowFunction]) -> bool:
             for condition in conditions:
                 if not truth(condition(row)):
                     return False
@@ -843,11 +843,11 @@ class Executor:
         # Row ids a RIGHT / FULL JOIN level matched, by level.
         matched_ids = {i: set() for i, level in enumerate(levels) if level.unmatched is not None}
 
-        def merge(level):
+        def merge(level: JoinLevel) -> None:
             for slot, parts in level.merges:
                 row[slot] = next((row[p] for p in parts if row[p] is not None), None)
 
-        def visit(i):
+        def visit(i: int) -> Iterator[Row]:
             if i == depth:
                 yield row
                 return
@@ -873,7 +873,7 @@ class Executor:
                 if passes(level.filters):
                     yield from visit(i + 1)
 
-        def unmatched(i):
+        def unmatched(i: int) -> Iterator[Row]:
             """The rows of a RIGHT / FULL JOIN's table that nothing before it
             matched, with NULL for the tables before, joined to the rest."""
             level = levels[i]
@@ -890,7 +890,7 @@ class Executor:
                 if row[stop - 1] not in seen and passes(level.filters):
                     yield from visit(i + 1)
 
-        def run():
+        def run() -> Iterator[Row]:
             yield from visit(0)
             for i in matched_ids:
                 yield from unmatched(i)
@@ -1060,13 +1060,13 @@ class Executor:
         limit = compiler.compile(stmt.limit)
         offset = compiler.compile(stmt.offset) if stmt.offset is not None else None
 
-        def integer(function):
+        def integer(function: RowFunction) -> int:
             value = values.numeric_affinity(function([]))
             if not isinstance(value, int):
                 raise IntegrityError("datatype mismatch")
             return value
 
-        def bounds():
+        def bounds() -> tuple[int, int | None]:
             count = integer(limit)
             if count == 0:
                 return 0, 0  # (SQLite stops here: the OFFSET is not evaluated)
@@ -1193,7 +1193,7 @@ class Executor:
             test = compiler.compile(check.expr)
             positions = check_positions(table, check)
 
-            def failed(row, test=test):
+            def failed(row: Row, test: RowFunction = test) -> bool:
                 value = test(row)
                 return value is not None and not truth(value)
             checks.append((f"CHECK constraint failed: {check.name or sqlite_dequote(check.text)}", failed, positions))
@@ -1892,7 +1892,7 @@ class Executor:
             raise OperationalError(f"error in table {table.name} after rename: duplicate column name: {new}")
         old = ascii_lower(table.columns[position].name)
 
-        def renamed(text, pos):
+        def renamed(text: str, pos: int) -> str:
             """The new name for the token at ``pos``, quoted as SQLite does."""
             bare = text[pos:pos + 1].isalnum() or text[pos:pos + 1] in "_$" or ord(text[pos]) > 127
             return new if bare and not new_quoted else quote(new)
