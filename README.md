@@ -156,8 +156,14 @@ SQL 文本
   ▼
   │  parser.py      递归下降语法分析 → 语法树（dataclass），运算符优先级与 SQLite 相同
   ▼
-  │  executor.py    名字解析、表达式编译成闭包、访问路径规划、嵌套循环连接、
-  │                 聚合/排序/限制、INSERT/UPDATE/DELETE 与约束检查
+  │  executor.py    语句分派、DDL、约束、触发器与外键的调度；下面几层各只依赖前面的：
+  │    expressions.py  名字解析（Scope）、表达式编译成闭包或生成的 Python 源码、聚合与窗口调用
+  │    generated.py    生成列的计算次序与填充、按查询看到的样子读行（load_row）
+  │    ordering.py     ORDER BY 排序键、top-k、DISTINCT、复合 SELECT 的集合运算
+  │    sources.py      FROM 里的子查询、视图、CTE（含递归）、pragma_xxx()、json_each()
+  │    planner.py      访问路径（rowid / 索引 / 自动哈希）、连接顺序、生成的嵌套循环
+  │    queries.py      编译好的 SELECT / VALUES / 复合查询
+  │    dml.py          INSERT / UPDATE / DELETE、upsert、RETURNING、视图上的 INSTEAD OF
   │  values.py      SQL 值语义：亲和性、比较、算术、文本转换、标量和聚合函数
   │  jsonb.py       JSON 文本 ⇄ JSONB 的解析、渲染与路径编辑（照 SQLite 的 json.c）
   │  jsonfuncs.py   JSON 标量/聚合函数与 json_each / json_tree
